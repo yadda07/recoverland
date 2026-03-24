@@ -1,0 +1,19 @@
+[general]
+name=RecoverLand
+qgisMinimumVersion=3.44
+description=Audit local et restauration de données SIG : capture automatique, recherche et restauration des modifications
+about=RecoverLand capture automatiquement chaque modification (attribut, geometrie, suppression) dans un journal SQLite local, puis permet de rechercher, comparer et restaurer les etats anterieurs des entites.
+version=3.0.0
+changelog=3.0.0 - Passage a l'audit local SQLite (plus de dependance PostgreSQL), capture automatique des modifications, recherche paginee, detection de derive de schema, retention configurable, journal d'integrite
+author=NGE ES DEVTEAM
+email=yadda@ext.nge.fr
+category=Data Management
+tags=audit,recovery,restore,sketching,versioning,local,sqlite
+icon=icon.svg
+supportsQt6=True
+qgisMaximumVersion=4.99
+experimental=False
+deprecated=False
+homepage=
+tracker=
+repository=
