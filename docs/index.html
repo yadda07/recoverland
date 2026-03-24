@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RecoverLand - Documentation</title>
+<link rel="stylesheet" href="rl.css?v=3">
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0"><defs>
+  <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--brd)"/></marker>
+  <marker id="ah2" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--ac)"/></marker>
+</defs></svg>
+
+<header class="bar">
+  <a class="bar-logo" href="index.html">
+    <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">3.0</span>
+  </a>
+  <nav class="bar-nav">
+    <a href="index.html" class="on">Vue d'ensemble</a>
+    <a href="guide.html">Guide</a>
+    <a href="formats.html">Formats</a>
+    <a href="limits.html">Limites</a>
+  </nav>
+  <div class="bar-right">
+    <button class="tbtn" onclick="toggleTheme()">&#9789;</button>
+  </div>
+</header>
+
+<div class="layout">
+<aside class="side"><nav>
+  <div class="cat">Presentation</div>
+  <a href="#intro">Introduction</a>
+  <a href="#what-it-does">Ce que ca fait</a>
+  <a href="#what-it-doesnt">Ce que ca ne fait pas</a>
+  <div class="cat">Fonctionnement</div>
+  <a href="#architecture">Architecture</a>
+  <a href="#journal">Journal SQLite</a>
+  <a href="#capture">Capture automatique</a>
+  <a href="#edit-buffer">Tampon d'edition</a>
+  <a href="#delta-storage">Stockage delta</a>
+  <div class="cat">Identification</div>
+  <a href="#identification">Systeme d'identification</a>
+  <a href="#fingerprint">Fingerprint</a>
+  <a href="#identity-strength">Force d'identification</a>
+  <div class="cat">Robustesse</div>
+  <a href="#dual-backend">Mode dual backend</a>
+  <a href="#schema-drift">Derive de schema</a>
+  <a href="#integrity">Integrite et recuperation</a>
+  <a href="#retention">Retention et purge</a>
+  <a href="#event-lifecycle">Cycle de vie</a>
+</nav></aside>
+
+<main class="main">
+
+<div class="hero">
+  <div class="hero-logo">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2909 443">
+      <rect x="34" y="0" width="371" height="442" fill="#febf00" stroke="none"/>
+      <g transform="translate(0,443) scale(0.1,-0.1)" fill-rule="evenodd" stroke="none" id="logo-text">
+        <path d="M393 3407 c-6 -10 -4 -587 3 -598 2 -5 592 -9 1310 -9 1142 0 1309 -2 1335 -15 35 -19 89 -109 89 -150 -1 -72 -69 -159 -147 -186 -31 -12 -266 -14 -1315 -14 -1271 0 -1278 0 -1279 -20 -1 -49 -1 -341 0 -447 l1 -118 711 0 711 0 77 -73 c42 -40 112 -103 156 -139 44 -37 98 -85 120 -108 22 -23 78 -74 125 -113 47 -39 114 -99 150 -133 36 -34 88 -80 115 -101 28 -22 64 -55 80 -74 17 -19 88 -83 159 -141 l128 -107 451 -1 c249 0 461 -2 471 -3 35 -4 25 18 -30 63 -31 25 -77 65 -103 90 -26 25 -96 88 -157 140 -60 52 -134 118 -164 146 -30 29 -103 94 -162 145 -58 52 -167 148 -242 213 -139 123 -164 158 -135 192 10 12 26 14 73 9 58 -6 145 3 248 24 73 16 201 84 281 151 90 76 145 147 208 275 28 55 56 106 62 114 8 9 12 72 12 195 l0 181 -33 77 c-18 43 -42 95 -54 115 -36 63 -124 175 -175 225 -54 52 -214 143 -265 151 -18 2 -59 14 -90 26 -57 21 -61 21 -1388 23 -733 2 -1334 0 -1337 -5z"/>
+        <path d="M23975 3403 c-9 -8 -12 -91 -13 -292 0 -242 2 -282 15 -293 13 -10 260 -13 1282 -15 696 -1 1283 -4 1303 -6 21 -3 53 -18 76 -36 31 -26 41 -42 51 -86 16 -73 3 -119 -50 -168 -82 -78 35 -72 -1389 -75 -996 -2 -1276 -5 -1282 -15 -4 -6 -8 -132 -8 -278 0 -201 3 -269 13 -277 8 -7 247 -11 702 -11 l689 -2 33 -25 c18 -14 104 -88 191 -166 86 -77 228 -204 315 -282 87 -77 175 -154 195 -169 20 -15 78 -67 127 -115 92 -90 185 -171 241 -210 31 -21 36 -21 494 -22 254 -1 464 1 466 3 9 8 -308 299 -390 357 -11 9 -58 51 -102 95 -45 44 -105 98 -133 120 -28 22 -82 71 -119 109 -37 38 -79 76 -94 85 -14 9 -60 49 -102 88 -56 52 -76 77 -76 96 0 14 5 29 11 33 7 4 59 8 118 10 58 2 136 10 174 19 65 15 92 25 187 68 52 24 244 197 268 242 112 210 148 379 118 555 -58 340 -237 539 -578 645 l-83 25 -1319 3 c-1003 1 -1322 -1 -1331 -10z"/>
+        <path d="M5140 3394 c-36 -7 -91 -18 -124 -24 -32 -6 -70 -17 -85 -24 -14 -7 -47 -18 -72 -24 -25 -6 -94 -34 -153 -61 -159 -75 -353 -240 -451 -384 -127 -187 -172 -285 -211 -467 -27 -121 -27 -461 -1 -570 34 -142 79 -262 112 -300 7 -8 24 -34 37 -56 76 -135 156 -228 296 -344 162 -135 252 -179 512 -254 75 -21 76 -21 1395 -21 l1320 0 3 293 c1 160 1 293 0 294 -2 2 -579 5 -1283 8 l-1280 5 -59 23 c-33 13 -78 36 -100 51 -23 15 -62 39 -87 54 -66 38 -155 138 -195 221 -63 128 -74 176 -74 314 0 119 2 130 36 223 51 138 109 219 214 296 99 72 158 102 255 132 70 21 72 21 1311 21 951 0 1243 3 1252 12 9 9 12 88 12 295 0 269 -1 283 -19 293 -13 7 -422 10 -1258 9 -1015 -1 -1250 -3 -1303 -15z"/>
+        <path d="M9100 3385 c-248 -51 -418 -119 -555 -221 -95 -70 -248 -220 -274 -269 -12 -22 -38 -62 -57 -90 -20 -27 -44 -68 -55 -90 -10 -22 -23 -47 -28 -55 -5 -8 -18 -40 -29 -70 -11 -30 -25 -71 -32 -90 -7 -19 -16 -69 -21 -110 -5 -41 -13 -94 -19 -117 -22 -93 -23 -184 -1 -287 12 -55 21 -118 21 -140 1 -23 7 -52 15 -66 8 -14 14 -35 15 -47 1 -60 131 -296 235 -425 53 -66 243 -228 330 -281 110 -68 293 -131 460 -158 28 -4 627 -8 1332 -8 l1283 -1 5 23 c3 12 4 146 3 297 l-3 275 -1280 5 -1280 5 -65 25 c-156 60 -326 197 -383 310 -60 116 -69 156 -74 308 -5 129 -3 150 17 210 34 102 97 218 140 254 156 136 209 167 343 204 l88 24 1238 0 c949 0 1240 3 1249 12 18 18 17 571 -1 586 -9 8 -375 11 -1258 11 l-1244 0 -115 -24z"/>
+        <path d="M13115 3403 c-71 -9 -275 -56 -344 -79 -113 -38 -261 -111 -301 -148 -19 -18 -70 -58 -112 -89 -49 -36 -91 -77 -117 -114 -22 -32 -60 -85 -85 -118 -75 -99 -133 -228 -183 -410 -26 -96 -27 -109 -27 -320 1 -204 3 -227 27 -315 49 -181 106 -313 164 -382 20 -24 50 -65 68 -93 39 -59 116 -141 165 -175 19 -13 58 -44 85 -69 89 -79 293 -165 488 -205 l127 -27 1078 3 1077 4 119 32 c312 85 474 195 702 477 102 125 174 290 216 495 17 81 22 140 22 260 1 198 -21 304 -108 539 -17 45 -63 132 -75 141 -4 3 -28 35 -53 71 -56 79 -251 268 -329 318 -49 32 -120 67 -231 115 -48 20 -265 73 -354 86 -65 9 -1948 12 -2019 3z m2036 -622 c35 -10 77 -22 93 -25 37 -9 123 -64 209 -133 50 -41 79 -76 115 -137 78 -131 92 -162 92 -195 0 -17 7 -49 16 -71 19 -46 15 -135 -10 -240 -33 -140 -161 -328 -265 -387 -25 -15 -64 -39 -86 -55 -22 -15 -75 -39 -118 -53 l-78 -25 -1002 0 c-577 0 -1017 4 -1037 10 -126 33 -273 115 -352 197 -51 53 -126 182 -164 282 -20 54 -24 81 -24 181 0 133 14 183 90 319 58 107 81 134 168 198 107 79 151 102 239 124 42 11 79 21 81 24 3 3 447 5 988 5 935 0 985 -1 1045 -19z"/>
+        <path d="M16075 3399 c-4 -5 8 -27 27 -48 62 -72 95 -116 140 -186 25 -39 65 -95 90 -125 24 -30 91 -120 148 -200 56 -80 115 -158 130 -175 14 -16 55 -73 90 -125 35 -52 85 -120 111 -152 27 -31 72 -91 100 -135 29 -43 78 -109 108 -148 31 -38 72 -92 91 -120 18 -27 46 -66 60 -85 40 -51 139 -185 183 -244 20 -28 58 -82 84 -121 25 -38 67 -95 93 -125 26 -30 73 -93 105 -140 31 -47 79 -114 106 -150 28 -36 71 -93 97 -128 26 -34 60 -78 76 -97 l28 -35 137 0 c75 0 142 4 148 8 13 8 93 115 140 187 14 22 45 63 69 91 23 27 73 95 109 150 37 54 87 119 110 144 23 25 57 71 74 102 18 32 36 60 42 63 5 4 27 32 49 63 22 31 69 95 105 142 36 47 92 123 125 170 33 47 82 114 110 150 28 36 64 88 80 115 16 28 60 86 97 130 38 44 84 105 103 135 19 30 53 80 77 110 23 30 75 100 116 155 168 228 189 256 232 305 25 28 45 57 45 64 0 12 119 177 161 222 41 44 40 44 -373 43 l-392 -2 -26 -26 c-14 -15 -43 -51 -65 -81 -22 -29 -54 -69 -71 -89 -17 -20 -46 -61 -64 -91 -18 -30 -44 -67 -58 -82 -14 -15 -41 -49 -61 -77 -85 -117 -222 -300 -258 -344 -21 -27 -59 -78 -85 -115 -58 -81 -101 -139 -151 -198 -20 -25 -57 -76 -81 -113 -24 -37 -52 -73 -62 -81 -9 -8 -36 -44 -59 -80 -23 -36 -52 -74 -63 -84 -12 -10 -36 -41 -53 -67 -29 -45 -34 -49 -71 -49 -46 0 -46 -1 -157 155 -44 61 -93 126 -109 145 -16 19 -44 58 -62 85 -18 28 -52 73 -75 100 -22 28 -62 82 -88 120 -25 39 -66 95 -91 125 -25 30 -65 82 -88 115 -23 33 -73 102 -112 153 -39 50 -85 112 -102 136 -18 25 -47 64 -67 88 -19 24 -42 58 -51 75 -9 18 -35 54 -59 81 -23 26 -62 78 -87 114 -25 37 -55 71 -66 77 -30 13 -781 14 -789 0z"/>
+        <path d="M20995 3403 c-87 -11 -287 -58 -339 -79 -33 -13 -63 -24 -68 -24 -5 0 -48 -19 -96 -42 -201 -98 -434 -328 -525 -518 -50 -107 -87 -193 -87 -205 0 -7 -11 -37 -24 -66 -22 -52 -50 -247 -48 -349 2 -191 46 -358 155 -590 115 -243 392 -495 642 -584 41 -14 116 -38 167 -53 l93 -27 1319 -3 c1061 -3 1321 -1 1328 9 9 15 11 548 2 572 -6 14 -127 16 -1269 16 l-1262 0 -76 25 c-222 72 -434 295 -478 504 -19 90 -6 272 25 355 34 88 103 192 170 253 63 58 152 123 169 123 7 0 22 7 34 15 12 8 50 25 85 37 l63 23 1259 2 c900 3 1263 7 1273 14 19 16 19 571 0 587 -9 8 -384 11 -1247 10 -679 0 -1248 -3 -1265 -5z"/>
+        <path d="M22245 2420 c-1164 -5 -1252 -6 -1280 -22 -53 -31 -113 -92 -139 -142 -22 -41 -26 -62 -25 -130 0 -74 3 -87 37 -151 34 -64 43 -73 102 -105 l65 -35 1249 -2 c984 -2 1252 0 1258 10 4 6 8 136 8 288 0 210 -3 279 -12 285 -8 5 -558 7 -1263 4z"/>
+        <path d="M5164 2395 c-113 -56 -183 -178 -170 -297 9 -91 57 -174 125 -215 29 -17 75 -37 103 -42 33 -8 445 -11 1262 -11 1016 0 1215 2 1225 14 8 9 11 95 9 292 l-3 279 -1250 3 -1251 2 -50 -25z"/>
+        <path d="M28175 1756 c-70 -30 -158 -81 -187 -108 -43 -41 -86 -112 -109 -178 -30 -86 -32 -235 -6 -301 64 -156 111 -205 262 -278 42 -20 70 -25 173 -29 109 -4 130 -2 189 18 139 47 244 149 290 280 44 125 27 293 -40 395 -48 73 -177 185 -214 185 -10 0 -38 9 -62 20 -63 29 -225 27 -296 -4z m282 -61 c37 -14 77 -35 88 -45 12 -11 24 -20 27 -20 15 0 68 -60 73 -83 4 -14 13 -31 21 -38 7 -6 17 -27 20 -48 4 -20 13 -50 21 -68 17 -43 17 -121 -2 -157 -8 -15 -15 -36 -15 -45 0 -9 -11 -38 -25 -66 -13 -27 -25 -54 -25 -60 0 -21 -132 -114 -161 -115 -9 0 -36 -9 -60 -20 -49 -22 -131 -19 -181 6 -15 8 -41 14 -58 14 -24 0 -44 12 -85 51 -76 72 -134 150 -141 190 -3 19 -13 55 -21 82 -13 41 -13 53 0 95 8 26 20 65 26 88 23 86 147 204 253 241 87 30 161 29 245 -2z"/>
+        <path d="M28170 1310 c0 -220 1 -230 19 -230 36 0 51 27 51 95 0 47 5 69 19 86 18 23 21 23 67 11 62 -17 66 -20 93 -89 12 -32 27 -68 32 -81 7 -19 15 -23 42 -20 29 3 32 6 35 42 3 37 -21 99 -61 158 -16 25 2 70 36 86 23 11 27 19 27 55 0 38 -5 47 -44 80 l-45 37 -135 0 -136 0 0 -230z m209 174 c43 -17 67 -58 56 -93 -15 -49 -138 -79 -177 -44 -24 22 -25 109 -1 135 20 22 69 23 122 2z"/>
+      </g>
+    </svg>
+  </div>
+  <p class="hero-sub">Audit local intelligent, stockage delta, restauration chirurgicale : remontez le temps sur vos donnees QGIS</p>
+  <div class="hero-badges">
+    <span class="hero-badge hero-badge-ac">v3.0</span>
+    <span class="hero-badge">QGIS 3.44+</span>
+    <span class="hero-badge">SQLite local</span>
+    <span class="hero-badge">Capture automatique</span>
+    <span class="hero-badge">Multi-format</span>
+  </div>
+  <div class="hero-line"></div>
+</div>
+
+<div class="info"><strong>Version 3.0</strong> : Journal 100% local (SQLite). Stockage delta intelligent (seuls les attributs modifies sont enregistres). Detection automatique de derive de schema. Mode dual backend (SQLite local + PostgreSQL legacy). Ecriture asynchrone sans gel de l'interface. Fonctionne avec tous les formats editables : GeoPackage, Shapefile, PostgreSQL, SpatiaLite, GeoJSON, CSV, etc.</div>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-core">Capture</div>
+    <div class="card-t">Enregistrement automatique</div>
+    <p>Chaque commit d'edition (attribut, geometrie, suppression, insertion) est intercepte et enregistre sans intervention manuelle.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Recherche</div>
+    <div class="card-t">Recherche paginee</div>
+    <p>Filtrage par couche, type d'operation, periode. Jusqu'a 500 evenements par page avec reconstruction des attributs.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Restauration</div>
+    <div class="card-t">Restauration selective</div>
+    <p>Selection individuelle ou par lot. Verification de compatibilite de schema avant restauration. Rollback en cas d'erreur.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Independant</div>
+    <div class="card-t">Aucune dependance externe</div>
+    <p>Fonctionne avec SQLite uniquement. Pas de serveur, pas de connexion reseau, pas de configuration de base de donnees.</p>
+  </div>
+</div>
+
+<!-- ====== CE QUE CA FAIT ====== -->
+<section id="what-it-does">
+<h2>Ce que RecoverLand fait</h2>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Capture chaque modification validee (commit) sur les couches editables surveillees</li>
+  <li>Stockage delta : seuls les attributs reellement modifies sont enregistres (reduction 10-50x du volume)</li>
+  <li>Tampon d'edition intelligent : fusionne les modifications multiples sur une meme entite en un seul evenement net</li>
+  <li>Filtre automatique des champs d'audit de la couche (date_modif, updated_by, etc.)</li>
+  <li>Recherche paginee dans l'historique par couche, operation, date, utilisateur</li>
+  <li>Restauration selective avec verification de compatibilite de schema</li>
+  <li>Detection de derive de schema entre l'etat sauvegarde et l'etat actuel</li>
+  <li>Mode dual backend : SQLite local (automatique) + PostgreSQL legacy (si disponible)</li>
+  <li>Ecriture asynchrone par lots dans un thread dedie (zero gel UI)</li>
+  <li>Verification d'integrite du journal au demarrage (WAL checkpoint, recovery d'evenements en attente)</li>
+  <li>Identification utilisateur automatique (config plugin, variable env, os.getlogin, profil QGIS)</li>
+  <li>Fonctionne sur tous les formats editables : GeoPackage, Shapefile, PostGIS, SpatiaLite, GeoJSON, CSV</li>
+</ul>
+</section>
+
+<!-- ====== CE QUE CA NE FAIT PAS ====== -->
+<section id="what-it-doesnt">
+<h2>Ce que RecoverLand ne fait pas</h2>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Ne remplace pas un systeme de versionnement (Git, GeoGig)</li>
+  <li>Ne sauvegarde pas les fichiers eux-memes, seulement les modifications d'entites</li>
+  <li>Ne fonctionne pas sur les couches non editables (WMS, rasters, couches virtuelles)</li>
+  <li>Ne capture pas les modifications faites en dehors de QGIS (edition directe du fichier)</li>
+  <li>Ne synchronise pas entre plusieurs postes de travail</li>
+  <li>Ne garantit pas la restauration sur les formats a identification faible (CSV, shapefiles recompactes)</li>
+</ul>
+<div class="warn"><strong>Honnetete</strong> : RecoverLand est un filet de securite local, pas une solution de versionnement distribuee. Il protege contre les erreurs de manipulation dans QGIS, pas contre la perte du fichier source lui-meme.</div>
+</section>
+
+<!-- ====== ARCHITECTURE ====== -->
+<section id="architecture">
+<h2>Architecture</h2>
+<p>Le plugin s'organise en couches independantes. Chaque couche a une responsabilite unique et communique avec les autres par des interfaces definies.</p>
+
+<div class="dia">
+<svg viewBox="0 0 620 320" xmlns="http://www.w3.org/2000/svg">
+  <!-- QGIS Layer -->
+  <rect x="10" y="10" width="600" height="50" rx="8" fill="var(--bg2)" stroke="var(--bg3)" stroke-width="1.2"/>
+  <text x="310" y="40" text-anchor="middle" class="lbl" font-size="13">QGIS : Couches editables (GeoPackage, Shapefile, PostGIS, ...)</text>
+
+  <!-- Arrow down -->
+  <line x1="310" y1="60" x2="310" y2="90" class="edge-ac"/>
+
+  <!-- Edit Tracker -->
+  <rect x="180" y="90" width="260" height="44" class="nd-ac"/>
+  <text x="310" y="117" text-anchor="middle" class="lbl">EditTracker (signaux QGIS)</text>
+
+  <!-- Arrow down -->
+  <line x1="310" y1="134" x2="310" y2="160" class="edge-ac"/>
+
+  <!-- Write Queue -->
+  <rect x="200" y="160" width="220" height="40" class="nd-ac"/>
+  <text x="310" y="185" text-anchor="middle" class="lbl">WriteQueue (thread dedie)</text>
+
+  <!-- Arrow down -->
+  <line x1="310" y1="200" x2="310" y2="230" class="edge-ac"/>
+
+  <!-- SQLite Journal -->
+  <rect x="190" y="230" width="240" height="44" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.8"/>
+  <text x="310" y="257" text-anchor="middle" class="lbl" font-size="12">Journal SQLite (audit_event)</text>
+
+  <!-- Search arrow left -->
+  <line x1="190" y1="252" x2="80" y2="252" class="edge"/>
+  <rect x="10" y="232" width="130" height="40" class="nd"/>
+  <text x="75" y="257" text-anchor="middle" class="lbl" font-size="11">SearchService</text>
+
+  <!-- Restore arrow right -->
+  <line x1="430" y1="252" x2="500" y2="252" class="edge"/>
+  <rect x="480" y="232" width="130" height="40" class="nd"/>
+  <text x="545" y="257" text-anchor="middle" class="lbl" font-size="11">RestoreService</text>
+
+  <!-- Dialog at bottom -->
+  <rect x="130" y="290" width="360" height="30" rx="6" fill="var(--bg2)" stroke="var(--brd)" stroke-width="1"/>
+  <text x="310" y="310" text-anchor="middle" class="dim" font-size="11">RecoverDialog (interface utilisateur)</text>
+  <line x1="310" y1="274" x2="310" y2="290" class="edge"/>
+</svg>
+</div>
+
+<h3>Composants principaux</h3>
+<div class="tw"><table>
+<thead><tr><th>Composant</th><th>Role</th><th>Fichier</th></tr></thead>
+<tbody>
+  <tr><td><strong>EditTracker</strong></td><td>Ecoute les signaux QGIS (beforeCommitChanges, afterCommitChanges, afterRollBack) et genere des evenements d'audit</td><td><code>core/edit_tracker.py</code></td></tr>
+  <tr><td><strong>WriteQueue</strong></td><td>File d'attente thread-safe qui ecrit les evenements dans SQLite par lots de 500</td><td><code>core/write_queue.py</code></td></tr>
+  <tr><td><strong>JournalManager</strong></td><td>Gere le chemin du journal : dans le dossier du projet (.recoverland/) ou dans le profil QGIS si le projet n'est pas sauvegarde</td><td><code>core/journal_manager.py</code></td></tr>
+  <tr><td><strong>SearchService</strong></td><td>Recherche paginee et reconstruction des attributs depuis le journal</td><td><code>core/search_service.py</code></td></tr>
+  <tr><td><strong>RestoreService</strong></td><td>Verification de compatibilite, restauration selective avec isolation par lot</td><td><code>core/restore_service.py</code></td></tr>
+  <tr><td><strong>BackendRouter</strong></td><td>Aiguille chaque couche vers le bon backend (SQLite local ou PostgreSQL legacy)</td><td><code>core/backend_router.py</code></td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ====== JOURNAL ====== -->
+<section id="journal">
+<h2>Journal SQLite</h2>
+<p>Le journal est un fichier SQLite unique par projet QGIS. Il utilise le mode WAL (Write-Ahead Logging) pour permettre des lectures et ecritures simultanees sans blocage.</p>
+
+<h3>Emplacement du journal</h3>
+<div class="tw"><table>
+<thead><tr><th>Situation</th><th>Emplacement</th></tr></thead>
+<tbody>
+  <tr><td>Projet sauvegarde dans <code>C:/projets/chantier.qgz</code></td><td><code>C:/projets/.recoverland/audit.db</code></td></tr>
+  <tr><td>Projet non sauvegarde</td><td><code>[profil QGIS]/recoverland/audit/audit.db</code></td></tr>
+</tbody>
+</table></div>
+
+<h3>Schema de la table audit_event</h3>
+<p>Chaque ligne represente une modification unique sur une entite.</p>
+<div class="tw"><table>
+<thead><tr><th>Colonne</th><th>Type</th><th>Role</th></tr></thead>
+<tbody>
+  <tr><td><code>event_id</code></td><td>INTEGER PK</td><td>Identifiant unique auto-incremente</td></tr>
+  <tr><td><code>project_fingerprint</code></td><td>TEXT</td><td>Identifie le projet QGIS source</td></tr>
+  <tr><td><code>datasource_fingerprint</code></td><td>TEXT</td><td>Identifie la couche source de maniere unique</td></tr>
+  <tr><td><code>feature_identity_json</code></td><td>TEXT</td><td>Identifie l'entite (FID + cle primaire si disponible)</td></tr>
+  <tr><td><code>operation_type</code></td><td>TEXT</td><td>INSERT, UPDATE ou DELETE</td></tr>
+  <tr><td><code>attributes_json</code></td><td>TEXT</td><td>Etat des attributs avant modification</td></tr>
+  <tr><td><code>geometry_wkb</code></td><td>BLOB</td><td>Geometrie au format WKB</td></tr>
+  <tr><td><code>user_name</code></td><td>TEXT</td><td>Utilisateur qui a effectue la modification</td></tr>
+  <tr><td><code>created_at</code></td><td>TEXT</td><td>Date et heure UTC de l'evenement</td></tr>
+</tbody>
+</table></div>
+<p style="font-size:13px;color:var(--tx3)">Schema simplifie. La table reelle contient aussi : <code>layer_id_snapshot</code>, <code>layer_name_snapshot</code>, <code>provider_type</code>, <code>geometry_type</code>, <code>crs_authid</code>, <code>field_schema_json</code>, <code>session_id</code>, <code>restored_from_event_id</code>.</p>
+</section>
+
+<!-- ====== CAPTURE ====== -->
+<section id="capture">
+<h2>Capture automatique</h2>
+<p>La capture est transparente. L'utilisateur edite ses couches normalement dans QGIS. RecoverLand intercepte les signaux d'edition au moment du commit.</p>
+
+<div class="flow">
+  <span class="fn">Utilisateur edite</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">beforeCommitChanges</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Snapshot des entites</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">afterCommitChanges</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Ecriture journal</span>
+</div>
+
+<h3>Quand la capture se declenche</h3>
+<div class="tw"><table>
+<thead><tr><th>Action utilisateur</th><th>Signal QGIS</th><th>Resultat dans le journal</th></tr></thead>
+<tbody>
+  <tr><td>Modifier un attribut et sauvegarder</td><td><code>beforeCommitChanges</code> + <code>afterCommitChanges</code></td><td>Evenement UPDATE avec l'ancien etat</td></tr>
+  <tr><td>Deplacer une geometrie et sauvegarder</td><td>Idem</td><td>Evenement UPDATE avec l'ancienne geometrie</td></tr>
+  <tr><td>Supprimer une entite et sauvegarder</td><td>Idem</td><td>Evenement DELETE avec l'etat complet avant suppression</td></tr>
+  <tr><td>Ajouter une entite et sauvegarder</td><td>Idem</td><td>Evenement INSERT avec l'etat apres ajout</td></tr>
+  <tr><td>Annuler l'edition (rollback)</td><td><code>afterRollBack</code></td><td>Rien (les snapshots en attente sont supprimes)</td></tr>
+</tbody>
+</table></div>
+
+<div class="warn"><strong>Modification hors QGIS</strong> : Si un fichier est modifie directement (avec un editeur de texte, un script Python externe, ou un autre logiciel), RecoverLand ne le detecte pas. Seules les modifications faites via l'interface d'edition de QGIS sont capturees.</div>
+</section>
+
+<!-- ====== EDIT BUFFER ====== -->
+<section id="edit-buffer">
+<h2>Tampon d'edition intelligent</h2>
+<p>Le tampon d'edition (<code>EditSessionBuffer</code>) est la memoire vive de RecoverLand. Il capture l'etat initial de chaque entite modifiee au debut de la session et calcule l'<strong>effet net reel</strong> au moment du commit.</p>
+
+<h3>Pourquoi un tampon ?</h3>
+<p>Un utilisateur peut modifier la meme entite plusieurs fois avant de sauvegarder. Sans tampon, chaque micro-modification genererait un evenement distinct. Le tampon fusionne tout en un seul evenement representant le changement reel entre l'etat initial et l'etat final.</p>
+
+<div class="flow">
+  <span class="fn">Modifier attribut A</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Modifier attribut B</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Remettre A a sa valeur initiale</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Effet net : seul B a change</span>
+</div>
+
+<h3>Cas speciaux geres par le tampon</h3>
+<div class="tw"><table>
+<thead><tr><th>Scenario</th><th>Resultat dans le journal</th></tr></thead>
+<tbody>
+  <tr><td>Modifier puis remettre a l'identique</td><td>Aucun evenement (non-changement detecte)</td></tr>
+  <tr><td>Inserer puis supprimer avant commit</td><td>Aucun evenement (effet net nul)</td></tr>
+  <tr><td>Modifier un attribut + deplacer la geometrie</td><td>Un seul evenement UPDATE avec le delta attribut + ancienne geometrie</td></tr>
+  <tr><td>Rollback de la session</td><td>Tampon purge, rien n'est ecrit</td></tr>
+</tbody>
+</table></div>
+
+<h3>Filtrage des champs d'audit</h3>
+<p>Les champs de metadonnees de la couche (<code>date_modif</code>, <code>updated_by</code>, <code>updated_at</code>, etc.) sont automatiquement exclus du delta. Si une modification ne touche que ces champs, elle est traitee comme un non-changement. Ce filtrage est applique a trois niveaux : enregistrement, lecture et restauration.</p>
+
+<div class="info"><strong>Borne memoire</strong> : Le tampon est limite en RAM. Au-dela de 10 000 entites ou 200 Mo, les snapshots sont flushed vers une table staging SQLite pour eviter les debordements memoire sur les editions massives.</div>
+</section>
+
+<!-- ====== DELTA STORAGE ====== -->
+<section id="delta-storage">
+<h2>Stockage delta</h2>
+<p>Le mode PostgreSQL historique sauvegardait la ligne entiere a chaque modification (<code>row_to_json(OLD)</code>). Sur une table a 50 colonnes, modifier un seul champ stockait 50 valeurs. Le mode local adopte une strategie differenciee :</p>
+
+<div class="tw"><table>
+<thead><tr><th>Operation</th><th>Strategie</th><th>Contenu stocke</th></tr></thead>
+<tbody>
+  <tr><td><strong>DELETE</strong></td><td>Snapshot complet</td><td>Tous les attributs + geometrie WKB (l'entite disparait, tout est necessaire pour la recreer)</td></tr>
+  <tr><td><strong>UPDATE</strong></td><td>Delta uniquement</td><td>Anciennes valeurs des seuls attributs modifies + ancienne geometrie si elle a change</td></tr>
+  <tr><td><strong>INSERT</strong></td><td>Snapshot complet</td><td>Etat de l'entite apres creation (pour permettre un "undo insert")</td></tr>
+</tbody>
+</table></div>
+
+<h3>Gain de stockage</h3>
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-medium">Avant (mode PG)</div>
+    <div class="card-t">Snapshot complet</div>
+    <p>50 attributs stockes pour chaque UPDATE, meme si un seul a change. Volume eleve, bruit dans la preview.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-strong">Maintenant (mode local)</div>
+    <div class="card-t">Delta intelligent</div>
+    <p>Seuls les attributs reellement modifies sont stockes. Reduction 10-50x du volume. La preview montre directement "ce qui a change".</p>
+  </div>
+</div>
+
+<h3>Format du delta</h3>
+<p>Le champ <code>attributes_json</code> change de semantique selon l'operation :</p>
+<pre>DELETE : {"all_attributes": {"nom": "Dupont", "age": 42, "ville": "Paris"}}
+UPDATE : {"changed_only": {"ville": {"old": "Paris", "new": "Lyon"}}}
+INSERT : {"all_attributes": {"nom": "Martin", "age": 35, "ville": "Lyon"}}</pre>
+
+<div class="tip"><strong>Serialisation robuste</strong> : Chaque type QVariant (QString, int, double, QDate, QDateTime, QByteArray, bool, listes, maps, NULL) est converti en JSON de maniere reversible. Les BLOB sont encodes en base64 avec prefixe <code>b64:</code>. Les NaN et Infinity sont stockes comme <code>null</code> avec un flag.</div>
+</section>
+
+<!-- ====== IDENTIFICATION ====== -->
+<section id="identification">
+<h2>Systeme d'identification</h2>
+<p>Le systeme utilise trois niveaux d'identification pour retrouver precisement chaque entite dans chaque couche de chaque projet.</p>
+
+<div class="dia">
+<svg viewBox="0 0 620 180" xmlns="http://www.w3.org/2000/svg">
+  <!-- Project -->
+  <rect x="10" y="10" width="600" height="50" rx="8" fill="none" stroke="var(--ac)" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="20" y="32" class="dim" font-size="10">NIVEAU 1</text>
+  <text x="20" y="48" class="lbl" font-size="12">project_fingerprint = project::C:/projets/chantier_A/mon_projet.qgz</text>
+
+  <!-- Layer -->
+  <rect x="30" y="70" width="560" height="50" rx="8" fill="none" stroke="var(--bl)" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="40" y="92" class="dim" font-size="10">NIVEAU 2</text>
+  <text x="40" y="108" class="lbl" font-size="12">datasource_fingerprint = ogr::C:/data/vegetation.shp</text>
+
+  <!-- Feature -->
+  <rect x="50" y="130" width="520" height="44" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.5"/>
+  <text x="60" y="150" class="dim" font-size="10">NIVEAU 3</text>
+  <text x="60" y="165" class="lbl" font-size="12">feature_identity_json = {"fid": 42, "pk_field": "gid", "pk_value": 42}</text>
+</svg>
+</div>
+</section>
+
+<!-- ====== FINGERPRINT ====== -->
+<section id="fingerprint">
+<h2>Fingerprint de couche</h2>
+<p>Le fingerprint est la piece centrale du systeme d'identification. Il permet de distinguer deux couches qui portent le meme nom mais proviennent de sources differentes.</p>
+
+<h3>Comment il est calcule</h3>
+<p>Format : <code>provider::source_normalisee</code></p>
+<div class="tw"><table>
+<thead><tr><th>Type de couche</th><th>Exemple de fingerprint</th></tr></thead>
+<tbody>
+  <tr><td>Shapefile</td><td><code>ogr::c:/data/parcelles/vegetation.shp</code></td></tr>
+  <tr><td>GeoPackage</td><td><code>ogr::c:/data/communes.gpkg|layername=batiments</code></td></tr>
+  <tr><td>PostGIS</td><td><code>postgres::host=10.241.228.107 port=5432 dbname=AUVERGNE schema=rbal table=cables</code></td></tr>
+  <tr><td>SpatiaLite</td><td><code>spatialite::c:/data/local.sqlite|layername=routes</code></td></tr>
+  <tr><td>GeoJSON</td><td><code>ogr::c:/export/zones.geojson</code></td></tr>
+</tbody>
+</table></div>
+
+<div class="tip"><strong>Deux couches "vegetation"</strong> dans deux dossiers differents ont des fingerprints differents car le chemin absolu est different. Le nom affiche dans QGIS n'est jamais utilise comme identifiant.</div>
+</section>
+
+<!-- ====== IDENTITY STRENGTH ====== -->
+<section id="identity-strength">
+<h2>Force d'identification</h2>
+<p>Tous les formats n'offrent pas le meme niveau de fiabilite pour identifier une entite. RecoverLand qualifie chaque format avec une force d'identification.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Force</th><th>Signification</th><th>Formats</th><th>Risque de restauration</th></tr></thead>
+<tbody>
+  <tr><td><span class="strength s-strong">STRONG</span></td><td>Cle primaire stable, ne change pas entre les sessions</td><td>GeoPackage, SpatiaLite, PostgreSQL, Oracle, MSSQL</td><td>Minimal</td></tr>
+  <tr><td><span class="strength s-medium">MEDIUM</span></td><td>FID generalement stable mais peut changer apres certaines operations</td><td>Shapefile, GeoJSON, FlatGeobuf</td><td>Possible si le fichier a ete recompacte ou re-exporte</td></tr>
+  <tr><td><span class="strength s-weak">WEAK</span></td><td>Pas de cle primaire, FID = numero de ligne</td><td>CSV, texte delimitie, Excel</td><td>Eleve : le numero de ligne change des qu'une ligne est ajoutee ou supprimee</td></tr>
+  <tr><td><span class="strength s-none">NONE</span></td><td>Pas d'identifiant stable, donnees non persistees</td><td>Couche memoire</td><td>Restauration impossible (capture a titre informatif uniquement)</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ====== DUAL BACKEND ====== -->
+<section id="dual-backend">
+<h2>Mode dual backend</h2>
+<p>RecoverLand supporte deux backends d'audit simultanement. Le <code>BackendRouter</code> decide automatiquement quel backend utiliser pour chaque couche.</p>
+
+<div class="dia">
+<svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg">
+  <rect x="200" y="10" width="220" height="40" class="nd-ac"/>
+  <text x="310" y="35" text-anchor="middle" class="lbl" font-size="12">BackendRouter</text>
+
+  <line x1="210" y1="50" x2="110" y2="90" class="edge-ac"/>
+  <line x1="410" y1="50" x2="510" y2="90" class="edge-ac"/>
+
+  <rect x="20" y="90" width="200" height="44" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.5"/>
+  <text x="120" y="110" text-anchor="middle" class="lbl" font-size="11">SQLite local</text>
+  <text x="120" y="124" text-anchor="middle" class="dim" font-size="9">GeoPackage, Shapefile, SpatiaLite, GeoJSON...</text>
+
+  <rect x="400" y="90" width="200" height="44" rx="6" fill="var(--bg2)" stroke="var(--brd)" stroke-width="1.2"/>
+  <text x="500" y="110" text-anchor="middle" class="lbl" font-size="11">PostgreSQL legacy</text>
+  <text x="500" y="124" text-anchor="middle" class="dim" font-size="9">Triggers serveur existants</text>
+
+  <text x="120" y="160" text-anchor="middle" class="dim" font-size="10">Automatique, sans configuration</text>
+  <text x="120" y="174" text-anchor="middle" class="dim" font-size="10">Capture via signaux QGIS</text>
+  <text x="500" y="160" text-anchor="middle" class="dim" font-size="10">Requiert triggers cote serveur</text>
+  <text x="500" y="174" text-anchor="middle" class="dim" font-size="10">Recherche via fonctions SQL</text>
+</svg>
+</div>
+
+<h3>Regles de routage</h3>
+<div class="tw"><table>
+<thead><tr><th>Situation</th><th>Backend choisi</th><th>Raison</th></tr></thead>
+<tbody>
+  <tr><td>Couche PostgreSQL avec triggers d'audit</td><td>PostgreSQL legacy</td><td>Les triggers serveur capturent deja les modifications</td></tr>
+  <tr><td>Couche PostgreSQL sans triggers</td><td>SQLite local</td><td>Pas de capture serveur, le plugin prend le relais</td></tr>
+  <tr><td>GeoPackage, Shapefile, SpatiaLite, GeoJSON</td><td>SQLite local</td><td>Fichiers locaux, pas de serveur</td></tr>
+  <tr><td>Couche non editable ou virtuelle</td><td>Aucun</td><td>Refus explicite avec message</td></tr>
+</tbody>
+</table></div>
+
+<div class="warn"><strong>Pas de double audit</strong> : Une couche n'est jamais auditee par les deux backends en meme temps. Le routeur garantit qu'un seul backend est actif par couche et par session.</div>
+</section>
+
+<!-- ====== SCHEMA DRIFT ====== -->
+<section id="schema-drift">
+<h2>Derive de schema</h2>
+<p>Entre le moment ou une modification est enregistree et le moment ou l'utilisateur tente de la restaurer, la structure de la couche peut avoir change. Le module <code>schema_drift.py</code> detecte ces derives avant toute restauration.</p>
+
+<h3>Ce que le module compare</h3>
+<p>Chaque evenement stocke le schema des champs au moment de la capture (<code>field_schema_json</code>). Avant restauration, ce schema historise est compare au schema actuel de la couche :</p>
+
+<div class="tw"><table>
+<thead><tr><th>Type de derive</th><th>Impact</th><th>Action du plugin</th></tr></thead>
+<tbody>
+  <tr><td>Champ ajoute depuis la capture</td><td>Le snapshot ne contient pas ce champ</td><td>Le champ est laisse a sa valeur par defaut</td></tr>
+  <tr><td>Champ supprime depuis la capture</td><td>Le snapshot contient un champ qui n'existe plus</td><td>La valeur est ignoree avec avertissement</td></tr>
+  <tr><td>Type de champ modifie</td><td>Incompatibilite de type</td><td>Tentative de conversion, refus si impossible</td></tr>
+  <tr><td>Champ renomme</td><td>Ancien nom introuvable</td><td>Traite comme champ supprime + champ ajoute</td></tr>
+</tbody>
+</table></div>
+
+<div class="info"><strong>Rapport de compatibilite</strong> : Avant chaque restauration, un rapport explicite liste les champs compatibles, les champs manquants et les champs incompatibles. La restauration n'est jamais silencieusement partielle.</div>
+</section>
+
+<!-- ====== INTEGRITY ====== -->
+<section id="integrity">
+<h2>Integrite et recuperation</h2>
+<p>Le module <code>integrity.py</code> verifie la sante du journal au demarrage du plugin et apres tout incident.</p>
+
+<h3>Verifications au demarrage</h3>
+<div class="tw"><table>
+<thead><tr><th>Verification</th><th>Action en cas de probleme</th></tr></thead>
+<tbody>
+  <tr><td><code>PRAGMA integrity_check</code></td><td>Notification utilisateur si corruption detectee ; proposition de renommer le fichier et recreer un journal vide</td></tr>
+  <tr><td>Verification du fichier WAL</td><td>Checkpoint automatique pour consolider les ecritures en attente</td></tr>
+  <tr><td>Table <code>schema_version</code></td><td>Detection de migration interrompue ; reprise ou alerte</td></tr>
+  <tr><td>Fichier de recuperation (<code>recoverland_pending.json</code>)</td><td>Reintegration des evenements en attente perdus lors d'un crash precedent</td></tr>
+</tbody>
+</table></div>
+
+<div class="tip"><strong>Zero perte silencieuse</strong> : Si des evenements n'ont pas pu etre ecrits (crash, disque plein), le plugin les sauvegarde dans un fichier de recuperation et les reintegre au prochain demarrage. L'utilisateur est toujours informe.</div>
+
+<h3>Ecriture asynchrone</h3>
+<p>Les evenements sont ecrits dans SQLite par un thread dedie (<code>WriteQueue</code>). Le thread UI n'attend jamais la fin de l'ecriture. La queue utilise des lots de 500 evenements par transaction pour maximiser les performances.</p>
+
+<div class="flow">
+  <span class="fn">Thread UI</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">queue.Queue</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Writer thread</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">SQLite (batch 500)</span>
+</div>
+</section>
+
+<!-- ====== RETENTION ====== -->
+<section id="retention">
+<h2>Retention et purge</h2>
+<p>Le journal grossit au fil du temps. Le module <code>retention.py</code> offre trois mecanismes pour maitriser sa taille :</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-core">Par age</div>
+    <div class="card-t">Purge par anciennete</div>
+    <p>Supprimer les evenements plus anciens qu'un seuil configurable (30, 90, 365 jours).</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Par session</div>
+    <div class="card-t">Purge par session</div>
+    <p>Supprimer tous les evenements d'une session d'edition specifique.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Compactage</div>
+    <div class="card-t">VACUUM</div>
+    <p>Recuperer l'espace disque apres une purge. Reduit la taille physique du fichier SQLite.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Statistiques</div>
+    <div class="card-t">Etat du journal</div>
+    <p>Nombre d'evenements, taille du fichier, age du plus ancien evenement. Visible dans la barre d'information.</p>
+  </div>
+</div>
+
+<div class="info"><strong>Taille typique</strong> : Un evenement UPDATE delta (2 attributs modifies) occupe 200 a 500 octets. Un DELETE avec 20 attributs + geometrie point occupe 1 a 3 Ko. 10 000 modifications representent entre 5 et 20 Mo.</div>
+</section>
+
+<!-- ====== EVENT LIFECYCLE ====== -->
+<section id="event-lifecycle">
+<h2>Cycle de vie d'un evenement</h2>
+
+<div class="flow">
+  <span class="fn">Edition QGIS</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Snapshot (RAM)</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Commit ?</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Effet net</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">WriteQueue</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">SQLite</span>
+</div>
+<p style="font-size:13px;color:var(--tx3);margin-top:4px">Si l'utilisateur fait un rollback au lieu d'un commit, le snapshot en RAM est simplement supprime. Rien n'est ecrit dans le journal.</p>
+
+<h3>Identification utilisateur</h3>
+<p>Chaque evenement porte un <code>user_name</code> resolu automatiquement par le plugin. Les sources sont testees dans l'ordre :</p>
+<div class="flow">
+  <span class="fn-ac">Config plugin</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Variable env</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">os.getlogin()</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Profil QGIS</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">"unknown"</span>
+</div>
+<p style="font-size:13px;color:var(--tx3);margin-top:4px">La premiere source non vide est utilisee. Aucun evenement n'est cree avec un user_name vide.</p>
+</section>
+
+</main>
+
+<aside class="rp">
+  <div class="srch" style="margin-bottom:16px">
+    <svg class="srch-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="si" placeholder="Rechercher..." autocomplete="off">
+    <div class="srch-res" id="sr"></div>
+  </div>
+  <h4>Sur cette page</h4>
+  <a href="#intro">Introduction</a>
+  <a href="#what-it-does">Ce que ca fait</a>
+  <a href="#what-it-doesnt">Ce que ca ne fait pas</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#journal">Journal SQLite</a>
+  <a href="#capture">Capture automatique</a>
+  <a href="#edit-buffer">Tampon d'edition</a>
+  <a href="#delta-storage">Stockage delta</a>
+  <a href="#identification">Identification</a>
+  <a href="#fingerprint">Fingerprint</a>
+  <a href="#identity-strength">Force d'identification</a>
+  <a href="#dual-backend">Mode dual backend</a>
+  <a href="#schema-drift">Derive de schema</a>
+  <a href="#integrity">Integrite</a>
+  <a href="#retention">Retention et purge</a>
+  <a href="#event-lifecycle">Cycle de vie</a>
+</aside>
+</div>
+
+<footer>RecoverLand 3.0 &middot; NGE ES DEVTEAM &middot; Documentation technique</footer>
+<script src="rl.js"></script>
+</body>
+</html>

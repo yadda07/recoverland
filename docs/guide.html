@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Guide utilisateur - RecoverLand</title>
+<link rel="stylesheet" href="rl.css?v=3">
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0"><defs>
+  <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--brd)"/></marker>
+  <marker id="ah2" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--ac)"/></marker>
+</defs></svg>
+
+<header class="bar">
+  <a class="bar-logo" href="index.html">
+    <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">3.0</span>
+  </a>
+  <nav class="bar-nav">
+    <a href="index.html">Vue d'ensemble</a>
+    <a href="guide.html" class="on">Guide</a>
+    <a href="formats.html">Formats</a>
+    <a href="limits.html">Limites</a>
+  </nav>
+  <div class="bar-right">
+    <button class="tbtn" onclick="toggleTheme()">&#9789;</button>
+  </div>
+</header>
+
+<div class="layout">
+<aside class="side"><nav>
+  <div class="cat">Demarrage</div>
+  <a href="#installation">Installation</a>
+  <a href="#first-launch">Premier lancement</a>
+  <a href="#ui-overview">Interface</a>
+  <div class="cat">Utilisation</div>
+  <a href="#tracking">Suivi des modifications</a>
+  <a href="#search">Rechercher</a>
+  <a href="#results">Lire les resultats</a>
+  <a href="#restore">Restaurer</a>
+  <div class="cat">Avance</div>
+  <a href="#schema-warning">Avertissement de schema</a>
+  <a href="#retention-config">Gerer la retention</a>
+  <a href="#dual-mode">Mode PostgreSQL</a>
+  <div class="cat">Scenarios</div>
+  <a href="#scenario-undo">Annuler une erreur</a>
+  <a href="#scenario-compare">Comparer avant/apres</a>
+  <a href="#scenario-deleted">Retrouver une suppression</a>
+</nav></aside>
+
+<main class="main">
+
+<div class="slbl">RecoverLand : Guide pratique</div>
+<h1>Guide utilisateur</h1>
+<p class="lead">Ce guide couvre l'utilisation quotidienne de RecoverLand : de l'installation a la restauration de donnees. Chaque etape est illustree pour que tout utilisateur QGIS puisse suivre, meme sans connaissance technique du plugin.</p>
+
+<!-- ====== INSTALLATION ====== -->
+<section id="installation">
+<h2>Installation</h2>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">1</div><div class="step-title">Ouvrir le gestionnaire d'extensions</div></div>
+  <div class="step-body"><p>Dans QGIS, ouvrez <strong>Extensions &rarr; Installer/Gerer les extensions</strong>.</p></div>
+</div>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">2</div><div class="step-title">Installer RecoverLand</div></div>
+  <div class="step-body">
+    <p>Recherchez "RecoverLand" dans la barre de recherche. Cliquez sur <strong>Installer</strong>.</p>
+    <p>Si le plugin n'est pas dans le depot officiel, copiez le dossier <code>recoverland</code> dans :</p>
+    <pre>C:\Users\[votre_nom]\AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins\</pre>
+    <p>Puis redemarrez QGIS.</p>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">3</div><div class="step-title">Verifier l'activation</div></div>
+  <div class="step-body"><p>Une icone RecoverLand apparait dans la barre d'outils QGIS. Si elle n'apparait pas, verifiez dans <strong>Extensions &rarr; Installer/Gerer les extensions &rarr; Installees</strong> que RecoverLand est coche.</p></div>
+</div>
+
+<div class="info"><strong>Configuration requise</strong> : QGIS 3.44 minimum. Aucune dependance externe. Le plugin utilise uniquement Python standard et SQLite, tous deux inclus dans QGIS.</div>
+</section>
+
+<!-- ====== PREMIER LANCEMENT ====== -->
+<section id="first-launch">
+<h2>Premier lancement</h2>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">1</div><div class="step-title">Ouvrir un projet QGIS avec des couches editables</div></div>
+  <div class="step-body"><p>RecoverLand a besoin d'au moins une couche vecteur editable pour fonctionner. Si vous n'avez pas de projet, creez-en un et ajoutez un GeoPackage ou un Shapefile.</p></div>
+</div>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">2</div><div class="step-title">Cliquer sur l'icone RecoverLand</div></div>
+  <div class="step-body">
+    <p>La fenetre RecoverLand s'ouvre. En haut, la <strong>barre d'information</strong> affiche :</p>
+    <ul style="font-size:13.5px;color:var(--tx2);margin:4px 0 8px 16px;line-height:1.9">
+      <li><strong>Journal local</strong> : nom et taille du journal SQLite</li>
+      <li><strong>Compteurs</strong> : nombre total d'evenements, updates, suppressions, insertions dans le scope courant</li>
+      <li><strong>Toggle d'enregistrement</strong> : active ou desactive la capture des modifications</li>
+    </ul>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">3</div><div class="step-title">Verifier que l'enregistrement est actif</div></div>
+  <div class="step-body"><p>Le toggle en haut a droite doit indiquer <strong>"Enregistrement actif"</strong> en vert. Si c'est rouge, activez-le.</p></div>
+</div>
+
+<div class="tip"><strong>Des ce moment</strong>, RecoverLand enregistre silencieusement chaque modification que vous faites sur les couches surveillees. Vous n'avez rien d'autre a configurer.</div>
+</section>
+
+<!-- ====== INTERFACE ====== -->
+<section id="ui-overview">
+<h2>Vue d'ensemble de l'interface</h2>
+
+<div class="dia">
+<svg viewBox="0 0 620 340" xmlns="http://www.w3.org/2000/svg">
+  <!-- Header zone -->
+  <rect x="10" y="10" width="600" height="30" rx="6" fill="var(--bg2)" stroke="var(--bg3)"/>
+  <text x="310" y="30" text-anchor="middle" class="dim" font-size="10">Logo RecoverLand</text>
+
+  <!-- Smart bar -->
+  <rect x="10" y="48" width="600" height="55" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.2"/>
+  <text x="30" y="68" class="lbl" font-size="11">Journal local</text>
+  <text x="30" y="82" class="dim" font-size="9">53 Ko | 2 couche(s)</text>
+  <!-- Tiles -->
+  <rect x="250" y="56" width="70" height="38" rx="6" fill="var(--bg2)" stroke="var(--bg3)"/>
+  <text x="285" y="74" text-anchor="middle" class="lbl" font-size="10">12</text>
+  <text x="285" y="86" text-anchor="middle" class="dim" font-size="8">Total</text>
+  <rect x="328" y="56" width="70" height="38" rx="6" fill="var(--bg2)" stroke="var(--bg3)"/>
+  <text x="363" y="74" text-anchor="middle" class="lbl" font-size="10" fill="var(--bl)">8</text>
+  <text x="363" y="86" text-anchor="middle" class="dim" font-size="8">Updates</text>
+  <rect x="406" y="56" width="70" height="38" rx="6" fill="var(--bg2)" stroke="var(--bg3)"/>
+  <text x="441" y="74" text-anchor="middle" class="lbl" font-size="10" fill="var(--rd)">2</text>
+  <text x="441" y="86" text-anchor="middle" class="dim" font-size="8">Suppr.</text>
+  <rect x="484" y="56" width="70" height="38" rx="6" fill="var(--bg2)" stroke="var(--bg3)"/>
+  <text x="519" y="74" text-anchor="middle" class="lbl" font-size="10" fill="var(--gr)">2</text>
+  <text x="519" y="86" text-anchor="middle" class="dim" font-size="8">Ajouts</text>
+
+  <!-- Selection -->
+  <rect x="10" y="112" width="600" height="50" rx="6" fill="var(--srf)" stroke="var(--bg3)"/>
+  <text x="30" y="132" class="lbl" font-size="11">Selection</text>
+  <text x="30" y="150" class="dim" font-size="9">Couche : [combo] | Operation : [combo]</text>
+
+  <!-- Period -->
+  <rect x="10" y="170" width="600" height="50" rx="6" fill="var(--srf)" stroke="var(--bg3)"/>
+  <text x="30" y="190" class="lbl" font-size="11">Periode</text>
+  <text x="30" y="208" class="dim" font-size="9">Date debut / Date fin / Raccourcis (10 min, 30 min, 1h, 1 jour)</text>
+
+  <!-- Results -->
+  <rect x="10" y="228" width="600" height="70" rx="6" fill="var(--srf)" stroke="var(--bg3)"/>
+  <text x="30" y="248" class="lbl" font-size="11">Resultats</text>
+  <text x="30" y="266" class="dim" font-size="9">Tableau des evenements avec attributs, type de modification, code couleur</text>
+  <text x="30" y="282" class="dim" font-size="9">Selection multiple pour restauration par lot</text>
+
+  <!-- Buttons -->
+  <rect x="180" y="308" width="80" height="24" rx="4" fill="var(--bg2)" stroke="var(--bg3)"/>
+  <text x="220" y="324" text-anchor="middle" class="dim" font-size="9">Fermer</text>
+  <rect x="270" y="308" width="80" height="24" rx="4" fill="var(--ac-lt)" stroke="var(--ac)"/>
+  <text x="310" y="324" text-anchor="middle" class="lbl" font-size="9">Recover</text>
+  <rect x="360" y="308" width="80" height="24" rx="4" fill="var(--bg2)" stroke="var(--bg3)"/>
+  <text x="400" y="324" text-anchor="middle" class="dim" font-size="9">Restore</text>
+</svg>
+</div>
+
+<h3>La barre d'information</h3>
+<p>La barre en haut de la fenetre affiche un resume en temps reel du journal. Les compteurs se mettent a jour quand vous changez les filtres de selection ou de periode. Cliquer sur une tuile (Total, Updates, Suppr., Ajouts) bascule le filtre d'operation correspondant.</p>
+</section>
+
+<!-- ====== SUIVI ====== -->
+<section id="tracking">
+<h2>Suivi des modifications</h2>
+<p>Par defaut, RecoverLand surveille toutes les couches editables du projet. Vous pouvez restreindre la surveillance a certaines couches dans la section <strong>Couches surveillees</strong>.</p>
+
+<h3>Activer/desactiver l'enregistrement</h3>
+<p>Le toggle en haut a droite de la barre d'information controle globalement la capture. Quand il est desactive, aucune modification n'est enregistree, meme si vous editez des couches.</p>
+
+<div class="warn"><strong>Desactiver = aucune protection</strong>. Si vous desactivez l'enregistrement, les modifications faites pendant cette periode sont perdues definitivement. RecoverLand ne peut pas les retrouver apres coup.</div>
+
+<h3>Choisir les couches surveillees</h3>
+<p>Ouvrez la section <strong>Couches surveillees</strong> (repliee par defaut). Chaque couche vecteur chargee dans le projet apparait avec une case a cocher. Decochez une couche pour arreter de surveiller ses modifications.</p>
+</section>
+
+<!-- ====== RECHERCHER ====== -->
+<section id="search">
+<h2>Rechercher des modifications</h2>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">1</div><div class="step-title">Choisir la couche et l'operation</div></div>
+  <div class="step-body">
+    <p>Dans la section <strong>Selection</strong> :</p>
+    <ul style="font-size:13.5px;color:var(--tx2);margin:4px 0 0 16px;line-height:1.8">
+      <li><strong>Couche</strong> : "Toutes les couches sauvegardees" ou une couche specifique</li>
+      <li><strong>Operation</strong> : Toutes, UPDATE, DELETE, ou INSERT</li>
+    </ul>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">2</div><div class="step-title">Definir la periode</div></div>
+  <div class="step-body">
+    <p>Utilisez les champs <strong>Date debut</strong> et <strong>Date fin</strong>, ou les raccourcis (10 min, 30 min, 1 heure, 1 jour) pour definir rapidement la fenetre de recherche.</p>
+  </div>
+</div>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">3</div><div class="step-title">Cliquer sur Recover</div></div>
+  <div class="step-body">
+    <p>Le bouton <strong>Recover</strong> lance la recherche dans le journal SQLite. Une barre de progression s'affiche pendant le traitement. Les resultats apparaissent dans le tableau.</p>
+  </div>
+</div>
+</section>
+
+<!-- ====== RESULTATS ====== -->
+<section id="results">
+<h2>Lire les resultats</h2>
+<p>Le tableau affiche chaque evenement avec des colonnes fixes et des colonnes dynamiques.</p>
+
+<h3>Colonnes fixes</h3>
+<div class="tw"><table>
+<thead><tr><th>Colonne</th><th>Contenu</th></tr></thead>
+<tbody>
+  <tr><td><strong>Operation</strong></td><td>INSERT, UPDATE ou DELETE</td></tr>
+  <tr><td><strong>Couche</strong></td><td>Nom de la couche au moment de la modification</td></tr>
+  <tr><td><strong>Date</strong></td><td>Date et heure UTC de la modification</td></tr>
+  <tr><td><strong>Utilisateur</strong></td><td>Nom de l'utilisateur qui a effectue la modification</td></tr>
+</tbody>
+</table></div>
+
+<h3>Colonnes dynamiques (attributs)</h3>
+<p>Les colonnes suivantes montrent les attributs de l'entite au moment de la modification. Les cellules sont colorees pour indiquer le type de changement :</p>
+<div class="tw"><table>
+<thead><tr><th>Couleur</th><th>Signification</th></tr></thead>
+<tbody>
+  <tr><td style="background:rgba(66,133,244,0.15);padding:4px 11px"><strong>Bleu clair</strong></td><td>Valeur modifiee (ancienne valeur affichee)</td></tr>
+  <tr><td style="background:rgba(219,68,55,0.12);padding:4px 11px"><strong>Rouge clair</strong></td><td>Valeur videe (etait remplie, maintenant vide)</td></tr>
+  <tr><td style="background:rgba(52,168,83,0.12);padding:4px 11px"><strong>Vert clair</strong></td><td>Valeur ajoutee (etait vide, maintenant remplie)</td></tr>
+  <tr><td style="background:rgba(255,152,0,0.15);padding:4px 11px"><strong>Orange clair</strong></td><td>Geometrie modifiee</td></tr>
+</tbody>
+</table></div>
+
+<div class="info"><strong>Filtre texte</strong> : Un champ de recherche au-dessus du tableau permet de filtrer les lignes par mot-cle. La recherche porte sur toutes les colonnes visibles.</div>
+</section>
+
+<!-- ====== RESTAURER ====== -->
+<section id="restore">
+<h2>Restaurer des donnees</h2>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">1</div><div class="step-title">Selectionner les lignes a restaurer</div></div>
+  <div class="step-body"><p>Cochez les lignes du tableau que vous souhaitez restaurer. Utilisez <strong>Tout selectionner</strong> / <strong>Tout deselectionner</strong> pour les operations en lot.</p></div>
+</div>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">2</div><div class="step-title">Cliquer sur Restore</div></div>
+  <div class="step-body">
+    <p>Un message de confirmation apparait avec le nombre d'entites a restaurer. Apres confirmation, RecoverLand :</p>
+    <ul style="font-size:13.5px;color:var(--tx2);margin:4px 0 0 16px;line-height:1.8">
+      <li>Verifie que la couche cible existe et est editable</li>
+      <li>Compare le schema actuel avec le schema sauvegarde</li>
+      <li>Restaure les attributs et la geometrie a leur etat anterieur</li>
+      <li>En cas d'erreur sur une entite, les autres entites du lot sont quand meme traitees</li>
+    </ul>
+  </div>
+</div>
+
+<div class="warn"><strong>La restauration modifie les donnees</strong>. Elle ecrase les valeurs actuelles par les valeurs enregistrees dans le journal. Assurez-vous de selectionner les bonnes lignes avant de confirmer.</div>
+
+<div class="danger"><strong>Restauration sur shapefile recompacte</strong> : Si un shapefile a ete re-exporte ou compacte entre le moment de la capture et la restauration, les FID ont pu changer. La restauration risque de modifier la mauvaise entite. Privilegiez le GeoPackage pour eviter ce risque.</div>
+</section>
+
+<!-- ====== SCHEMA WARNING ====== -->
+<section id="schema-warning">
+<h2>Avertissement de derive de schema</h2>
+<p>Si la structure d'une couche a change entre la capture et la restauration (champ ajoute, supprime ou renomme), RecoverLand affiche un avertissement avant de proceder.</p>
+
+<h3>Ce qui se passe concretement</h3>
+<div class="step">
+  <div class="step-head"><div class="step-num">1</div><div class="step-title">Vous lancez une restauration</div></div>
+  <div class="step-body"><p>RecoverLand compare le schema enregistre dans l'evenement (<code>field_schema_json</code>) avec le schema actuel de la couche.</p></div>
+</div>
+
+<div class="step">
+  <div class="step-head"><div class="step-num">2</div><div class="step-title">Differences detectees</div></div>
+  <div class="step-body">
+    <p>Le rapport indique :</p>
+    <ul style="font-size:13.5px;color:var(--tx2);margin:4px 0 0 16px;line-height:1.8">
+      <li><strong>Champs compatibles</strong> : restauration normale</li>
+      <li><strong>Champs manquants</strong> : existaient a la capture mais ont ete supprimes. Valeurs ignorees.</li>
+      <li><strong>Champs nouveaux</strong> : n'existaient pas a la capture. Laisses a leur valeur par defaut.</li>
+      <li><strong>Champs incompatibles</strong> : le type a change (ex: texte vers entier). Tentative de conversion.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="tip"><strong>Bonne pratique</strong> : Evitez de modifier la structure d'une couche si vous prevoyez de restaurer des donnees anciennes. Si c'est inevitable, verifiez le rapport de compatibilite avant de confirmer.</div>
+</section>
+
+<!-- ====== RETENTION CONFIG ====== -->
+<section id="retention-config">
+<h2>Gerer la retention du journal</h2>
+<p>Le journal SQLite grossit au fil du temps. RecoverLand offre des outils pour maitriser sa taille.</p>
+
+<h3>Purge par anciennete</h3>
+<p>Supprimez les evenements plus anciens qu'un seuil : 30 jours, 90 jours, 365 jours. Les evenements purges sont definitivement supprimes.</p>
+
+<h3>Purge par session</h3>
+<p>Supprimez tous les evenements d'une session d'edition specifique. Utile pour nettoyer les sessions de test ou les imports massifs.</p>
+
+<h3>Compactage (VACUUM)</h3>
+<p>Apres une purge, la taille physique du fichier SQLite ne diminue pas automatiquement. Le compactage VACUUM recupere l'espace disque. Cette operation peut prendre quelques secondes sur un journal volumineux.</p>
+
+<div class="warn"><strong>Purge = suppression definitive</strong>. Une fois purges, les evenements ne sont plus recuperables. Assurez-vous que l'historique purge n'est plus necessaire.</div>
+
+<h3>Surveillance de la taille</h3>
+<p>La barre d'information en haut de la fenetre RecoverLand affiche en permanence la taille du journal et le nombre d'evenements. Surveillez ces indicateurs pour savoir quand une purge est necessaire.</p>
+</section>
+
+<!-- ====== DUAL MODE ====== -->
+<section id="dual-mode">
+<h2>Mode PostgreSQL (legacy)</h2>
+<p>Si votre projet utilise des couches PostgreSQL avec des triggers d'audit installes cote serveur (schema <code>suppresions</code>), RecoverLand detecte automatiquement ce backend et l'utilise pour ces couches.</p>
+
+<h3>Coexistence des deux modes</h3>
+<div class="flow">
+  <span class="fn">Couche GeoPackage</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">SQLite local</span>
+</div>
+<div class="flow" style="margin-top:6px">
+  <span class="fn">Couche PostGIS + triggers</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">PostgreSQL legacy</span>
+</div>
+
+<p style="margin-top:12px">Les deux modes coexistent dans le meme projet. Le <code>BackendRouter</code> decide du backend pour chaque couche. Vous n'avez rien a configurer : la detection est automatique.</p>
+
+<div class="info"><strong>Recommandation</strong> : Le mode SQLite local est recommande car il ne depend pas de la disponibilite du serveur pour consulter l'historique. Le mode PostgreSQL est conserve pour la compatibilite avec les installations existantes.</div>
+</section>
+
+<!-- ====== SCENARIOS ====== -->
+<section id="scenario-undo">
+<h2>Scenario : Annuler une erreur</h2>
+<p>Vous venez de modifier par erreur 50 attributs sur une couche de vegetation.</p>
+
+<div class="flow">
+  <span class="fn">Ouvrir RecoverLand</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Couche = vegetation</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Operation = UPDATE</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Periode = 10 min</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Recover</span>
+</div>
+<p>Les 50 modifications apparaissent. Selectionnez-les toutes, puis cliquez <strong>Restore</strong>. Les attributs reviennent a leur etat precedent.</p>
+</section>
+
+<section id="scenario-compare">
+<h2>Scenario : Comparer avant/apres</h2>
+<p>Vous voulez voir ce qui a change sur une couche depuis hier.</p>
+
+<div class="flow">
+  <span class="fn">Couche = parcelles</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Operation = Toutes</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Periode = 1 jour</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Recover</span>
+</div>
+<p>Le tableau montre toutes les modifications. Les cellules colorees indiquent exactement quels attributs ont change et quelles etaient les anciennes valeurs.</p>
+</section>
+
+<section id="scenario-deleted">
+<h2>Scenario : Retrouver une entite supprimee</h2>
+<p>Un collegue a supprime par erreur une entite importante.</p>
+
+<div class="flow">
+  <span class="fn">Couche = batiments</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Operation = DELETE</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Periode = 1 jour</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Recover</span>
+</div>
+<p>L'entite supprimee apparait avec tous ses attributs et sa geometrie au moment de la suppression. Selectionnez-la et cliquez <strong>Restore</strong> pour la re-inserer dans la couche.</p>
+
+<div class="tip"><strong>L'entite restauree</strong> est inseree comme une nouvelle entite avec un nouveau FID. Les attributs et la geometrie sont identiques a l'etat sauvegarde.</div>
+</section>
+
+</main>
+
+<aside class="rp">
+  <div class="srch" style="margin-bottom:16px">
+    <svg class="srch-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="si" placeholder="Rechercher..." autocomplete="off">
+    <div class="srch-res" id="sr"></div>
+  </div>
+  <h4>Sur cette page</h4>
+  <a href="#installation">Installation</a>
+  <a href="#first-launch">Premier lancement</a>
+  <a href="#ui-overview">Interface</a>
+  <a href="#tracking">Suivi</a>
+  <a href="#search">Rechercher</a>
+  <a href="#results">Resultats</a>
+  <a href="#restore">Restaurer</a>
+  <a href="#schema-warning">Schema warning</a>
+  <a href="#retention-config">Retention</a>
+  <a href="#dual-mode">Mode PostgreSQL</a>
+  <a href="#scenario-undo">Annuler une erreur</a>
+  <a href="#scenario-compare">Comparer</a>
+  <a href="#scenario-deleted">Entite supprimee</a>
+</aside>
+</div>
+
+<footer>RecoverLand 3.0 &middot; NGE ES DEVTEAM &middot; Documentation technique</footer>
+<script src="rl.js"></script>
+</body>
+</html>

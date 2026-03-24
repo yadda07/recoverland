@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Formats supportes - RecoverLand</title>
+<link rel="stylesheet" href="rl.css?v=3">
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0"><defs>
+  <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--brd)"/></marker>
+  <marker id="ah2" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--ac)"/></marker>
+</defs></svg>
+
+<header class="bar">
+  <a class="bar-logo" href="index.html">
+    <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">3.0</span>
+  </a>
+  <nav class="bar-nav">
+    <a href="index.html">Vue d'ensemble</a>
+    <a href="guide.html">Guide</a>
+    <a href="formats.html" class="on">Formats</a>
+    <a href="limits.html">Limites</a>
+  </nav>
+  <div class="bar-right">
+    <button class="tbtn" onclick="toggleTheme()">&#9789;</button>
+  </div>
+</header>
+
+<div class="layout">
+<aside class="side"><nav>
+  <div class="cat">Vue d'ensemble</div>
+  <a href="#matrix">Matrice de support</a>
+  <a href="#reading-the-table">Lire le tableau</a>
+  <div class="cat">Formats fichier</div>
+  <a href="#geopackage">GeoPackage</a>
+  <a href="#shapefile">Shapefile</a>
+  <a href="#geojson">GeoJSON</a>
+  <a href="#flatgeobuf">FlatGeobuf</a>
+  <a href="#csv">CSV / Texte delimitie</a>
+  <div class="cat">Bases de donnees</div>
+  <a href="#postgresql">PostgreSQL / PostGIS</a>
+  <a href="#spatialite">SpatiaLite</a>
+  <a href="#mssql">MS SQL Server</a>
+  <a href="#oracle">Oracle Spatial</a>
+  <div class="cat">Autres</div>
+  <a href="#memory">Couche memoire</a>
+  <a href="#wfs">WFS</a>
+  <a href="#virtual">Couche virtuelle</a>
+  <a href="#recommendation">Recommandation</a>
+</nav></aside>
+
+<main class="main">
+
+<div class="slbl">RecoverLand : Formats</div>
+<h1>Formats supportes</h1>
+<p class="lead">RecoverLand fonctionne avec tous les formats editables de QGIS, mais tous les formats n'offrent pas le meme niveau de fiabilite. Cette page decrit precisement ce qui fonctionne, ce qui fonctionne partiellement, et ce qui ne fonctionne pas.</p>
+
+<!-- ====== MATRICE ====== -->
+<section id="matrix">
+<h2>Matrice de support</h2>
+
+<div class="tw"><table>
+<thead><tr><th>Format</th><th>Capture</th><th>Restauration</th><th>Identification</th><th>Niveau</th></tr></thead>
+<tbody>
+  <tr><td><strong>GeoPackage</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-strong">STRONG</span></td><td>Complet</td></tr>
+  <tr><td><strong>SpatiaLite</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-strong">STRONG</span></td><td>Complet</td></tr>
+  <tr><td><strong>PostgreSQL / PostGIS</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-strong">STRONG</span></td><td>Complet</td></tr>
+  <tr><td><strong>Oracle Spatial</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-strong">STRONG</span></td><td>Complet</td></tr>
+  <tr><td><strong>MS SQL Server</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-strong">STRONG</span></td><td>Complet</td></tr>
+  <tr><td><strong>Shapefile (.shp)</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-medium">MEDIUM</span></td><td>Complet</td></tr>
+  <tr><td><strong>GeoJSON</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-medium">MEDIUM</span></td><td>Complet</td></tr>
+  <tr><td><strong>FlatGeobuf (.fgb)</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-strong">STRONG</span></td><td>Complet</td></tr>
+  <tr><td><strong>CSV / Texte</strong></td><td>Oui</td><td>Oui (risque)</td><td><span class="strength s-weak">WEAK</span></td><td>Partiel</td></tr>
+  <tr><td><strong>WFS-T</strong></td><td>Oui</td><td>Oui</td><td><span class="strength s-medium">MEDIUM</span></td><td>Partiel</td></tr>
+  <tr><td><strong>Couche memoire</strong></td><td>Oui</td><td>Non</td><td><span class="strength s-none">NONE</span></td><td>Informatif</td></tr>
+  <tr><td><strong>Couche virtuelle</strong></td><td>Non</td><td>Non</td><td><span class="strength s-none">NONE</span></td><td>Refuse</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ====== LIRE LE TABLEAU ====== -->
+<section id="reading-the-table">
+<h2>Lire le tableau</h2>
+
+<h3>Capture</h3>
+<p>"Oui" signifie que RecoverLand enregistre les modifications faites sur ce format. L'enregistrement est identique quel que soit le format : attributs, geometrie, type d'operation.</p>
+
+<h3>Restauration</h3>
+<p>"Oui" signifie que RecoverLand peut re-appliquer un etat anterieur sur la couche. "Oui (risque)" signifie que la restauration est techniquement possible mais que le resultat peut etre incorrect si les identifiants d'entite ont change entre temps.</p>
+
+<h3>Identification</h3>
+<p>La force d'identification determine la fiabilite avec laquelle RecoverLand retrouve la bonne entite au moment de la restauration :</p>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li><span class="strength s-strong">STRONG</span> : Cle primaire stable. L'entite est retrouvee de maniere certaine.</li>
+  <li><span class="strength s-medium">MEDIUM</span> : FID generalement stable. Correct dans la plupart des cas, mais fragile apres certaines operations sur le fichier.</li>
+  <li><span class="strength s-weak">WEAK</span> : FID = numero de ligne. Change des qu'une ligne est ajoutee ou supprimee.</li>
+  <li><span class="strength s-none">NONE</span> : Pas d'identifiant stable. Restauration impossible ou non pertinente.</li>
+</ul>
+</section>
+
+<!-- ====== GEOPACKAGE ====== -->
+<section id="geopackage">
+<h2>GeoPackage (.gpkg)</h2>
+<div class="card-tag tag-strong">STRONG</div>
+
+<p>Le GeoPackage est le format recommande pour RecoverLand. C'est un fichier SQLite avec des extensions spatiales standardisees par l'OGC.</p>
+
+<h3>Pourquoi c'est le meilleur choix</h3>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Cle primaire auto-incrementee (<code>fid</code>) qui ne reutilise jamais les valeurs supprimees</li>
+  <li>Un seul fichier (pas de .shx, .dbf, .prj a gerer)</li>
+  <li>Support multi-couches dans un seul fichier</li>
+  <li>Support des types de donnees riches (date, datetime, entier 64 bits, blob)</li>
+  <li>Pas de limite de 254 caracteres sur les noms de champs (contrairement au shapefile)</li>
+</ul>
+
+<div class="tip"><strong>Recommandation</strong> : Si vous commencez un nouveau projet et que vous avez le choix du format, utilisez GeoPackage. C'est le format qui offre la meilleure fiabilite avec RecoverLand.</div>
+</section>
+
+<!-- ====== SHAPEFILE ====== -->
+<section id="shapefile">
+<h2>Shapefile (.shp)</h2>
+<div class="card-tag tag-medium">MEDIUM</div>
+
+<p>Le shapefile est le format historique du SIG. RecoverLand le supporte entierement pour la capture et la restauration, avec une reserve sur la stabilite des FID.</p>
+
+<h3>Ce qui fonctionne</h3>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Capture de toutes les modifications (attributs, geometries, suppressions, insertions)</li>
+  <li>Restauration correcte tant que le fichier n'a pas ete re-exporte ou compacte</li>
+</ul>
+
+<h3>Ce qui peut echouer</h3>
+<div class="warn"><strong>FID instable</strong> : Le FID d'un shapefile est le numero de ligne dans le fichier .dbf. Si le shapefile est re-exporte, compacte (Pack), ou si des entites sont supprimees puis le fichier reorganise, les FID changent. La restauration risque de modifier la mauvaise entite.</div>
+
+<h3>Quand ca pose probleme concretement</h3>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Vous exportez le shapefile avec "Enregistrer sous..." dans un nouveau fichier</li>
+  <li>Un script externe reorganise ou compacte le .dbf</li>
+  <li>Vous supprimez des entites puis faites un "Pack" du shapefile dans un autre outil</li>
+</ul>
+
+<p>Si vous editez le shapefile uniquement dans QGIS sans le re-exporter, les FID restent stables et la restauration fonctionne correctement.</p>
+</section>
+
+<!-- ====== GEOJSON ====== -->
+<section id="geojson">
+<h2>GeoJSON (.geojson)</h2>
+<div class="card-tag tag-medium">MEDIUM</div>
+
+<p>Meme comportement que le shapefile. Les FID sont generalement stables tant que le fichier est edite uniquement dans QGIS. Un re-export ou une edition externe peut changer les FID.</p>
+</section>
+
+<!-- ====== FLATGEOBUF ====== -->
+<section id="flatgeobuf">
+<h2>FlatGeobuf (.fgb)</h2>
+<div class="card-tag tag-strong">STRONG</div>
+
+<p>FlatGeobuf utilise des identifiants stables similaires au GeoPackage. C'est un bon choix pour les fichiers volumineux grace a son index spatial integre.</p>
+</section>
+
+<!-- ====== CSV ====== -->
+<section id="csv">
+<h2>CSV / Texte delimitie</h2>
+<div class="card-tag tag-weak">WEAK</div>
+
+<p>Le CSV n'a pas de notion de cle primaire. Le FID est le numero de ligne dans le fichier.</p>
+
+<div class="danger"><strong>Restauration tres risquee</strong> : Ajouter ou supprimer une seule ligne decale tous les FID suivants. RecoverLand capture les modifications, mais la restauration a de grandes chances de modifier la mauvaise ligne si le fichier a change depuis.</div>
+
+<h3>Usage recommande</h3>
+<p>Utilisez RecoverLand sur un CSV uniquement pour <strong>consulter l'historique</strong> (voir ce qui a change et quand). Evitez la restauration automatique sur ce format. Si vous devez restaurer, exportez le CSV en GeoPackage d'abord.</p>
+</section>
+
+<!-- ====== POSTGRESQL ====== -->
+<section id="postgresql">
+<h2>PostgreSQL / PostGIS</h2>
+<div class="card-tag tag-strong">STRONG</div>
+
+<p>Les tables PostgreSQL ont une cle primaire explicite (generalement <code>gid</code> ou <code>id</code>). RecoverLand enregistre cette cle dans <code>feature_identity_json</code> et l'utilise pour la restauration.</p>
+
+<div class="info"><strong>Deux modes</strong> : RecoverLand supporte PostgreSQL via le backend SQLite local (capture automatique) et via le backend legacy (connexion directe). Le mode local est recommande car il ne depend pas de la disponibilite du serveur pour consulter l'historique.</div>
+</section>
+
+<!-- ====== SPATIALITE ====== -->
+<section id="spatialite">
+<h2>SpatiaLite</h2>
+<div class="card-tag tag-strong">STRONG</div>
+
+<p>Similaire au GeoPackage : fichier SQLite avec extensions spatiales, cle primaire auto-incrementee stable. Entierement supporte.</p>
+</section>
+
+<!-- ====== MSSQL ====== -->
+<section id="mssql">
+<h2>MS SQL Server</h2>
+<div class="card-tag tag-strong">STRONG</div>
+<p>Cle primaire explicite, identification forte. Entierement supporte pour la capture et la restauration.</p>
+</section>
+
+<!-- ====== ORACLE ====== -->
+<section id="oracle">
+<h2>Oracle Spatial</h2>
+<div class="card-tag tag-strong">STRONG</div>
+<p>Cle primaire explicite, identification forte. Entierement supporte pour la capture et la restauration.</p>
+</section>
+
+<!-- ====== MEMORY ====== -->
+<section id="memory">
+<h2>Couche memoire</h2>
+<div class="card-tag tag-none">NONE</div>
+
+<p>Les couches memoire n'ont pas de fichier source. Elles existent uniquement dans la session QGIS courante et disparaissent a la fermeture.</p>
+
+<p>RecoverLand capture les modifications a titre informatif (vous pouvez voir l'historique), mais la restauration est impossible car il n'y a pas de cible persistante ou re-appliquer les donnees.</p>
+</section>
+
+<!-- ====== WFS ====== -->
+<section id="wfs">
+<h2>WFS (Web Feature Service)</h2>
+<div class="card-tag tag-medium">MEDIUM</div>
+
+<p>Les couches WFS-T (transactionnelles) sont supportees pour la capture et la restauration. La fiabilite depend du serveur WFS et de la stabilite des identifiants qu'il fournit.</p>
+
+<div class="warn"><strong>Dependance reseau</strong> : La restauration necessite que le serveur WFS soit accessible au moment de la restauration. Si le serveur est hors ligne, la restauration echoue.</div>
+</section>
+
+<!-- ====== VIRTUAL ====== -->
+<section id="virtual">
+<h2>Couche virtuelle</h2>
+<div class="card-tag tag-none">REFUSE</div>
+
+<p>Les couches virtuelles sont des vues derivees d'autres couches. RecoverLand les refuse completement : pas de capture, pas de restauration. Modifier une couche virtuelle n'a pas de sens car elle est recalculee a partir de ses sources.</p>
+</section>
+
+<!-- ====== RECOMMANDATION ====== -->
+<section id="recommendation">
+<h2>Recommandation de format</h2>
+
+<div class="dia">
+<svg viewBox="0 0 600 140" xmlns="http://www.w3.org/2000/svg">
+  <!-- Best -->
+  <rect x="10" y="10" width="180" height="50" rx="8" class="nd-success" stroke-width="1.5"/>
+  <text x="100" y="32" text-anchor="middle" font-size="12" font-weight="700" class="lbl-success">Recommande</text>
+  <text x="100" y="48" text-anchor="middle" font-size="10" class="lbl-success">GeoPackage, SpatiaLite</text>
+
+  <!-- Good -->
+  <rect x="210" y="10" width="180" height="50" rx="8" class="nd-warn" stroke-width="1.2"/>
+  <text x="300" y="32" text-anchor="middle" font-size="12" font-weight="700" class="lbl-warn">Acceptable</text>
+  <text x="300" y="48" text-anchor="middle" font-size="10" class="lbl-warn">Shapefile, GeoJSON</text>
+
+  <!-- Risky -->
+  <rect x="410" y="10" width="180" height="50" rx="8" class="nd-danger" stroke-width="1.2"/>
+  <text x="500" y="32" text-anchor="middle" font-size="12" font-weight="700" class="lbl-danger">Risque</text>
+  <text x="500" y="48" text-anchor="middle" font-size="10" class="lbl-danger">CSV, Texte delimitie</text>
+
+  <text x="100" y="90" text-anchor="middle" font-size="11" fill="var(--tx2)">Cle primaire stable</text>
+  <text x="100" y="106" text-anchor="middle" font-size="11" fill="var(--tx2)">Restauration fiable</text>
+  <text x="100" y="122" text-anchor="middle" font-size="11" fill="var(--tx2)">Multi-couches</text>
+
+  <text x="300" y="90" text-anchor="middle" font-size="11" fill="var(--tx2)">FID stable en usage normal</text>
+  <text x="300" y="106" text-anchor="middle" font-size="11" fill="var(--tx2)">Fragile si re-export</text>
+  <text x="300" y="122" text-anchor="middle" font-size="11" fill="var(--tx2)">Largement utilise</text>
+
+  <text x="500" y="90" text-anchor="middle" font-size="11" fill="var(--tx2)">FID = numero de ligne</text>
+  <text x="500" y="106" text-anchor="middle" font-size="11" fill="var(--tx2)">Restauration peu fiable</text>
+  <text x="500" y="122" text-anchor="middle" font-size="11" fill="var(--tx2)">Consultation uniquement</text>
+</svg>
+</div>
+
+<p>Si vous avez le choix du format, utilisez <strong>GeoPackage</strong>. C'est un fichier unique, portable, avec des identifiants stables. RecoverLand fonctionnera de maniere optimale avec ce format.</p>
+</section>
+
+</main>
+
+<aside class="rp">
+  <div class="srch" style="margin-bottom:16px">
+    <svg class="srch-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="si" placeholder="Rechercher..." autocomplete="off">
+    <div class="srch-res" id="sr"></div>
+  </div>
+  <h4>Sur cette page</h4>
+  <a href="#matrix">Matrice</a>
+  <a href="#reading-the-table">Lire le tableau</a>
+  <a href="#geopackage">GeoPackage</a>
+  <a href="#shapefile">Shapefile</a>
+  <a href="#geojson">GeoJSON</a>
+  <a href="#flatgeobuf">FlatGeobuf</a>
+  <a href="#csv">CSV</a>
+  <a href="#postgresql">PostgreSQL</a>
+  <a href="#spatialite">SpatiaLite</a>
+  <a href="#mssql">MS SQL Server</a>
+  <a href="#oracle">Oracle</a>
+  <a href="#memory">Memoire</a>
+  <a href="#wfs">WFS</a>
+  <a href="#virtual">Virtuelle</a>
+  <a href="#recommendation">Recommandation</a>
+</aside>
+</div>
+
+<footer>RecoverLand 3.0 &middot; NGE ES DEVTEAM &middot; Documentation technique</footer>
+<script src="rl.js"></script>
+</body>
+</html>

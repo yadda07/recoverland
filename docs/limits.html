@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Limites et cas d'echec - RecoverLand</title>
+<link rel="stylesheet" href="rl.css?v=3">
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0"><defs>
+  <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--brd)"/></marker>
+  <marker id="ah2" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--ac)"/></marker>
+</defs></svg>
+
+<header class="bar">
+  <a class="bar-logo" href="index.html">
+    <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">3.0</span>
+  </a>
+  <nav class="bar-nav">
+    <a href="index.html">Vue d'ensemble</a>
+    <a href="guide.html">Guide</a>
+    <a href="formats.html">Formats</a>
+    <a href="limits.html" class="on">Limites</a>
+  </nav>
+  <div class="bar-right">
+    <button class="tbtn" onclick="toggleTheme()">&#9789;</button>
+  </div>
+</header>
+
+<div class="layout">
+<aside class="side"><nav>
+  <div class="cat">Limites connues</div>
+  <a href="#intro-limits">Vue d'ensemble</a>
+  <a href="#severity">Echelle de severite</a>
+  <div class="cat">Identification</div>
+  <a href="#file-moved">Fichier deplace</a>
+  <a href="#network-drive">Lecteur reseau</a>
+  <a href="#fid-instable">FID instable</a>
+  <a href="#fid-minus-one">FID = -1</a>
+  <div class="cat">Capture</div>
+  <a href="#outside-qgis">Modification hors QGIS</a>
+  <a href="#tracking-off">Enregistrement desactive</a>
+  <a href="#crash">Crash QGIS</a>
+  <div class="cat">Restauration</div>
+  <a href="#schema-drift">Derive de schema</a>
+  <a href="#concurrent-edit">Edition concurrente</a>
+  <a href="#memory-layer">Couche memoire</a>
+  <div class="cat">Journal</div>
+  <a href="#journal-size">Taille du journal</a>
+  <a href="#journal-deleted">Journal supprime</a>
+  <a href="#project-moved">Projet deplace</a>
+  <div class="cat">Posture</div>
+  <a href="#what-rl-is-not">Ce que RecoverLand n'est pas</a>
+</nav></aside>
+
+<main class="main">
+
+<div class="slbl">RecoverLand : Limites</div>
+<h1>Limites et cas d'echec</h1>
+<p class="lead">Cette page documente honnetement les situations ou RecoverLand ne fonctionne pas, fonctionne partiellement, ou peut produire un resultat incorrect. Chaque cas est accompagne d'une explication de la cause et d'une recommandation pour l'eviter.</p>
+
+<div class="info"><strong>Pourquoi cette page existe</strong> : Un outil de recuperation de donnees doit etre transparent sur ce qu'il ne peut pas faire. Connaitre les limites evite les fausses certitudes.</div>
+
+<!-- ====== SEVERITE ====== -->
+<section id="severity">
+<h2>Echelle de severite</h2>
+<div class="tw"><table>
+<thead><tr><th>Niveau</th><th>Signification</th></tr></thead>
+<tbody>
+  <tr><td><span class="strength s-critical">CRITIQUE</span></td><td>Perte de donnees ou restauration sur la mauvaise entite. L'utilisateur doit comprendre ce risque avant d'utiliser RecoverLand dans ce contexte.</td></tr>
+  <tr><td><span class="strength s-medium">MODERE</span></td><td>Le systeme fonctionne mais avec une fiabilite reduite. L'historique reste consultable mais la restauration automatique est deconseilllee.</td></tr>
+  <tr><td><span class="strength s-weak" style="background:var(--bg2);color:var(--tx2)">FAIBLE</span></td><td>Cas de bord rare. Impact limite a un scenario specifique.</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ====== FICHIER DEPLACE ====== -->
+<section id="file-moved">
+<h2>Fichier deplace ou renomme</h2>
+<p><span class="strength s-medium">MODERE</span></p>
+
+<h3>Le probleme</h3>
+<p>Le fingerprint de couche utilise le chemin absolu du fichier source. Si le fichier est deplace, renomme ou copie ailleurs, le nouveau chemin produit un fingerprint different. L'historique enregistre sous l'ancien chemin n'est plus relie a la couche.</p>
+
+<div class="dia">
+<svg viewBox="0 0 580 120" xmlns="http://www.w3.org/2000/svg">
+  <rect x="10" y="10" width="240" height="40" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.2"/>
+  <text x="130" y="35" text-anchor="middle" class="lbl" font-size="11">ogr::C:/data/vegetation.shp</text>
+  <text x="130" y="70" text-anchor="middle" class="dim">Historique : 150 evenements</text>
+
+  <text x="290" y="35" text-anchor="middle" font-size="18" fill="var(--rd)">&#8800;</text>
+
+  <rect x="330" y="10" width="240" height="40" rx="6" class="nd-danger" stroke-width="1.2"/>
+  <text x="450" y="35" text-anchor="middle" class="lbl" font-size="11">ogr::D:/archive/vegetation.shp</text>
+  <text x="450" y="70" text-anchor="middle" class="dim">Historique : 0 evenement</text>
+
+  <text x="290" y="105" text-anchor="middle" class="dim" font-size="10">Meme fichier physique, deux fingerprints differents</text>
+</svg>
+</div>
+
+<h3>Consequence</h3>
+<p>L'historique existant reste intact et consultable (il n'est pas supprime). Mais RecoverLand ne sait pas que le fichier deplace est le meme que l'ancien. La recherche par couche ne montre pas l'historique ancien.</p>
+
+<h3>Comment l'eviter</h3>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Ne deplacez pas les fichiers de donnees apres avoir commence a les editer dans QGIS</li>
+  <li>Si vous devez reorganiser vos dossiers, faites-le avant de commencer le travail d'edition</li>
+  <li>Utilisez des chemins stables (pas de cles USB, pas de dossiers temporaires)</li>
+</ul>
+</section>
+
+<!-- ====== LECTEUR RESEAU ====== -->
+<section id="network-drive">
+<h2>Lecteur reseau avec montage variable</h2>
+<p><span class="strength s-medium">MODERE</span></p>
+
+<h3>Le probleme</h3>
+<p>Si un fichier est accessible via <code>Z:\partage\vegetation.shp</code> sur un poste et via <code>\\serveur\partage\vegetation.shp</code> sur un autre, les deux chemins produisent des fingerprints differents bien que ce soit le meme fichier physique.</p>
+
+<p>Meme probleme si la lettre du lecteur change : <code>Z:</code> un jour, <code>Y:</code> le lendemain.</p>
+
+<h3>Comment l'eviter</h3>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Utilisez toujours le meme chemin pour acceder au fichier (toujours la lettre de lecteur, ou toujours le chemin UNC)</li>
+  <li>Fixez la lettre du lecteur reseau pour qu'elle ne change pas entre les sessions</li>
+</ul>
+</section>
+
+<!-- ====== FID INSTABLE ====== -->
+<section id="fid-instable">
+<h2>FID instable (shapefile, GeoJSON)</h2>
+<p><span class="strength s-critical">CRITIQUE</span></p>
+
+<h3>Le probleme</h3>
+<p>Le FID d'un shapefile est le numero d'enregistrement dans le .dbf. Ce numero peut changer si :</p>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Le shapefile est re-exporte ("Enregistrer sous..." dans QGIS ou un autre outil)</li>
+  <li>Le fichier .dbf est compacte (Pack) apres des suppressions</li>
+  <li>Un script externe reorganise les enregistrements</li>
+</ul>
+
+<div class="danger"><strong>Risque concret</strong> : Vous avez enregistre une modification sur l'entite FID=42 (un batiment). Le shapefile est re-exporte. Le FID 42 designe maintenant une route. Si vous restaurez, RecoverLand ecrit les attributs du batiment sur la route. Les donnees sont corrompues.</div>
+
+<h3>Comment l'eviter</h3>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Utilisez GeoPackage au lieu de Shapefile quand c'est possible</li>
+  <li>Si vous devez utiliser un shapefile, ne le re-exportez pas entre les captures et les restaurations</li>
+  <li>Avant de restaurer sur un shapefile, verifiez manuellement que le FID correspond bien a l'entite attendue</li>
+</ul>
+</section>
+
+<!-- ====== FID -1 ====== -->
+<section id="fid-minus-one">
+<h2>FID = -1 (entite en cours de creation)</h2>
+<p><span class="strength s-weak" style="background:var(--bg2);color:var(--tx2)">FAIBLE</span></p>
+
+<h3>Le probleme</h3>
+<p>Pendant la creation d'une entite (avant le commit), QGIS attribue un FID temporaire de -1. Si le plugin capture un snapshot a ce moment, l'identite enregistree est <code>{"fid": -1}</code>, ce qui n'est pas unique.</p>
+
+<h3>Impact reel</h3>
+<p>Ce cas est rare car RecoverLand capture au moment du commit (afterCommitChanges), pas pendant l'edition. A ce stade, QGIS a deja attribue un FID definitif. Le risque est theorique.</p>
+</section>
+
+<!-- ====== HORS QGIS ====== -->
+<section id="outside-qgis">
+<h2>Modifications hors QGIS</h2>
+<p><span class="strength s-critical">CRITIQUE</span></p>
+
+<h3>Le probleme</h3>
+<p>RecoverLand ecoute les signaux d'edition de QGIS. Si un fichier est modifie par un autre logiciel (ArcGIS, script Python, editeur de texte, ogr2ogr), RecoverLand ne detecte rien. Ces modifications ne sont pas dans le journal.</p>
+
+<div class="dia">
+<svg viewBox="0 0 580 100" xmlns="http://www.w3.org/2000/svg">
+  <rect x="10" y="10" width="160" height="40" rx="6" class="nd-ac"/>
+  <text x="90" y="35" text-anchor="middle" class="lbl" font-size="11">Edition QGIS</text>
+  <text x="90" y="70" text-anchor="middle" font-size="11" fill="var(--gr)">Capture</text>
+
+  <rect x="210" y="10" width="160" height="40" rx="6" class="nd-danger" stroke-width="1.2"/>
+  <text x="290" y="35" text-anchor="middle" class="lbl" font-size="11">Script Python</text>
+  <text x="290" y="70" text-anchor="middle" font-size="11" fill="var(--rd)">Pas de capture</text>
+
+  <rect x="410" y="10" width="160" height="40" rx="6" class="nd-danger" stroke-width="1.2"/>
+  <text x="490" y="35" text-anchor="middle" class="lbl" font-size="11">Autre logiciel</text>
+  <text x="490" y="70" text-anchor="middle" font-size="11" fill="var(--rd)">Pas de capture</text>
+</svg>
+</div>
+
+<h3>Comment l'eviter</h3>
+<p>Faites toutes vos modifications dans QGIS. Si vous devez utiliser un script, executez-le dans la console Python de QGIS en mode edition (startEditing / commitChanges) pour que les signaux soient emis.</p>
+</section>
+
+<!-- ====== TRACKING OFF ====== -->
+<section id="tracking-off">
+<h2>Enregistrement desactive</h2>
+<p><span class="strength s-critical">CRITIQUE</span></p>
+
+<p>Si l'utilisateur desactive le toggle d'enregistrement, aucune modification n'est capturee. RecoverLand ne peut pas recuperer ce qui n'a pas ete enregistre. Il n'y a pas de mode "rattrapage" apres coup.</p>
+
+<div class="warn"><strong>Verifiez que l'enregistrement est actif</strong> (toggle vert) avant de commencer a editer. C'est la premiere chose a verifier si vous constatez que l'historique est vide.</div>
+</section>
+
+<!-- ====== CRASH ====== -->
+<section id="crash">
+<h2>Crash de QGIS</h2>
+<p><span class="strength s-weak" style="background:var(--bg2);color:var(--tx2)">FAIBLE</span></p>
+
+<h3>Le probleme</h3>
+<p>Si QGIS plante pendant une session d'edition (avant le commit), les modifications en cours ne sont pas capturees car le commit n'a jamais eu lieu.</p>
+
+<p>Si QGIS plante apres le commit mais avant que la WriteQueue ait ecrit dans SQLite, quelques evenements en file d'attente peuvent etre perdus. Le mode WAL de SQLite protege les evenements deja ecrits.</p>
+
+<h3>Impact reel</h3>
+<p>La WriteQueue ecrit par lots de 500 evenements ou a la fermeture. En usage normal (quelques modifications a la fois), les evenements sont ecrits rapidement. Le risque de perte est limite a quelques secondes d'activite avant le crash.</p>
+
+<h3>Mecanisme de recuperation</h3>
+<p>Au demarrage, le module <code>integrity.py</code> effectue plusieurs verifications :</p>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li><code>PRAGMA integrity_check</code> pour detecter une corruption du journal</li>
+  <li>Checkpoint WAL pour consolider les ecritures en attente</li>
+  <li>Recherche d'un fichier <code>recoverland_pending.json</code> contenant des evenements non ecrits lors du crash precedent</li>
+  <li>Reintegration automatique de ces evenements avec notification a l'utilisateur</li>
+</ul>
+
+<div class="tip"><strong>Zero perte silencieuse</strong> : Si des evenements sont perdus malgre les mecanismes de recuperation, l'utilisateur est explicitement informe. Aucune perte n'est masquee.</div>
+</section>
+
+<!-- ====== SCHEMA DRIFT ====== -->
+<section id="schema-drift">
+<h2>Derive de schema</h2>
+<p><span class="strength s-medium">MODERE</span></p>
+
+<h3>Le probleme</h3>
+<p>Si la structure d'une couche change entre le moment de la capture et la restauration (champ ajoute, supprime, renomme, ou type modifie), la restauration peut echouer ou produire un resultat incomplet.</p>
+
+<h3>Ce que RecoverLand fait</h3>
+<p>Avant la restauration, le module <code>schema_drift.py</code> compare le schema sauvegarde avec le schema actuel et genere un rapport de compatibilite. Les champs manquants ou incompatibles sont signales.</p>
+
+<div class="tip"><strong>Bonne pratique</strong> : Evitez de modifier la structure d'une couche (ajout/suppression de champs) entre les captures et les restaurations. Si c'est necessaire, consultez d'abord l'historique pour voir si des restaurations sont prevues.</div>
+</section>
+
+<!-- ====== CONCURRENT EDIT ====== -->
+<section id="concurrent-edit">
+<h2>Edition concurrente</h2>
+<p><span class="strength s-weak" style="background:var(--bg2);color:var(--tx2)">FAIBLE</span></p>
+
+<p>RecoverLand est concu pour un usage mono-poste. Si deux utilisateurs editent le meme fichier simultanement, chacun a son propre journal. La restauration par l'un peut ecraser les modifications de l'autre sans avertissement.</p>
+
+<p>Ce n'est pas un scenario supporte. Pour l'edition collaborative, utilisez une base de donnees avec un systeme de verrouillage (PostGIS, par exemple).</p>
+</section>
+
+<!-- ====== COUCHE MEMOIRE ====== -->
+<section id="memory-layer">
+<h2>Couche memoire</h2>
+<p><span class="strength s-weak" style="background:var(--bg2);color:var(--tx2)">FAIBLE</span></p>
+
+<p>Les couches memoire n'ont pas de fichier source persistant. RecoverLand capture les modifications a titre informatif, mais la restauration est impossible car la couche n'existe plus apres la fermeture de QGIS.</p>
+</section>
+
+<!-- ====== TAILLE DU JOURNAL ====== -->
+<section id="journal-size">
+<h2>Taille du journal</h2>
+<p><span class="strength s-weak" style="background:var(--bg2);color:var(--tx2)">FAIBLE</span></p>
+
+<h3>Le probleme</h3>
+<p>Le journal grossit indefiniment si la retention n'est pas configuree. Sur un projet avec des milliers de modifications quotidiennes, le fichier peut atteindre plusieurs centaines de Mo.</p>
+
+<h3>Impact</h3>
+<p>Les performances de recherche se degradent graduellement. SQLite reste performant jusqu'a plusieurs Go, mais les requetes deviennent plus lentes au-dela de 100 000 evenements.</p>
+
+<h3>Solution</h3>
+<p>Utilisez le module de retention (<code>retention.py</code>) pour purger les evenements anciens. Par exemple, conserver 90 jours d'historique et purger le reste.</p>
+
+<h3>Impact du stockage delta</h3>
+<p>Le mode local v3.0 utilise le stockage delta pour les UPDATE : seuls les attributs reellement modifies sont enregistres. Sur une table a 50 colonnes, modifier un seul champ stocke 1 valeur au lieu de 50. Cela reduit le volume du journal de 10 a 50 fois par rapport au mode PostgreSQL historique (qui stockait la ligne entiere).</p>
+
+<div class="tw"><table>
+<thead><tr><th>Type d'evenement</th><th>Taille estimee</th></tr></thead>
+<tbody>
+  <tr><td>UPDATE delta (2 attributs simples)</td><td>200 a 500 octets</td></tr>
+  <tr><td>UPDATE delta (geometrie polygone simple)</td><td>1 a 5 Ko</td></tr>
+  <tr><td>DELETE snapshot (20 attributs + point)</td><td>1 a 3 Ko</td></tr>
+  <tr><td>DELETE snapshot (20 attributs + polygone complexe)</td><td>10 a 100 Ko</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ====== JOURNAL SUPPRIME ====== -->
+<section id="journal-deleted">
+<h2>Journal supprime</h2>
+<p><span class="strength s-critical">CRITIQUE</span></p>
+
+<p>Si le fichier <code>.recoverland/audit.db</code> est supprime (manuellement, par un nettoyage de disque, ou par un antivirus), tout l'historique est perdu definitivement. RecoverLand creera un nouveau journal vide au prochain demarrage.</p>
+
+<div class="danger"><strong>Ne supprimez jamais le dossier .recoverland</strong> dans le repertoire de votre projet QGIS, sauf si vous voulez explicitement effacer tout l'historique de modifications.</div>
+</section>
+
+<!-- ====== PROJET DEPLACE ====== -->
+<section id="project-moved">
+<h2>Projet QGIS deplace</h2>
+<p><span class="strength s-medium">MODERE</span></p>
+
+<p>Si vous deplacez un projet QGIS (.qgz) dans un autre dossier, le <code>project_fingerprint</code> change. Le journal existant (qui est dans le dossier <code>.recoverland/</code> de l'ancien emplacement) n'est plus trouve automatiquement.</p>
+
+<h3>Comment l'eviter</h3>
+<p>Si vous deplacez un projet, deplacez aussi le dossier <code>.recoverland/</code> qui se trouve a cote du fichier .qgz. Le journal sera retrouve si le dossier .recoverland est present a cote du fichier projet.</p>
+</section>
+
+<!-- ====== CE QUE RL N'EST PAS ====== -->
+<section id="what-rl-is-not">
+<h2>Ce que RecoverLand n'est pas</h2>
+
+<div class="tw"><table>
+<thead><tr><th>RecoverLand n'est pas...</th><th>Utilisez plutot...</th></tr></thead>
+<tbody>
+  <tr><td>Un systeme de versionnement (pas de branches, pas de merge)</td><td>Git, GeoGig, ou un systeme de versionnement dedie</td></tr>
+  <tr><td>Un systeme de sauvegarde (ne copie pas les fichiers)</td><td>Sauvegarde fichier classique, rsync, ou un NAS</td></tr>
+  <tr><td>Un systeme de collaboration (pas de synchronisation entre postes)</td><td>PostGIS avec gestion de sessions, ou un SIG collaboratif</td></tr>
+  <tr><td>Un systeme de suivi en temps reel (pas de notification push)</td><td>Triggers de base de donnees ou systeme d'audit au niveau SGBD</td></tr>
+  <tr><td>Un remplacement du Ctrl+Z (ne fonctionne qu'apres le commit)</td><td>Le Ctrl+Z natif de QGIS pour les modifications non commitees</td></tr>
+</tbody>
+</table></div>
+
+<h3>Ce que RecoverLand est</h3>
+<p>Un filet de securite local. Il enregistre automatiquement chaque modification validee dans un journal SQLite, et permet de retrouver et restaurer des etats anterieurs. Il protege contre les erreurs humaines courantes : suppression accidentelle, modification incorrecte d'attributs, ecrasement de geometries.</p>
+
+<p>Il fonctionne mieux avec des formats a identification forte (GeoPackage, PostGIS), sur un poste de travail unique, avec des fichiers qui restent au meme emplacement.</p>
+</section>
+
+</main>
+
+<aside class="rp">
+  <div class="srch" style="margin-bottom:16px">
+    <svg class="srch-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="si" placeholder="Rechercher..." autocomplete="off">
+    <div class="srch-res" id="sr"></div>
+  </div>
+  <h4>Sur cette page</h4>
+  <a href="#severity">Severite</a>
+  <a href="#file-moved">Fichier deplace</a>
+  <a href="#network-drive">Lecteur reseau</a>
+  <a href="#fid-instable">FID instable</a>
+  <a href="#fid-minus-one">FID = -1</a>
+  <a href="#outside-qgis">Hors QGIS</a>
+  <a href="#tracking-off">Enregistrement off</a>
+  <a href="#crash">Crash QGIS</a>
+  <a href="#schema-drift">Derive de schema</a>
+  <a href="#concurrent-edit">Edition concurrente</a>
+  <a href="#memory-layer">Couche memoire</a>
+  <a href="#journal-size">Taille journal</a>
+  <a href="#journal-deleted">Journal supprime</a>
+  <a href="#project-moved">Projet deplace</a>
+  <a href="#what-rl-is-not">Ce que RL n'est pas</a>
+</aside>
+</div>
+
+<footer>RecoverLand 3.0 &middot; NGE ES DEVTEAM &middot; Documentation technique</footer>
+<script src="rl.js"></script>
+</body>
+</html>
