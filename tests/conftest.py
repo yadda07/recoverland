@@ -194,6 +194,9 @@ if 'qgis' not in sys.modules:
         class TextInteractionFlag:
             TextSelectableByMouse = 1
         TextSelectableByMouse = 1
+        class ItemDataRole:
+            UserRole = 0x0100
+        UserRole = 0x0100
         class PenStyle:
             NoPen = 0
         NoPen = 0
@@ -237,9 +240,30 @@ if 'qgis' not in sys.modules:
     class _QTime:
         pass
     class _QTimer:
-        pass
+        @staticmethod
+        def singleShot(ms, callback):
+            pass
     class _QByteArray:
         pass
+
+    class _QCoreApplication:
+        @staticmethod
+        def translate(context, text, *args):
+            return text
+        @staticmethod
+        def installTranslator(translator):
+            pass
+
+    class _QTranslator:
+        def load(self, path):
+            return False
+
+    class _QLocale:
+        @staticmethod
+        def system():
+            return _QLocale()
+        def name(self):
+            return 'en_US'
     class _QVariantAnimation:
         pass
     class _QRectF:
@@ -255,6 +279,10 @@ if 'qgis' not in sys.modules:
     qtcore.QTime = _QTime
     qtcore.QTimer = _QTimer
     qtcore.QByteArray = _QByteArray
+    qtcore.QCoreApplication = _QCoreApplication
+    qtcore.QTranslator = _QTranslator
+    qtcore.QSettings = _FakeQgsSettings
+    qtcore.QLocale = _QLocale
     qtcore.QVariantAnimation = _QVariantAnimation
     qtcore.QRectF = _QRectF
     sys.modules['qgis.PyQt.QtCore'] = qtcore
@@ -292,7 +320,7 @@ if 'qgis' not in sys.modules:
                      'QComboBox', 'QProgressBar', 'QFormLayout', 'QCheckBox',
                      'QApplication', 'QTableWidget', 'QTableWidgetItem',
                      'QLineEdit', 'QFileDialog', 'QGraphicsDropShadowEffect',
-                     'QWidget', 'QAction'):
+                     'QWidget', 'QAction', 'QSpinBox', 'QGroupBox'):
         setattr(qtwidgets, cls_name, type(cls_name, (), {}))
     sys.modules['qgis.PyQt.QtWidgets'] = qtwidgets
 
@@ -307,7 +335,16 @@ if 'qgis' not in sys.modules:
         class CompositionMode:
             CompositionMode_Screen = 14
         CompositionMode_Screen = 14
+    class _QPalette:
+        class ColorRole:
+            WindowText = 0
+            Highlight = 12
+            Mid = 5
+        WindowText = 0
+        Highlight = 12
+        Mid = 5
     qtgui.QPainter = _QPainter
+    qtgui.QPalette = _QPalette
     for cls_name in ('QIcon', 'QColor', 'QLinearGradient', 'QAction'):
         setattr(qtgui, cls_name, type(cls_name, (), {}))
     sys.modules['qgis.PyQt.QtGui'] = qtgui
