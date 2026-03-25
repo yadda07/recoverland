@@ -80,14 +80,18 @@ def get_event_by_id(conn: sqlite3.Connection, event_id: int) -> Optional[AuditEv
     return _row_to_event(row)
 
 
+_MAX_DISTINCT_RESULTS = 1000
+
+
 def get_distinct_layers(conn: sqlite3.Connection) -> List[Dict[str, str]]:
     """List distinct audited layers with their display names."""
     query = """
         SELECT DISTINCT datasource_fingerprint, layer_name_snapshot, provider_type
         FROM audit_event
         ORDER BY layer_name_snapshot
+        LIMIT ?
     """
-    rows = conn.execute(query).fetchall()
+    rows = conn.execute(query, (_MAX_DISTINCT_RESULTS,)).fetchall()
     return [
         {"fingerprint": r[0], "name": r[1], "provider": r[2]}
         for r in rows
@@ -96,8 +100,8 @@ def get_distinct_layers(conn: sqlite3.Connection) -> List[Dict[str, str]]:
 
 def get_distinct_users(conn: sqlite3.Connection) -> List[str]:
     """List distinct user names in the journal."""
-    query = "SELECT DISTINCT user_name FROM audit_event ORDER BY user_name"
-    return [r[0] for r in conn.execute(query).fetchall()]
+    query = "SELECT DISTINCT user_name FROM audit_event ORDER BY user_name LIMIT ?"
+    return [r[0] for r in conn.execute(query, (_MAX_DISTINCT_RESULTS,)).fetchall()]
 
 
 def summarize_scope(conn: sqlite3.Connection, criteria: SearchCriteria) -> JournalScopeSummary:

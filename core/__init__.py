@@ -49,8 +49,8 @@ from .schema_drift import (
     format_drift_message, DriftReport,
 )
 from .restore_service import (
-    pre_check_restore, restore_deleted_feature, restore_updated_feature,
-    restore_batch, PreCheckResult,
+    pre_check_restore, restore_deleted_feature, restore_inserted_feature,
+    restore_updated_feature, restore_batch, PreCheckResult,
 )
 from .pg_backend import PostgreSQLAuditBackend
 from .sqlite_backend import SQLiteAuditBackend

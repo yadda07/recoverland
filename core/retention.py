@@ -146,11 +146,3 @@ def vacuum_async(db_path: str,
     t.start()
 
 
-def _try_vacuum(conn: sqlite3.Connection) -> bool:
-    try:
-        conn.execute("VACUUM")
-        flog("retention: VACUUM completed")
-        return True
-    except sqlite3.Error as e:
-        flog(f"retention: VACUUM failed: {e}", "WARNING")
-        return False

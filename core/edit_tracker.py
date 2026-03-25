@@ -233,6 +233,8 @@ class EditSessionTracker:
             buf.clear()
             flog(f"EditSessionTracker: rollback, buffer cleared for {layer_id}")
 
+    _MEMORY_HARD_LIMIT_MB = 500
+
     def _capture_edit_buffer_state(self, layer, buf: EditSessionBuffer) -> None:
         """Read the edit buffer and capture originals from the provider.
 
@@ -240,6 +242,9 @@ class EditSessionTracker:
         no attribute changes, no geometry changes, and no additions, skip
         capture entirely. This avoids recording phantom events when a user
         opens edit mode and commits without modifying anything.
+
+        Guards against OOM: checks buffer thresholds after each capture phase
+        and stops capture if the hard memory limit is exceeded.
         """
         edit_buf = layer.editBuffer()
         if edit_buf is None:
@@ -255,8 +260,24 @@ class EditSessionTracker:
         provider = layer.dataProvider()
         field_names = [f.name() for f in layer.fields()]
         self._capture_deletions(provider, edit_buf, buf, field_names)
+        if self._check_buffer_pressure(buf):
+            return
         self._capture_modifications(provider, edit_buf, buf, field_names)
+        self._check_buffer_pressure(buf)
         self._capture_additions(edit_buf, buf)
+
+    def _check_buffer_pressure(self, buf: EditSessionBuffer) -> bool:
+        """Log warning if buffer exceeds soft threshold; return True if hard limit hit."""
+        if buf.approx_memory_mb > self._MEMORY_HARD_LIMIT_MB:
+            flog(f"EditSessionTracker: buffer hard limit reached "
+                 f"({buf.approx_memory_mb:.0f} MB, {buf.total_tracked} features) "
+                 f"on {buf.layer_id}, stopping capture to prevent OOM", "ERROR")
+            return True
+        if buf.needs_flush():
+            flog(f"EditSessionTracker: buffer pressure warning "
+                 f"({buf.approx_memory_mb:.0f} MB, {buf.total_tracked} features) "
+                 f"on {buf.layer_id}", "WARNING")
+        return False
 
     def _capture_deletions(self, provider, edit_buf, buf, field_names) -> None:
         from qgis.core import QgsFeatureRequest

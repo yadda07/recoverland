@@ -80,6 +80,36 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
     return {"success": True, "message": "Restored", "fid": new_fid}
 
 
+def restore_inserted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
+    """Undo an INSERT by deleting the inserted feature from the target layer."""
+    if layer is None:
+        return {"success": False, "message": "Target layer not found"}
+
+    provider = layer.dataProvider()
+    if provider is None:
+        return {"success": False, "message": "No data provider"}
+
+    if not bool(provider.capabilities() & 8):
+        return {"success": False, "message": "Provider lacks delete capability"}
+
+    identity = _parse_identity(event.feature_identity_json)
+    strength = get_identity_strength_for_layer(layer)
+
+    if strength == IdentityStrength.NONE:
+        return {"success": False, "message": "No stable identity for restore"}
+
+    target_fid = _find_target_feature(layer, identity)
+    if target_fid is None:
+        return {"success": False, "message": "Target feature not found"}
+
+    if not provider.deleteFeatures([target_fid]):
+        errors = provider.errors()
+        msg = "; ".join(errors) if errors else "Delete failed"
+        return {"success": False, "message": msg}
+
+    return {"success": True, "message": "Deleted (undo insert)"}
+
+
 def restore_updated_feature(layer, event: AuditEvent) -> Dict[str, Any]:
     """Revert a modified feature to its pre-update state.
 
@@ -131,6 +161,8 @@ def restore_batch(layer, events: List[AuditEvent]) -> RestoreReport:
                 result = restore_deleted_feature(layer, event)
             elif event.operation_type == "UPDATE":
                 result = restore_updated_feature(layer, event)
+            elif event.operation_type == "INSERT":
+                result = restore_inserted_feature(layer, event)
             else:
                 result = {"success": False, "message": f"Unsupported: {event.operation_type}"}
 
@@ -167,7 +199,8 @@ def build_restore_trace_event(source_event: AuditEvent, layer) -> Optional[Audit
         return None
 
     now = datetime.now(timezone.utc).isoformat()
-    restore_op = "INSERT" if source_event.operation_type == "DELETE" else "UPDATE"
+    _UNDO_OP = {"DELETE": "INSERT", "UPDATE": "UPDATE", "INSERT": "DELETE"}
+    restore_op = _UNDO_OP.get(source_event.operation_type, "UPDATE")
 
     return AuditEvent(
         event_id=None,
@@ -196,6 +229,8 @@ def _can_write(provider, operation_type: str) -> bool:
         return bool(caps & 1)
     if operation_type == "UPDATE":
         return bool(caps & 4)
+    if operation_type == "INSERT":
+        return bool(caps & 8)
     return False
 
 
@@ -210,6 +245,7 @@ def _find_target_feature(layer, identity: Dict) -> Optional[int]:
     """Find the FID of the target feature using identity info."""
     from qgis.core import QgsFeatureRequest, QgsExpression
 
+    provider = layer.dataProvider()
     pk_field = identity.get("pk_field")
     pk_value = identity.get("pk_value")
     if pk_field and pk_value is not None:
@@ -221,13 +257,13 @@ def _find_target_feature(layer, identity: Dict) -> Optional[int]:
                  f"value={pk_value!r}: {expr.parserErrorString()}", "WARNING")
         else:
             request = QgsFeatureRequest(expr).setLimit(1)
-            for feat in layer.getFeatures(request):
+            for feat in provider.getFeatures(request):
                 return feat.id()
 
     fid = identity.get("fid")
     if fid is not None:
         request = QgsFeatureRequest(fid)
-        for feat in layer.getFeatures(request):
+        for feat in provider.getFeatures(request):
             return feat.id()
 
     return None
