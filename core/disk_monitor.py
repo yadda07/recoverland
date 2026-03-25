@@ -6,7 +6,13 @@ import os
 import shutil
 from typing import NamedTuple
 
+from qgis.PyQt.QtCore import QCoreApplication
+
 from .logger import flog
+
+
+def _tr(msg):
+    return QCoreApplication.translate("DiskMonitor", msg)
 
 _CHECK_INTERVAL_SEC = 300  # 5 minutes
 
@@ -49,16 +55,16 @@ def check_disk_for_path(path: str) -> DiskStatus:
 def format_disk_message(status: DiskStatus) -> str:
     """Build user-facing message from disk status."""
     if status.is_critical:
-        return (
-            f"Espace disque critique sur {status.volume_path} : "
-            f"{_fmt(status.free_bytes)} libre. "
+        return _tr(
+            "Espace disque critique sur {volume} : "
+            "{free} libre. "
             "L'enregistrement a ete desactive pour eviter la perte de donnees."
-        )
+        ).format(volume=status.volume_path, free=_fmt(status.free_bytes))
     if status.is_low:
-        return (
-            f"Espace disque faible sur {status.volume_path} : "
-            f"{_fmt(status.free_bytes)} libre."
-        )
+        return _tr(
+            "Espace disque faible sur {volume} : "
+            "{free} libre."
+        ).format(volume=status.volume_path, free=_fmt(status.free_bytes))
     return ""
 
 
@@ -81,9 +87,9 @@ def _extract_volume(path: str) -> str:
 
 def _fmt(size_bytes: int) -> str:
     if size_bytes < 1024:
-        return f"{size_bytes} o"
+        return _tr("{size} o").format(size=size_bytes)
     if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.0f} Ko"
+        return _tr("{size} Ko").format(size=f"{size_bytes / 1024:.0f}")
     if size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.0f} Mo"
-    return f"{size_bytes / (1024 * 1024 * 1024):.1f} Go"
+        return _tr("{size} Mo").format(size=f"{size_bytes / (1024 * 1024):.0f}")
+    return _tr("{size} Go").format(size=f"{size_bytes / (1024 * 1024 * 1024):.1f}")

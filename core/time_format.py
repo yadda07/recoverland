@@ -6,6 +6,12 @@ Pure Python, no Qt dependency.
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from qgis.PyQt.QtCore import QCoreApplication
+
+
+def _tr(msg):
+    return QCoreApplication.translate("TimeFormat", msg)
+
 
 def format_relative_time(iso_timestamp: str) -> str:
     """Format an ISO timestamp as relative time ("il y a 5 min").
@@ -25,19 +31,19 @@ def format_relative_time(iso_timestamp: str) -> str:
 
     seconds = int(delta.total_seconds())
     if seconds < 60:
-        return "a l'instant" if seconds < 10 else f"il y a {seconds}s"
+        return _tr("a l'instant") if seconds < 10 else _tr("il y a {n}s").format(n=seconds)
     minutes = seconds // 60
     if minutes < 60:
-        return f"il y a {minutes} min"
+        return _tr("il y a {n} min").format(n=minutes)
     hours = minutes // 60
     if hours < 24:
-        return f"il y a {hours}h"
+        return _tr("il y a {n}h").format(n=hours)
 
     days = delta.days
     if days == 1:
-        return f"hier {dt.strftime('%H:%M')}"
+        return _tr("hier {time}").format(time=dt.strftime('%H:%M'))
     if days < 7:
-        return f"il y a {days}j"
+        return _tr("il y a {n}j").format(n=days)
 
     return format_short_absolute(iso_timestamp)
 
@@ -73,18 +79,18 @@ def compute_history_span(oldest: str, newest: str) -> str:
     if days == 0:
         hours = int(delta.total_seconds() // 3600)
         if hours == 0:
-            return "< 1 heure"
-        return f"{hours} heure(s)"
+            return _tr("< 1 heure")
+        return _tr("{n} heure(s)").format(n=hours)
     if days < 30:
-        return f"{days} jour(s)"
+        return _tr("{n} jour(s)").format(n=days)
     months = days // 30
     if months < 12:
-        return f"{months} mois"
+        return _tr("{n} mois").format(n=months)
     years = days // 365
     remainder = (days % 365) // 30
     if remainder > 0:
-        return f"{years} an(s) et {remainder} mois"
-    return f"{years} an(s)"
+        return _tr("{y} an(s) et {m} mois").format(y=years, m=remainder)
+    return _tr("{n} an(s)").format(n=years)
 
 
 def _parse_iso(timestamp: str) -> Optional[datetime]:

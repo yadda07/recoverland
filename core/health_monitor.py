@@ -7,7 +7,13 @@ import os
 import shutil
 from typing import NamedTuple, Optional
 
+from qgis.PyQt.QtCore import QCoreApplication
+
 from .logger import flog
+
+
+def _tr(msg):
+    return QCoreApplication.translate("HealthMonitor", msg)
 
 
 class HealthLevel:
@@ -94,7 +100,7 @@ def check_disk_space(journal_path: str) -> DiskSpaceStatus:
         return DiskSpaceStatus(
             level=HealthLevel.WARNING,
             free_bytes=0,
-            message="Impossible de verifier l'espace disque.",
+            message=_tr("Impossible de verifier l'espace disque."),
             should_disable_tracking=False,
         )
 
@@ -102,14 +108,14 @@ def check_disk_space(journal_path: str) -> DiskSpaceStatus:
         return DiskSpaceStatus(
             level=HealthLevel.CRITICAL,
             free_bytes=free,
-            message=f"Espace disque critique : {_format_size(free)} libre.",
+            message=_tr("Espace disque critique : {size} libre.").format(size=_format_size(free)),
             should_disable_tracking=True,
         )
     if free < _DISK_WARNING:
         return DiskSpaceStatus(
             level=HealthLevel.WARNING,
             free_bytes=free,
-            message=f"Espace disque faible : {_format_size(free)} libre.",
+            message=_tr("Espace disque faible : {size} libre.").format(size=_format_size(free)),
             should_disable_tracking=False,
         )
     return DiskSpaceStatus(
@@ -128,7 +134,7 @@ def format_integrity_message(issues: list, recovered: int) -> Optional[str]:
     parts = []
     if recovered > 0:
         parts.append(
-            f"{recovered} evenement(s) recupere(s) depuis la derniere session."
+            _tr("{count} evenement(s) recupere(s) depuis la derniere session.").format(count=recovered)
         )
     for issue in issues:
         parts.append(_humanize_integrity_issue(issue))
@@ -180,29 +186,29 @@ def _build_health_message(
     size_str = _format_size(size_bytes)
     count_str = f"{event_count:,}".replace(",", " ")
     if level == HealthLevel.CRITICAL:
-        return (
-            f"Journal volumineux : {size_str}, "
-            f"{count_str} evenement(s). Purge recommandee."
-        )
+        return _tr(
+            "Journal volumineux : {size}, "
+            "{count} evenement(s). Purge recommandee."
+        ).format(size=size_str, count=count_str)
     if level == HealthLevel.WARNING:
-        return (
-            f"Journal en croissance : {size_str}, "
-            f"{count_str} evenement(s). "
+        return _tr(
+            "Journal en croissance : {size}, "
+            "{count} evenement(s). "
             "Pensez a purger les anciens evenements."
-        )
+        ).format(size=size_str, count=count_str)
     if level == HealthLevel.INFO:
-        return f"Journal : {size_str}, {count_str} evenement(s)."
+        return _tr("Journal : {size}, {count} evenement(s).").format(size=size_str, count=count_str)
     return ""
 
 
 def _build_health_suggestion(level: str, _size: int, _count: int) -> str:
     if level == HealthLevel.CRITICAL:
-        return (
+        return _tr(
             "Ouvrez la maintenance du journal pour purger les "
             "evenements anciens et compacter la base."
         )
     if level == HealthLevel.WARNING:
-        return (
+        return _tr(
             "Ouvrez la maintenance du journal pour configurer "
             "la politique de retention."
         )
@@ -213,31 +219,31 @@ def _humanize_integrity_issue(issue: str) -> str:
     """Convert technical integrity messages to user-friendly text."""
     lower = issue.lower()
     if "integrity check failed" in lower:
-        return (
+        return _tr(
             "Le journal presente des anomalies. "
             "Les donnees recentes peuvent etre incompletes."
         )
     if "wal checkpoint failed" in lower:
-        return "Le journal a des ecritures en attente de consolidation."
+        return _tr("Le journal a des ecritures en attente de consolidation.")
     if "schema version" in lower and "newer" in lower:
-        return (
+        return _tr(
             "Le journal a ete cree par une version plus recente du plugin. "
             "Certaines donnees pourraient ne pas etre lisibles."
         )
     if "no schema version" in lower:
-        return "Le journal ne contient pas d'information de version."
+        return _tr("Le journal ne contient pas d'information de version.")
     if "not found" in lower:
-        return "Le fichier journal est introuvable."
+        return _tr("Le fichier journal est introuvable.")
     if "cannot open" in lower:
-        return "Impossible d'ouvrir le journal."
-    return f"Anomalie detectee : {issue}"
+        return _tr("Impossible d'ouvrir le journal.")
+    return _tr("Anomalie detectee : {issue}").format(issue=issue)
 
 
 def _format_size(size_bytes: int) -> str:
     if size_bytes < 1024:
-        return f"{size_bytes} o"
+        return _tr("{size} o").format(size=size_bytes)
     if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} Ko"
+        return _tr("{size} Ko").format(size=f"{size_bytes / 1024:.1f}")
     if size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.1f} Mo"
-    return f"{size_bytes / (1024 * 1024 * 1024):.2f} Go"
+        return _tr("{size} Mo").format(size=f"{size_bytes / (1024 * 1024):.1f}")
+    return _tr("{size} Go").format(size=f"{size_bytes / (1024 * 1024 * 1024):.2f}")

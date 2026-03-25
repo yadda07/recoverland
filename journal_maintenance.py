@@ -34,7 +34,7 @@ class JournalMaintenanceDialog(QDialog):
     def __init__(self, journal, parent=None):
         super().__init__(parent)
         self._journal = journal
-        self.setWindowTitle("RecoverLand - Maintenance du journal")
+        self.setWindowTitle(self.tr("RecoverLand - Maintenance du journal"))
         self.setMinimumWidth(520)
         self.setMinimumHeight(400)
         self.resize(560, 480)
@@ -46,7 +46,7 @@ class JournalMaintenanceDialog(QDialog):
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        info_group = QGroupBox("Informations du journal")
+        info_group = QGroupBox(self.tr("Informations du journal"))
         info_layout = QFormLayout()
         self._path_label = QLabel("")
         self._path_label.setWordWrap(True)
@@ -57,70 +57,70 @@ class JournalMaintenanceDialog(QDialog):
         self._schema_label = QLabel("")
         self._health_label = QLabel("")
         self._health_label.setWordWrap(True)
-        info_layout.addRow("Chemin :", self._path_label)
-        info_layout.addRow("Taille :", self._size_label)
-        info_layout.addRow("Evenements :", self._events_label)
-        info_layout.addRow("Historique :", self._span_label)
-        info_layout.addRow("Schema :", self._schema_label)
-        info_layout.addRow("Sante :", self._health_label)
+        info_layout.addRow(self.tr("Chemin :"), self._path_label)
+        info_layout.addRow(self.tr("Taille :"), self._size_label)
+        info_layout.addRow(self.tr("Evenements :"), self._events_label)
+        info_layout.addRow(self.tr("Historique :"), self._span_label)
+        info_layout.addRow(self.tr("Schema :"), self._schema_label)
+        info_layout.addRow(self.tr("Sante :"), self._health_label)
         info_group.setLayout(info_layout)
 
-        open_folder_btn = QPushButton("Ouvrir le dossier")
+        open_folder_btn = QPushButton(self.tr("Ouvrir le dossier"))
         open_folder_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileOpen.svg'))
-        open_folder_btn.setToolTip("Ouvrir le dossier contenant le journal")
+        open_folder_btn.setToolTip(self.tr("Ouvrir le dossier contenant le journal"))
         open_folder_btn.clicked.connect(self._open_journal_folder)
 
-        retention_group = QGroupBox("Politique de retention")
+        retention_group = QGroupBox(self.tr("Politique de retention"))
         retention_layout = QFormLayout()
         self._retention_days_spin = QSpinBox()
         self._retention_days_spin.setRange(7, 3650)
-        self._retention_days_spin.setSuffix(" jours")
-        self._retention_days_spin.setToolTip("Duree de conservation des evenements")
+        self._retention_days_spin.setSuffix(self.tr(" jours"))
+        self._retention_days_spin.setToolTip(self.tr("Duree de conservation des evenements"))
         self._max_events_spin = QSpinBox()
         self._max_events_spin.setRange(10000, 10_000_000)
         self._max_events_spin.setSingleStep(10000)
-        self._max_events_spin.setToolTip("Nombre maximum d'evenements")
-        self._auto_purge_check = QCheckBox("Purger automatiquement au demarrage")
+        self._max_events_spin.setToolTip(self.tr("Nombre maximum d'evenements"))
+        self._auto_purge_check = QCheckBox(self.tr("Purger automatiquement au demarrage"))
         self._auto_purge_check.setToolTip(
-            "Si active, les evenements hors politique sont supprimes a l'ouverture du journal")
-        retention_layout.addRow("Conservation :", self._retention_days_spin)
-        retention_layout.addRow("Maximum :", self._max_events_spin)
+            self.tr("Si active, les evenements hors politique sont supprimes a l'ouverture du journal"))
+        retention_layout.addRow(self.tr("Conservation :"), self._retention_days_spin)
+        retention_layout.addRow(self.tr("Maximum :"), self._max_events_spin)
         retention_layout.addRow("", self._auto_purge_check)
-        save_retention_btn = QPushButton("Enregistrer la politique")
+        save_retention_btn = QPushButton(self.tr("Enregistrer la politique"))
         save_retention_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSave.svg'))
         save_retention_btn.clicked.connect(self._save_retention)
         retention_layout.addRow("", save_retention_btn)
         retention_group.setLayout(retention_layout)
 
-        actions_group = QGroupBox("Actions")
+        actions_group = QGroupBox(self.tr("Actions"))
         actions_layout = QVBoxLayout()
         actions_layout.setSpacing(8)
 
         purge_row = QHBoxLayout()
-        self._purge_btn = QPushButton("Purger les anciens evenements")
+        self._purge_btn = QPushButton(self.tr("Purger les anciens evenements"))
         self._purge_btn.setIcon(QgsApplication.getThemeIcon('/mActionDeleteSelected.svg'))
-        self._purge_btn.setToolTip("Supprimer les evenements hors politique de retention")
+        self._purge_btn.setToolTip(self.tr("Supprimer les evenements hors politique de retention"))
         self._purge_btn.clicked.connect(self._purge_events)
         self._purge_info = QLabel("")
         purge_row.addWidget(self._purge_btn)
         purge_row.addWidget(self._purge_info, 1)
         actions_layout.addLayout(purge_row)
 
-        vacuum_btn = QPushButton("Compacter le journal (VACUUM)")
+        vacuum_btn = QPushButton(self.tr("Compacter le journal (VACUUM)"))
         vacuum_btn.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
-        vacuum_btn.setToolTip("Recuperer l'espace disque apres une purge")
+        vacuum_btn.setToolTip(self.tr("Recuperer l'espace disque apres une purge"))
         vacuum_btn.clicked.connect(self._vacuum_journal)
         actions_layout.addWidget(vacuum_btn)
 
-        integrity_btn = QPushButton("Verifier l'integrite")
+        integrity_btn = QPushButton(self.tr("Verifier l'integrite"))
         integrity_btn.setIcon(QgsApplication.getThemeIcon('/mActionCheckGeometry.svg'))
-        integrity_btn.setToolTip("Lancer une verification d'integrite du journal")
+        integrity_btn.setToolTip(self.tr("Lancer une verification d'integrite du journal"))
         integrity_btn.clicked.connect(self._check_integrity)
         actions_layout.addWidget(integrity_btn)
 
-        export_btn = QPushButton("Exporter le journal")
+        export_btn = QPushButton(self.tr("Exporter le journal"))
         export_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSaveAs.svg'))
-        export_btn.setToolTip("Copier le fichier journal vers un emplacement choisi")
+        export_btn.setToolTip(self.tr("Copier le fichier journal vers un emplacement choisi"))
         export_btn.clicked.connect(self._export_journal)
         actions_layout.addWidget(export_btn)
 
@@ -129,7 +129,7 @@ class JournalMaintenanceDialog(QDialog):
         self._progress = QProgressBar()
         self._progress.setVisible(False)
 
-        close_btn = QPushButton("Fermer")
+        close_btn = QPushButton(self.tr("Fermer"))
         close_btn.clicked.connect(self.accept)
 
         layout.addWidget(info_group)
@@ -144,13 +144,13 @@ class JournalMaintenanceDialog(QDialog):
     def _refresh_stats(self) -> None:
         """Refresh all displayed journal statistics."""
         path = self._journal.path if self._journal and self._journal.is_open else ""
-        self._path_label.setText(path or "Aucun journal actif")
+        self._path_label.setText(path or self.tr("Aucun journal actif"))
         if not path:
             self._size_label.setText("-")
             self._events_label.setText("-")
             self._span_label.setText("-")
             self._schema_label.setText("-")
-            self._health_label.setText("Aucun journal")
+            self._health_label.setText(self.tr("Aucun journal"))
             return
 
         size_bytes = get_journal_size_bytes(path)
@@ -173,28 +173,28 @@ class JournalMaintenanceDialog(QDialog):
 
             health = evaluate_journal_health(size_bytes, total, oldest, newest)
             if health.level == HealthLevel.HEALTHY:
-                self._health_label.setText("Sain")
+                self._health_label.setText(self.tr("Sain"))
                 self._health_label.setStyleSheet("color: #2ecc71; font-weight: 600;")
             elif health.level == HealthLevel.INFO:
-                self._health_label.setText("Information : " + health.message)
+                self._health_label.setText(self.tr("Information : ") + health.message)
                 self._health_label.setStyleSheet("color: #4285f4; font-weight: 600;")
             elif health.level == HealthLevel.WARNING:
-                self._health_label.setText("Attention : " + health.message)
+                self._health_label.setText(self.tr("Attention : ") + health.message)
                 self._health_label.setStyleSheet("color: #ff9800; font-weight: 600;")
             else:
-                self._health_label.setText("Critique : " + health.message)
+                self._health_label.setText(self.tr("Critique : ") + health.message)
                 self._health_label.setStyleSheet("color: #db4437; font-weight: 600;")
 
             policy = self._load_retention_policy()
             purgeable = count_purgeable_events(conn, policy)
             if purgeable > 0:
-                self._purge_info.setText(f"{purgeable} evenement(s) purgeable(s)")
+                self._purge_info.setText(self.tr("{count} evenement(s) purgeable(s)").format(count=purgeable))
             else:
-                self._purge_info.setText("Rien a purger")
+                self._purge_info.setText(self.tr("Rien a purger"))
         except Exception as e:
             flog(f"JournalMaintenanceDialog: stats error: {e}", "WARNING")
-            self._events_label.setText("Erreur")
-            self._health_label.setText("Impossible de lire les statistiques")
+            self._events_label.setText(self.tr("Erreur"))
+            self._health_label.setText(self.tr("Impossible de lire les statistiques"))
         finally:
             if conn:
                 try:
@@ -241,12 +241,12 @@ class JournalMaintenanceDialog(QDialog):
                 except Exception:
                     pass
         if purgeable == 0:
-            QMessageBox.information(self, "Purge", "Aucun evenement a purger.")
+            QMessageBox.information(self, self.tr("Purge"), self.tr("Aucun evenement a purger."))
             return
         reply = QMessageBox.question(
-            self, "Confirmer la purge",
-            f"Supprimer {purgeable} evenement(s) anciens ?\n"
-            "Cette action est irreversible.",
+            self, self.tr("Confirmer la purge"),
+            self.tr("Supprimer {count} evenement(s) anciens ?\n"
+            "Cette action est irreversible.").format(count=purgeable),
             QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_NO)
         if reply != QtCompat.MSG_YES:
             return
@@ -255,10 +255,10 @@ class JournalMaintenanceDialog(QDialog):
             conn = self._journal.get_connection()
             result = purge_old_events(conn, policy)
             QMessageBox.information(
-                self, "Purge terminee",
-                f"{result.deleted_count} evenement(s) supprime(s).")
+                self, self.tr("Purge terminee"),
+                self.tr("{count} evenement(s) supprime(s).").format(count=result.deleted_count))
         except Exception as e:
-            QMessageBox.warning(self, "Erreur de purge", str(e))
+            QMessageBox.warning(self, self.tr("Erreur de purge"), str(e))
         self._refresh_stats()
 
     def _vacuum_journal(self) -> None:
@@ -268,34 +268,37 @@ class JournalMaintenanceDialog(QDialog):
         self._progress.setVisible(True)
 
         def on_done(success):
-            self._progress.setVisible(False)
-            if success:
-                self._refresh_stats()
-            else:
-                QMessageBox.warning(self, "VACUUM", "Le compactage a echoue.")
+            QTimer.singleShot(0, lambda: self._on_vacuum_finished(success))
 
         vacuum_async(self._journal.path, callback=on_done)
+
+    def _on_vacuum_finished(self, success: bool) -> None:
+        self._progress.setVisible(False)
+        if success:
+            self._refresh_stats()
+        else:
+            QMessageBox.warning(self, self.tr("VACUUM"), self.tr("Le compactage a echoue."))
 
     def _check_integrity(self) -> None:
         if not self._journal or not self._journal.path:
             return
         result = check_journal_integrity(self._journal.path)
         if result.is_healthy:
-            msg = "Le journal est sain."
+            msg = self.tr("Le journal est sain.")
             if result.recovered_events > 0:
-                msg += f"\n{result.recovered_events} evenement(s) recupere(s)."
-            QMessageBox.information(self, "Integrite", msg)
+                msg += "\n" + self.tr("{count} evenement(s) recupere(s).").format(count=result.recovered_events)
+            QMessageBox.information(self, self.tr("Integrite"), msg)
         else:
             human_msg = format_integrity_message(result.issues, result.recovered_events)
-            QMessageBox.warning(self, "Problemes detectes", human_msg or "Anomalies detectees.")
+            QMessageBox.warning(self, self.tr("Problemes detectes"), human_msg or self.tr("Anomalies detectees."))
 
     def _export_journal(self) -> None:
         if not self._journal or not self._journal.path:
             return
         source = self._journal.path
         dest, _ = QFileDialog.getSaveFileName(
-            self, "Exporter le journal", "",
-            "SQLite (*.sqlite);;Tous les fichiers (*)")
+            self, self.tr("Exporter le journal"), "",
+            self.tr("SQLite (*.sqlite);;Tous les fichiers (*)"))
         if not dest:
             return
         try:
@@ -304,9 +307,9 @@ class JournalMaintenanceDialog(QDialog):
             if os.path.exists(wal):
                 shutil.copy2(wal, dest + "-wal")
             QMessageBox.information(
-                self, "Export", f"Journal exporte vers {os.path.basename(dest)}.")
+                self, self.tr("Export"), self.tr("Journal exporte vers {name}.").format(name=os.path.basename(dest)))
         except OSError as e:
-            QMessageBox.warning(self, "Erreur d'export", str(e))
+            QMessageBox.warning(self, self.tr("Erreur d'export"), str(e))
 
     def _open_journal_folder(self) -> None:
         if not self._journal or not self._journal.path:

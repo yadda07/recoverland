@@ -38,7 +38,7 @@ class StatusBarIndicator(QWidget):
         layout.addWidget(self._dot)
         layout.addWidget(self._text)
         self.setFixedHeight(20)
-        self._apply_state("no_project", "RecoverLand : aucun projet")
+        self._apply_state("no_project", self.tr("RecoverLand : aucun projet"))
 
     def update_state(
         self,
@@ -51,16 +51,15 @@ class StatusBarIndicator(QWidget):
         if not tracking_active:
             self._apply_state(
                 "disabled",
-                f"RecoverLand : enregistrement desactive ({size_str})")
+                self.tr("RecoverLand : enregistrement desactive ({size})").format(size=size_str))
             return
-        tooltip = (
-            f"RecoverLand : actif, "
-            f"{event_count} evenement(s), {size_str}"
-        )
+        tooltip = self.tr(
+            "RecoverLand : actif, {count} evenement(s), {size}"
+        ).format(count=event_count, size=size_str)
         self._apply_state(health_level, tooltip)
 
     def set_no_project(self) -> None:
-        self._apply_state("no_project", "RecoverLand : aucun projet ouvert")
+        self._apply_state("no_project", self.tr("RecoverLand : aucun projet ouvert"))
 
     def mousePressEvent(self, _event) -> None:
         self.clicked.emit()

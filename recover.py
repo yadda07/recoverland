@@ -3,6 +3,7 @@ try:
 except ImportError:
     from qgis.PyQt.QtGui import QAction
 from qgis.PyQt.QtGui import QIcon
+from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import QgsProject, QgsApplication, QgsSettings
 from .recover_dialog import RecoverDialog
 from .themed_action_icon import ThemedActionIconController
@@ -52,7 +53,7 @@ class RecoverPlugin:
             self.action = QAction("RecoverLand", self.iface.mainWindow())
         
         self.action.setIconVisibleInMenu(True)
-        self.action.setToolTip("RecoverLand - Récupération de données d'audit")
+        self.action.setToolTip(QCoreApplication.translate("RecoverPlugin", "RecoverLand - Récupération de données d'audit"))
         self.action.triggered.connect(self.run)
         self.iface.addPluginToMenu("RecoverLand", self.action)
         self.iface.addToolBarIcon(self.action)
@@ -257,14 +258,20 @@ class RecoverPlugin:
         if is_mass_delete:
             self.iface.messageBar().pushMessage(
                 "RecoverLand",
-                f"Suppression massive detectee : {delete_count} entite(s) "
-                f"supprimee(s) sur '{layer_name}'. "
-                "Ouvrez RecoverLand pour verifier.",
+                QCoreApplication.translate(
+                    "RecoverPlugin",
+                    "Suppression massive detectee : {count} entite(s) "
+                    "supprimee(s) sur '{layer}'. "
+                    "Ouvrez RecoverLand pour verifier."
+                ).format(count=delete_count, layer=layer_name),
                 QgisCompat.MSG_WARNING, 10)
         elif show_notif:
             self.iface.messageBar().pushMessage(
                 "RecoverLand",
-                f"{event_count} modification(s) enregistree(s) sur '{layer_name}'.",
+                QCoreApplication.translate(
+                    "RecoverPlugin",
+                    "{count} modification(s) enregistree(s) sur '{layer}'."
+                ).format(count=event_count, layer=layer_name),
                 QgisCompat.MSG_SUCCESS, 3)
         self._update_status_bar()
 

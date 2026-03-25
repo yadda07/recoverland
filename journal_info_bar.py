@@ -131,7 +131,7 @@ class SmartBarTile(QPushButton):
         self._refresh_theme()
 
     def _refresh_theme(self) -> None:
-        text = self.palette().color(QtCompat.PALETTE_WINDOW_TEXT)
+        text = self.palette().windowText().color()
         accent = self._accent
         if self._visual_mode == "active":
             bg = _rgba(accent, 34)
@@ -198,6 +198,7 @@ class JournalInfoBar(QWidget):
         self._health_label.setCursor(QtCompat.POINTING_HAND_CURSOR)
         self._health_label.mousePressEvent = lambda _e: self.maintenanceRequested.emit()
         self._current_health = "healthy"
+        self._refreshing = False
         self._tiles: Dict[str, SmartBarTile] = {}
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -209,6 +210,7 @@ class JournalInfoBar(QWidget):
         top.addWidget(self._meta_label)
         top.addStretch(1)
         top.addWidget(self._message_label, 2)
+        self._top_layout = top
         tiles_row = QHBoxLayout()
         tiles_row.setContentsMargins(0, 0, 0, 0)
         tiles_row.setSpacing(8)
@@ -247,6 +249,9 @@ class JournalInfoBar(QWidget):
                 widget.set_visual_mode("idle")
         self._refresh_theme()
 
+    def add_trailing_widget(self, widget) -> None:
+        self._top_layout.addWidget(widget)
+
     def _emit_metric(self) -> None:
         tile = self.sender()
         key = tile.property("metric_key") if tile is not None else None
@@ -255,15 +260,22 @@ class JournalInfoBar(QWidget):
 
     def changeEvent(self, event):
         super().changeEvent(event)
+        if self._refreshing:
+            return
         if event.type() == QtCompat.EVENT_PALETTE_CHANGE:
-            self._refresh_theme()
-            for tile in self._tiles.values():
-                tile._refresh_theme()
+            self._refreshing = True
+            try:
+                self._refresh_theme()
+                for tile in self._tiles.values():
+                    tile._refresh_theme()
+            finally:
+                self._refreshing = False
 
     def _refresh_theme(self) -> None:
-        text = self.palette().color(QtCompat.PALETTE_WINDOW_TEXT)
-        highlight = self.palette().color(QtCompat.PALETTE_HIGHLIGHT)
-        mid = self.palette().color(QtCompat.PALETTE_MID)
+        pal = self.palette()
+        text = pal.windowText().color()
+        highlight = pal.highlight().color()
+        mid = pal.mid().color()
         self.setStyleSheet(
             f"QWidget#journalInfoBar {{"
             f"background-color: {_rgba(highlight, 14)};"

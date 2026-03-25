@@ -9,7 +9,7 @@ from qgis.PyQt.QtCore import (QDateTime, QDate, QTime, QTimer,
                               QEasingCurve, Qt)
 from qgis.PyQt.QtGui import QIcon, QColor, QKeySequence
 from qgis.core import (QgsVectorLayer, QgsProject, QgsApplication, QgsSettings)
-from qgis.gui import QgsCollapsibleGroupBox, QgsDateTimeEdit, QgsMessageBar
+from qgis.gui import QgsCollapsibleGroupBox, QgsDateTimeEdit
 from .compat import QtCompat, QgisCompat
 from .core import (
     flog, LoggerMixin,
@@ -39,17 +39,21 @@ CHANGE_TYPE_COLORS = {
     "geometry":  QColor(255, 152, 0, 60),
 }
 
-CHANGE_TYPE_LABELS = {
-    "modified":  "Valeur modifiee",
-    "emptied":   "Valeur videe",
-    "populated": "Valeur ajoutee",
-    "geometry":  "Geometrie modifiee",
-}
+def _change_type_labels():
+    from qgis.PyQt.QtCore import QCoreApplication
+    _tr = lambda msg: QCoreApplication.translate("RecoverDialog", msg)
+    return {
+        "modified":  _tr("Valeur modifiee"),
+        "emptied":   _tr("Valeur videe"),
+        "populated": _tr("Valeur ajoutee"),
+        "geometry":  _tr("Geometrie modifiee"),
+    }
 
 
 RECOVER_GLOW_COLOR = QColor(219, 177, 52, 180)
 RESTORE_GLOW_COLOR = QColor(40, 167, 69, 180)
 _MIN_RECOVER_ANIMATION_SEC = 3.0
+_MIN_RESTORE_ANIMATION_SEC = 1.8
 
 
 class RecoverDialog(QDialog, LoggerMixin):
@@ -64,7 +68,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._journal = journal
         self._tracker = tracker
         self._write_queue = write_queue
-        self.setWindowTitle("RecoverLand - Récupération de données")
+        self.setWindowTitle(self.tr("RecoverLand - Récupération de données"))
         self.setMinimumWidth(750)
         self.setMinimumHeight(600)
         self.resize(800, 700)
@@ -88,6 +92,8 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._smart_bar_summary = None
         self._recover_started_at = 0.0
         self._pending_search_result = None
+        self._restore_started_at = 0.0
+        self._pending_restore_feedback = None
         self._dialog_read_conn = None
 
         self.setup_ui()
@@ -103,7 +109,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         tracking_on = QgsSettings().value("RecoverLand/tracking_enabled", True, type=bool)
         self.tracking_toggle.setChecked(tracking_on)
         if not tracking_on:
-            self.tracking_label.setText("Enregistrement désactivé")
+            self.tracking_label.setText(self.tr("Enregistrement désactivé"))
             self.tracking_label.setStyleSheet("color: #e74c3c; font-weight: 600;")
         self._refresh_smart_bar()
         self._check_onboarding()
@@ -114,12 +120,14 @@ class RecoverDialog(QDialog, LoggerMixin):
         done = QgsSettings().value("RecoverLand/onboarding_done", False, type=bool)
         if done:
             return
-        self.message_bar.pushMessage(
-            "Bienvenue dans RecoverLand",
-            "RecoverLand enregistre automatiquement vos modifications. "
-            "Utilisez Recover pour retrouver vos donnees, "
-            "puis Restore pour les reinjecter dans vos couches. "
-            "Le journal est stocke localement a cote de votre projet.",
+        self.iface.messageBar().pushMessage(
+            self.tr("Bienvenue dans RecoverLand"),
+            self.tr(
+                "RecoverLand enregistre automatiquement vos modifications. "
+                "Utilisez Recover pour retrouver vos donnees, "
+                "puis Restore pour les reinjecter dans vos couches. "
+                "Le journal est stocke localement a cote de votre projet."
+            ),
             QgisCompat.MSG_INFO, 0,
         )
         QgsSettings().setValue("RecoverLand/onboarding_done", True)
@@ -132,13 +140,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         status = check_disk_for_path(path)
         if status.is_critical:
             msg = format_disk_message(status)
-            self.message_bar.pushMessage("Espace disque", msg, QgisCompat.MSG_CRITICAL, 0)
+            self.iface.messageBar().pushMessage(self.tr("Espace disque"), msg, QgisCompat.MSG_CRITICAL, 0)
             if self._tracker and self.tracking_toggle.isChecked():
                 self._on_tracking_toggled(False)
                 self.tracking_toggle.setChecked(False, animated=True)
         elif status.is_low:
             msg = format_disk_message(status)
-            self.message_bar.pushMessage("Espace disque", msg, QgisCompat.MSG_WARNING, 10)
+            self.iface.messageBar().pushMessage(self.tr("Espace disque"), msg, QgisCompat.MSG_WARNING, 10)
 
     def _set_journal_info_visible(self, visible: bool) -> None:
         if not hasattr(self, 'smart_bar'):
@@ -169,29 +177,48 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _build_smart_bar_message(self, summary) -> str:
         if summary.total_count == 0:
-            suffix = "Enregistrement actif." if self.tracking_toggle.isChecked() else "Enregistrement désactivé."
-            return f"Aucun événement dans le scope courant. {suffix}"
-        count_text = f"{summary.selected_count} / {summary.total_count} événement(s)"
+            return self.tr("Aucune activité dans le périmètre courant.")
+        operation = self.operation_input.currentText()
+        if operation != self.tr("Toutes"):
+            return self._build_filtered_smart_bar_message(summary, operation)
+        return self._build_scope_activity_message(summary)
+
+    def _build_filtered_smart_bar_message(self, summary, operation: str) -> str:
+        if summary.selected_count == 0:
+            return self.tr("Filtre {op} : aucun événement visible.").format(op=operation)
         if summary.selected_count == summary.total_count:
-            count_text = f"{summary.total_count} événement(s)"
-        if self.operation_input.currentText() != "Toutes":
-            count_text = f"{count_text} pour {self.operation_input.currentText()}"
-        else:
-            count_text = f"{count_text} dans le scope courant"
-        suffix = "Enregistrement actif." if self.tracking_toggle.isChecked() else "Enregistrement désactivé."
-        return f"{count_text}. {suffix}"
+            return self.tr("Filtre {op} : le périmètre courant ne contient que ce type.").format(op=operation)
+        hidden_count = summary.total_count - summary.selected_count
+        return self.tr("Filtre {op} : {selected} visible(s), {hidden} masqué(s).").format(
+            op=operation,
+            selected=summary.selected_count,
+            hidden=hidden_count,
+        )
+
+    def _build_scope_activity_message(self, summary) -> str:
+        if summary.update_count == summary.total_count:
+            return self.tr("Cette sélection ne contient que des mises à jour.")
+        if summary.delete_count == summary.total_count:
+            return self.tr("Cette sélection ne contient que des suppressions.")
+        if summary.insert_count == summary.total_count:
+            return self.tr("Cette sélection ne contient que des ajouts.")
+        if summary.user_count <= 1:
+            return self.tr("Activité d'un seul utilisateur dans cette sélection.")
+        return self.tr("Activité répartie entre {count} utilisateur(s) dans cette sélection.").format(
+            count=summary.user_count,
+        )
 
     def _build_smart_bar_tiles(self, summary) -> tuple:
-        total_color = self.palette().color(QtCompat.PALETTE_HIGHLIGHT)
+        total_color = self.palette().highlight().color()
         return (
-            SmartBarTileState("ALL", "Total", str(summary.total_count), total_color,
-                              "Réinitialiser le filtre d'opération"),
-            SmartBarTileState("UPDATE", "Updates", str(summary.update_count), QColor(66, 133, 244),
-                              "Basculer le filtre sur UPDATE"),
-            SmartBarTileState("DELETE", "Suppr.", str(summary.delete_count), QColor(219, 68, 55),
-                              "Basculer le filtre sur DELETE"),
-            SmartBarTileState("INSERT", "Ajouts", str(summary.insert_count), QColor(52, 168, 83),
-                              "Basculer le filtre sur INSERT"),
+            SmartBarTileState("ALL", self.tr("Total"), str(summary.total_count), total_color,
+                              self.tr("Réinitialiser le filtre d'opération")),
+            SmartBarTileState("UPDATE", self.tr("Updates"), str(summary.update_count), QColor(66, 133, 244),
+                              self.tr("Basculer le filtre sur UPDATE")),
+            SmartBarTileState("DELETE", self.tr("Suppr."), str(summary.delete_count), QColor(219, 68, 55),
+                              self.tr("Basculer le filtre sur DELETE")),
+            SmartBarTileState("INSERT", self.tr("Ajouts"), str(summary.insert_count), QColor(52, 168, 83),
+                              self.tr("Basculer le filtre sur INSERT")),
         )
 
     def _build_smart_bar_state(self, summary, size_str: str) -> SmartBarState:
@@ -207,18 +234,18 @@ class RecoverDialog(QDialog, LoggerMixin):
                 health_message = health.message
                 health_suggestion = health.suggestion
         if summary is None:
-            message = override or "Ouvrez un projet QGIS pour activer le journal local."
+            message = override or self.tr("Ouvrez un projet QGIS pour activer le journal local.")
             return SmartBarState(
-                title="Journal local",
+                title=self.tr("Journal local"),
                 meta="",
                 message=message,
                 mode="disabled",
                 active_keys=(),
                 tiles=(
-                    SmartBarTileState("ALL", "Total", "0", self.palette().color(QtCompat.PALETTE_HIGHLIGHT), ""),
-                    SmartBarTileState("UPDATE", "Updates", "0", QColor(66, 133, 244), ""),
-                    SmartBarTileState("DELETE", "Suppr.", "0", QColor(219, 68, 55), ""),
-                    SmartBarTileState("INSERT", "Ajouts", "0", QColor(52, 168, 83), ""),
+                    SmartBarTileState("ALL", self.tr("Total"), "0", self.palette().highlight().color(), ""),
+                    SmartBarTileState("UPDATE", self.tr("Updates"), "0", QColor(66, 133, 244), ""),
+                    SmartBarTileState("DELETE", self.tr("Suppr."), "0", QColor(219, 68, 55), ""),
+                    SmartBarTileState("INSERT", self.tr("Ajouts"), "0", QColor(52, 168, 83), ""),
                 ),
                 health_level=health_level,
                 health_message=health_message,
@@ -226,12 +253,12 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
         message = override or self._build_smart_bar_message(summary)
         pending = self._get_write_queue_pending()
-        meta_parts = [size_str, f"{summary.layer_count} couche(s)"]
+        meta_parts = [size_str, self.tr("{count} couche(s)").format(count=summary.layer_count)]
         if pending > 0:
-            meta_parts.append(f"{pending} en attente")
+            meta_parts.append(self.tr("{count} en attente").format(count=pending))
         meta = " | ".join(meta_parts)
         return SmartBarState(
-            title="Journal local",
+            title=self.tr("Journal local"),
             meta=meta,
             message=message,
             mode="ready",
@@ -315,10 +342,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         """Refresh journal label, layer list and user list from local SQLite journal."""
         if self._journal is None or not self._journal.is_open:
             self._smart_bar_summary = None
-            self._smart_bar_message_override = "Ouvrez un projet QGIS pour activer le journal local."
+            self._smart_bar_message_override = self.tr("Ouvrez un projet QGIS pour activer le journal local.")
             self.layer_input.blockSignals(True)
             self.layer_input.clear()
-            self.layer_input.addItem("Aucune couche sauvegardée", "")
+            self.layer_input.addItem(self.tr("Aucune couche sauvegardée"), "")
             self.layer_input.blockSignals(False)
             self.layer_input.setEnabled(False)
             self.operation_input.setEnabled(False)
@@ -355,9 +382,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.layer_input.blockSignals(True)
         self.layer_input.clear()
         if layers:
-            self.layer_input.addItem("Toutes les couches sauvegardées", "")
+            self.layer_input.addItem(self.tr("Toutes les couches sauvegardées"), "")
         else:
-            self.layer_input.addItem("Aucune couche sauvegardée", "")
+            self.layer_input.addItem(self.tr("Aucune couche sauvegardée"), "")
         for lyr in layers:
             label = f"{lyr['name']}"
             self.layer_input.addItem(label, lyr['fingerprint'])
@@ -382,10 +409,10 @@ class RecoverDialog(QDialog, LoggerMixin):
             else:
                 self._tracker.deactivate()
         if enabled:
-            self.tracking_label.setText("Enregistrement actif")
+            self.tracking_label.setText(self.tr("Enregistrement actif"))
             self.tracking_label.setStyleSheet("color: #2ecc71; font-weight: 600;")
         else:
-            self.tracking_label.setText("Enregistrement désactivé")
+            self.tracking_label.setText(self.tr("Enregistrement désactivé"))
             self.tracking_label.setStyleSheet("color: #e74c3c; font-weight: 600;")
         flog(f"RecoverDialog: tracking {'enabled' if enabled else 'disabled'}")
         self._refresh_smart_bar()
@@ -434,12 +461,12 @@ class RecoverDialog(QDialog, LoggerMixin):
             layout.insertWidget(layout.count() - 1, cb)
 
         if not layers:
-            self.layers_status_label.setText("Aucune couche vecteur chargée")
+            self.layers_status_label.setText(self.tr("Aucune couche vecteur chargée"))
         elif all_tracked:
-            self.layers_status_label.setText("Toutes les couches surveillées")
+            self.layers_status_label.setText(self.tr("Toutes les couches surveillées"))
         else:
             n = sum(1 for lyr in layers if compute_datasource_fingerprint(lyr) in allowed)
-            self.layers_status_label.setText(f"{n} / {len(layers)} couche(s) surveillée(s)")
+            self.layers_status_label.setText(self.tr("{n} / {total} couche(s) surveillée(s)").format(n=n, total=len(layers)))
 
         if self._tracker is not None:
             self._tracker.set_filter(set() if all_tracked else allowed)
@@ -469,9 +496,9 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._tracker.set_filter(filter_set)
 
         if all_tracked:
-            self.layers_status_label.setText("Toutes les couches surveillées")
+            self.layers_status_label.setText(self.tr("Toutes les couches surveillées"))
         else:
-            self.layers_status_label.setText(f"{len(allowed)} / {total} couche(s) surveillée(s)")
+            self.layers_status_label.setText(self.tr("{n} / {total} couche(s) surveillée(s)").format(n=len(allowed), total=total))
 
     def setup_ui(self):
         
@@ -482,9 +509,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         logo_label.setSizePolicy(QtCompat.SIZE_FIXED, QtCompat.SIZE_FIXED)
         self.logo_label = logo_label
         self._load_themed_logo()
-        self.message_bar = QgsMessageBar()
-        self.message_bar.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
-        self.message_bar.setMinimumHeight(0)
         # Status Frame (Sleek modern header instead of QFormLayout GroupBox)
         status_frame = QFrame()
         status_frame.setObjectName("statusFrame")
@@ -507,32 +531,33 @@ class RecoverDialog(QDialog, LoggerMixin):
         tracking_panel.setSizePolicy(QtCompat.SIZE_FIXED, QtCompat.SIZE_FIXED)
         tracking_panel.setStyleSheet("background: transparent;")
         tracking_layout = QHBoxLayout(tracking_panel)
-        tracking_layout.setContentsMargins(4, 0, 4, 0)
+        tracking_layout.setContentsMargins(4, 0, 0, 0)
         tracking_layout.setSpacing(6)
         
-        self.tracking_label = QLabel("Enregistrement actif")
+        self.tracking_label = QLabel(self.tr("Enregistrement actif"))
         self.tracking_label.setStyleSheet("font-size: 12px; font-weight: bold; color: #2ecc71;")
         self.tracking_toggle = AppleToggleSwitch()
         self.tracking_toggle.toggled.connect(self._on_tracking_toggled)
         
         tracking_layout.addWidget(self.tracking_label)
         tracking_layout.addWidget(self.tracking_toggle)
+
         status_layout.addWidget(self.smart_bar, 1)
-        status_layout.addWidget(tracking_panel, 0, QtCompat.ALIGN_VCENTER)
+        self.smart_bar.add_trailing_widget(tracking_panel)
 
         layers_group = QgsCollapsibleGroupBox()
-        layers_group.setTitle("Couches surveillées")
+        layers_group.setTitle(self.tr("Couches surveillées"))
         layers_group.setCollapsed(True)
         layers_vbox = QVBoxLayout()
         layers_vbox.setSpacing(6)
 
         layers_header = QHBoxLayout()
-        self.layers_status_label = QLabel("Toutes les couches surveillées")
+        self.layers_status_label = QLabel(self.tr("Toutes les couches surveillées"))
         self.layers_status_label.setStyleSheet("font-style: italic; color: #555;")
         refresh_layers_btn = QPushButton()
         refresh_layers_btn.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
         refresh_layers_btn.setFixedSize(24, 24)
-        refresh_layers_btn.setToolTip("Rafraîchir la liste")
+        refresh_layers_btn.setToolTip(self.tr("Rafraîchir la liste"))
         refresh_layers_btn.clicked.connect(self._refresh_layers_panel)
         layers_header.addWidget(self.layers_status_label, 1)
         layers_header.addWidget(refresh_layers_btn)
@@ -554,23 +579,23 @@ class RecoverDialog(QDialog, LoggerMixin):
         layers_group.setLayout(layers_vbox)
 
         selection_group = QgsCollapsibleGroupBox()
-        selection_group.setTitle("Sélection")
+        selection_group.setTitle(self.tr("Sélection"))
         selection_layout = QFormLayout()
         
         self.layer_input = QComboBox()
-        self.layer_input.setToolTip("Couche dont les modifications sont enregistrées dans le journal local")
+        self.layer_input.setToolTip(self.tr("Couche dont les modifications sont enregistrées dans le journal local"))
         self.layer_input.currentIndexChanged.connect(self._refresh_smart_bar)
 
         self.operation_input = QComboBox()
-        self.operation_input.addItems(["Toutes", "UPDATE", "DELETE", "INSERT"])
-        self.operation_input.setToolTip("Type d'opération à rechercher")
+        self.operation_input.addItems([self.tr("Toutes"), "UPDATE", "DELETE", "INSERT"])
+        self.operation_input.setToolTip(self.tr("Type d'opération à rechercher"))
         self.operation_input.currentIndexChanged.connect(self._refresh_smart_bar)
 
-        selection_layout.addRow("Couche:", self.layer_input)
-        selection_layout.addRow("Opération:", self.operation_input)
+        selection_layout.addRow(self.tr("Couche:"), self.layer_input)
+        selection_layout.addRow(self.tr("Opération:"), self.operation_input)
         selection_group.setLayout(selection_layout)
         date_group = QgsCollapsibleGroupBox()
-        date_group.setTitle("Période")
+        date_group.setTitle(self.tr("Période"))
         date_layout = QFormLayout()
         
         today = QDateTime.currentDateTime()
@@ -598,37 +623,37 @@ class RecoverDialog(QDialog, LoggerMixin):
         min10_btn.setIcon(clock_icon)
         min10_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
         min10_btn.clicked.connect(lambda: self.set_period("10min"))
-        min10_btn.setToolTip("Dernières 10 minutes")
+        min10_btn.setToolTip(self.tr("Dernières 10 minutes"))
         
         min30_btn = QPushButton("30 min")
         min30_btn.setIcon(clock_icon)
         min30_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
         min30_btn.clicked.connect(lambda: self.set_period("30min"))
-        min30_btn.setToolTip("Dernières 30 minutes")
+        min30_btn.setToolTip(self.tr("Dernières 30 minutes"))
         
-        hour1_btn = QPushButton("1 heure")
+        hour1_btn = QPushButton(self.tr("1 heure"))
         hour1_btn.setIcon(clock_icon)
         hour1_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
         hour1_btn.clicked.connect(lambda: self.set_period("1hour"))
-        hour1_btn.setToolTip("Dernière heure")
+        hour1_btn.setToolTip(self.tr("Dernière heure"))
         
-        day1_btn = QPushButton("1 jour")
+        day1_btn = QPushButton(self.tr("1 jour"))
         day1_btn.setIcon(clock_icon)
         day1_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
         day1_btn.clicked.connect(lambda: self.set_period("1day"))
-        day1_btn.setToolTip("Dernières 24 heures")
+        day1_btn.setToolTip(self.tr("Dernières 24 heures"))
         
-        today_btn = QPushButton("Aujourd'hui")
+        today_btn = QPushButton(self.tr("Aujourd'hui"))
         today_btn.setIcon(clock_icon)
         today_btn.setFixedSize(shortcut_button_width + 10, shortcut_button_height)
         today_btn.clicked.connect(lambda: self.set_period("today"))
-        today_btn.setToolTip("Depuis minuit aujourd'hui")
+        today_btn.setToolTip(self.tr("Depuis minuit aujourd'hui"))
 
-        week_btn = QPushButton("Semaine")
+        week_btn = QPushButton(self.tr("Semaine"))
         week_btn.setIcon(clock_icon)
         week_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
         week_btn.clicked.connect(lambda: self.set_period("week"))
-        week_btn.setToolTip("Depuis lundi 00:00")
+        week_btn.setToolTip(self.tr("Depuis lundi 00:00"))
 
         date_shortcuts.addWidget(min10_btn)
         date_shortcuts.addWidget(min30_btn)
@@ -638,18 +663,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         date_shortcuts.addWidget(week_btn)
         date_shortcuts.addStretch()
         
-        date_layout.addRow("Date début:", self.start_input)
-        date_layout.addRow("Date fin:", self.end_input)
-        date_layout.addRow("Raccourcis:", date_shortcuts)
+        date_layout.addRow(self.tr("Date début:"), self.start_input)
+        date_layout.addRow(self.tr("Date fin:"), self.end_input)
+        date_layout.addRow(self.tr("Raccourcis:"), date_shortcuts)
         date_group.setLayout(date_layout)
-        options_group = QgsCollapsibleGroupBox("Options")
+        options_group = QgsCollapsibleGroupBox(self.tr("Options"))
         options_layout = QVBoxLayout()
         
-        self.auto_zoom_check = QCheckBox("Zoomer automatiquement sur les résultats")
+        self.auto_zoom_check = QCheckBox(self.tr("Zoomer automatiquement sur les résultats"))
         self.auto_zoom_check.setIcon(QgsApplication.getThemeIcon('/mActionZoomToSelected.svg'))
         self.auto_zoom_check.setChecked(True)
         
-        self.open_attribute_check = QCheckBox("Ouvrir la table d'attributs après chargement")
+        self.open_attribute_check = QCheckBox(self.tr("Ouvrir la table d'attributs après chargement"))
         self.open_attribute_check.setIcon(QgsApplication.getThemeIcon('/mActionOpenTable.svg'))
         self.open_attribute_check.setChecked(False)
         
@@ -657,15 +682,15 @@ class RecoverDialog(QDialog, LoggerMixin):
         options_layout.addWidget(self.open_attribute_check)
         options_group.setLayout(options_layout)
         results_group = QgsCollapsibleGroupBox()
-        results_group.setTitle("Résultats")
+        results_group.setTitle(self.tr("Résultats"))
         results_group.setCollapsed(True)
         results_layout = QVBoxLayout()
-        self.results_info_label = QLabel("Aucune donnée récupérée")
+        self.results_info_label = QLabel(self.tr("Aucune donnée récupérée"))
         
         self.search_filter = QLineEdit()
-        self.search_filter.setPlaceholderText("Rechercher (GID, utilisateur, ...)")
+        self.search_filter.setPlaceholderText(self.tr("Rechercher (GID, utilisateur, ...)"))
         self.search_filter.setClearButtonEnabled(True)
-        self.search_filter.setToolTip("Filtrer les résultats en temps réel")
+        self.search_filter.setToolTip(self.tr("Filtrer les résultats en temps réel"))
         self.search_filter.textChanged.connect(self._filter_results)
         self.search_filter.setVisible(False)
         
@@ -685,25 +710,25 @@ class RecoverDialog(QDialog, LoggerMixin):
         selection_buttons_layout = QHBoxLayout()
         selection_buttons_layout.setSpacing(8)
         selection_button_height = 32
-        self.select_all_button = QPushButton("Tout sélectionner")
+        self.select_all_button = QPushButton(self.tr("Tout sélectionner"))
         select_all_icon = QgsApplication.getThemeIcon('/mActionSelectAll.svg')
         self.select_all_button.setIcon(select_all_icon)
         self.select_all_button.setFixedHeight(selection_button_height)
         self.select_all_button.clicked.connect(self.select_all_rows)
         self.select_all_button.setEnabled(False)
-        self.select_all_button.setToolTip("Sélectionner toutes les lignes du tableau")
-        self.select_none_button = QPushButton("Tout désélectionner") 
+        self.select_all_button.setToolTip(self.tr("Sélectionner toutes les lignes du tableau"))
+        self.select_none_button = QPushButton(self.tr("Tout désélectionner")) 
         deselect_icon = QgsApplication.getThemeIcon('/mActionDeselectAll.svg')
         self.select_none_button.setIcon(deselect_icon)
         self.select_none_button.setFixedHeight(selection_button_height)
         self.select_none_button.clicked.connect(self.select_none_rows)
         self.select_none_button.setEnabled(False)
-        self.select_none_button.setToolTip("Désélectionner toutes les lignes du tableau")
+        self.select_none_button.setToolTip(self.tr("Désélectionner toutes les lignes du tableau"))
         
-        self.export_csv_button = QPushButton("Exporter CSV")
+        self.export_csv_button = QPushButton(self.tr("Exporter CSV"))
         self.export_csv_button.setIcon(QgsApplication.getThemeIcon('/mActionFileSave.svg'))
         self.export_csv_button.setFixedHeight(selection_button_height)
-        self.export_csv_button.setToolTip("Exporter les résultats en fichier CSV")
+        self.export_csv_button.setToolTip(self.tr("Exporter les résultats en fichier CSV"))
         self.export_csv_button.clicked.connect(self._export_csv)
         self.export_csv_button.setEnabled(False)
         
@@ -736,15 +761,15 @@ class RecoverDialog(QDialog, LoggerMixin):
         button_width = 120
         button_height = 35
         
-        self.cancel_button = QPushButton("Fermer")
+        self.cancel_button = QPushButton(self.tr("Fermer"))
         self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
         self.cancel_button.setFixedSize(button_width, button_height)
         self.cancel_button.clicked.connect(self.cancel_operation)
         
-        self.quick_last_btn = QPushButton("Derniers")
+        self.quick_last_btn = QPushButton(self.tr("Derniers"))
         self.quick_last_btn.setIcon(QgsApplication.getThemeIcon('/mIconClock.svg'))
         self.quick_last_btn.setFixedSize(button_width, button_height)
-        self.quick_last_btn.setToolTip("Rechercher les 50 derniers evenements (24h)")
+        self.quick_last_btn.setToolTip(self.tr("Rechercher les 50 derniers evenements (24h)"))
         self.quick_last_btn.clicked.connect(self._quick_last_changes)
 
         self.recover_button = QPushButton("Recover")
@@ -769,7 +794,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         button_layout.addWidget(self.restore_button)
         button_layout.addStretch()
         main_layout.addWidget(logo_label, 0, QtCompat.ALIGN_HCENTER)
-        main_layout.addWidget(self.message_bar)
         main_layout.addWidget(status_frame)
         main_layout.addWidget(layers_group)
         layers_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
@@ -803,9 +827,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         QShortcut(QKeySequence("F5"), self, self.recover_and_load)
         QShortcut(QKeySequence("Ctrl+F"), self, self._focus_search_filter)
         QShortcut(QKeySequence("Ctrl+E"), self, self._export_csv)
-        self.recover_button.setToolTip("Lancer la recherche (F5)")
-        self.export_csv_button.setToolTip("Exporter les résultats (Ctrl+E)")
-        self.search_filter.setToolTip("Filtrer les résultats (Ctrl+F)")
+        self.recover_button.setToolTip(self.tr("Lancer la recherche (F5)"))
+        self.export_csv_button.setToolTip(self.tr("Exporter les résultats (Ctrl+E)"))
+        self.search_filter.setToolTip(self.tr("Filtrer les résultats (Ctrl+F)"))
 
     def _focus_search_filter(self) -> None:
         if self.search_filter.isVisible():
@@ -821,10 +845,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         if selected:
             restore_act = menu.addAction(
                 QgsApplication.getThemeIcon('/mActionSaveAllEdits.svg'),
-                f"Restaurer ({len(selected)} ligne(s))")
+                self.tr("Restaurer ({count} ligne(s))").format(count=len(selected)))
             restore_act.triggered.connect(self.restore_selected_data)
             menu.addSeparator()
-        copy_act = menu.addAction("Copier les valeurs")
+        copy_act = menu.addAction(self.tr("Copier les valeurs"))
         copy_act.triggered.connect(self._copy_selected_to_clipboard)
         if selected and len(selected) == 1:
             row = selected[0].row()
@@ -837,9 +861,9 @@ class RecoverDialog(QDialog, LoggerMixin):
                     filter_act.triggered.connect(
                         lambda: self._filter_on_layer(event.datasource_fingerprint))
         menu.addSeparator()
-        sel_all = menu.addAction("Tout selectionner")
+        sel_all = menu.addAction(self.tr("Tout selectionner"))
         sel_all.triggered.connect(self.select_all_rows)
-        desel = menu.addAction("Tout deselectionner")
+        desel = menu.addAction(self.tr("Tout deselectionner"))
         desel.triggered.connect(self.select_none_rows)
         menu.exec_(self.table_widget.viewport().mapToGlobal(pos))
 
@@ -861,8 +885,8 @@ class RecoverDialog(QDialog, LoggerMixin):
                 cells.append(item.text() if item else "")
             lines.append("\t".join(cells))
         QApplication.clipboard().setText("\n".join(lines))
-        self.message_bar.pushMessage(
-            "Copie", f"{len(rows)} ligne(s) copiee(s).",
+        self.iface.messageBar().pushMessage(
+            self.tr("Copie"), self.tr("{count} ligne(s) copiee(s).").format(count=len(rows)),
             QgisCompat.MSG_SUCCESS, 3)
 
     def _filter_on_layer(self, fingerprint: str) -> None:
@@ -897,25 +921,25 @@ class RecoverDialog(QDialog, LoggerMixin):
         """UX-B02: Build contextual suggestion when search returns 0 results."""
         parts = []
         if not self.tracking_toggle.isChecked():
-            parts.append(
+            parts.append(self.tr(
                 "L'enregistrement est desactive. "
-                "Activez-le pour capturer les modifications.")
+                "Activez-le pour capturer les modifications."))
             return " ".join(parts)
         start = self.start_input.dateTime()
         end = self.end_input.dateTime()
         span_secs = start.secsTo(end)
         if span_secs < 3600:
-            parts.append("La periode est courte (< 1h). Essayez d'elargir a 24h ou 7 jours.")
+            parts.append(self.tr("La periode est courte (< 1h). Essayez d'elargir a 24h ou 7 jours."))
         if self.layer_input.currentData():
-            parts.append(
+            parts.append(self.tr(
                 "Un filtre de couche est actif. "
-                "Essayez 'Toutes les couches sauvegardees'.")
-        if self.operation_input.currentText() != "Toutes":
-            parts.append(
-                f"Filtre operation actif ({self.operation_input.currentText()}). "
-                "Essayez 'Toutes'.")
+                "Essayez 'Toutes les couches sauvegardees'."))
+        if self.operation_input.currentText() != self.tr("Toutes"):
+            parts.append(self.tr(
+                "Filtre operation actif ({op}). "
+                "Essayez 'Toutes'.").format(op=self.operation_input.currentText()))
         if not parts:
-            parts.append("Aucun evenement pour ces criteres. Verifiez la periode et la couche.")
+            parts.append(self.tr("Aucun evenement pour ces criteres. Verifiez la periode et la couche."))
         return " ".join(parts)
 
     def _apply_glow_effect(self, widget, color: QColor) -> None:
@@ -946,8 +970,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.logo_label.setProperty("glow_base_alpha", 0)
         self.logo_label.setProperty("glow_hover_alpha", min(255, RECOVER_GLOW_COLOR.alpha() + 75))
 
-    def _start_logo_activity(self, color: QColor) -> None:
-        self.logo_label.start_recovery_effect(color)
+    def _start_logo_activity(self, color: QColor, mode: str) -> None:
+        if mode == "recover":
+            self.logo_label.start_recovery_effect(color)
+        elif mode == "restore":
+            self.logo_label.start_restore_effect(color)
+        else:
+            raise ValueError(f"Unknown logo activity mode: {mode}")
         self._pulse_logo_glow(color)
 
     def _stop_logo_activity(self) -> None:
@@ -979,9 +1008,15 @@ class RecoverDialog(QDialog, LoggerMixin):
     def changeEvent(self, event):
         """Re-render logo when QGIS theme/palette changes (dark mode)."""
         super().changeEvent(event)
+        if getattr(self, '_refreshing_theme', False):
+            return
         if event.type() == QtCompat.EVENT_PALETTE_CHANGE and hasattr(self, 'logo_label'):
-            self._load_themed_logo()
-            self._refresh_smart_bar()
+            self._refreshing_theme = True
+            try:
+                self._load_themed_logo()
+                self._refresh_smart_bar()
+            finally:
+                self._refreshing_theme = False
     
     def eventFilter(self, obj, event) -> bool:
         """Handle hover events for glow animation."""
@@ -1035,7 +1070,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             return
         
         try:
-            text_color = self.palette().color(QtCompat.PALETTE_WINDOW_TEXT)
+            text_color = self.palette().windowText().color()
             color_hex = text_color.name()
             
             with open(logo_path, 'r', encoding='utf-8') as f:
@@ -1078,13 +1113,13 @@ class RecoverDialog(QDialog, LoggerMixin):
                 f"border:1px solid rgba({r},{g},{b},140);"
                 f"border-radius:2px;"
             )
-            label = QLabel(CHANGE_TYPE_LABELS[change_type])
+            label = QLabel(_change_type_labels()[change_type])
             label.setStyleSheet("font-size:11px; padding-left:2px; padding-right:8px;")
             layout.addWidget(swatch)
             layout.addWidget(label)
         layout.addStretch()
-        self._modified_only_check = QCheckBox("Modifications uniquement")
-        self._modified_only_check.setToolTip("Afficher uniquement les colonnes modifiées")
+        self._modified_only_check = QCheckBox(self.tr("Modifications uniquement"))
+        self._modified_only_check.setToolTip(self.tr("Afficher uniquement les colonnes modifiées"))
         self._modified_only_check.setStyleSheet("font-size:11px;")
         self._modified_only_check.stateChanged.connect(self._toggle_modified_columns)
         layout.addWidget(self._modified_only_check)
@@ -1110,7 +1145,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         if self.table_widget.rowCount() == 0:
             return
         filepath, _ = QFileDialog.getSaveFileName(
-            self, "Exporter les résultats", "", "CSV (*.csv);;Tous les fichiers (*)"
+            self, self.tr("Exporter les résultats"), "", self.tr("CSV (*.csv);;Tous les fichiers (*)")
         )
         if not filepath:
             return
@@ -1130,9 +1165,9 @@ class RecoverDialog(QDialog, LoggerMixin):
                             item = self.table_widget.item(row, col)
                             row_data.append(item.text() if item else "")
                         writer.writerow(row_data)
-            self.message_bar.pushMessage("Export", f"Résultats exportés vers {os.path.basename(filepath)}", QgisCompat.MSG_SUCCESS, 5)
+            self.iface.messageBar().pushMessage(self.tr("Export"), self.tr("Résultats exportés vers {name}").format(name=os.path.basename(filepath)), QgisCompat.MSG_SUCCESS, 5)
         except Exception as e:
-            self.message_bar.pushMessage("Erreur export", str(e), QgisCompat.MSG_CRITICAL, 0)
+            self.iface.messageBar().pushMessage(self.tr("Erreur export"), str(e), QgisCompat.MSG_CRITICAL, 0)
     
     def _validate_dates(self):
         """Real-time date validation: disable recover button if dates are invalid."""
@@ -1224,7 +1259,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         criteria = self._build_search_criteria()
         flog(f"recover_and_load: layer={criteria.datasource_fingerprint} op={criteria.operation_type} start={criteria.start_date} end={criteria.end_date}")
 
-        self.cancel_button.setText("Arrêter")
+        self.cancel_button.setText(self.tr("Arrêter"))
         self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mTaskCancel.svg'))
 
         self.worker_thread = LocalSearchThread(self._journal, criteria)
@@ -1233,7 +1268,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.worker_thread.error_occurred.connect(self.on_error)
         self._recover_started_at = time.monotonic()
         self._pending_search_result = None
-        self._start_logo_activity(RECOVER_GLOW_COLOR)
+        self._start_logo_activity(RECOVER_GLOW_COLOR, "recover")
         QTimer.singleShot(100, self.worker_thread.start)
 
     def _on_search_complete(self, result) -> None:
@@ -1265,14 +1300,14 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._stop_logo_activity()
         self.progress_bar.setVisible(False)
         self.progress_phase_label.setVisible(False)
-        self.cancel_button.setText("Fermer")
+        self.cancel_button.setText(self.tr("Fermer"))
         self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
         self.enable_controls(True)
 
         flog(f"_display_search_result: total_count={result.total_count} events={len(result.events)}")
         if result.total_count == 0:
             suggestion = self._build_empty_result_suggestion()
-            self.message_bar.pushMessage(
+            self.iface.messageBar().pushMessage(
                 "Information",
                 suggestion,
                 QgisCompat.MSG_INFO, 8,
@@ -1282,8 +1317,40 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         self._search_events = result.events
         self._populate_results_table(result.events, result.total_count)
-        self._smart_bar_message_override = f"{result.total_count} événement(s) chargé(s) dans la table."
+        self._smart_bar_message_override = self.tr("{count} événement(s) chargé(s) dans la table.").format(count=result.total_count)
         self._refresh_smart_bar()
+
+    def _display_deferred_restore_feedback(self) -> None:
+        feedback = self._pending_restore_feedback
+        self._pending_restore_feedback = None
+        if feedback is None:
+            return
+        self._display_restore_feedback(feedback)
+
+    def _display_restore_feedback(self, feedback) -> None:
+        total_ok, total_fail, errors = feedback
+        self.progress_bar.setVisible(False)
+        self._stop_logo_activity()
+        self.restore_button.setEnabled(bool(self.selected_rows))
+        self.recover_button.setEnabled(True)
+
+        if total_ok > 0 and total_fail == 0:
+            self.iface.messageBar().pushMessage(
+                self.tr("Restauration"), self.tr("{count} entité(s) restaurée(s) avec succès.").format(count=total_ok),
+                QgisCompat.MSG_SUCCESS, 5,
+            )
+        elif total_ok > 0:
+            self.iface.messageBar().pushMessage(
+                self.tr("Restauration partielle"), self.tr("{ok} ok, {fail} échec(s).").format(ok=total_ok, fail=total_fail),
+                QgisCompat.MSG_WARNING, 0,
+            )
+        else:
+            self.iface.messageBar().pushMessage(
+                self.tr("Erreur de restauration"), " | ".join(errors[:5]),
+                QgisCompat.MSG_CRITICAL, 0,
+            )
+        if total_ok > 0:
+            self.iface.mapCanvas().refresh()
 
     def _populate_results_table(self, events, total: int) -> None:
         """Fill the results table from AuditEvent objects."""
@@ -1297,9 +1364,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._all_attr_keys = attr_keys
 
         has_geom_change = any(is_geometry_only_update(e) or e.geometry_wkb is not None for e in events)
-        fixed_cols = ["#", "Date", "Utilisateur", "Opération", "Couche"]
+        fixed_cols = ["#", self.tr("Date"), self.tr("Utilisateur"), self.tr("Opération"), self.tr("Couche")]
         if has_geom_change:
-            fixed_cols.append("Géométrie")
+            fixed_cols.append(self.tr("Géométrie"))
         columns = fixed_cols + attr_keys
         n_fixed = len(fixed_cols)
         self.table_widget.setSortingEnabled(False)
@@ -1333,9 +1400,11 @@ class RecoverDialog(QDialog, LoggerMixin):
             if has_geom_change:
                 geom_changed = is_geometry_only_update(event) or (
                     is_update and event.geometry_wkb is not None)
-                row_values.append("Modifiée" if geom_changed else "")
+                row_values.append(self.tr("Modifiée") if geom_changed else "")
             for col_idx, val in enumerate(row_values):
                 item = QTableWidgetItem(val)
+                if col_idx == 0:
+                    item.setData(QtCompat.USER_ROLE, row_idx)
                 if has_geom_change and col_idx == len(row_values) - 1 and val:
                     item.setBackground(CHANGE_TYPE_COLORS["geometry"])
                 if geom_changed and is_geometry_only_update(event):
@@ -1353,7 +1422,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                         data = json.loads(event.attributes_json)
                         change = data.get("changed_only", {}).get(key, {})
                         if isinstance(change, dict):
-                            item.setToolTip(f"Ancien: {val}\nActuel: {change.get('new')}")
+                            item.setToolTip(self.tr("Ancien: {old}\nActuel: {new}").format(old=val, new=change.get('new')))
                     except (json.JSONDecodeError, TypeError):
                         pass
                 self.table_widget.setItem(row_idx, col_idx, item)
@@ -1361,9 +1430,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.table_widget.setSortingEnabled(True)
         self.table_widget.resizeColumnsToContents()
         self.results_info_label.setText(
-            f"{total} \u00e9v\u00e9nement(s) trouv\u00e9(s), s\u00e9lectionnez les lignes \u00e0 restaurer"
+            self.tr("{count} événement(s) trouvé(s), sélectionnez les lignes à restaurer").format(count=total)
         )
-        self.results_group.setTitle(f"Résultats ({total} événements)")
+        self.results_group.setTitle(self.tr("Résultats ({count} événements)").format(count=total))
         self.results_group.setCollapsed(False)
         self.select_all_button.setEnabled(True)
         self.select_none_button.setEnabled(True)
@@ -1383,15 +1452,15 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._stop_logo_activity()
         self.progress_bar.setVisible(False)
         self.progress_phase_label.setVisible(False)
-        self.cancel_button.setText("Fermer")
+        self.cancel_button.setText(self.tr("Fermer"))
         self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
         self.enable_controls(True)
         self.log_error(f"Erreur de recuperation: {error_message}")
         user_msg = self._humanize_error(
-            "Impossible de recuperer les donnees",
+            self.tr("Impossible de recuperer les donnees"),
             error_message)
-        self.message_bar.pushMessage(
-            "Erreur", user_msg, QgisCompat.MSG_CRITICAL, 0)
+        self.iface.messageBar().pushMessage(
+            self.tr("Erreur"), user_msg, QgisCompat.MSG_CRITICAL, 0)
     
     def on_log_message(self, message, level):
         """Log handler"""
@@ -1410,12 +1479,12 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_timer.stop()
             self.progress_bar.setVisible(False)
             self.progress_phase_label.setVisible(False)
-            self.cancel_button.setText("Fermer")
+            self.cancel_button.setText(self.tr("Fermer"))
             self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
             self.enable_controls(True)
-            self.message_bar.pushMessage(
-                "Opération annulée",
-                "La récupération de données a été annulée",
+            self.iface.messageBar().pushMessage(
+                self.tr("Opération annulée"),
+                self.tr("La récupération de données a été annulée"),
                 QgisCompat.MSG_WARNING, 3,
             )
             return
@@ -1425,12 +1494,12 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_timer.stop()
             self.progress_bar.setVisible(False)
             self.progress_phase_label.setVisible(False)
-            self.cancel_button.setText("Fermer")
+            self.cancel_button.setText(self.tr("Fermer"))
             self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
             self.enable_controls(True)
-            self.message_bar.pushMessage(
-                "Opération annulée", 
-                "La récupération de données a été annulée", 
+            self.iface.messageBar().pushMessage(
+                self.tr("Opération annulée"), 
+                self.tr("La récupération de données a été annulée"), 
                 QgisCompat.MSG_WARNING, 
                 3
             )
@@ -1440,12 +1509,12 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_timer.stop()
             self.progress_bar.setVisible(False)
             self.progress_phase_label.setVisible(False)
-            self.cancel_button.setText("Fermer")
+            self.cancel_button.setText(self.tr("Fermer"))
             self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
             self.enable_controls(True)
-            self.message_bar.pushMessage(
-                "Restauration annulée", 
-                "La restauration a été annulée", 
+            self.iface.messageBar().pushMessage(
+                self.tr("Restauration annulée"), 
+                self.tr("La restauration a été annulée"), 
                 QgisCompat.MSG_WARNING, 
                 3
             )
@@ -1513,17 +1582,26 @@ class RecoverDialog(QDialog, LoggerMixin):
             return "date" if is_date else "populated"
         return "date" if is_date else "modified"
 
+    def _resolve_event_indices(self) -> list:
+        """Map selected visual rows to original _search_events indices via UserRole."""
+        indices = []
+        for index in self.table_widget.selectionModel().selectedRows():
+            item = self.table_widget.item(index.row(), 0)
+            if item is None:
+                continue
+            event_idx = item.data(QtCompat.USER_ROLE)
+            if event_idx is not None:
+                indices.append(event_idx)
+        return indices
+
     def on_selection_changed(self):
         """Selection change"""
         if self.sync_in_progress:
             return
-        selected_rows = set()
-        for index in self.table_widget.selectionModel().selectedRows():
-            selected_rows.add(index.row())
-        self.selected_rows = list(selected_rows)
+        self.selected_rows = self._resolve_event_indices()
         total = self.table_widget.rowCount()
         selected = len(self.selected_rows)
-        self.selection_count_label.setText(f"{selected} / {total} sélectionnées" if selected > 0 else "")
+        self.selection_count_label.setText(self.tr("{selected} / {total} sélectionnées").format(selected=selected, total=total) if selected > 0 else "")
         self.restore_button.setEnabled(selected > 0)
     
     def select_all_rows(self):
@@ -1539,7 +1617,7 @@ class RecoverDialog(QDialog, LoggerMixin):
     def restore_selected_data(self):
         """Restore selected audit events to their source QGIS layers."""
         if not self.selected_rows:
-            self.message_bar.pushMessage("Attention", "Sélectionnez au moins une ligne à restaurer.", QgisCompat.MSG_WARNING, 5)
+            self.iface.messageBar().pushMessage(self.tr("Attention"), self.tr("Sélectionnez au moins une ligne à restaurer."), QgisCompat.MSG_WARNING, 5)
             return
 
         selected_events = [
@@ -1550,14 +1628,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         if not selected_events:
             return
 
-        first = selected_events[0]
-        layer_name = first.layer_name_snapshot or "?"
+        ops = sorted({e.operation_type for e in selected_events})
+        layers = sorted({e.layer_name_snapshot or "?" for e in selected_events})
+        op_label = ", ".join(ops)
+        layer_label = ", ".join(layers)
         reply = QMessageBox.question(
             self,
-            "Confirmation de restauration",
-            f"Restaurer {len(selected_events)} entité(s) [{first.operation_type}] "
-            f"de la couche '{layer_name}' ?\n\n"
-            "La couche cible doit être ouverte dans le projet QGIS.",
+            self.tr("Confirmation de restauration"),
+            self.tr(
+                "Restaurer {count} entité(s) [{op}] "
+                "sur '{layer}' ?\n\n"
+                "La couche cible doit être ouverte dans le projet QGIS."
+            ).format(count=len(selected_events), op=op_label, layer=layer_label),
             QtCompat.MSG_YES | QtCompat.MSG_NO,
             QtCompat.MSG_NO,
         )
@@ -1574,14 +1656,16 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        self._start_logo_activity(RESTORE_GLOW_COLOR)
+        self._restore_started_at = time.monotonic()
+        self._pending_restore_feedback = None
+        self._start_logo_activity(RESTORE_GLOW_COLOR, "restore")
 
         processed = 0
         for fp, events_group in by_ds.items():
             layer = self._find_target_layer(events_group[0])
             if layer is None:
                 name = events_group[0].layer_name_snapshot or fp
-                errors.append(f"Couche '{name}' non trouvée dans le projet.")
+                errors.append(self.tr("Couche '{name}' non trouvée dans le projet.").format(name=name))
                 total_fail += len(events_group)
                 continue
             report = restore_batch(layer, events_group)
@@ -1589,32 +1673,22 @@ class RecoverDialog(QDialog, LoggerMixin):
             total_fail += len(report.failed)
             for eid, msg in report.failed.items():
                 errors.append(f"Evt {eid}: {msg}")
+            if report.succeeded:
+                layer.reload()
             layer.triggerRepaint()
             processed += len(events_group)
             self.progress_bar.setValue(int(processed / len(selected_events) * 100))
             QApplication.processEvents()
 
-        self.progress_bar.setVisible(False)
-        self._stop_logo_activity()
-        self.restore_button.setEnabled(bool(self.selected_rows))
-        self.recover_button.setEnabled(True)
-
-        if total_ok > 0 and total_fail == 0:
-            self.message_bar.pushMessage(
-                "Restauration", f"{total_ok} entité(s) restaurée(s) avec succès.",
-                QgisCompat.MSG_SUCCESS, 5,
-            )
-            self.iface.mapCanvas().refresh()
-        elif total_ok > 0:
-            self.message_bar.pushMessage(
-                "Restauration partielle", f"{total_ok} ok, {total_fail} échec(s).",
-                QgisCompat.MSG_WARNING, 0,
-            )
-        else:
-            self.message_bar.pushMessage(
-                "Erreur de restauration", " | ".join(errors[:5]),
-                QgisCompat.MSG_CRITICAL, 0,
-            )
+        self.progress_bar.setValue(100)
+        feedback = (total_ok, total_fail, tuple(errors))
+        elapsed = time.monotonic() - self._restore_started_at
+        remaining = _MIN_RESTORE_ANIMATION_SEC - elapsed
+        if remaining > 0:
+            self._pending_restore_feedback = feedback
+            QTimer.singleShot(int(remaining * 1000), self._display_deferred_restore_feedback)
+            return
+        self._display_restore_feedback(feedback)
 
     def _find_target_layer(self, event):
         """Find the QGIS layer matching an audit event.
@@ -1670,7 +1744,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.progress_timer.stop()
         self._stop_logo_activity()
         self.progress_bar.setVisible(False)
-        self.cancel_button.setText("Fermer")
+        self.cancel_button.setText(self.tr("Fermer"))
         self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
         self.restore_button.setEnabled(bool(self.selected_rows))
         self.recover_button.setEnabled(True)
@@ -1680,7 +1754,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.iface.messageBar().pushMessage("RecoverLand", message, QgisCompat.MSG_SUCCESS, 5)
             self.table_widget.clearSelection()
         else:
-            self.message_bar.pushMessage("Erreur de restauration", message, QgisCompat.MSG_CRITICAL, 0)
+            self.iface.messageBar().pushMessage(self.tr("Erreur de restauration"), message, QgisCompat.MSG_CRITICAL, 0)
     
     
     def showEvent(self, event):
@@ -1743,40 +1817,43 @@ class RecoverDialog(QDialog, LoggerMixin):
     def validate_inputs(self):
         """Validate inputs with exploitable messages (UX-H01)."""
         if self._journal is None or not self._journal.is_open:
-            self.message_bar.pushMessage(
-                "Attention",
-                "Aucun journal local disponible. "
-                "Ouvrez un projet QGIS pour activer l'enregistrement.",
+            self.iface.messageBar().pushMessage(
+                self.tr("Attention"),
+                self.tr(
+                    "Aucun journal local disponible. "
+                    "Ouvrez un projet QGIS pour activer l'enregistrement."
+                ),
                 QgisCompat.MSG_WARNING, 5)
             return False
         start_datetime = self.start_input.dateTime().toPyDateTime()
         end_datetime = self.end_input.dateTime().toPyDateTime()
         if start_datetime >= end_datetime:
-            self.message_bar.pushMessage(
-                "Attention",
-                "La date de debut doit etre anterieure a la date de fin. "
-                "Ajustez les dates ou utilisez un raccourci de periode.",
+            self.iface.messageBar().pushMessage(
+                self.tr("Attention"),
+                self.tr(
+                    "La date de debut doit etre anterieure a la date de fin. "
+                    "Ajustez les dates ou utilisez un raccourci de periode."
+                ),
                 QgisCompat.MSG_WARNING, 5)
             return False
         return True
 
-    @staticmethod
-    def _humanize_error(what: str, technical: str) -> str:
+    def _humanize_error(self, what: str, technical: str) -> str:
         """UX-H01: Convert technical error to user-friendly message."""
         lower = technical.lower()
         if "connection" in lower or "connect" in lower:
-            return (f"{what} : connexion au journal impossible. "
-                    "Verifiez que le fichier est accessible.")
+            return self.tr("{what} : connexion au journal impossible. "
+                    "Verifiez que le fichier est accessible.").format(what=what)
         if "locked" in lower or "busy" in lower:
-            return (f"{what} : le journal est verrouille par un autre processus. "
-                    "Fermez les autres instances et reessayez.")
+            return self.tr("{what} : le journal est verrouille par un autre processus. "
+                    "Fermez les autres instances et reessayez.").format(what=what)
         if "disk" in lower or "space" in lower or "full" in lower:
-            return (f"{what} : espace disque insuffisant. "
-                    "Liberez de l'espace ou purgez les anciens evenements.")
+            return self.tr("{what} : espace disque insuffisant. "
+                    "Liberez de l'espace ou purgez les anciens evenements.").format(what=what)
         if "permission" in lower or "access" in lower:
-            return (f"{what} : acces refuse au fichier journal. "
-                    "Verifiez les permissions du dossier.")
+            return self.tr("{what} : acces refuse au fichier journal. "
+                    "Verifiez les permissions du dossier.").format(what=what)
         if "corrupt" in lower or "malformed" in lower:
-            return (f"{what} : le journal semble endommage. "
-                    "Ouvrez la maintenance pour verifier l'integrite.")
+            return self.tr("{what} : le journal semble endommage. "
+                    "Ouvrez la maintenance pour verifier l'integrite.").format(what=what)
         return f"{what} : {technical}"

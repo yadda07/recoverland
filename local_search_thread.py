@@ -23,9 +23,9 @@ class LocalSearchThread(QThread):
     def run(self):
         conn = None
         try:
-            self.phase_changed.emit("Connexion au journal local...")
+            self.phase_changed.emit(self.tr("Connexion au journal local..."))
             conn = self._journal.create_read_connection()
-            self.phase_changed.emit("Recherche en cours...")
+            self.phase_changed.emit(self.tr("Recherche en cours..."))
             flog(f"LocalSearchThread: criteria fp={self._criteria.datasource_fingerprint} "
                  f"op={self._criteria.operation_type} "
                  f"start={self._criteria.start_date} end={self._criteria.end_date}")
