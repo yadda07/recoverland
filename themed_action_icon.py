@@ -43,7 +43,12 @@ class ThemedActionIconController(QObject):
 
     def eventFilter(self, watched, event):
         if watched is self._host_widget and event.type() == QtCompat.EVENT_PALETTE_CHANGE:
-            self.refresh()
+            if not getattr(self, '_refreshing', False):
+                self._refreshing = True
+                try:
+                    self.refresh()
+                finally:
+                    self._refreshing = False
         return False
 
 
@@ -62,7 +67,7 @@ def _resolve_window_text_color(host_widget):
     if host_widget is None:
         return None
     try:
-        return host_widget.palette().color(QtCompat.PALETTE_WINDOW_TEXT)
+        return host_widget.palette().windowText().color()
     except (AttributeError, RuntimeError, TypeError) as exc:
         flog(f"ThemedActionIconController palette error: {exc}", "WARNING")
         return None
