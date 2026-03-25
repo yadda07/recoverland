@@ -89,6 +89,7 @@ class QtCompat:
 
     # --- Qt.TextInteractionFlag ---
     TEXT_SELECTABLE_BY_MOUSE = _resolve_enum(Qt, 'TextInteractionFlag', 'TextSelectableByMouse')
+    USER_ROLE = _resolve_enum(Qt, 'ItemDataRole', 'UserRole')
 
     # --- Qt.PenStyle ---
     NO_PEN = _resolve_enum(Qt, 'PenStyle', 'NoPen')
