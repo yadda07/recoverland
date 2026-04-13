@@ -351,5 +351,148 @@ class TestWriteQueueUnicodeAndSpecialChars(unittest.TestCase):
         self.assertIsNotNone(tables)
 
 
+class TestWriteQueueConcurrentEnqueue(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
+        self.tmp_path = self.tmp.name
+        self.tmp.close()
+        conn = sqlite3.connect(self.tmp_path)
+        initialize_schema(conn)
+        conn.close()
+
+    def tearDown(self):
+        _cleanup(self.tmp_path)
+
+    def test_concurrent_enqueue_from_multiple_threads(self):
+        import threading
+        wq = WriteQueue()
+        wq.start(self.tmp_path)
+        errors = []
+
+        def enqueue_batch(batch_id):
+            try:
+                events = [
+                    _make_event(
+                        user_name=f"thread_{batch_id}",
+                        created_at=f"2025-01-{(i % 28) + 1:02d}T{batch_id % 24:02d}:00:00",
+                    )
+                    for i in range(50)
+                ]
+                wq.enqueue(events)
+            except Exception as e:
+                errors.append(str(e))
+
+        threads = [threading.Thread(target=enqueue_batch, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        wq.stop()
+        self.assertEqual(errors, [])
+        conn = sqlite3.connect(self.tmp_path)
+        count = conn.execute("SELECT COUNT(*) FROM audit_event").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 250)
+
+
+class TestWriteQueueEnqueueAfterStop(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
+        self.tmp_path = self.tmp.name
+        self.tmp.close()
+        conn = sqlite3.connect(self.tmp_path)
+        initialize_schema(conn)
+        conn.close()
+
+    def tearDown(self):
+        _cleanup(self.tmp_path)
+
+    def test_enqueue_before_start_no_crash(self):
+        wq = WriteQueue()
+        wq.enqueue([_make_event()])
+
+    def test_enqueue_after_stop_no_crash(self):
+        wq = WriteQueue()
+        wq.start(self.tmp_path)
+        wq.stop()
+        wq.enqueue([_make_event()])
+
+
+class TestWriteQueueAllFieldsPersisted(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False)
+        self.tmp_path = self.tmp.name
+        self.tmp.close()
+        conn = sqlite3.connect(self.tmp_path)
+        initialize_schema(conn)
+        conn.close()
+
+    def tearDown(self):
+        _cleanup(self.tmp_path)
+
+    def test_all_fields_roundtrip(self):
+        wkb = b'\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0?\x00\x00\x00\x00\x00\x00\x00@'
+        wq = WriteQueue()
+        wq.start(self.tmp_path)
+        wq.enqueue([_make_event(
+            project_fingerprint="proj_test",
+            datasource_fingerprint="ogr::full.gpkg",
+            layer_id_snapshot="lid_1",
+            layer_name_snapshot="full_layer",
+            provider_type="ogr",
+            feature_identity_json='{"fid": 99, "pk_field": "gid", "pk_value": 42}',
+            operation_type="UPDATE",
+            attributes_json='{"changed_only": {"x": {"old": 1, "new": 2}}}',
+            geometry_wkb=wkb,
+            geometry_type="Point",
+            crs_authid="EPSG:2154",
+            field_schema_json='[{"name": "gid", "type": "int"}]',
+            user_name="roundtrip_user",
+            session_id="sess_rt",
+            created_at="2025-06-15T14:30:00",
+        )])
+        wq.stop()
+        conn = sqlite3.connect(self.tmp_path)
+        row = conn.execute(
+            "SELECT project_fingerprint, datasource_fingerprint, layer_name_snapshot, "
+            "provider_type, operation_type, user_name, crs_authid, geometry_wkb "
+            "FROM audit_event"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row[0], "proj_test")
+        self.assertEqual(row[1], "ogr::full.gpkg")
+        self.assertEqual(row[2], "full_layer")
+        self.assertEqual(row[3], "ogr")
+        self.assertEqual(row[4], "UPDATE")
+        self.assertEqual(row[5], "roundtrip_user")
+        self.assertEqual(row[6], "EPSG:2154")
+        self.assertEqual(bytes(row[7]), wkb)
+
+
+class TestValidateEventEdgeCases(unittest.TestCase):
+
+    def test_whitespace_only_operation_type_rejected(self):
+        self.assertFalse(_validate_event(_make_event(operation_type="   ")))
+
+    def test_lowercase_operation_rejected(self):
+        self.assertFalse(_validate_event(_make_event(operation_type="delete")))
+        self.assertFalse(_validate_event(_make_event(operation_type="update")))
+        self.assertFalse(_validate_event(_make_event(operation_type="insert")))
+
+    def test_valid_operations_accepted(self):
+        self.assertTrue(_validate_event(_make_event(operation_type="DELETE")))
+        self.assertTrue(_validate_event(_make_event(operation_type="UPDATE")))
+        self.assertTrue(_validate_event(_make_event(operation_type="INSERT")))
+
+    def test_numeric_created_at_accepted(self):
+        self.assertTrue(_validate_event(_make_event(created_at=12345)))
+
+    def test_integer_operation_type_rejected(self):
+        self.assertFalse(_validate_event(_make_event(operation_type=42)))
+
+
 if __name__ == '__main__':
     unittest.main()

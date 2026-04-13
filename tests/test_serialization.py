@@ -190,5 +190,116 @@ class TestValuesEqual(unittest.TestCase):
         self.assertTrue(_values_equal("abc", "abc"))
 
 
+class TestSerializeEdgeCases(unittest.TestCase):
+
+    def test_negative_zero_float(self):
+        result = serialize_value(-0.0)
+        self.assertEqual(result, 0.0)
+
+    def test_very_large_int(self):
+        big = 2**63
+        self.assertEqual(serialize_value(big), big)
+
+    def test_very_small_float(self):
+        tiny = 1e-300
+        result = serialize_value(tiny)
+        self.assertAlmostEqual(result, tiny)
+
+    def test_nested_dict_in_list(self):
+        val = [{"a": [1, 2]}, {"b": {"c": 3}}]
+        result = serialize_value(val)
+        self.assertEqual(result, val)
+
+    def test_empty_list(self):
+        self.assertEqual(serialize_value([]), [])
+
+    def test_empty_bytes(self):
+        result = serialize_value(b'')
+        self.assertTrue(result.startswith("b64:"))
+
+    def test_large_bytes(self):
+        data = b'\xFF' * 100_000
+        result = serialize_value(data)
+        self.assertTrue(result.startswith("b64:"))
+        decoded = base64.b64decode(result[4:])
+        self.assertEqual(decoded, data)
+
+    def test_null_representation_becomes_none(self):
+        self.assertIsNone(serialize_value("NULL"))
+
+
+class TestDeserializeEdgeCases(unittest.TestCase):
+
+    def test_float_from_int_string(self):
+        result = deserialize_value("42", "double")
+        self.assertAlmostEqual(result, 42.0)
+
+    def test_bool_from_zero(self):
+        self.assertFalse(deserialize_value(0, "bool"))
+
+    def test_none_passthrough_all_types(self):
+        for t in ("int", "double", "bool", "str", "QByteArray"):
+            self.assertIsNone(deserialize_value(None, t))
+
+    def test_blob_non_b64_prefix_returns_none(self):
+        result = deserialize_value("regular string", "QByteArray")
+        self.assertIsNone(result)
+
+
+class TestUpdateDeltaEdgeCases(unittest.TestCase):
+
+    def test_empty_dicts_returns_none(self):
+        self.assertIsNone(compute_update_delta({}, {}))
+
+    def test_new_field_in_new_only(self):
+        old = {"a": 1}
+        new = {"a": 1, "b": 2}
+        result = compute_update_delta(old, new)
+        if result is not None:
+            parsed = json.loads(result)
+            self.assertIn("b", parsed["changed_only"])
+
+    def test_old_field_missing_in_new(self):
+        old = {"a": 1, "b": 2}
+        new = {"a": 1}
+        result = compute_update_delta(old, new)
+        if result is not None:
+            parsed = json.loads(result)
+            self.assertIn("b", parsed["changed_only"])
+
+    def test_none_to_none_no_change(self):
+        old = {"a": None}
+        new = {"a": None}
+        self.assertIsNone(compute_update_delta(old, new))
+
+    def test_nan_to_nan_no_change(self):
+        old = {"a": float('nan')}
+        new = {"a": float('nan')}
+        self.assertIsNone(compute_update_delta(old, new))
+
+    def test_all_audit_fields_ignored(self):
+        old = {"date modif": "a", "modif par": "x", "name": "A"}
+        new = {"date modif": "b", "modif par": "y", "name": "A"}
+        result = compute_update_delta(old, new, ["date modif", "modif par", "name"])
+        self.assertIsNone(result)
+
+
+class TestFullSnapshotEdgeCases(unittest.TestCase):
+
+    def test_empty_attrs(self):
+        result = json.loads(build_full_snapshot({}))
+        self.assertEqual(result["all_attributes"], {})
+
+    def test_attrs_with_none_values(self):
+        result = json.loads(build_full_snapshot({"a": None, "b": 1}))
+        self.assertIsNone(result["all_attributes"]["a"])
+        self.assertEqual(result["all_attributes"]["b"], 1)
+
+    def test_large_attrs(self):
+        attrs = {f"field_{i}": f"value_{i}" for i in range(1000)}
+        result = json.loads(build_full_snapshot(attrs))
+        self.assertEqual(len(result["all_attributes"]), 1000)
+
+
 if __name__ == '__main__':
     unittest.main()

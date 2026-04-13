@@ -284,5 +284,194 @@ class TestReconstructAttributes(unittest.TestCase):
         self.assertEqual(attrs, {})
 
 
+class TestSearchCombinedFilters(unittest.TestCase):
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        initialize_schema(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_layer_and_operation_filter(self):
+        _insert_event(self.conn, operation_type="DELETE", datasource_fingerprint="fp1")
+        _insert_event(self.conn, operation_type="UPDATE", datasource_fingerprint="fp1",
+                      attributes_json='{"changed_only": {}}')
+        _insert_event(self.conn, operation_type="DELETE", datasource_fingerprint="fp2")
+        criteria = SearchCriteria("fp1", None, "DELETE", None, None, None, 1, 100)
+        result = search_events(self.conn, criteria)
+        self.assertEqual(result.total_count, 1)
+
+    def test_user_and_date_filter(self):
+        _insert_event(self.conn, user_name="alice", created_at="2025-01-01T00:00:00")
+        _insert_event(self.conn, user_name="alice", created_at="2025-06-01T00:00:00")
+        _insert_event(self.conn, user_name="bob", created_at="2025-06-01T00:00:00")
+        criteria = SearchCriteria(
+            None, None, None, "alice", "2025-05-01T00:00:00", "2025-07-01T00:00:00", 1, 100)
+        result = search_events(self.conn, criteria)
+        self.assertEqual(result.total_count, 1)
+
+    def test_all_filters_combined(self):
+        _insert_event(self.conn, operation_type="DELETE", user_name="alice",
+                      datasource_fingerprint="fp1", created_at="2025-06-15T00:00:00")
+        _insert_event(self.conn, operation_type="UPDATE", user_name="alice",
+                      datasource_fingerprint="fp1", created_at="2025-06-15T00:00:00",
+                      attributes_json='{"changed_only": {}}')
+        _insert_event(self.conn, operation_type="DELETE", user_name="bob",
+                      datasource_fingerprint="fp1", created_at="2025-06-15T00:00:00")
+        criteria = SearchCriteria(
+            "fp1", None, "DELETE", "alice", "2025-06-01", "2025-07-01", 1, 100)
+        result = search_events(self.conn, criteria)
+        self.assertEqual(result.total_count, 1)
+        self.assertEqual(result.events[0].user_name, "alice")
+        self.assertEqual(result.events[0].operation_type, "DELETE")
+
+
+class TestSearchPaginationEdgeCases(unittest.TestCase):
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        initialize_schema(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_page_zero_treated_as_page_one(self):
+        _insert_event(self.conn)
+        criteria = SearchCriteria(None, None, None, None, None, None, 0, 100)
+        result = search_events(self.conn, criteria)
+        self.assertGreaterEqual(result.total_count, 1)
+
+    def test_negative_page_no_crash(self):
+        _insert_event(self.conn)
+        criteria = SearchCriteria(None, None, None, None, None, None, -1, 100)
+        result = search_events(self.conn, criteria)
+        self.assertIsNotNone(result)
+
+    def test_page_size_one(self):
+        for i in range(5):
+            _insert_event(self.conn, created_at=f"2025-01-{i+1:02d}T00:00:00")
+        criteria = SearchCriteria(None, None, None, None, None, None, 1, 1)
+        result = search_events(self.conn, criteria)
+        self.assertEqual(result.total_count, 5)
+        self.assertEqual(len(result.events), 1)
+
+    def test_page_beyond_total_returns_empty(self):
+        _insert_event(self.conn)
+        criteria = SearchCriteria(None, None, None, None, None, None, 999, 10)
+        result = search_events(self.conn, criteria)
+        self.assertEqual(result.total_count, 1)
+        self.assertEqual(len(result.events), 0)
+
+    def test_last_page_partial(self):
+        for i in range(7):
+            _insert_event(self.conn, created_at=f"2025-01-{i+1:02d}T00:00:00")
+        criteria = SearchCriteria(None, None, None, None, None, None, 2, 5)
+        result = search_events(self.conn, criteria)
+        self.assertEqual(result.total_count, 7)
+        self.assertEqual(len(result.events), 2)
+
+
+class TestSearchSqlInjection(unittest.TestCase):
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        initialize_schema(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_sql_injection_in_user_filter(self):
+        _insert_event(self.conn, user_name="safe_user")
+        toxic = "'; DROP TABLE audit_event; --"
+        criteria = SearchCriteria(None, None, None, toxic, None, None, 1, 100)
+        result = search_events(self.conn, criteria)
+        self.assertEqual(result.total_count, 0)
+        tables = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_event'"
+        ).fetchone()
+        self.assertIsNotNone(tables)
+
+    def test_sql_injection_in_datasource_filter(self):
+        _insert_event(self.conn)
+        toxic = "'; DROP TABLE audit_event; --"
+        criteria = SearchCriteria(toxic, None, None, None, None, None, 1, 100)
+        result = search_events(self.conn, criteria)
+        self.assertEqual(result.total_count, 0)
+
+    def test_sql_injection_in_date_filter(self):
+        _insert_event(self.conn, created_at="2025-06-15T00:00:00")
+        toxic = "'; DROP TABLE audit_event; --"
+        criteria = SearchCriteria(None, None, None, None, toxic, None, 1, 100)
+        search_events(self.conn, criteria)
+        tables = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_event'"
+        ).fetchone()
+        self.assertIsNotNone(tables)
+
+
+class TestGetEventByIdEdgeCases(unittest.TestCase):
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        initialize_schema(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_event_id_zero(self):
+        event = get_event_by_id(self.conn, 0)
+        self.assertIsNone(event)
+
+    def test_event_id_negative(self):
+        event = get_event_by_id(self.conn, -1)
+        self.assertIsNone(event)
+
+    def test_event_id_very_large(self):
+        event = get_event_by_id(self.conn, 2**53)
+        self.assertIsNone(event)
+
+    def test_event_roundtrip_all_fields(self):
+        _insert_event(self.conn, user_name="full_test", operation_type="UPDATE",
+                      attributes_json='{"changed_only": {"x": {"old": 1, "new": 2}}}',
+                      geometry_wkb=b'\x01\x02\x03', crs_authid="EPSG:2154")
+        event = get_event_by_id(self.conn, 1)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.user_name, "full_test")
+        self.assertEqual(event.operation_type, "UPDATE")
+        self.assertEqual(event.crs_authid, "EPSG:2154")
+        self.assertEqual(bytes(event.geometry_wkb), b'\x01\x02\x03')
+
+
+class TestSummarizeScopeEdgeCases(unittest.TestCase):
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        initialize_schema(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_empty_journal(self):
+        criteria = SearchCriteria(None, None, None, None, None, None, 1, 100)
+        summary = summarize_scope(self.conn, criteria)
+        self.assertEqual(summary.total_count, 0)
+        self.assertEqual(summary.selected_count, 0)
+        self.assertEqual(summary.update_count, 0)
+        self.assertEqual(summary.delete_count, 0)
+        self.assertEqual(summary.insert_count, 0)
+
+    def test_single_operation_type(self):
+        for i in range(5):
+            _insert_event(self.conn, operation_type="DELETE",
+                          created_at=f"2025-01-{i+1:02d}T00:00:00")
+        criteria = SearchCriteria(None, None, None, None, None, None, 1, 100)
+        summary = summarize_scope(self.conn, criteria)
+        self.assertEqual(summary.total_count, 5)
+        self.assertEqual(summary.delete_count, 5)
+        self.assertEqual(summary.update_count, 0)
+        self.assertEqual(summary.insert_count, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

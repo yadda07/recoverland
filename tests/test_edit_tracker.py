@@ -68,6 +68,7 @@ class _FakeLayer:
         self._provider = _FakeProvider()
         self.editingStarted = _Signal()
         self.beforeCommitChanges = _Signal()
+        self.committedFeaturesAdded = _Signal()
         self.afterCommitChanges = _Signal()
         self.afterRollBack = _Signal()
 
@@ -121,6 +122,166 @@ class TestEditTracker(unittest.TestCase):
 
         self.assertIn("layer_xyz", tracker._buffers)
         self.assertEqual(captured, [("layer_xyz", "layer_xyz")])
+
+
+class TestEditTrackerLifecycle(unittest.TestCase):
+
+    def test_activate_deactivate(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        self.assertFalse(tracker.is_active)
+        tracker.activate()
+        self.assertTrue(tracker.is_active)
+        tracker.deactivate()
+        self.assertFalse(tracker.is_active)
+
+    def test_inactive_tracker_ignores_editing_started(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        layer = _FakeLayer("l1")
+        tracker.connect_layer(layer)
+        layer.editingStarted.emit()
+        self.assertNotIn("l1", tracker._buffers)
+
+    def test_active_tracker_creates_buffer_on_editing_started(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        layer = _FakeLayer("l1")
+        tracker.connect_layer(layer)
+        layer.editingStarted.emit()
+        self.assertIn("l1", tracker._buffers)
+
+    def test_rollback_clears_buffer(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        layer = _FakeLayer("l_rb")
+        tracker.connect_layer(layer)
+        layer.editingStarted.emit()
+        self.assertIn("l_rb", tracker._buffers)
+        layer.afterRollBack.emit()
+        self.assertNotIn("l_rb", tracker._buffers)
+
+    def test_rollback_without_buffer_no_crash(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        layer = _FakeLayer("l_no_buf")
+        tracker.connect_layer(layer)
+        layer.afterRollBack.emit()
+
+    def test_disconnect_layer_removes_all_state(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        layer = _FakeLayer("l_disc")
+        tracker.connect_layer(layer)
+        layer.editingStarted.emit()
+        self.assertIn("l_disc", tracker._connected_layers)
+        self.assertIn("l_disc", tracker._buffers)
+        tracker.disconnect_layer(layer)
+        self.assertNotIn("l_disc", tracker._connected_layers)
+        self.assertNotIn("l_disc", tracker._buffers)
+        self.assertNotIn("l_disc", tracker._layer_fingerprints)
+
+    def test_disconnect_all(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        for lid in ("l1", "l2", "l3"):
+            layer = _FakeLayer(lid)
+            tracker.connect_layer(layer)
+            layer.editingStarted.emit()
+        self.assertEqual(len(tracker._connected_layers), 3)
+        tracker.disconnect_all()
+        self.assertEqual(len(tracker._connected_layers), 0)
+        self.assertEqual(len(tracker._buffers), 0)
+
+    def test_disconnect_layer_by_id(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        layer = _FakeLayer("l_byid")
+        tracker.connect_layer(layer)
+        layer.editingStarted.emit()
+        tracker.disconnect_layer_by_id("l_byid")
+        self.assertNotIn("l_byid", tracker._connected_layers)
+
+    def test_connect_layer_idempotent(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        layer = _FakeLayer("l_idem")
+        tracker.connect_layer(layer)
+        tracker.connect_layer(layer)
+        self.assertEqual(
+            sum(1 for k in tracker._connected_layers if k == "l_idem"), 1)
+
+
+class TestEditTrackerSuppression(unittest.TestCase):
+
+    def test_suppress_unsuppress_cycle(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        self.assertFalse(tracker.is_suppressed)
+        tracker.suppress()
+        self.assertTrue(tracker.is_suppressed)
+        tracker.unsuppress()
+        self.assertFalse(tracker.is_suppressed)
+
+    def test_suppressed_ignores_editing_started(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        tracker.suppress()
+        layer = _FakeLayer("l_sup")
+        tracker.connect_layer(layer)
+        layer.editingStarted.emit()
+        self.assertNotIn("l_sup", tracker._buffers)
+
+    def test_suppressed_ignores_before_commit(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.activate()
+        layer = _FakeLayer("l_sup2")
+        tracker.connect_layer(layer)
+        layer.editingStarted.emit()
+        tracker.suppress()
+        captured = []
+        tracker._capture_edit_buffer_state = lambda *a: captured.append(True)
+        layer.beforeCommitChanges.emit(True)
+        self.assertEqual(captured, [])
+
+    def test_double_suppress_no_crash(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker.suppress()
+        tracker.suppress()
+        self.assertTrue(tracker.is_suppressed)
+        tracker.unsuppress()
+        self.assertFalse(tracker.is_suppressed)
+
+
+class TestEditTrackerSessionCounter(unittest.TestCase):
+
+    def test_initial_count_zero(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        self.assertEqual(tracker.session_event_count, 0)
+
+    def test_reset_session_count(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        tracker._session_event_count = 42
+        tracker.reset_session_count()
+        self.assertEqual(tracker.session_event_count, 0)
+
+    def test_mass_delete_threshold_constant(self):
+        self.assertEqual(EditSessionTracker._MASS_DELETE_THRESHOLD, 100)
+
+    def test_memory_hard_limit_constant(self):
+        self.assertEqual(EditSessionTracker._MEMORY_HARD_LIMIT_MB, 500)
+
+
+class TestEditTrackerCallbacks(unittest.TestCase):
+
+    def test_commit_callback_setter(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        called = []
+        tracker.set_commit_callback(lambda *a: called.append(a))
+        self.assertIsNotNone(tracker._on_commit_callback)
+
+    def test_overflow_callback_setter(self):
+        tracker = EditSessionTracker(_DummyWriteQueue(), None)
+        called = []
+        tracker.set_overflow_callback(lambda: called.append(True))
+        self.assertIsNotNone(tracker._on_overflow_callback)
 
 
 if __name__ == '__main__':

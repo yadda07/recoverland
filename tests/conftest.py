@@ -84,7 +84,19 @@ if 'qgis' not in sys.modules:
 
     class _FakeQgsExpression:
         def __init__(self, expr_str=''):
-            pass
+            self._expr = expr_str
+        @staticmethod
+        def quotedColumnRef(col):
+            return f'"{col}"'
+        @staticmethod
+        def quotedValue(val):
+            return f"'{val}'"
+        def hasParserError(self):
+            return False
+        def parserErrorString(self):
+            return ''
+        def prepare(self, fields):
+            return True
 
     class _FakeQgsAuthMethodConfig:
         def configMap(self):
@@ -147,9 +159,32 @@ if 'qgis' not in sys.modules:
     qgis_core.QgsGeometry = _FakeQgsGeometry
     qgis_core.QgsFields = _FakeQgsFields
     qgis_core.QgsFeature = _FakeQgsFeature
+    class _FakeQgsVectorDataProvider:
+        class Capability:
+            AddFeatures = 1
+            DeleteFeatures = 2
+            ChangeAttributeValues = 4
+            AddAttributes = 8
+            DeleteAttributes = 16
+            ChangeGeometries = 0x800
+        AddFeatures = 1
+        DeleteFeatures = 2
+        ChangeAttributeValues = 4
+        AddAttributes = 8
+        DeleteAttributes = 16
+        ChangeGeometries = 0x800
+
     qgis_core.QgsVectorLayer = _FakeQgsVectorLayer
+    qgis_core.QgsVectorDataProvider = _FakeQgsVectorDataProvider
     qgis_core.QgsDataSourceUri = _FakeQgsDataSourceUri
 
+    def _core_getattr(name):
+        """Auto-stub any missing qgis.core type as an empty class."""
+        cls = type(name, (), {'__init__': lambda self, *a, **kw: None})
+        setattr(qgis_core, name, cls)
+        return cls
+
+    qgis_core.__getattr__ = _core_getattr
     qgis_mock.core = qgis_core
     sys.modules['qgis'] = qgis_mock
     sys.modules['qgis.core'] = qgis_core
@@ -203,6 +238,22 @@ if 'qgis' not in sys.modules:
         class WidgetAttribute:
             WA_TransparentForMouseEvents = 76
         WA_TransparentForMouseEvents = 76
+        class Orientation:
+            Horizontal = 1
+            Vertical = 2
+        Horizontal = 1
+        Vertical = 2
+        class DateFormat:
+            ISODate = 1
+        ISODate = 1
+        class ItemFlag:
+            ItemIsUserCheckable = 16
+        ItemIsUserCheckable = 16
+        class CheckState:
+            Unchecked = 0
+            Checked = 2
+        Unchecked = 0
+        Checked = 2
 
     class _QEvent:
         class Type:
@@ -320,8 +371,15 @@ if 'qgis' not in sys.modules:
                      'QComboBox', 'QProgressBar', 'QFormLayout', 'QCheckBox',
                      'QApplication', 'QTableWidget', 'QTableWidgetItem',
                      'QLineEdit', 'QFileDialog', 'QGraphicsDropShadowEffect',
-                     'QWidget', 'QAction', 'QSpinBox', 'QGroupBox'):
+                     'QWidget', 'QAction', 'QSpinBox', 'QGroupBox',
+                     'QButtonGroup', 'QScrollArea', 'QFrame', 'QMenu',
+                     'QShortcut', 'QStackedWidget', 'QSlider'):
         setattr(qtwidgets, cls_name, type(cls_name, (), {}))
+    def _widgets_getattr(name):
+        cls = type(name, (), {'__init__': lambda self, *a, **kw: None})
+        setattr(qtwidgets, name, cls)
+        return cls
+    qtwidgets.__getattr__ = _widgets_getattr
     sys.modules['qgis.PyQt.QtWidgets'] = qtwidgets
 
     # QtGui stub
@@ -345,8 +403,20 @@ if 'qgis' not in sys.modules:
         Mid = 5
     qtgui.QPainter = _QPainter
     qtgui.QPalette = _QPalette
-    for cls_name in ('QIcon', 'QColor', 'QLinearGradient', 'QAction'):
-        setattr(qtgui, cls_name, type(cls_name, (), {}))
+    class _FakeQColor:
+        def __init__(self, *args, **kwargs):
+            self._r = args[0] if len(args) > 0 else 0
+            self._g = args[1] if len(args) > 1 else 0
+            self._b = args[2] if len(args) > 2 else 0
+            self._a = args[3] if len(args) > 3 else 255
+        def red(self): return self._r
+        def green(self): return self._g
+        def blue(self): return self._b
+        def alpha(self): return self._a
+        def name(self): return '#%02x%02x%02x' % (self._r, self._g, self._b)
+    qtgui.QColor = _FakeQColor
+    for cls_name in ('QIcon', 'QLinearGradient', 'QAction'):
+        setattr(qtgui, cls_name, type(cls_name, (), {'__init__': lambda self, *a, **kw: None}))
     sys.modules['qgis.PyQt.QtGui'] = qtgui
 
     # QtSvg stub
@@ -358,6 +428,13 @@ if 'qgis' not in sys.modules:
     qgis_gui = types.ModuleType('qgis.gui')
     for cls_name in ('QgsCollapsibleGroupBox', 'QgsDateTimeEdit', 'QgsMessageBar'):
         setattr(qgis_gui, cls_name, type(cls_name, (), {}))
+
+    def _gui_getattr(name):
+        cls = type(name, (), {'__init__': lambda self, *a, **kw: None})
+        setattr(qgis_gui, name, cls)
+        return cls
+
+    qgis_gui.__getattr__ = _gui_getattr
     sys.modules['qgis.gui'] = qgis_gui
     qgis_mock.gui = qgis_gui
 

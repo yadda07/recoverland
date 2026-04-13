@@ -32,10 +32,15 @@ class TestResolveJournalPath(unittest.TestCase):
         self.assertIn("audit_", result)
         self.assertTrue(result.endswith(".sqlite"))
 
-    def test_unsaved_project_deterministic(self):
-        a = _resolve_journal_path("", "/fake/profile")
-        b = _resolve_journal_path("", "/fake/profile")
+    def test_unsaved_project_same_token_same_path(self):
+        a = _resolve_journal_path("", "/fake/profile", "token-a")
+        b = _resolve_journal_path("", "/fake/profile", "token-a")
         self.assertEqual(a, b)
+
+    def test_unsaved_project_different_tokens_different_paths(self):
+        a = _resolve_journal_path("", "/fake/profile", "token-a")
+        b = _resolve_journal_path("", "/fake/profile", "token-b")
+        self.assertNotEqual(a, b)
 
 
 class TestJournalForSavedProject(unittest.TestCase):
@@ -57,6 +62,19 @@ class TestJournalForUnsavedProject(unittest.TestCase):
         a = _journal_for_unsaved_project("/profile", "hint1")
         b = _journal_for_unsaved_project("/profile", "hint2")
         self.assertNotEqual(a, b)
+
+    def test_empty_hint_uses_session_token(self):
+        result = _journal_for_unsaved_project("/profile", "", "session-a")
+        import hashlib
+        expected_hint = "session-a"
+        expected_fp = hashlib.sha256(expected_hint.encode("utf-8")).hexdigest()[:16]
+        self.assertIn(expected_fp, result)
+
+    def test_empty_hints_different_tokens_differ(self):
+        import hashlib
+        fp_a = hashlib.sha256("session_a".encode()).hexdigest()[:16]
+        fp_b = hashlib.sha256("session_b".encode()).hexdigest()[:16]
+        self.assertNotEqual(fp_a, fp_b)
 
 
 class TestJournalManager(unittest.TestCase):
@@ -110,6 +128,17 @@ class TestJournalManager(unittest.TestCase):
                 write_conn = jm.create_write_connection()
                 self.assertIsNotNone(write_conn)
                 write_conn.close()
+            finally:
+                jm.close()
+
+    def test_unsaved_reopen_uses_new_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jm = JournalManager()
+            try:
+                first = jm.open_for_project("", tmpdir)
+                jm.close()
+                second = jm.open_for_project("", tmpdir)
+                self.assertNotEqual(first, second)
             finally:
                 jm.close()
 

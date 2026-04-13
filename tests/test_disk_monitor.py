@@ -12,8 +12,8 @@ from recoverland.core.disk_monitor import (
     DiskStatus,
     _find_existing_parent,
     _extract_volume,
-    _fmt,
 )
+from recoverland.core.health_monitor import _format_size
 
 
 class TestCheckDiskForPath:
@@ -107,31 +107,31 @@ class TestExtractVolume:
 class TestFmt:
 
     def test_bytes(self):
-        assert _fmt(500) == "500 o"
+        assert _format_size(500) == "500 o"
 
     def test_zero(self):
-        assert _fmt(0) == "0 o"
+        assert _format_size(0) == "0 o"
 
     def test_kilobytes(self):
-        result = _fmt(2048)
+        result = _format_size(2048)
         assert "Ko" in result
 
     def test_megabytes(self):
-        result = _fmt(100 * 1024 * 1024)
+        result = _format_size(100 * 1024 * 1024)
         assert "Mo" in result
 
     def test_gigabytes(self):
-        result = _fmt(5 * 1024 * 1024 * 1024)
+        result = _format_size(5 * 1024 * 1024 * 1024)
         assert "Go" in result
 
     def test_exact_1kb(self):
-        result = _fmt(1024)
+        result = _format_size(1024)
         assert "Ko" in result
 
     def test_exact_1mb(self):
-        result = _fmt(1024 * 1024)
+        result = _format_size(1024 * 1024)
         assert "Mo" in result
 
     def test_exact_1gb(self):
-        result = _fmt(1024 * 1024 * 1024)
+        result = _format_size(1024 * 1024 * 1024)
         assert "Go" in result

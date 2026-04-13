@@ -118,5 +118,104 @@ class TestFormatDriftMessage(unittest.TestCase):
         self.assertIn("val", msg)
 
 
+class TestSchemaDriftEdgeCases(unittest.TestCase):
+
+    def _make_schema(self, fields):
+        return [FieldInfo(name=f[0], type_name=f[1], length=0, precision=0) for f in fields]
+
+    def test_empty_historical_empty_current(self):
+        drift = compare_schemas([], [])
+        self.assertTrue(drift.is_compatible)
+        self.assertEqual(len(drift.matched), 0)
+        self.assertEqual(len(drift.missing_in_current), 0)
+        self.assertEqual(len(drift.added_in_current), 0)
+
+    def test_empty_historical_non_empty_current(self):
+        current = self._make_schema([("gid", "integer")])
+        drift = compare_schemas([], current)
+        self.assertTrue(drift.is_compatible)
+        self.assertIn("gid", drift.added_in_current)
+
+    def test_non_empty_historical_empty_current(self):
+        historical = self._make_schema([("gid", "integer")])
+        drift = compare_schemas(historical, [])
+        self.assertFalse(drift.is_compatible)
+        self.assertIn("gid", drift.missing_in_current)
+
+    def test_many_fields_all_matched(self):
+        fields = [(f"field_{i}", "varchar") for i in range(100)]
+        schema = self._make_schema(fields)
+        drift = compare_schemas(schema, schema)
+        self.assertTrue(drift.is_compatible)
+        self.assertEqual(len(drift.matched), 100)
+
+    def test_field_order_does_not_affect_compatibility(self):
+        historical = self._make_schema([("a", "int"), ("b", "text"), ("c", "double")])
+        current = self._make_schema([("c", "double"), ("a", "int"), ("b", "text")])
+        drift = compare_schemas(historical, current)
+        self.assertTrue(drift.is_compatible)
+        self.assertEqual(len(drift.matched), 3)
+
+    def test_multiple_type_changes(self):
+        historical = self._make_schema([("a", "integer"), ("b", "varchar"), ("c", "double")])
+        current = self._make_schema([("a", "boolean"), ("b", "integer"), ("c", "double")])
+        drift = compare_schemas(historical, current)
+        self.assertFalse(drift.is_compatible)
+        self.assertGreaterEqual(len(drift.type_changed), 1)
+
+    def test_simultaneous_add_and_remove(self):
+        historical = self._make_schema([("a", "int"), ("old", "text")])
+        current = self._make_schema([("a", "int"), ("new", "text")])
+        drift = compare_schemas(historical, current)
+        self.assertFalse(drift.is_compatible)
+        self.assertIn("old", drift.missing_in_current)
+        self.assertIn("new", drift.added_in_current)
+
+
+class TestParseFieldSchemaEdgeCases(unittest.TestCase):
+
+    def test_json_with_extra_keys_no_crash(self):
+        schema_json = json.dumps([
+            {"name": "gid", "type": "integer", "length": 0, "precision": 0, "extra": True}
+        ])
+        result = parse_field_schema(schema_json)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].name, "gid")
+
+    def test_json_missing_optional_fields(self):
+        schema_json = json.dumps([{"name": "gid", "type": "integer"}])
+        result = parse_field_schema(schema_json)
+        self.assertEqual(len(result), 1)
+
+    def test_json_number_literal(self):
+        self.assertEqual(parse_field_schema("42"), [])
+
+    def test_json_string_literal(self):
+        self.assertEqual(parse_field_schema('"hello"'), [])
+
+    def test_empty_string(self):
+        self.assertEqual(parse_field_schema(""), [])
+
+
+class TestBuildFieldMappingEdgeCases(unittest.TestCase):
+
+    def test_empty_matched(self):
+        drift = DriftReport(
+            matched=[], missing_in_current=[], added_in_current=[],
+            type_changed={}, is_compatible=True,
+        )
+        mapping = build_field_mapping(drift, [])
+        self.assertEqual(mapping, {})
+
+    def test_type_changed_field_still_mapped(self):
+        historical = [FieldInfo("a", "int", 0, 0)]
+        drift = DriftReport(
+            matched=["a"], missing_in_current=[], added_in_current=[],
+            type_changed={"a": "int -> boolean"}, is_compatible=False,
+        )
+        mapping = build_field_mapping(drift, historical)
+        self.assertIn("a", mapping)
+
+
 if __name__ == '__main__':
     unittest.main()
