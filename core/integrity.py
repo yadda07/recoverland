@@ -10,7 +10,7 @@ import sqlite3
 from typing import NamedTuple, List
 
 from .sqlite_schema import apply_pragmas, get_schema_version, CURRENT_SCHEMA_VERSION
-from .logger import flog
+from .logger import flog, timed_op
 
 _PENDING_FILENAME = "recoverland_pending.json"
 
@@ -21,7 +21,7 @@ class IntegrityResult(NamedTuple):
     recovered_events: int
 
 
-def check_journal_integrity(db_path: str) -> IntegrityResult:
+def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult:
     """Run all integrity checks on a journal file.
 
     Returns IntegrityResult with health status and any issues found.
@@ -29,24 +29,25 @@ def check_journal_integrity(db_path: str) -> IntegrityResult:
     issues: List[str] = []
     recovered = 0
 
-    if not os.path.isfile(db_path):
-        return IntegrityResult(False, ["Journal file not found"], 0)
+    with timed_op("check_journal_integrity", trace_id):
+        if not os.path.isfile(db_path):
+            return IntegrityResult(False, ["Journal file not found"], 0)
 
-    conn = None
-    try:
-        conn = sqlite3.connect(db_path)
-        apply_pragmas(conn)
+        conn = None
+        try:
+            conn = sqlite3.connect(db_path)
+            apply_pragmas(conn)
 
-        _check_sqlite_integrity(conn, issues)
-        _check_wal_state(conn, issues)
-        _check_schema_version(conn, issues)
-        recovered = _recover_pending_events(db_path, conn)
+            _check_sqlite_integrity(conn, issues)
+            _check_wal_state(conn, issues)
+            _check_schema_version(conn, issues)
+            recovered = _recover_pending_events(db_path, conn)
 
-    except sqlite3.Error as e:
-        issues.append(f"Cannot open journal: {e}")
-    finally:
-        if conn:
-            conn.close()
+        except sqlite3.Error as e:
+            issues.append(f"Cannot open journal: {e}")
+        finally:
+            if conn:
+                conn.close()
 
     is_healthy = len(issues) == 0
     return IntegrityResult(is_healthy, issues, recovered)
@@ -95,7 +96,15 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> int:
             os.remove(pending_path)
             return 0
 
-        count = _insert_pending_events(conn, events)
+        count, remaining = _insert_pending_events(conn, events)
+        if remaining:
+            _rewrite_pending_events(pending_path, remaining)
+            flog(
+                f"integrity: recovered {count} pending events, kept {len(remaining)} unrecovered",
+                "WARNING",
+            )
+            return count
+
         os.remove(pending_path)
         flog(f"integrity: recovered {count} pending events")
         return count
@@ -105,24 +114,28 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> int:
         return 0
 
 
-def _insert_pending_events(conn: sqlite3.Connection, events: list) -> int:
-    """Insert recovered events into audit_event table."""
+def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
+    """Insert recovered events into audit_event table (v2 schema)."""
     sql = """
         INSERT INTO audit_event (
             project_fingerprint, datasource_fingerprint, layer_id_snapshot,
             layer_name_snapshot, provider_type, feature_identity_json,
             operation_type, attributes_json, geometry_wkb, geometry_type,
             crs_authid, field_schema_json, user_name, session_id,
-            created_at, restored_from_event_id
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            created_at, restored_from_event_id,
+            entity_fingerprint, event_schema_version, new_geometry_wkb
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
     count = 0
+    remaining = []
     with conn:
         for evt in events:
             if not isinstance(evt, dict):
+                flog("integrity: skip pending event with invalid payload", "WARNING")
+                remaining.append(evt)
                 continue
             try:
-                restored = _restore_event_from_json(evt)
+                restored = _restore_event_from_json(dict(evt))
                 conn.execute(sql, (
                     restored.get("project_fingerprint", ""),
                     restored.get("datasource_fingerprint", ""),
@@ -140,17 +153,36 @@ def _insert_pending_events(conn: sqlite3.Connection, events: list) -> int:
                     evt.get("session_id"),
                     evt.get("created_at", ""),
                     evt.get("restored_from_event_id"),
+                    evt.get("entity_fingerprint"),
+                    evt.get("event_schema_version"),
+                    restored.get("new_geometry_wkb"),
                 ))
                 count += 1
             except sqlite3.Error as e:
                 flog(f"integrity: skip pending event: {e}", "WARNING")
-    return count
+                remaining.append(evt)
+    return count, remaining
+
+
+def _rewrite_pending_events(pending_path: str, events: list) -> None:
+    with open(pending_path, "w", encoding="utf-8") as f:
+        json.dump(events, f, ensure_ascii=False)
 
 
 def save_pending_events(db_path: str, events: list) -> None:
-    """Save unwritten events to a recovery file for next startup."""
+    """Save unwritten events to a recovery file for next startup.
+
+    Checks available disk space before writing to avoid silent failure.
+    """
     pending_path = _get_pending_path(db_path)
     try:
+        import shutil
+        parent = os.path.dirname(pending_path)
+        if os.path.exists(parent):
+            usage = shutil.disk_usage(parent)
+            if usage.free < 10 * 1024 * 1024:
+                flog(f"integrity: skip pending save, disk free={usage.free} < 10 MB", "ERROR")
+                return
         serializable = []
         for evt in events:
             if hasattr(evt, '_asdict'):
@@ -224,17 +256,19 @@ def get_journal_health_report(db_path: str) -> JournalHealthReport:
 def _prepare_event_for_json(d: dict) -> dict:
     """Convert bytes fields to base64 strings for JSON serialization."""
     out = dict(d)
-    wkb = out.get("geometry_wkb")
-    if isinstance(wkb, (bytes, bytearray)):
-        out["geometry_wkb"] = "b64:" + base64.b64encode(bytes(wkb)).decode("ascii")
+    for key in ("geometry_wkb", "new_geometry_wkb"):
+        wkb = out.get(key)
+        if isinstance(wkb, (bytes, bytearray)):
+            out[key] = "b64:" + base64.b64encode(bytes(wkb)).decode("ascii")
     return out
 
 
 def _restore_event_from_json(d: dict) -> dict:
     """Convert base64-encoded fields back to bytes after JSON deserialization."""
-    wkb = d.get("geometry_wkb")
-    if isinstance(wkb, str) and wkb.startswith("b64:"):
-        d["geometry_wkb"] = base64.b64decode(wkb[4:])
+    for key in ("geometry_wkb", "new_geometry_wkb"):
+        wkb = d.get(key)
+        if isinstance(wkb, str) and wkb.startswith("b64:"):
+            d[key] = base64.b64decode(wkb[4:])
     return d
 
 

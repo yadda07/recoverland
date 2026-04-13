@@ -12,6 +12,7 @@ from typing import Optional
 
 _ENVVAR_NAME = "RECOVERLAND_USER"
 _FALLBACK_USER = "unknown"
+_MAX_USER_LEN = 200
 _cached_user: Optional[str] = None
 
 
@@ -30,18 +31,25 @@ def resolve_user_name(plugin_config_user: Optional[str] = None) -> str:
     return _cached_user
 
 
+def _sanitize(name: str) -> str:
+    """Strip control characters and limit length for safe storage."""
+    clean = "".join(ch for ch in name if ch.isprintable())
+    clean = clean.strip()[:_MAX_USER_LEN]
+    return clean if clean else _FALLBACK_USER
+
+
 def _resolve_from_sources() -> str:
     env_user = os.environ.get(_ENVVAR_NAME, "").strip()
     if env_user:
-        return env_user
+        return _sanitize(env_user)
 
     os_user = _get_os_login()
     if os_user:
-        return os_user
+        return _sanitize(os_user)
 
     profile_user = _get_qgis_profile_name()
     if profile_user:
-        return profile_user
+        return _sanitize(profile_user)
 
     return _FALLBACK_USER
 

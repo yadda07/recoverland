@@ -17,6 +17,7 @@ from .logger import flog
 _MAX_BATCH_SIZE = 500
 _FLUSH_TIMEOUT_SEC = 10
 _QUEUE_WARNING_THRESHOLD = 10000
+_QUEUE_EARLY_WARNING = 40000
 _QUEUE_HARD_LIMIT = 50000
 _BATCH_RETRY_COUNT = 3
 _BATCH_RETRY_BASE_SEC = 0.2
@@ -28,8 +29,9 @@ _INSERT_SQL = """
         layer_name_snapshot, provider_type, feature_identity_json,
         operation_type, attributes_json, geometry_wkb, geometry_type,
         crs_authid, field_schema_json, user_name, session_id,
-        created_at, restored_from_event_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        created_at, restored_from_event_id,
+        entity_fingerprint, event_schema_version, new_geometry_wkb
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -42,6 +44,8 @@ class WriteQueue:
         self._db_path: Optional[str] = None
         self._stop_event = threading.Event()
         self._running = False
+        self._early_warning_emitted = False
+        self._on_early_warning = None
 
     def start(self, db_path: str) -> None:
         """Start the writer thread for the given database path."""
@@ -71,24 +75,36 @@ class WriteQueue:
         self._thread = None
         flog("WriteQueue: writer thread stopped")
 
-    def enqueue(self, events: List[AuditEvent]) -> None:
+    def enqueue(self, events: List[AuditEvent]) -> bool:
         """Add events to the write queue.
 
-        Validates JSON fields before accepting. Applies back-pressure
-        if the queue exceeds the hard limit (drops events with a log).
+        Validates JSON fields before accepting. Returns False and saves
+        events to the pending recovery file if the queue exceeds the
+        hard limit, signaling that tracking should be halted.
         """
         qsize = self._queue.qsize()
         if qsize > _QUEUE_HARD_LIMIT:
             flog(f"WriteQueue: queue size={qsize} exceeds hard limit, "
-                 f"dropping {len(events)} events", "ERROR")
-            return
+                 f"saving {len(events)} events to pending recovery", "ERROR")
+            self._save_lost_events(events)
+            return False
         for event in events:
             if not _validate_event(event):
                 continue
             self._queue.put(event)
         qsize = self._queue.qsize()
-        if qsize > _QUEUE_WARNING_THRESHOLD:
+        if qsize > _QUEUE_EARLY_WARNING and not self._early_warning_emitted:
+            self._early_warning_emitted = True
+            flog(f"WriteQueue: queue size={qsize} at 80% of hard limit", "WARNING")
+            if self._on_early_warning is not None:
+                self._on_early_warning()
+        elif qsize > _QUEUE_WARNING_THRESHOLD:
             flog(f"WriteQueue: queue size={qsize} exceeds threshold", "WARNING")
+        return True
+
+    def set_early_warning_callback(self, callback) -> None:
+        """Set callback() invoked once when queue reaches 80% of hard limit."""
+        self._on_early_warning = callback
 
     @property
     def pending_count(self) -> int:
@@ -231,4 +247,7 @@ def _event_to_row(event: AuditEvent) -> tuple:
         event.session_id,
         event.created_at,
         event.restored_from_event_id,
+        event.entity_fingerprint,
+        event.event_schema_version,
+        event.new_geometry_wkb,
     )

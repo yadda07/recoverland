@@ -9,6 +9,7 @@ from typing import NamedTuple
 from qgis.PyQt.QtCore import QCoreApplication
 
 from .logger import flog
+from .health_monitor import _format_size
 
 
 def _tr(msg):
@@ -59,12 +60,12 @@ def format_disk_message(status: DiskStatus) -> str:
             "Espace disque critique sur {volume} : "
             "{free} libre. "
             "L'enregistrement a ete desactive pour eviter la perte de donnees."
-        ).format(volume=status.volume_path, free=_fmt(status.free_bytes))
+        ).format(volume=status.volume_path, free=_format_size(status.free_bytes))
     if status.is_low:
         return _tr(
             "Espace disque faible sur {volume} : "
             "{free} libre."
-        ).format(volume=status.volume_path, free=_fmt(status.free_bytes))
+        ).format(volume=status.volume_path, free=_format_size(status.free_bytes))
     return ""
 
 
@@ -83,13 +84,3 @@ def _find_existing_parent(path: str) -> str:
 def _extract_volume(path: str) -> str:
     drive = os.path.splitdrive(os.path.abspath(path))[0]
     return drive if drive else "/"
-
-
-def _fmt(size_bytes: int) -> str:
-    if size_bytes < 1024:
-        return _tr("{size} o").format(size=size_bytes)
-    if size_bytes < 1024 * 1024:
-        return _tr("{size} Ko").format(size=f"{size_bytes / 1024:.0f}")
-    if size_bytes < 1024 * 1024 * 1024:
-        return _tr("{size} Mo").format(size=f"{size_bytes / (1024 * 1024):.0f}")
-    return _tr("{size} Go").format(size=f"{size_bytes / (1024 * 1024 * 1024):.1f}")

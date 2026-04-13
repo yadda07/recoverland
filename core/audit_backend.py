@@ -25,6 +25,9 @@ class AuditEvent(NamedTuple):
     session_id: Optional[str]
     created_at: str
     restored_from_event_id: Optional[int]
+    entity_fingerprint: Optional[str] = None
+    event_schema_version: Optional[int] = None
+    new_geometry_wkb: Optional[bytes] = None
 
 
 class SearchCriteria(NamedTuple):
@@ -54,6 +57,7 @@ class RestoreReport(NamedTuple):
     succeeded: List[int]
     failed: Dict[int, str]
     total_requested: int
+    trace_events: tuple = ()
 
 
 class AuditBackend(ABC):

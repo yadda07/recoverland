@@ -40,6 +40,7 @@ class EditSessionBuffer:
         self._modified: Dict[int, FeatureSnapshot] = {}
         self._deleted: Dict[int, FeatureSnapshot] = {}
         self._added_fids: Set[int] = set()
+        self._committed_additions: List[Dict] = []
         self._approx_bytes = 0
 
     @property
@@ -80,8 +81,15 @@ class EditSessionBuffer:
         self._approx_bytes += _estimate_snapshot_size(snapshot)
 
     def record_addition(self, fid: int) -> None:
-        """Track a newly added feature ID."""
+        """Track a newly added feature ID (temporary FID from edit buffer)."""
         self._added_fids.add(fid)
+
+    def record_committed_addition(self, data: Dict) -> None:
+        """Store full feature data captured from committedFeaturesAdded signal."""
+        self._committed_additions.append(data)
+
+    def get_committed_additions(self) -> List[Dict]:
+        return list(self._committed_additions)
 
     def get_modified_snapshots(self) -> Dict[int, FeatureSnapshot]:
         return dict(self._modified)
@@ -105,6 +113,7 @@ class EditSessionBuffer:
         self._modified.clear()
         self._deleted.clear()
         self._added_fids.clear()
+        self._committed_additions.clear()
         self._approx_bytes = 0
         flog(f"EditSessionBuffer: cleared for layer {self.layer_id}")
 
@@ -126,17 +135,27 @@ class EditSessionBuffer:
         }
 
 
+_DICT_BASE_OVERHEAD = 232
+_ENTRY_OVERHEAD = 100
+_LIST_ITEM_OVERHEAD = 8
+_SNAPSHOT_OBJECT_OVERHEAD = 120
+
+
 def _estimate_snapshot_size(snapshot: FeatureSnapshot) -> int:
-    size = 64
-    for val in snapshot.attributes.values():
+    size = _SNAPSHOT_OBJECT_OVERHEAD + _DICT_BASE_OVERHEAD
+    for key, val in snapshot.attributes.items():
+        size += _ENTRY_OVERHEAD + len(key)
         if isinstance(val, str):
-            size += len(val)
+            size += len(val) + 50
         elif isinstance(val, (bytes, bytearray)):
-            size += len(val)
+            size += len(val) + 40
         else:
-            size += 8
+            size += 28
     if snapshot.geometry_wkb:
-        size += len(snapshot.geometry_wkb)
+        size += len(snapshot.geometry_wkb) + 40
+    size += _LIST_ITEM_OVERHEAD * (len(snapshot.field_names) + len(snapshot.changed_field_names))
+    for name in snapshot.field_names:
+        size += len(name) + 50
     return size
 
 

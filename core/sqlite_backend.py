@@ -25,8 +25,8 @@ class SQLiteAuditBackend(AuditBackend):
         self._read_conn: Optional[sqlite3.Connection] = None
 
     def write_events(self, events: List[AuditEvent]) -> int:
-        self._write_queue.enqueue(events)
-        return len(events)
+        accepted = self._write_queue.enqueue(events)
+        return len(events) if accepted else 0
 
     def search(self, criteria: SearchCriteria) -> SearchResult:
         conn = self._get_read_conn()
@@ -51,13 +51,17 @@ class SQLiteAuditBackend(AuditBackend):
     def is_available(self) -> bool:
         return self._journal.is_open
 
-    def close(self) -> None:
+    def invalidate_read_cache(self) -> None:
+        """Close cached read connection so the next query sees fresh WAL data."""
         if self._read_conn is not None:
             try:
                 self._read_conn.close()
             except sqlite3.Error:
                 pass
             self._read_conn = None
+
+    def close(self) -> None:
+        self.invalidate_read_cache()
 
     def _get_read_conn(self) -> sqlite3.Connection:
         if self._read_conn is None:

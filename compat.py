@@ -19,7 +19,7 @@ from qgis.PyQt.QtGui import QPainter, QPalette
 from qgis.PyQt.QtWidgets import (
     QSizePolicy, QAbstractItemView, QMessageBox, QVBoxLayout
 )
-from qgis.core import Qgis, QgsFeatureRequest
+from qgis.core import Qgis, QgsFeatureRequest, QgsVectorDataProvider
 
 
 def _resolve_enum(parent, scoped_attr, fallback_attr):
@@ -97,6 +97,16 @@ class QtCompat:
     # --- Qt.WidgetAttribute ---
     WA_TRANSPARENT_FOR_MOUSE = _resolve_enum(Qt, 'WidgetAttribute', 'WA_TransparentForMouseEvents')
 
+    # --- Qt.Orientation ---
+    HORIZONTAL = _resolve_enum(Qt, 'Orientation', 'Horizontal')
+
+    # --- Qt.ItemFlag ---
+    ITEM_IS_USER_CHECKABLE = _resolve_enum(Qt, 'ItemFlag', 'ItemIsUserCheckable')
+
+    # --- Qt.CheckState ---
+    CHECKED = _resolve_enum(Qt, 'CheckState', 'Checked')
+    UNCHECKED = _resolve_enum(Qt, 'CheckState', 'Unchecked')
+
     # --- QPainter.RenderHint ---
     ANTIALIAS = _resolve_enum(QPainter, 'RenderHint', 'Antialiasing')
     SMOOTH_PIXMAP = _resolve_enum(QPainter, 'RenderHint', 'SmoothPixmapTransform')
@@ -122,6 +132,18 @@ class QgisCompat:
         NO_GEOMETRY = QgsFeatureRequest.Flag.NoGeometry
     except AttributeError:
         NO_GEOMETRY = QgsFeatureRequest.NoGeometry
+
+    # --- QgsVectorDataProvider.Capability ---
+    try:
+        CAP_ADD_FEATURES = QgsVectorDataProvider.Capability.AddFeatures
+        CAP_DELETE_FEATURES = QgsVectorDataProvider.Capability.DeleteFeatures
+        CAP_CHANGE_ATTRIBUTE_VALUES = QgsVectorDataProvider.Capability.ChangeAttributeValues
+        CAP_CHANGE_GEOMETRIES = QgsVectorDataProvider.Capability.ChangeGeometries
+    except AttributeError:
+        CAP_ADD_FEATURES = QgsVectorDataProvider.AddFeatures
+        CAP_DELETE_FEATURES = QgsVectorDataProvider.DeleteFeatures
+        CAP_CHANGE_ATTRIBUTE_VALUES = QgsVectorDataProvider.ChangeAttributeValues
+        CAP_CHANGE_GEOMETRIES = QgsVectorDataProvider.ChangeGeometries
 
     # --- Qgis.MessageLevel (stable 3.28-3.44, guard for 4.0) ---
     MSG_INFO = getattr(Qgis, 'Info', 0)

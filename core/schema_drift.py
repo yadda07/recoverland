@@ -31,6 +31,8 @@ def parse_field_schema(field_schema_json: str) -> List[FieldInfo]:
         raw = json.loads(field_schema_json)
     except (json.JSONDecodeError, TypeError):
         return []
+    if not isinstance(raw, list):
+        return []
     result = []
     for entry in raw:
         result.append(FieldInfo(

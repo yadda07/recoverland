@@ -99,6 +99,30 @@ def _safe_pk_value(value: Any) -> Any:
     return str(value)
 
 
+def compute_entity_fingerprint(identity_json: Optional[str]) -> Optional[str]:
+    """Compute a stable, indexable fingerprint from feature_identity_json.
+
+    Returns a canonical string like 'pk:field_name=value' or 'fid:123'.
+    Returns None if identity cannot be determined.
+    """
+    if not identity_json or not isinstance(identity_json, str):
+        return None
+    try:
+        identity = json.loads(identity_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(identity, dict):
+        return None
+    pk_field = identity.get("pk_field")
+    pk_value = identity.get("pk_value")
+    if pk_field and pk_value is not None:
+        return f"pk:{pk_field}={pk_value}"
+    fid = identity.get("fid")
+    if fid is not None:
+        return f"fid:{fid}"
+    return None
+
+
 def get_identity_strength_for_layer(layer) -> IdentityStrength:
     """Determine identity strength for a specific layer."""
     provider_name = layer.dataProvider().name()

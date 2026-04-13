@@ -3,7 +3,7 @@ from .constants import (
     DB_CONNECT_TIMEOUT, DB_STATEMENT_TIMEOUT, THREAD_STOP_TIMEOUT,
     PLUGIN_NAME, SCHEMA_AUDIT_MAPPING, AVAILABLE_SCHEMAS, HAS_PSYCOPG2, psycopg2
 )
-from .logger import flog, LoggerMixin
+from .logger import flog, qlog, LoggerMixin, generate_trace_id, timed_op
 from .database import DatabaseMixin
 from .threads import RecoverThread, RestoreThread
 
@@ -68,6 +68,31 @@ from .datasource_registry import (
     DatasourceInfo,
 )
 from .restore_service import build_restore_trace_event
+from .restore_contracts import (
+    RestoreMode, RestoreScope, CutoffType, ConflictPolicy,
+    AtomicityPolicy, PreflightVerdict,
+    RestoreCutoff, PlannedAction, Conflict, RestorePlan, PreflightReport,
+    COMPENSATORY_OPS, MAX_EVENTS_PER_RESTORE, MAX_ENTITIES_PER_RESTORE,
+    is_restore_allowed, validate_cutoff, check_volume_limits,
+    default_atomicity, scope_requires_confirmation,
+    RestoreSession,
+)
+from .identity import compute_entity_fingerprint
+from .event_stream_repository import (
+    fetch_entity_stream, fetch_events_after_cutoff,
+    count_events_after_cutoff, fetch_events_by_ids,
+    get_oldest_event_date,
+)
+from .restore_planner import (
+    plan_event_restore, plan_temporal_restore, preflight_check,
+    check_retention_coverage,
+)
+from .restore_executor import execute_restore_plan, preflight_layer_check, build_restore_session
+from .restore_service import undo_restore_batch
+from .search_service import reconstruct_new_attributes
+from .restore_preview import (
+    format_plan_summary, format_preflight_report, format_dry_run_message,
+)
 from .health_monitor import (
     evaluate_journal_health, check_disk_space, format_integrity_message,
     format_user_error, HealthLevel, JournalHealthStatus, DiskSpaceStatus,
@@ -77,3 +102,13 @@ from .time_format import (
     compute_history_span,
 )
 from .disk_monitor import check_disk_for_path, format_disk_message, DiskStatus
+from .db_maintenance import (
+    run_analyze, check_integrity_quick, wal_checkpoint,
+    run_maintenance, MaintenanceResult,
+)
+from .geometry_preview import GeometryPreviewManager
+from .layer_stats_cache import LayerStatsCache, LayerStats
+from .workflow_service import (
+    execute_grouped_restore, execute_grouped_undo,
+    find_target_layer, GroupedRestoreResult,
+)

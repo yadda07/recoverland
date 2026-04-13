@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 
 from .audit_backend import AuditEvent, SearchCriteria, SearchResult
-from .logger import flog
+from .logger import flog, timed_op
 from .serialization import is_layer_audit_field
 
 _MAX_PAGE_SIZE = 500
@@ -28,34 +28,38 @@ class JournalScopeSummary:
     layer_count: int
 
 
-def search_events(conn: sqlite3.Connection, criteria: SearchCriteria) -> SearchResult:
+def search_events(conn: sqlite3.Connection,
+                  criteria: SearchCriteria,
+                  trace_id: str = "") -> SearchResult:
     """Execute a bounded, paginated search on the audit journal."""
-    page_size = min(criteria.page_size or _DEFAULT_PAGE_SIZE, _MAX_PAGE_SIZE)
-    page = max(criteria.page, 1)
-    offset = (page - 1) * page_size
+    with timed_op("search_events", trace_id):
+        page_size = min(criteria.page_size or _DEFAULT_PAGE_SIZE, _MAX_PAGE_SIZE)
+        page = max(criteria.page, 1)
+        offset = (page - 1) * page_size
 
-    where_clause, params = _build_where_clause(criteria)
-    total = _count_matching(conn, where_clause, params)
-    flog(f"search_events: where={where_clause!r} params={params!r} total={total}")
+        where_clause, params = _build_where_clause(criteria)
+        total = _count_matching(conn, where_clause, params)
+        flog(f"search_events: where={where_clause!r} params={params!r} total={total}")
 
-    query = f"""
-        SELECT event_id, project_fingerprint, datasource_fingerprint,
-               layer_id_snapshot, layer_name_snapshot, provider_type,
-               feature_identity_json, operation_type, attributes_json,
-               geometry_wkb, geometry_type, crs_authid, field_schema_json,
-               user_name, session_id, created_at, restored_from_event_id
-        FROM audit_event
-        {where_clause}
-        ORDER BY created_at DESC
-        LIMIT ? OFFSET ?
-    """
-    all_params = params + [page_size, offset]
-    rows = conn.execute(query, all_params).fetchall()
-    events = [_row_to_event(row) for row in rows]
+        query = f"""
+            SELECT event_id, project_fingerprint, datasource_fingerprint,
+                   layer_id_snapshot, layer_name_snapshot, provider_type,
+                   feature_identity_json, operation_type, attributes_json,
+                   geometry_wkb, geometry_type, crs_authid, field_schema_json,
+                   user_name, session_id, created_at, restored_from_event_id,
+                   entity_fingerprint, event_schema_version, new_geometry_wkb
+            FROM audit_event
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """
+        all_params = params + [page_size, offset]
+        rows = conn.execute(query, all_params).fetchall()
+        events = [_row_to_event(row) for row in rows]
 
-    return SearchResult(
-        events=events, total_count=total, page=page, page_size=page_size
-    )
+        return SearchResult(
+            events=events, total_count=total, page=page, page_size=page_size
+        )
 
 
 def count_events(conn: sqlite3.Connection, criteria: SearchCriteria) -> int:
@@ -71,7 +75,8 @@ def get_event_by_id(conn: sqlite3.Connection, event_id: int) -> Optional[AuditEv
                layer_id_snapshot, layer_name_snapshot, provider_type,
                feature_identity_json, operation_type, attributes_json,
                geometry_wkb, geometry_type, crs_authid, field_schema_json,
-               user_name, session_id, created_at, restored_from_event_id
+               user_name, session_id, created_at, restored_from_event_id,
+               entity_fingerprint, event_schema_version, new_geometry_wkb
         FROM audit_event WHERE event_id = ?
     """
     row = conn.execute(query, (event_id,)).fetchone()
@@ -116,30 +121,36 @@ def summarize_scope(conn: sqlite3.Connection, criteria: SearchCriteria) -> Journ
         page_size=1,
     )
     where_clause, params = _build_where_clause(scope_criteria)
-    totals_query = (
-        "SELECT COUNT(*), COUNT(DISTINCT user_name), COUNT(DISTINCT datasource_fingerprint) "
-        f"FROM audit_event {where_clause}"
+    query = (
+        "SELECT COUNT(*),"
+        " COUNT(DISTINCT user_name),"
+        " COUNT(DISTINCT datasource_fingerprint),"
+        " SUM(CASE WHEN operation_type='UPDATE' THEN 1 ELSE 0 END),"
+        " SUM(CASE WHEN operation_type='DELETE' THEN 1 ELSE 0 END),"
+        " SUM(CASE WHEN operation_type='INSERT' THEN 1 ELSE 0 END)"
+        f" FROM audit_event {where_clause}"
     )
-    total_row = conn.execute(totals_query, params).fetchone() or (0, 0, 0)
-    op_query = f"SELECT operation_type, COUNT(*) FROM audit_event {where_clause} GROUP BY operation_type"
-    op_counts = {"UPDATE": 0, "DELETE": 0, "INSERT": 0}
-    for op_name, count in conn.execute(op_query, params).fetchall():
-        op_counts[str(op_name or "").upper()] = int(count)
-    selected_count = count_events(conn, criteria)
+    row = conn.execute(query, params).fetchone() or (0, 0, 0, 0, 0, 0)
+    total_count = int(row[0] or 0)
+    selected_count = count_events(conn, criteria) if criteria.operation_type else total_count
     return JournalScopeSummary(
-        total_count=int(total_row[0] or 0),
+        total_count=total_count,
         selected_count=selected_count,
-        update_count=op_counts["UPDATE"],
-        delete_count=op_counts["DELETE"],
-        insert_count=op_counts["INSERT"],
-        user_count=int(total_row[1] or 0),
-        layer_count=int(total_row[2] or 0),
+        update_count=int(row[3] or 0),
+        delete_count=int(row[4] or 0),
+        insert_count=int(row[5] or 0),
+        user_count=int(row[1] or 0),
+        layer_count=int(row[2] or 0),
     )
 
 
-def _build_where_clause(criteria: SearchCriteria) -> Tuple[str, list]:
+def _build_where_clause(criteria: SearchCriteria,
+                        include_traces: bool = False) -> Tuple[str, list]:
     conditions = []
     params = []
+
+    if not include_traces:
+        conditions.append("restored_from_event_id IS NULL")
 
     if criteria.datasource_fingerprint:
         conditions.append("datasource_fingerprint = ?")
@@ -196,6 +207,9 @@ def _row_to_event(row: tuple) -> AuditEvent:
         session_id=row[14],
         created_at=row[15],
         restored_from_event_id=row[16],
+        entity_fingerprint=row[17] if len(row) > 17 else None,
+        event_schema_version=row[18] if len(row) > 18 else None,
+        new_geometry_wkb=row[19] if len(row) > 19 else None,
     )
 
 
@@ -220,6 +234,34 @@ def reconstruct_attributes(event: AuditEvent) -> Dict[str, Any]:
                 continue
             if isinstance(change, dict) and "old" in change:
                 result[key] = change["old"]
+            else:
+                result[key] = change
+        return result
+
+    return data
+
+
+def reconstruct_new_attributes(event: AuditEvent) -> Dict[str, Any]:
+    """Extract the 'new' (post-edit) attribute values from an event.
+
+    For UPDATE deltas, returns the 'new' side of each changed field.
+    For full snapshots (DELETE/INSERT), returns all_attributes as-is.
+    """
+    try:
+        data = json.loads(event.attributes_json)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+    if "all_attributes" in data:
+        return data["all_attributes"]
+
+    if "changed_only" in data:
+        result = {}
+        for key, change in data["changed_only"].items():
+            if is_layer_audit_field(key):
+                continue
+            if isinstance(change, dict) and "new" in change:
+                result[key] = change["new"]
             else:
                 result[key] = change
         return result

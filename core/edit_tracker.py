@@ -18,7 +18,9 @@ from .edit_buffer import (
 from .identity import (
     compute_datasource_fingerprint, compute_feature_identity,
     compute_project_fingerprint, extract_layer_name,
+    compute_entity_fingerprint,
 )
+from .sqlite_schema import CURRENT_SCHEMA_VERSION
 from .geometry_utils import geometries_equal
 from .serialization import (
     serialize_attributes, serialize_field_schema,
@@ -46,13 +48,29 @@ class EditSessionTracker:
         self._layer_fingerprints: Dict[str, str] = {}
         self._signal_connections: Dict[str, List] = {}
         self._active = False
+        self._suppressed = False
         self._allowed_layer_fingerprints: set = set()  # empty = track all
         self._session_event_count = 0
         self._on_commit_callback = None
+        self._on_overflow_callback = None
 
     @property
     def is_active(self) -> bool:
         return self._active
+
+    @property
+    def is_suppressed(self) -> bool:
+        return self._suppressed
+
+    def suppress(self) -> None:
+        """Temporarily suppress event capture (e.g. during restore)."""
+        self._suppressed = True
+        flog("EditSessionTracker: suppressed (restore mode)")
+
+    def unsuppress(self) -> None:
+        """Re-enable event capture after restore."""
+        self._suppressed = False
+        flog("EditSessionTracker: unsuppressed")
 
     @property
     def session_event_count(self) -> int:
@@ -61,6 +79,14 @@ class EditSessionTracker:
     def set_commit_callback(self, callback) -> None:
         """Set callback(event_count, layer_name, is_mass_delete, delete_count)."""
         self._on_commit_callback = callback
+
+    def set_overflow_callback(self, callback) -> None:
+        """Set callback() invoked on the main thread when the write queue overflows.
+
+        The tracker automatically deactivates before calling this.
+        Use this to display a blocking user alert.
+        """
+        self._on_overflow_callback = callback
 
     def reset_session_count(self) -> None:
         self._session_event_count = 0
@@ -121,6 +147,18 @@ class EditSessionTracker:
         self._connected_layers.pop(layer_id, None)
         self._layer_fingerprints.pop(layer_id, None)
 
+    def disconnect_layer_by_id(self, layer_id: str) -> None:
+        """Stop monitoring a layer by its ID (for layersRemoved signal)."""
+        layer = self._connected_layers.get(layer_id)
+        if layer is not None:
+            try:
+                self._unbind_signals(layer)
+            except RuntimeError:
+                pass
+        self._buffers.pop(layer_id, None)
+        self._connected_layers.pop(layer_id, None)
+        self._layer_fingerprints.pop(layer_id, None)
+
     def disconnect_all(self) -> None:
         for layer_id in list(self._connected_layers.keys()):
             layer = self._connected_layers.get(layer_id)
@@ -140,6 +178,8 @@ class EditSessionTracker:
              lambda *_, lid=layer_id: self._on_editing_started(lid)),
             (layer.beforeCommitChanges,
              lambda *_, lid=layer_id: self._on_before_commit(lid)),
+            (layer.committedFeaturesAdded,
+             lambda _lid, feats, lid=layer_id: self._on_committed_features_added(lid, feats)),
             (layer.afterCommitChanges,
              lambda *_, lid=layer_id: self._on_after_commit(lid)),
             (layer.afterRollBack,
@@ -165,7 +205,7 @@ class EditSessionTracker:
         return buf
 
     def _on_editing_started(self, layer_id: str) -> None:
-        if not self._active:
+        if not self._active or self._suppressed:
             return
         layer_fp = self._layer_fingerprints.get(layer_id)
         if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
@@ -175,7 +215,7 @@ class EditSessionTracker:
 
     def _on_before_commit(self, layer_id: str) -> None:
         """Capture initial state of all affected features before commit."""
-        if not self._active:
+        if not self._active or self._suppressed:
             return
         layer_fp = self._layer_fingerprints.get(layer_id)
         if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
@@ -191,7 +231,7 @@ class EditSessionTracker:
 
     def _on_after_commit(self, layer_id: str) -> None:
         """Generate audit events after successful commit."""
-        if not self._active:
+        if not self._active or self._suppressed:
             return
         layer_fp = self._layer_fingerprints.get(layer_id)
         if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
@@ -205,7 +245,14 @@ class EditSessionTracker:
             flog(f"EditSessionTracker: commit on {layer_id} produced 0 real events "
                  "(false commit: edit buffer had changes but values were identical)")
             return
-        self._write_queue.enqueue(events)
+        accepted = self._write_queue.enqueue(events)
+        if not accepted:
+            flog("EditSessionTracker: write queue overflow, "
+                 "deactivating tracking to prevent further data loss", "ERROR")
+            self.deactivate()
+            if self._on_overflow_callback is not None:
+                self._on_overflow_callback()
+            return
         self._register_datasource(layer)
         self._session_event_count += len(events)
         ops = [e.operation_type for e in events]
@@ -226,6 +273,41 @@ class EditSessionTracker:
             register_datasource(conn, layer)
         except Exception as e:
             flog(f"EditSessionTracker: datasource register failed: {e}", "WARNING")
+
+    def _on_committed_features_added(self, layer_id: str, features) -> None:
+        """Capture full feature data from committedFeaturesAdded signal.
+
+        This signal fires during commit, after the provider has assigned
+        real FIDs. We serialize everything here so _generate_events can
+        build INSERT events without any provider lookup.
+        """
+        buf = self._buffers.get(layer_id)
+        if buf is None:
+            flog(f"EditSessionTracker: committedFeaturesAdded but no buffer "
+                 f"for {layer_id}", "WARNING")
+            return
+        layer = self._connected_layers.get(layer_id)
+        if layer is None:
+            flog(f"EditSessionTracker: committedFeaturesAdded but no layer "
+                 f"for {layer_id}", "WARNING")
+            return
+        field_names = [f.name() for f in layer.fields()]
+        for feature in features:
+            attrs = serialize_attributes(feature, field_names)
+            wkb = None
+            geom = feature.geometry()
+            if geom and not geom.isNull() and not geom.isEmpty():
+                wkb = bytes(geom.asWkb())
+            identity = compute_feature_identity(layer, feature)
+            buf.record_committed_addition({
+                "fid": feature.id(),
+                "attrs_json": build_full_snapshot(attrs),
+                "geometry_wkb": wkb,
+                "identity_json": identity,
+                "entity_fingerprint": compute_entity_fingerprint(identity),
+            })
+        flog(f"EditSessionTracker: committedFeaturesAdded "
+             f"{len(features)} features captured on {layer_id}")
 
     def _on_rollback(self, layer_id: str) -> None:
         buf = self._buffers.pop(layer_id, None)
@@ -249,11 +331,16 @@ class EditSessionTracker:
         edit_buf = layer.editBuffer()
         if edit_buf is None:
             return
-        has_deletes = bool(edit_buf.deletedFeatureIds())
-        has_attr_changes = bool(edit_buf.changedAttributeValues())
-        has_geom_changes = bool(edit_buf.changedGeometries())
-        has_additions = bool(edit_buf.addedFeatures())
-        if not (has_deletes or has_attr_changes or has_geom_changes or has_additions):
+        deleted_fids = edit_buf.deletedFeatureIds()
+        changed_attrs = edit_buf.changedAttributeValues()
+        changed_geoms = edit_buf.changedGeometries()
+        added_feats = edit_buf.addedFeatures()
+        flog(f"EditSessionTracker: edit buffer state on {buf.layer_id}: "
+             f"deletes={len(deleted_fids)} "
+             f"attr_changes={len(changed_attrs)} "
+             f"geom_changes={len(changed_geoms)} "
+             f"additions={len(added_feats)}")
+        if not (deleted_fids or changed_attrs or changed_geoms or added_feats):
             flog(f"EditSessionTracker: empty edit buffer on {buf.layer_id}, "
                  "commit without modifications, skipping capture")
             return
@@ -281,13 +368,20 @@ class EditSessionTracker:
 
     def _capture_deletions(self, provider, edit_buf, buf, field_names) -> None:
         from qgis.core import QgsFeatureRequest
-        deleted_fids = edit_buf.deletedFeatureIds()
+        deleted_fids = list(edit_buf.deletedFeatureIds())
         if not deleted_fids:
             return
+        flog(f"EditSessionTracker: capturing {len(deleted_fids)} deletions, "
+             f"FIDs={deleted_fids[:20]}")
         request = QgsFeatureRequest().setFilterFids(deleted_fids)
+        captured = 0
         for feature in provider.getFeatures(request):
             snapshot = create_snapshot_from_feature(feature, field_names)
             buf.record_deletion(snapshot)
+            captured += 1
+        if captured != len(deleted_fids):
+            flog(f"EditSessionTracker: deletion capture mismatch: "
+                 f"expected={len(deleted_fids)} captured={captured}", "WARNING")
 
     def _capture_modifications(self, provider, edit_buf, buf, field_names) -> None:
         from qgis.core import QgsFeatureRequest
@@ -355,14 +449,29 @@ class EditSessionTracker:
             if event is not None:
                 events.append(event)
 
-        for fid in net["added"]:
-            event = self._make_insert_event(
-                layer, fid, ds_fp, proj_fp, layer_name,
-                provider_type, user, now, field_schema, geom_type, crs,
-                buf.session_id,
-            )
-            if event is not None:
-                events.append(event)
+        committed = buf.get_committed_additions()
+        flog(f"EditSessionTracker: generating events: "
+             f"net_deleted={len(net['deleted'])} net_modified={len(net['modified'])} "
+             f"net_added={len(net['added'])} committed_additions={len(committed)}")
+        if committed:
+            for ca in committed:
+                events.append(self._make_insert_event_from_committed(
+                    ca, ds_fp, proj_fp, layer, layer_name,
+                    provider_type, user, now, field_schema, geom_type, crs,
+                    buf.session_id,
+                ))
+        else:
+            for fid in net["added"]:
+                event = self._make_insert_event(
+                    layer, fid, ds_fp, proj_fp, layer_name,
+                    provider_type, user, now, field_schema, geom_type, crs,
+                    buf.session_id,
+                )
+                if event is not None:
+                    events.append(event)
+                else:
+                    flog(f"EditSessionTracker: INSERT event dropped for "
+                         f"FID={fid}, feature not found", "WARNING")
 
         return events
 
@@ -387,6 +496,9 @@ class EditSessionTracker:
             field_schema_json=field_schema, user_name=user,
             session_id=session_id, created_at=now,
             restored_from_event_id=None,
+            entity_fingerprint=compute_entity_fingerprint(identity),
+            event_schema_version=CURRENT_SCHEMA_VERSION,
+            new_geometry_wkb=None,
         )
 
     @staticmethod
@@ -423,6 +535,9 @@ class EditSessionTracker:
             field_schema_json=field_schema, user_name=user,
             session_id=session_id, created_at=now,
             restored_from_event_id=None,
+            entity_fingerprint=compute_entity_fingerprint(identity),
+            event_schema_version=CURRENT_SCHEMA_VERSION,
+            new_geometry_wkb=new_wkb if geom_changed else None,
         )
 
     @staticmethod
@@ -452,6 +567,32 @@ class EditSessionTracker:
             field_schema_json=field_schema, user_name=user,
             session_id=session_id, created_at=now,
             restored_from_event_id=None,
+            entity_fingerprint=compute_entity_fingerprint(identity),
+            event_schema_version=CURRENT_SCHEMA_VERSION,
+            new_geometry_wkb=wkb,
+        )
+
+    @staticmethod
+    def _make_insert_event_from_committed(ca, ds_fp, proj_fp, layer,
+                                          layer_name, provider_type, user,
+                                          now, field_schema, geom_type,
+                                          crs, session_id) -> AuditEvent:
+        """Build INSERT event from data captured by committedFeaturesAdded."""
+        wkb = ca["geometry_wkb"]
+        return AuditEvent(
+            event_id=None, project_fingerprint=proj_fp,
+            datasource_fingerprint=ds_fp, layer_id_snapshot=layer.id(),
+            layer_name_snapshot=layer_name, provider_type=provider_type,
+            feature_identity_json=ca["identity_json"],
+            operation_type="INSERT",
+            attributes_json=ca["attrs_json"], geometry_wkb=wkb,
+            geometry_type=geom_type, crs_authid=crs,
+            field_schema_json=field_schema, user_name=user,
+            session_id=session_id, created_at=now,
+            restored_from_event_id=None,
+            entity_fingerprint=ca["entity_fingerprint"],
+            event_schema_version=CURRENT_SCHEMA_VERSION,
+            new_geometry_wkb=wkb,
         )
 
 
