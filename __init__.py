@@ -1,5 +1,10 @@
 import os
-from qgis.PyQt.QtCore import QCoreApplication, QTranslator, QSettings, QLocale
+
+try:
+    from qgis.PyQt.QtCore import QCoreApplication, QTranslator, QSettings, QLocale
+    _HAS_QGIS = True
+except ImportError:
+    _HAS_QGIS = False
 
 _translator = None
 

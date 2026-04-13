@@ -25,7 +25,7 @@ from .core.health_monitor import (
 )
 from .core.time_format import compute_history_span
 import os
-import shutil
+import sqlite3
 
 
 class JournalMaintenanceDialog(QDialog):
@@ -295,21 +295,35 @@ class JournalMaintenanceDialog(QDialog):
     def _export_journal(self) -> None:
         if not self._journal or not self._journal.path:
             return
-        source = self._journal.path
         dest, _ = QFileDialog.getSaveFileName(
             self, self.tr("Exporter le journal"), "",
             self.tr("SQLite (*.sqlite);;Tous les fichiers (*)"))
         if not dest:
             return
+        src_conn = None
+        dst_conn = None
         try:
-            shutil.copy2(source, dest)
-            wal = source + "-wal"
-            if os.path.exists(wal):
-                shutil.copy2(wal, dest + "-wal")
+            src_conn = self._journal.create_read_connection()
+            dst_conn = sqlite3.connect(dest)
+            src_conn.backup(dst_conn)
             QMessageBox.information(
-                self, self.tr("Export"), self.tr("Journal exporte vers {name}.").format(name=os.path.basename(dest)))
-        except OSError as e:
+                self, self.tr("Export"),
+                self.tr("Journal exporte vers {name}.").format(
+                    name=os.path.basename(dest)))
+        except (sqlite3.Error, OSError) as e:
+            flog(f"_export_journal: backup failed: {e}", "ERROR")
             QMessageBox.warning(self, self.tr("Erreur d'export"), str(e))
+        finally:
+            if dst_conn:
+                try:
+                    dst_conn.close()
+                except Exception:
+                    pass
+            if src_conn:
+                try:
+                    src_conn.close()
+                except Exception:
+                    pass
 
     def _open_journal_folder(self) -> None:
         if not self._journal or not self._journal.path:

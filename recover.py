@@ -3,17 +3,18 @@ try:
 except ImportError:
     from qgis.PyQt.QtGui import QAction
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtCore import QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QTimer
 from qgis.core import QgsProject, QgsApplication, QgsSettings
 from .recover_dialog import RecoverDialog
 from .themed_action_icon import ThemedActionIconController
 from .core import (
-    flog, JournalManager, WriteQueue, EditSessionTracker,
+    flog, qlog, JournalManager, WriteQueue, EditSessionTracker,
     BackendRouter, SQLiteAuditBackend,
     check_journal_integrity,
     get_journal_size_bytes, format_journal_size,
-    get_journal_stats, evaluate_journal_health, HealthLevel,
+    get_journal_stats, evaluate_journal_health,
     format_integrity_message,
+    generate_trace_id,
 )
 from .core.journal_manager import cleanup_orphan_journals
 from .core.user_identity import invalidate_cache as _invalidate_user_cache
@@ -35,6 +36,8 @@ class RecoverPlugin:
         self._sqlite_backend = None
         self._status_indicator = None
         self._integrity_result = None
+        self._disk_timer = None
+        self._disk_journal_path = None
 
     def initGui(self):
         icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
@@ -111,12 +114,17 @@ class RecoverPlugin:
             profile_path = QgsApplication.qgisSettingsDirPath()
             journal_path = self._journal.open_for_project(project_path, profile_path)
 
-            integrity = check_journal_integrity(journal_path)
+            integrity_trace_id = generate_trace_id()
+            flog(f"[{integrity_trace_id}] RecoverPlugin: integrity check start path={journal_path}")
+            integrity = check_journal_integrity(journal_path, trace_id=integrity_trace_id)
             self._integrity_result = integrity
             if not integrity.is_healthy:
                 for issue in integrity.issues:
                     flog(f"Journal issue: {issue}", "WARNING")
-                self._notify_integrity_issues(integrity)
+                if self._is_corrupt(integrity):
+                    journal_path = self._handle_corrupt_journal(journal_path, profile_path, project_path)
+                else:
+                    self._notify_integrity_issues(integrity)
 
             self._write_queue.start(journal_path)
             self._sqlite_backend = SQLiteAuditBackend(self._journal, self._write_queue)
@@ -125,6 +133,8 @@ class RecoverPlugin:
 
             self._tracker = EditSessionTracker(self._write_queue, self._journal)
             self._tracker.set_commit_callback(self._on_events_committed)
+            self._tracker.set_overflow_callback(self._on_queue_overflow)
+            self._write_queue.set_early_warning_callback(self._on_queue_early_warning)
             tracking_on = QgsSettings().value(
                 "RecoverLand/tracking_enabled", True, type=bool
             )
@@ -155,13 +165,24 @@ class RecoverPlugin:
             except Exception as oe:
                 flog(f"RecoverPlugin: orphan cleanup error: {oe}", "WARNING")
 
+            self._run_auto_purge_if_enabled()
+            self._start_disk_monitor(journal_path)
+
             flog("RecoverPlugin: local backend initialized")
         except Exception as e:
             flog(f"RecoverPlugin: local backend init failed: {e}", "ERROR")
+            qlog(QCoreApplication.translate(
+                "RecoverPlugin",
+                "Initialisation du journal impossible. "
+                "L'enregistrement est desactive pour cette session."
+            ), "ERROR")
+            if self._status_indicator is not None:
+                self._status_indicator.set_no_project()
 
     def _shutdown_local_backend(self) -> None:
         """Cleanly shut down local backend, flushing pending events."""
         _invalidate_user_cache()
+        self._stop_disk_monitor()
 
         if self._tracker is not None:
             self._tracker.deactivate()
@@ -199,6 +220,7 @@ class RecoverPlugin:
         if self._tracker is None:
             return
         for lid in layer_ids:
+            self._tracker.disconnect_layer_by_id(lid)
             self._router.invalidate_layer(lid)
 
     def _on_project_opened(self) -> None:
@@ -252,27 +274,141 @@ class RecoverPlugin:
     def _on_events_committed(self, event_count, layer_name,
                               is_mass_delete, delete_count) -> None:
         """UX-G02 + UX-B04: Handle commit callback from tracker."""
-        show_notif = QgsSettings().value(
-            "RecoverLand/show_commit_notifications", True, type=bool)
-        from .compat import QgisCompat
         if is_mass_delete:
-            self.iface.messageBar().pushMessage(
-                "RecoverLand",
-                QCoreApplication.translate(
-                    "RecoverPlugin",
-                    "Suppression massive detectee : {count} entite(s) "
-                    "supprimee(s) sur '{layer}'. "
-                    "Ouvrez RecoverLand pour verifier."
-                ).format(count=delete_count, layer=layer_name),
-                QgisCompat.MSG_WARNING, 10)
-        elif show_notif:
-            self.iface.messageBar().pushMessage(
-                "RecoverLand",
-                QCoreApplication.translate(
-                    "RecoverPlugin",
-                    "{count} modification(s) enregistree(s) sur '{layer}'."
-                ).format(count=event_count, layer=layer_name),
-                QgisCompat.MSG_SUCCESS, 3)
+            qlog(QCoreApplication.translate(
+                "RecoverPlugin",
+                "Suppression massive: {count} entite(s) supprimee(s) sur '{layer}'."
+            ).format(count=delete_count, layer=layer_name), "WARNING")
+        else:
+            qlog(QCoreApplication.translate(
+                "RecoverPlugin",
+                "{count} modification(s) enregistree(s) sur '{layer}'."
+            ).format(count=event_count, layer=layer_name))
+        if self._sqlite_backend is not None:
+            self._sqlite_backend.invalidate_read_cache()
+        self._update_status_bar()
+        if self.dlg is not None:
+            QTimer.singleShot(500, self.dlg.on_events_committed)
+
+    def _run_auto_purge_if_enabled(self) -> None:
+        """P1.2 / P0.4: Execute auto-purge at startup if the setting is enabled."""
+        settings = QgsSettings()
+        if not settings.value("RecoverLand/auto_purge", False, type=bool):
+            return
+        if not self._journal or not self._journal.is_open:
+            return
+        try:
+            from .core import purge_old_events, RetentionPolicy
+            days = int(settings.value("RecoverLand/retention_days", 365))
+            max_ev = int(settings.value("RecoverLand/max_events", 1_000_000))
+            policy = RetentionPolicy(retention_days=days, max_events=max_ev)
+            conn = self._journal.get_connection()
+            trace_id = generate_trace_id()
+            flog(f"[{trace_id}] RecoverPlugin: auto-purge start days={days} max_events={max_ev}")
+            result = purge_old_events(conn, policy, trace_id=trace_id)
+            if result.deleted_count > 0:
+                flog(f"RecoverPlugin: auto-purge deleted {result.deleted_count} events")
+        except Exception as e:
+            flog(f"RecoverPlugin: auto-purge failed: {e}", "WARNING")
+
+    def _start_disk_monitor(self, journal_path: str) -> None:
+        """P1.2 / P0.4: Start a periodic timer checking disk space every 5 minutes."""
+        from .core.disk_monitor import check_disk_for_path, _CHECK_INTERVAL_SEC
+        self._disk_journal_path = journal_path
+
+        def _check():
+            if not self._journal or not self._journal.is_open:
+                return
+            status = check_disk_for_path(self._disk_journal_path)
+            if status.is_critical:
+                if self._tracker and self._tracker.is_active:
+                    self._tracker.deactivate()
+                    QgsSettings().setValue("RecoverLand/tracking_enabled", False)
+                    from .core.disk_monitor import format_disk_message
+                    qlog(format_disk_message(status), "ERROR")
+                    self._update_status_bar()
+
+        self._disk_timer = QTimer()
+        self._disk_timer.timeout.connect(_check)
+        self._disk_timer.start(_CHECK_INTERVAL_SEC * 1000)
+        _check()
+
+    def _stop_disk_monitor(self) -> None:
+        """Stop the periodic disk space timer."""
+        if self._disk_timer is not None:
+            self._disk_timer.stop()
+            self._disk_timer = None
+
+    @staticmethod
+    def _is_corrupt(integrity) -> bool:
+        """Return True if integrity issues indicate actual database corruption."""
+        for issue in integrity.issues:
+            lower = issue.lower()
+            if "integrity check failed" in lower or "cannot open" in lower:
+                return True
+        return False
+
+    def _handle_corrupt_journal(self, journal_path: str,
+                                profile_path: str,
+                                project_path: str) -> str:
+        """P0.4: Rename corrupt journal and create a fresh one.
+
+        Returns the new journal path (which may be the same path
+        if the corrupt file was successfully renamed).
+        """
+        from qgis.PyQt.QtWidgets import QMessageBox
+        from .compat import QtCompat
+        from datetime import datetime, timezone
+
+        self._journal.close()
+
+        reply = QMessageBox.question(
+            self.iface.mainWindow(),
+            QCoreApplication.translate("RecoverPlugin", "Journal corrompu"),
+            QCoreApplication.translate(
+                "RecoverPlugin",
+                "Le journal d'audit est corrompu.\n"
+                "Voulez-vous le renommer et creer un nouveau journal ?\n\n"
+                "Le fichier corrompu sera conserve pour analyse."
+            ),
+            QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_YES)
+
+        if reply == QtCompat.MSG_YES:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            corrupt_path = journal_path + f".corrupt_{ts}"
+            try:
+                os.rename(journal_path, corrupt_path)
+                for suffix in ("-wal", "-shm"):
+                    sidecar = journal_path + suffix
+                    if os.path.exists(sidecar):
+                        os.rename(sidecar, corrupt_path + suffix)
+                flog(f"RecoverPlugin: corrupt journal renamed to {corrupt_path}")
+            except OSError as e:
+                flog(f"RecoverPlugin: rename failed: {e}", "ERROR")
+
+        new_path = self._journal.open_for_project(project_path, profile_path)
+        flog(f"RecoverPlugin: fresh journal created at {new_path}")
+        return new_path
+
+    def _on_queue_early_warning(self) -> None:
+        """MED-07: Warn user when write queue reaches 80% of hard limit."""
+        qlog(QCoreApplication.translate(
+            "RecoverPlugin",
+            "File d'ecriture a 80%% de capacite. "
+            "Si le probleme persiste, l'enregistrement sera desactive. "
+            "Verifiez les performances disque."
+        ), "WARNING")
+        self._update_status_bar()
+
+    def _on_queue_overflow(self) -> None:
+        """P0.2: Alert user when write queue overflows and tracking is halted."""
+        QgsSettings().setValue("RecoverLand/tracking_enabled", False)
+        qlog(QCoreApplication.translate(
+            "RecoverPlugin",
+            "File d'ecriture saturee: enregistrement desactive. "
+            "Evenements en attente sauvegardes. "
+            "Relancez le suivi manuellement."
+        ), "ERROR")
         self._update_status_bar()
 
     def _notify_integrity_issues(self, integrity) -> None:
@@ -281,8 +417,7 @@ class RecoverPlugin:
         if msg is None:
             return
         try:
-            from .compat import QgisCompat
-            level = QgisCompat.MSG_WARNING if integrity.issues else QgisCompat.MSG_INFO
-            self.iface.messageBar().pushMessage("RecoverLand", msg, level, 10)
+            level = "WARNING" if integrity.issues else "INFO"
+            qlog(msg, level)
         except Exception as e:
             flog(f"RecoverPlugin: notify integrity failed: {e}", "WARNING")

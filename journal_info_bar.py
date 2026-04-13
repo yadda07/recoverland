@@ -1,42 +1,18 @@
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
-from qgis.PyQt.QtCore import QByteArray, QRectF, Qt, pyqtSignal
-from qgis.PyQt.QtGui import QColor, QPainter
-from qgis.PyQt.QtSvg import QSvgRenderer
+from qgis.PyQt.QtCore import pyqtSignal
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import QPushButton, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from qgis.core import QgsApplication
 
 from .compat import QtCompat
 
-_ICON_TEMPLATES: Dict[str, str] = {
-    "ALL": """
-<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\">
-  <ellipse cx=\"12\" cy=\"6\" rx=\"7\" ry=\"3\" fill=\"{ACCENT}\" fill-opacity=\"0.18\" stroke=\"{ACCENT}\" stroke-width=\"1.6\"/>
-  <path d=\"M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6\" fill=\"{ACCENT}\" fill-opacity=\"0.10\" stroke=\"{ACCENT}\" stroke-width=\"1.6\" stroke-linejoin=\"round\"/>
-  <path d=\"M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6\" fill=\"{ACCENT}\" fill-opacity=\"0.10\" stroke=\"{ACCENT}\" stroke-width=\"1.6\" stroke-linejoin=\"round\"/>
-</svg>
-""",
-    "UPDATE": """
-<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"-1 -1 26 26\">
-  <path d=\"M7 8a6 6 0 1 1-1 8\" fill=\"none\" stroke=\"{ACCENT}\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>
-  <path d=\"M7 4v4h4\" fill=\"none\" stroke=\"{ACCENT}\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>
-  <circle cx=\"17\" cy=\"16\" r=\"2.4\" fill=\"{ACCENT}\" fill-opacity=\"0.18\" stroke=\"{ACCENT}\" stroke-width=\"1.4\"/>
-</svg>
-""",
-    "DELETE": """
-<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\">
-  <path d=\"M9 8V6h6v2\" fill=\"none\" stroke=\"{ACCENT}\" stroke-width=\"1.7\" stroke-linecap=\"round\"/>
-  <path d=\"M6 8h12\" fill=\"none\" stroke=\"{ACCENT}\" stroke-width=\"1.7\" stroke-linecap=\"round\"/>
-  <rect x=\"7.5\" y=\"8\" width=\"9\" height=\"10\" rx=\"2\" fill=\"{ACCENT}\" fill-opacity=\"0.12\" stroke=\"{ACCENT}\" stroke-width=\"1.6\"/>
-  <path d=\"M10.5 11v4M13.5 11v4\" fill=\"none\" stroke=\"{ACCENT}\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>
-</svg>
-""",
-    "INSERT": """
-<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\">
-  <circle cx=\"12\" cy=\"12\" r=\"7.2\" fill=\"{ACCENT}\" fill-opacity=\"0.14\" stroke=\"{ACCENT}\" stroke-width=\"1.7\"/>
-  <path d=\"M12 8v8M8 12h8\" fill=\"none\" stroke=\"{ACCENT}\" stroke-width=\"1.9\" stroke-linecap=\"round\"/>
-</svg>
-""",
+_TILE_ICONS: Dict[str, str] = {
+    "ALL": '/mIconDbSchema.svg',
+    "UPDATE": '/mActionRefresh.svg',
+    "DELETE": '/mActionDeleteSelected.svg',
+    "INSERT": '/mActionAdd.svg',
 }
 
 
@@ -66,60 +42,38 @@ def _rgba(color: QColor, alpha: int) -> str:
     return f"rgba({color.red()}, {color.green()}, {color.blue()}, {alpha})"
 
 
-class SvgGlyph(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._renderer = QSvgRenderer(self)
-        self.setFixedSize(22, 22)
-
-    def load_icon(self, icon_key: str, accent: QColor) -> None:
-        template = _ICON_TEMPLATES.get(icon_key, _ICON_TEMPLATES["ALL"])
-        svg_data = template.replace("{ACCENT}", accent.name())
-        self._renderer.load(QByteArray(svg_data.encode("utf-8")))
-        self.update()
-
-    def paintEvent(self, _event):
-        if not self._renderer.isValid():
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QtCompat.ANTIALIAS, True)
-        painter.setRenderHint(QtCompat.SMOOTH_PIXMAP, True)
-        self._renderer.render(painter, QRectF(0, 0, self.width(), self.height()))
-
-
 class SmartBarTile(QPushButton):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._accent = QColor(96, 96, 96)
         self._visual_mode = "idle"
         self.setObjectName("smartBarTile")
         self.setCursor(QtCompat.POINTING_HAND_CURSOR)
-        self.setMinimumHeight(54)
+        self.setMinimumHeight(38)
         self.setMinimumWidth(90)
         self.setSizePolicy(QtCompat.SIZE_EXPANDING, QtCompat.SIZE_FIXED)
-        self._icon = SvgGlyph(self)
+        self._icon_label = QLabel(self)
+        self._icon_label.setFixedSize(20, 20)
         self._value_label = QLabel("0", self)
         self._title_label = QLabel("", self)
-        self._value_label.setObjectName("smartBarTileValue")
-        self._title_label.setObjectName("smartBarTileTitle")
-        for child in (self._icon, self._value_label, self._title_label):
+        for child in (self._icon_label, self._value_label, self._title_label):
             child.setAttribute(QtCompat.WA_TRANSPARENT_FOR_MOUSE)
         content = QHBoxLayout(self)
-        content.setContentsMargins(10, 8, 10, 8)
-        content.setSpacing(8)
+        content.setContentsMargins(8, 4, 8, 4)
+        content.setSpacing(6)
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(1)
         text_col.addWidget(self._value_label)
         text_col.addWidget(self._title_label)
-        content.addWidget(self._icon, 0, QtCompat.ALIGN_VCENTER)
+        content.addWidget(self._icon_label, 0, QtCompat.ALIGN_VCENTER)
         content.addLayout(text_col, 1)
         self._refresh_theme()
 
     def apply_state(self, tile_state: SmartBarTileState) -> None:
         self.setProperty("metric_key", tile_state.key)
-        self._accent = tile_state.accent
-        self._icon.load_icon(tile_state.key, tile_state.accent)
+        icon_path = _TILE_ICONS.get(tile_state.key, _TILE_ICONS["ALL"])
+        icon = QgsApplication.getThemeIcon(icon_path)
+        self._icon_label.setPixmap(icon.pixmap(20, 20))
         self._value_label.setText(tile_state.value)
         self._title_label.setText(tile_state.label)
         self.setToolTip(tile_state.tooltip)
@@ -131,44 +85,43 @@ class SmartBarTile(QPushButton):
         self._refresh_theme()
 
     def _refresh_theme(self) -> None:
-        text = self.palette().windowText().color()
-        accent = self._accent
+        pal = self.palette()
+        text = pal.windowText().color()
+        highlight = pal.highlight().color()
+        mid = pal.mid().color()
         if self._visual_mode == "active":
-            bg = _rgba(accent, 34)
-            border = _rgba(accent, 138)
-            hover_bg = _rgba(accent, 42)
-            value_color = accent.name()
-            title_color = text.name()
+            bg = _rgba(highlight, 30)
+            border = _rgba(highlight, 100)
+            hover_bg = _rgba(highlight, 45)
+            value_color = text.name()
         elif self._visual_mode == "disabled":
-            bg = _rgba(text, 10)
-            border = _rgba(text, 22)
+            bg = _rgba(mid, 12)
+            border = _rgba(mid, 30)
             hover_bg = bg
             value_color = _rgba(text, 88)
-            title_color = _rgba(text, 112)
         else:
-            bg = _rgba(accent, 16)
-            border = _rgba(accent, 56)
-            hover_bg = _rgba(accent, 24)
+            bg = _rgba(mid, 18)
+            border = _rgba(mid, 40)
+            hover_bg = _rgba(mid, 30)
             value_color = text.name()
-            title_color = _rgba(text, 170)
+        title_color = _rgba(text, 160)
         self.setStyleSheet(
             f"QPushButton#smartBarTile {{"
             f"background-color: {bg};"
             f"border: 1px solid {border};"
-            f"border-radius: 12px;"
+            f"border-radius: 4px;"
             f"text-align: left;"
             f"padding: 0px;"
             f"}}"
             f"QPushButton#smartBarTile:hover {{"
             f"background-color: {hover_bg};"
-            f"border-color: {border};"
             f"}}"
         )
         self._value_label.setStyleSheet(
-            f"font-size: 15px; font-weight: 700; color: {value_color};"
+            f"font-size: 13px; font-weight: 700; color: {value_color};"
         )
         self._title_label.setStyleSheet(
-            f"font-size: 10px; font-weight: 600; color: {title_color};"
+            f"font-size: 9px; font-weight: 600; color: {title_color};"
         )
 
 
@@ -201,8 +154,8 @@ class JournalInfoBar(QWidget):
         self._refreshing = False
         self._tiles: Dict[str, SmartBarTile] = {}
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(6)
+        root.setContentsMargins(10, 6, 10, 6)
+        root.setSpacing(4)
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(10)
@@ -280,7 +233,7 @@ class JournalInfoBar(QWidget):
             f"QWidget#journalInfoBar {{"
             f"background-color: {_rgba(highlight, 14)};"
             f"border: 1px solid {_rgba(mid, 60)};"
-            f"border-radius: 14px;"
+            f"border-radius: 4px;"
             f"}}"
         )
         self._title_label.setStyleSheet(
