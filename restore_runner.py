@@ -96,8 +96,10 @@ class RestoreRunner(QObject):
         self._group_ok = 0
 
         layer = self._find_layer_fn(group[0])
+        prefix = f"[{self._trace_id}] " if self._trace_id else ""
         if layer is None:
             name = group[0].layer_name_snapshot or fp
+            flog(f"{prefix}RestoreRunner: layer NOT FOUND name='{name}' fp={fp} events={len(group)}", "ERROR")
             self._errors.append(f"Couche '{name}' non trouvee dans le projet.")
             self._total_fail += len(group)
             self._processed += len(group)
@@ -107,15 +109,20 @@ class RestoreRunner(QObject):
             return
 
         if hasattr(layer, 'isEditable') and layer.isEditable():
-            msg = "Target layer has uncommitted edits; commit or rollback before restore"
-            for event in group:
-                self._errors.append(f"Evt {event.event_id or 0}: {msg}")
-            self._total_fail += len(group)
-            self._processed += len(group)
-            self.progress.emit(self._processed, len(self._events))
-            self._group_idx += 1
-            QTimer.singleShot(0, self._advance_group)
-            return
+            name = group[0].layer_name_snapshot or fp
+            if hasattr(layer, 'isModified') and layer.isModified():
+                flog(f"{prefix}RestoreRunner: layer HAS UNSAVED EDITS name='{name}' fp={fp}", "ERROR")
+                msg = "Target layer has uncommitted edits; commit or rollback before restore"
+                for event in group:
+                    self._errors.append(f"Evt {event.event_id or 0}: {msg}")
+                self._total_fail += len(group)
+                self._processed += len(group)
+                self.progress.emit(self._processed, len(self._events))
+                self._group_idx += 1
+                QTimer.singleShot(0, self._advance_group)
+                return
+            flog(f"{prefix}RestoreRunner: auto-closing edit session name='{name}' fp={fp}")
+            layer.commitChanges()
 
         self._current_layer = layer
         self._group_fid_cache = build_fid_cache(layer, group)
@@ -223,6 +230,7 @@ class UndoRunner(QObject):
         layer = self._find_layer_fn(group[0])
         if layer is None:
             name = group[0].layer_name_snapshot or fp
+            flog(f"UndoRunner: layer NOT FOUND name='{name}' fp={fp} events={len(group)}", "ERROR")
             self._errors.append(f"Couche '{name}' non trouvee dans le projet.")
             self._total_fail += len(group)
             self._processed += len(group)
@@ -230,6 +238,22 @@ class UndoRunner(QObject):
             self._group_idx += 1
             QTimer.singleShot(0, self._process_next_group)
             return
+
+        if hasattr(layer, 'isEditable') and layer.isEditable():
+            name = group[0].layer_name_snapshot or fp
+            if hasattr(layer, 'isModified') and layer.isModified():
+                flog(f"UndoRunner: layer HAS UNSAVED EDITS name='{name}' fp={fp}", "ERROR")
+                msg = "Target layer has uncommitted edits"
+                for event in group:
+                    self._errors.append(f"Evt {event.event_id or 0}: {msg}")
+                self._total_fail += len(group)
+                self._processed += len(group)
+                self.progress.emit(self._processed, self._total_events)
+                self._group_idx += 1
+                QTimer.singleShot(0, self._process_next_group)
+                return
+            flog(f"UndoRunner: auto-closing edit session name='{name}' fp={fp}")
+            layer.commitChanges()
 
         report = undo_restore_batch(layer, group)
         self._total_ok += len(report.succeeded)

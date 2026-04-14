@@ -52,11 +52,11 @@ class RestoreModeSelector(QWidget):
         self._btn_temporal.clicked.connect(lambda: self._on_select("temporal"))
 
         layout.addWidget(self._label)
-        layout.addWidget(self._btn_event)
         layout.addWidget(self._btn_temporal)
+        layout.addWidget(self._btn_event)
         layout.addStretch()
 
-        self._current = "event"
+        self._current = "temporal"
         self._apply_styles()
 
     def mode(self) -> str:

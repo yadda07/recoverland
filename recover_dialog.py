@@ -101,6 +101,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._restore_started_at = 0.0
         self._pending_restore_feedback = None
         self._restore_runner = None
+        self._last_restore_events = None
+        self._last_restore_by_ds = None
+        self._pending_rewind_events = None
         self._active_search_trace_id = ""
         self._active_restore_trace_id = ""
         self._dialog_read_conn = None
@@ -116,7 +119,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._layer_refresh_timer.setInterval(10000)
         self._layer_refresh_timer.timeout.connect(self._refresh_journal_status)
         self._layer_refresh_timer.start()
-        self._refresh_journal_status()
         self._refresh_layers_panel()
         tracking_on = QgsSettings().value("RecoverLand/tracking_enabled", True, type=bool)
         self.tracking_toggle.setChecked(tracking_on)
@@ -444,6 +446,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._set_journal_info_visible(True)
         self._rebuild_stats_cache()
         self._load_journal_layers()
+        if self.restore_mode_selector.mode() == "temporal":
+            self._refresh_slider_bounds()
+            if not self._is_recovering:
+                self.recover_button.setEnabled(True)
         self._refresh_smart_bar()
 
     def _load_journal_layers(self) -> None:
@@ -486,11 +492,19 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.layer_input.setCurrentIndex(1)
         self.layer_input.blockSignals(False)
 
+        prev_checks = {}
+        for i in range(self._version_layer_list.count()):
+            it = self._version_layer_list.item(i)
+            fp = it.data(QtCompat.USER_ROLE)
+            if fp:
+                prev_checks[fp] = it.checkState()
+
         self._version_layer_list.clear()
         for lyr in layers:
             item = QListWidgetItem(lyr['name'])
             item.setFlags(item.flags() | QtCompat.ITEM_IS_USER_CHECKABLE)
-            item.setCheckState(QtCompat.CHECKED)
+            saved = prev_checks.get(lyr['fingerprint'])
+            item.setCheckState(saved if saved is not None else QtCompat.CHECKED)
             item.setData(QtCompat.USER_ROLE, lyr['fingerprint'])
             self._version_layer_list.addItem(item)
 
@@ -689,6 +703,27 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._version_layer_list.setStyleSheet("QListWidget { border: 1px solid palette(mid); border-radius: 3px; }")
         self._version_layer_list.setVisible(False)
 
+        self._version_layer_btns = QWidget()
+        vl_btn_layout = QHBoxLayout(self._version_layer_btns)
+        vl_btn_layout.setContentsMargins(0, 0, 0, 0)
+        vl_btn_layout.setSpacing(4)
+        vl_btn_layout.addStretch()
+        self._vl_select_all_btn = QPushButton()
+        self._vl_select_all_btn.setIcon(QgsApplication.getThemeIcon('/mActionSelectAll.svg'))
+        self._vl_select_all_btn.setToolTip(self.tr("Tout selectionner"))
+        self._vl_select_all_btn.setFixedSize(26, 26)
+        self._vl_select_all_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
+        self._vl_select_all_btn.clicked.connect(self._version_layers_check_all)
+        self._vl_deselect_btn = QPushButton()
+        self._vl_deselect_btn.setIcon(QgsApplication.getThemeIcon('/mActionDeselectAll.svg'))
+        self._vl_deselect_btn.setToolTip(self.tr("Tout deselectionner"))
+        self._vl_deselect_btn.setFixedSize(26, 26)
+        self._vl_deselect_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
+        self._vl_deselect_btn.clicked.connect(self._version_layers_uncheck_all)
+        vl_btn_layout.addWidget(self._vl_select_all_btn)
+        vl_btn_layout.addWidget(self._vl_deselect_btn)
+        self._version_layer_btns.setVisible(False)
+
         self.operation_input = QComboBox()
         self.operation_input.addItems([self.tr("Toutes")])
         self.operation_input.setToolTip(self.tr("Type d'opération à rechercher"))
@@ -702,6 +737,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         selection_row.addWidget(self.operation_input, 1)
         selection_outer.addLayout(selection_row)
         selection_outer.addWidget(self._version_layer_list)
+        selection_outer.addWidget(self._version_layer_btns)
         selection_group.setLayout(selection_outer)
         date_group = QgsCollapsibleGroupBox()
         date_group.setTitle(self.tr("Période"))
@@ -953,7 +989,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         
         self.setLayout(main_layout)
         
-        self.recover_button.setEnabled(False)
+        self._on_period_mode_changed(self.restore_mode_selector.mode())
         self._setup_shortcuts()
 
     def _setup_shortcuts(self) -> None:
@@ -1280,19 +1316,33 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._period_stack.setCurrentIndex(1)
             self.layer_input.setVisible(False)
             self._version_layer_list.setVisible(True)
+            self._version_layer_btns.setVisible(True)
             self.results_group.setVisible(False)
             self.restore_button.setVisible(False)
             self.recover_button.setText(self.tr("Rewind"))
             self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionUndo.svg'))
+            if not self._is_recovering:
+                self.recover_button.setEnabled(True)
             self._refresh_slider_bounds()
         else:
             self._period_stack.setCurrentIndex(0)
             self._version_layer_list.setVisible(False)
+            self._version_layer_btns.setVisible(False)
             self.layer_input.setVisible(True)
             self.results_group.setVisible(True)
             self.restore_button.setVisible(True)
             self.recover_button.setText(self.tr("Recover"))
             self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
+
+    def _version_layers_check_all(self) -> None:
+        for i in range(self._version_layer_list.count()):
+            self._version_layer_list.item(i).setCheckState(QtCompat.CHECKED)
+
+    def _version_layers_uncheck_all(self) -> None:
+        for i in range(self._version_layer_list.count()):
+            self._version_layer_list.item(i).setCheckState(QtCompat.UNCHECKED)
+
+    _SLIDER_DEFAULT_OFFSET_SECS = 600
 
     def _refresh_slider_bounds(self) -> None:
         """Configure slider bounds from the stats cache (no live query)."""
@@ -1309,7 +1359,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.time_slider.disable()
             return
         newest_dt = QDateTime.currentDateTime()
-        self.time_slider.set_bounds(oldest_dt, newest_dt)
+        max_str = self._stats_cache.global_max_date()
+        initial_dt = None
+        if max_str:
+            max_dt = self._parse_iso_datetime(max_str)
+            if max_dt is not None and max_dt.isValid():
+                initial_dt = max_dt.addSecs(-self._SLIDER_DEFAULT_OFFSET_SECS)
+        self.time_slider.set_bounds(oldest_dt, newest_dt, initial=initial_dt)
 
     @staticmethod
     def _parse_iso_datetime(iso_str: str):
@@ -1340,6 +1396,8 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _validate_dates(self):
         """Real-time date validation: disable recover button if dates are invalid."""
+        if hasattr(self, 'restore_mode_selector') and self.restore_mode_selector.mode() == "temporal":
+            return
         start_dt = self.start_input.dateTime()
         end_dt = self.end_input.dateTime()
         is_valid = start_dt < end_dt
@@ -1411,7 +1469,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(value)
 
-    def on_events_committed(self) -> None:
+    def on_events_committed(self, edited_fingerprint="") -> None:
         """Auto-refresh smart bar and event table after new events are flushed.
 
         Called by the plugin after a short delay post-commit so the
@@ -1421,6 +1479,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             return
         if self._is_recovering:
             return
+        self._invalidate_undo_for(edited_fingerprint)
         self._close_dialog_read_conn()
         self._rebuild_stats_cache()
         self._refresh_smart_bar()
@@ -1540,6 +1599,25 @@ class RecoverDialog(QDialog, LoggerMixin):
             flog(f"[{trace_id}] recover_version: fetched total={total_count}")
 
         if total_count == 0:
+            if self._last_restore_by_ds:
+                n_undo = sum(len(v) for v in self._last_restore_by_ds.values())
+                reply = QMessageBox.question(
+                    self,
+                    self.tr("Revenir a l'etat actuel"),
+                    self.tr("Remettre {count} entite(s) dans leur etat actuel ?").format(
+                        count=n_undo),
+                    QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_NO)
+                if reply != QtCompat.MSG_YES:
+                    self._is_recovering = False
+                    self._stop_logo_activity()
+                    self.progress_bar.setVisible(False)
+                    self.enable_controls(True)
+                    self.recover_button.setEnabled(True)
+                    return
+                flog(f"auto-undo: slider at current date, returning to current state ({n_undo} entities)")
+                self._pending_rewind_events = None
+                self._auto_undo_for_rewind()
+                return
             if trace_id:
                 self._active_restore_trace_id = ""
             self._is_recovering = False
@@ -1606,7 +1684,50 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self._active_restore_trace_id = ""
             return
 
+        if self._last_restore_by_ds:
+            self._pending_rewind_events = events
+            flog("auto-undo: previous rewind active, undoing before new rewind")
+            self._auto_undo_for_rewind()
+            return
+
         self._execute_version_restore(events)
+
+    def _auto_undo_for_rewind(self) -> None:
+        """Silently undo the previous Rewind, then apply the pending new one."""
+        by_ds = self._last_restore_by_ds
+        self._last_restore_events = None
+        self._last_restore_by_ds = None
+        self.undo_last_btn.setEnabled(False)
+
+        read_conn = self._get_dialog_read_conn()
+        resolver = lambda evt: find_target_layer(evt, read_conn)
+
+        runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
+        runner.progress.connect(self._on_restore_runner_progress)
+        runner.finished.connect(self._on_auto_undo_then_rewind)
+        self._restore_runner = runner
+        runner.start()
+
+    def _on_auto_undo_then_rewind(self, result) -> None:
+        """After auto-undo completes, proceed with the pending Rewind."""
+        self._restore_runner = None
+        flog(f"auto-undo done: ok={result.total_ok} fail={result.total_fail}")
+        if result.total_fail > 0:
+            flog(f"auto-undo: {result.total_fail} failures: {result.errors[:5]}", "WARNING")
+        events = getattr(self, '_pending_rewind_events', None)
+        self._pending_rewind_events = None
+        if events:
+            self._execute_version_restore(events)
+        else:
+            self._restore_in_progress = False
+            self._is_recovering = False
+            self._stop_logo_activity()
+            self.progress_bar.setVisible(False)
+            self.enable_controls(True)
+            self.recover_button.setEnabled(True)
+            if result.total_ok > 0:
+                qlog(self.tr("{count} entite(s) remise(s) a l'etat actuel.").format(
+                    count=result.total_ok))
 
     def _execute_version_restore(self, events) -> None:
         """Execute reverse replay restore (async, non-blocking)."""
@@ -1652,20 +1773,47 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._last_restore_events = events
             self._last_restore_by_ds = result.by_ds
             self.undo_last_btn.setEnabled(True)
+            flog(f"undo_last_btn: ENABLED ({result.total_ok} events)")
         self._version_restore_events = None
 
+        detail_lines = self._build_restore_summary(result.by_ds)
         if result.total_fail == 0 and not result.errors:
-            qlog(self.tr("{count} entite(s) restauree(s) avec succes.").format(count=result.total_ok))
+            summary = self.tr("{count} entite(s) restauree(s) avec succes.").format(count=result.total_ok)
+            qlog(summary + detail_lines)
         else:
             msg = self.tr("{ok} restauree(s), {fail} echouee(s).").format(ok=result.total_ok, fail=result.total_fail)
             if result.errors:
                 msg += " | " + " | ".join(result.errors[:5])
-            qlog(msg, "WARNING")
+            qlog(msg + detail_lines, "WARNING")
 
         self.progress_bar.setVisible(False)
         self.enable_controls(True)
         self.recover_button.setEnabled(True)
 
+    def _build_restore_summary(self, by_ds: dict) -> str:
+        """Build per-layer operation breakdown from by_ds event groups."""
+        if not by_ds:
+            return ""
+        parts = []
+        for _fp, events in by_ds.items():
+            if not events:
+                continue
+            name = events[0].layer_name_snapshot or "?"
+            counts = {}
+            for e in events:
+                counts[e.operation_type] = counts.get(e.operation_type, 0) + 1
+            tokens = []
+            if counts.get("DELETE"):
+                tokens.append(f"{counts['DELETE']} suppression(s)")
+            if counts.get("UPDATE"):
+                tokens.append(f"{counts['UPDATE']} modification(s)")
+            if counts.get("INSERT"):
+                tokens.append(f"{counts['INSERT']} insertion(s)")
+            if tokens:
+                parts.append(f"{name} : {', '.join(tokens)}")
+        if not parts:
+            return ""
+        return "\n" + "\n".join(parts)
 
     def _on_search_complete(self, result) -> None:
         """Handle search results from local SQLite journal.
@@ -2127,18 +2275,45 @@ class RecoverDialog(QDialog, LoggerMixin):
             return
         self._display_restore_feedback(feedback)
 
+    def _invalidate_undo_for(self, edited_fingerprint: str) -> None:
+        """Remove a single layer from the undo state after user edits it."""
+        if not self._last_restore_by_ds:
+            return
+        if not edited_fingerprint:
+            return
+        if edited_fingerprint not in self._last_restore_by_ds:
+            return
+        name = self._last_restore_by_ds[edited_fingerprint][0].layer_name_snapshot
+        del self._last_restore_by_ds[edited_fingerprint]
+        self._last_restore_events = [
+            e for e in (self._last_restore_events or [])
+            if e.datasource_fingerprint != edited_fingerprint
+        ]
+        flog(f"undo: '{name}' invalidated (edited), "
+             f"{len(self._last_restore_by_ds)} layer(s) still undo-able")
+        if not self._last_restore_by_ds:
+            self._last_restore_events = None
+            self.undo_last_btn.setEnabled(False)
+            flog("undo_last_btn: DISABLED (all layers edited)")
+
     def _undo_last_restore(self):
         """Undo the last restore: revert data to its pre-restore state."""
-        events = getattr(self, '_last_restore_events', None)
-        by_ds = getattr(self, '_last_restore_by_ds', None)
-        if not events or not by_ds:
+        by_ds = self._last_restore_by_ds
+        if not by_ds:
             return
+
+        layer_lines = []
+        total = 0
+        for fp, evts in by_ds.items():
+            name = evts[0].layer_name_snapshot or fp
+            layer_lines.append(f"  - {name} ({len(evts)} op.)")
+            total += len(evts)
 
         reply = QMessageBox.question(
             self,
             self.tr("Annuler le restore"),
-            self.tr("Remettre les {count} entite(s) dans leur etat avant le restore ?").format(
-                count=len(events)),
+            self.tr("Remettre {count} entite(s) dans leur etat avant le restore ?\n\n{layers}").format(
+                count=total, layers="\n".join(layer_lines)),
             QtCompat.MSG_YES | QtCompat.MSG_NO,
             QtCompat.MSG_NO,
         )
@@ -2174,6 +2349,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         super().showEvent(event)
         if hasattr(self, '_layer_refresh_timer'):
             self._layer_refresh_timer.start()
+        self._refresh_journal_status()
 
     def hideEvent(self, event):
         super().hideEvent(event)

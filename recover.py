@@ -272,7 +272,8 @@ class RecoverPlugin:
             tracking, health_level, event_count, size_str)
 
     def _on_events_committed(self, event_count, layer_name,
-                              is_mass_delete, delete_count) -> None:
+                              is_mass_delete, delete_count,
+                              datasource_fp="") -> None:
         """UX-G02 + UX-B04: Handle commit callback from tracker."""
         if is_mass_delete:
             qlog(QCoreApplication.translate(
@@ -288,7 +289,8 @@ class RecoverPlugin:
             self._sqlite_backend.invalidate_read_cache()
         self._update_status_bar()
         if self.dlg is not None:
-            QTimer.singleShot(500, self.dlg.on_events_committed)
+            fp = datasource_fp
+            QTimer.singleShot(500, lambda: self.dlg.on_events_committed(fp))
 
     def _run_auto_purge_if_enabled(self) -> None:
         """P1.2 / P0.4: Execute auto-purge at startup if the setting is enabled."""
