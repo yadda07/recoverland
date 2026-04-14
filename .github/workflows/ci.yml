@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+        env:
+          PYTHONPATH: .
+
+  qgis-runtime:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        qgis-image: ["qgis/qgis:latest", "qgis/qgis:4.0-trixie"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull QGIS image
+        run: docker pull ${{ matrix.qgis-image }}
+
+      - name: Run QGIS runtime smoke test
+        run: |
+          docker run --rm --volume "${{ github.workspace }}:/app" -w /app ${{ matrix.qgis-image }} sh -c "python3 -m pip install --upgrade pip && python3 -m pip install pytest pytest-qgis && PYTHONPATH=/app xvfb-run -s '+extension GLX -screen 0 1024x768x24' pytest tests/test_qgis_runtime_smoke.py -v --tb=short"
