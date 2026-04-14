@@ -1,22 +1,21 @@
 [general]
 name=RecoverLand
-qgisMinimumVersion=3.44
 description=Audit local et restauration de données SIG : capture automatique, recherche et restauration des modifications
 description[en]=Local GIS data audit and recovery: automatic capture, search and restoration of modifications
 about=RecoverLand capture automatiquement chaque modification (attribut, geometrie, suppression) dans un journal SQLite local, puis permet de rechercher, comparer et restaurer les etats anterieurs des entites.
 about[en]=RecoverLand automatically captures every modification (attribute, geometry, deletion) in a local SQLite journal, then allows you to search, compare and restore previous states of features.
 version=4.1.3
-changelog=4.1.3 - Temporal restore: event-based and cutoff-date planning with two execution strategies (STRICT via editing buffer, BEST_EFFORT for limited providers); preflight validation and human-readable preview; restore contracts, enums, volume limits and provider capability matrix; grouped restore/undo workflow service; SQLite schema v2 (entity_fingerprint, new_geometry_wkb, event_schema_version) with automatic v1-v2 migration and backfill; bounded event stream repository; provider support policy with per-format identity strength evaluation; datasource registry for layer reconnection at restore time; journal health monitoring with threshold evaluation; per-layer statistics cache; geometry preview on map canvas via QgsRubberBand; restore mode selector widget, preflight confirmation dialog, time slider synchronized with QgsDateTimeEdit, animated toggle switch; human-friendly relative time formatting; re-entrance guard on restore operations; QGIS 3.44 to 4.x compatibility via symbolic capability constants and Qt5/Qt6 compat layer
-    3.0.0 - Local SQLite audit (no more PostgreSQL dependency), automatic modification capture, paginated search, schema drift detection, configurable retention, integrity journal
+changelog=4.1.3 Temporal restore (event-based and cutoff-date), preflight validation, schema v2 migration, time slider, restore mode selector, provider hardening, QGIS 3.44-4.x compat. 3.0.0 Local SQLite audit, automatic capture, paginated search, schema drift detection, configurable retention.
 author=GEODECI
 email=youcef.geodesien@gmail.com
-category=Data Management
-tags=audit,recovery,restore,sketching,versioning,local,sqlite,temporal,rollback,health,preview
-icon=icon.svg
-supportsQt6=True
-qgisMaximumVersion=4.99
-experimental=False
-deprecated=False
-homepage=https://github.com/yadda07/recoverland
+homepage=https://yadda07.github.io/recoverland
 tracker=https://github.com/yadda07/recoverland/issues
 repository=https://github.com/yadda07/recoverland
+qgisMinimumVersion=3.44
+qgisMaximumVersion=4.99
+tags=audit,recovery,restore,sketching,versioning,local,sqlite,temporal,rollback,health,preview
+category=Data Management
+icon=icon.svg
+experimental=False
+deprecated=False
+supportsQt6=True
