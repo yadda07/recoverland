@@ -55,13 +55,25 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
 
     Returns dict with 'success', 'message', and optionally 'fid'.
     """
+    eid = event.event_id or 0
     check = pre_check_restore(layer, event)
     if not check.can_restore:
+        flog(f"restore_deleted[{eid}]: pre_check failed: {check.reason}", "WARNING")
         return {"success": False, "message": check.reason}
+
+    identity = _parse_identity(event.feature_identity_json)
+    pk_field = identity.get("pk_field")
+    pk_value = identity.get("pk_value")
+    if pk_field and pk_value is not None:
+        existing_fid = _find_target_feature(layer, identity)
+        if existing_fid is not None:
+            flog(f"restore_deleted[{eid}]: skip, {pk_field}={pk_value} already exists fid={existing_fid}")
+            return {"success": True, "message": "Already exists (skip)", "fid": existing_fid}
 
     attrs = reconstruct_attributes(event)
     geom = rebuild_geometry(event.geometry_wkb)
     field_mapping = _build_safe_mapping(check.drift, event)
+    flog(f"restore_deleted[{eid}]: attrs={len(attrs)} keys, geom={'yes' if geom else 'no'}, mapping={len(field_mapping)} fields")
 
     from qgis.core import QgsFeature, QgsFields
     new_feature = QgsFeature(layer.fields())
@@ -75,9 +87,11 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
     if not success:
         errors = provider.errors()
         msg = "; ".join(errors) if errors else "Insert failed"
+        flog(f"restore_deleted[{eid}]: addFeatures failed: {msg}", "ERROR")
         return {"success": False, "message": msg}
 
     new_fid = added[0].id() if added else None
+    flog(f"restore_deleted[{eid}]: OK new_fid={new_fid}")
     return {"success": True, "message": "Restored", "fid": new_fid}
 
 
@@ -158,7 +172,8 @@ def validate_restore_layer_state(layer) -> Optional[str]:
     if layer is None:
         return "Target layer not found"
     if hasattr(layer, 'isEditable') and layer.isEditable():
-        return "Target layer has uncommitted edits; commit or rollback before restore"
+        if hasattr(layer, 'isModified') and layer.isModified():
+            return "Target layer has uncommitted edits; commit or rollback before restore"
     return None
 
 

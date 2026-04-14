@@ -128,9 +128,10 @@ def _cutoff_where(
     op = ">=" if cutoff.inclusive else ">"
     ds_cond = "datasource_fingerprint = ? AND " if datasource_fp else ""
     ds_params = [datasource_fp] if datasource_fp else []
+    trace_filter = "restored_from_event_id IS NULL AND "
     if cutoff.cutoff_type == CutoffType.BY_EVENT_ID:
-        return f"{ds_cond}event_id {op} ?", ds_params + [cutoff.value]
+        return f"{ds_cond}{trace_filter}event_id {op} ?", ds_params + [cutoff.value]
     if cutoff.cutoff_type == CutoffType.BY_DATE:
-        return f"{ds_cond}created_at {op} ?", ds_params + [cutoff.value]
+        return f"{ds_cond}{trace_filter}created_at {op} ?", ds_params + [cutoff.value]
     flog(f"event_stream_repository: unknown cutoff type {cutoff.cutoff_type}", "WARNING")
     return None, []

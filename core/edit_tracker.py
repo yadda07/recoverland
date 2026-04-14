@@ -263,7 +263,8 @@ class EditSessionTracker:
         is_mass_delete = delete_count >= self._MASS_DELETE_THRESHOLD
         if self._on_commit_callback is not None:
             self._on_commit_callback(
-                len(events), layer_name, is_mass_delete, delete_count)
+                len(events), layer_name, is_mass_delete, delete_count,
+                events[0].datasource_fingerprint)
 
     def _register_datasource(self, layer) -> None:
         """Store the layer's source URI in the journal registry for future restore."""

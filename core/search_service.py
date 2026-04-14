@@ -90,9 +90,23 @@ _MAX_DISTINCT_RESULTS = 1000
 
 def get_distinct_layers(conn: sqlite3.Connection) -> List[Dict[str, str]]:
     """List distinct audited layers with their display names."""
+    try:
+        rows = conn.execute(
+            "SELECT datasource_fingerprint, layer_name, provider_type"
+            " FROM datasource_registry ORDER BY layer_name LIMIT ?",
+            (_MAX_DISTINCT_RESULTS,),
+        ).fetchall()
+        if rows:
+            return [
+                {"fingerprint": r[0], "name": r[1], "provider": r[2]}
+                for r in rows
+            ]
+    except sqlite3.OperationalError:
+        pass
     query = """
-        SELECT DISTINCT datasource_fingerprint, layer_name_snapshot, provider_type
+        SELECT datasource_fingerprint, layer_name_snapshot, provider_type
         FROM audit_event
+        GROUP BY datasource_fingerprint
         ORDER BY layer_name_snapshot
         LIMIT ?
     """
