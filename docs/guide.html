@@ -2,8 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="view-transition" content="same-origin">
 <title>User Guide - RecoverLand</title>
-<link rel="stylesheet" href="rl.css?v=3">
+<link rel="stylesheet" href="rl.css?v=6">
 </head>
 <body>
 <svg style="position:absolute;width:0;height:0"><defs>
@@ -37,7 +38,11 @@
   <a href="#tracking">Tracking changes</a>
   <a href="#search">Searching</a>
   <a href="#results">Reading results</a>
-  <a href="#restore">Restoring</a>
+  <a href="#restore">The three buttons</a>
+  <a href="#btn-recover">&nbsp;&nbsp;Recover</a>
+  <a href="#btn-restore">&nbsp;&nbsp;Restore</a>
+  <a href="#btn-last">&nbsp;&nbsp;Last</a>
+  <a href="#time-travel">&nbsp;&nbsp;Restore modes</a>
   <div class="cat">Advanced</div>
   <a href="#schema-warning">Schema drift warning</a>
   <a href="#retention-config">Retention management</a>
@@ -252,31 +257,201 @@
 <div class="info"><strong>Text filter</strong>: A search field above the table filters rows by keyword. The search covers all visible columns.</div>
 </section>
 
-<!-- ====== RESTORE ====== -->
-<section id="restore">
-<h2>Restoring data</h2>
+<!-- ====== THE THREE BUTTONS ====== -->
+<section id="restore" class="reveal">
+<h2>The three buttons: Recover, Restore, Last</h2>
+<p>RecoverLand's workflow is built around three buttons. Each one plays a distinct role in the data recovery chain. Understanding them is the key to using the plugin effectively.</p>
 
-<div class="step">
-  <div class="step-head"><div class="step-num">1</div><div class="step-title">Select the rows to restore</div></div>
-  <div class="step-body"><p>Check the rows in the table that you want to restore. Use <strong>Select all</strong> / <strong>Deselect all</strong> for batch operations.</p></div>
+<!-- ── GLOBAL FLOW DIAGRAM ── -->
+<div class="dia">
+<svg viewBox="0 0 640 260" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background zones -->
+  <rect x="4" y="16" width="195" height="230" rx="10" fill="var(--bg2)" stroke="var(--bg3)" stroke-width="1" opacity=".6"/>
+  <rect x="222" y="16" width="195" height="230" rx="10" fill="var(--bg2)" stroke="var(--bg3)" stroke-width="1" opacity=".6"/>
+  <rect x="440" y="16" width="195" height="230" rx="10" fill="var(--bg2)" stroke="var(--bg3)" stroke-width="1" opacity=".6"/>
+  <!-- Zone labels -->
+  <text x="101" y="40" text-anchor="middle" font-size="10" font-weight="700" fill="var(--tx3)" letter-spacing=".08em" text-transform="uppercase" style="text-transform:uppercase">STEP 1</text>
+  <text x="319" y="40" text-anchor="middle" font-size="10" font-weight="700" fill="var(--tx3)" letter-spacing=".08em" style="text-transform:uppercase">STEP 2</text>
+  <text x="537" y="40" text-anchor="middle" font-size="10" font-weight="700" fill="var(--tx3)" letter-spacing=".08em" style="text-transform:uppercase">SAFETY NET</text>
+  <!-- Recover button -->
+  <rect x="40" y="62" width="122" height="44" rx="8" fill="#2563EB" opacity=".12" stroke="#2563EB" stroke-width="1.5"/>
+  <text x="101" y="88" text-anchor="middle" font-size="14" font-weight="700" fill="#2563EB">Recover</text>
+  <!-- Recover description -->
+  <text x="101" y="122" text-anchor="middle" font-size="10.5" fill="var(--tx2)">Search the journal</text>
+  <text x="101" y="137" text-anchor="middle" font-size="10.5" fill="var(--tx2)">for past changes</text>
+  <!-- Recover icon: magnifier -->
+  <circle cx="101" cy="175" r="18" fill="none" stroke="#2563EB" stroke-width="1.2" opacity=".3"/>
+  <circle cx="96" cy="171" r="8" fill="none" stroke="#2563EB" stroke-width="1.5"/>
+  <line x1="102" y1="177" x2="110" y2="185" stroke="#2563EB" stroke-width="1.5" stroke-linecap="round"/>
+  <text x="101" y="212" text-anchor="middle" font-size="9.5" fill="var(--tx3)" font-style="italic">Read-only</text>
+  <text x="101" y="226" text-anchor="middle" font-size="9.5" fill="var(--tx3)" font-style="italic">No data changed</text>
+  <!-- Arrow 1 -->
+  <line x1="200" y1="84" x2="248" y2="84" stroke="var(--ac)" stroke-width="1.8" marker-end="url(#ah2)" class="draw" style="--len:48"/>
+  <!-- Restore button -->
+  <rect x="258" y="62" width="122" height="44" rx="8" fill="#D97706" opacity=".12" stroke="#D97706" stroke-width="1.5"/>
+  <text x="319" y="88" text-anchor="middle" font-size="14" font-weight="700" fill="#D97706">Restore</text>
+  <!-- Restore description -->
+  <text x="319" y="122" text-anchor="middle" font-size="10.5" fill="var(--tx2)">Revert selected features</text>
+  <text x="319" y="137" text-anchor="middle" font-size="10.5" fill="var(--tx2)">to their previous state</text>
+  <!-- Restore icon: rewind arrows -->
+  <circle cx="319" cy="175" r="18" fill="none" stroke="#D97706" stroke-width="1.2" opacity=".3"/>
+  <path d="M312 175l-6-5v10z M324 175l-6-5v10z" fill="#D97706" opacity=".8"/>
+  <text x="319" y="212" text-anchor="middle" font-size="9.5" fill="var(--tx3)" font-style="italic">Writes to layer</text>
+  <text x="319" y="226" text-anchor="middle" font-size="9.5" fill="var(--tx3)" font-style="italic">Preflight validated</text>
+  <!-- Arrow 2 -->
+  <line x1="418" y1="84" x2="466" y2="84" stroke="var(--ac)" stroke-width="1.8" marker-end="url(#ah2)" class="draw" style="--len:48"/>
+  <!-- Last button -->
+  <rect x="476" y="62" width="122" height="44" rx="8" fill="#16A34A" opacity=".12" stroke="#16A34A" stroke-width="1.5"/>
+  <text x="537" y="88" text-anchor="middle" font-size="14" font-weight="700" fill="#16A34A">Last</text>
+  <!-- Last description -->
+  <text x="537" y="122" text-anchor="middle" font-size="10.5" fill="var(--tx2)">Undo the last restore</text>
+  <text x="537" y="137" text-anchor="middle" font-size="10.5" fill="var(--tx2)">back to pre-restore state</text>
+  <!-- Last icon: undo arrow -->
+  <circle cx="537" cy="175" r="18" fill="none" stroke="#16A34A" stroke-width="1.2" opacity=".3"/>
+  <path d="M530 172a10 10 0 0 1 14 0" fill="none" stroke="#16A34A" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M530 172l-3-4v4z" fill="#16A34A"/>
+  <text x="537" y="212" text-anchor="middle" font-size="9.5" fill="var(--tx3)" font-style="italic">One-click undo</text>
+  <text x="537" y="226" text-anchor="middle" font-size="9.5" fill="var(--tx3)" font-style="italic">Available once</text>
+</svg>
 </div>
 
-<div class="step">
-  <div class="step-head"><div class="step-num">2</div><div class="step-title">Click Restore</div></div>
-  <div class="step-body">
-    <p>A confirmation message appears with the number of features to restore. After confirmation, RecoverLand:</p>
-    <ul style="font-size:13.5px;color:var(--tx2);margin:4px 0 0 16px;line-height:1.8">
-      <li>Verifies that the target layer exists and is editable</li>
-      <li>Compares the current schema with the saved schema</li>
-      <li>Restores attributes and geometry to their previous state</li>
-      <li>If one feature fails, the other features in the batch are still processed</li>
-    </ul>
-  </div>
+<!-- ── RECOVER CARD ── -->
+<h3 id="btn-recover">Recover: find what changed</h3>
+<div class="cards stagger">
+<div class="card">
+  <div class="card-tag tag-core">PURPOSE</div>
+  <div class="card-t">Search the audit journal</div>
+  <p>Recover queries the local SQLite journal and displays all recorded changes matching your filters: layer, operation type, date range, and text search.</p>
 </div>
+<div class="card">
+  <div class="card-tag tag-strong">SAFE</div>
+  <div class="card-t">Read-only operation</div>
+  <p>Recover never modifies your data. It only reads the journal and displays results in the table. You can run it as many times as needed without risk.</p>
+</div>
+</div>
+
+<div class="flow">
+  <span class="fn">Set filters</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Layer + operation + period</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">Click Recover (F5)</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Results appear in the table</span>
+</div>
+
+<div class="tip"><strong>Keyboard shortcut</strong>: Press <code>F5</code> to trigger Recover. Use <code>Ctrl+F</code> to filter results by text.</div>
+
+<!-- ── RESTORE CARD ── -->
+<h3 id="btn-restore">Restore: revert changes</h3>
+<div class="cards stagger">
+<div class="card">
+  <div class="card-tag tag-core">PURPOSE</div>
+  <div class="card-t">Write previous values back to the layer</div>
+  <p>Restore reverses the selected events: it puts back old attribute values, re-inserts deleted features, or removes incorrectly inserted features.</p>
+</div>
+<div class="card">
+  <div class="card-tag tag-medium">CAUTION</div>
+  <div class="card-t">Modifies data with preflight check</div>
+  <p>Before executing, RecoverLand runs a preflight validation (schema, capabilities, volume limits). A confirmation dialog shows the plan and any warnings.</p>
+</div>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Original event</th><th>What Restore does</th><th>Result</th></tr></thead>
+<tbody>
+  <tr><td><strong>UPDATE</strong></td><td>Puts back old attribute values + geometry</td><td>Feature reverted to its pre-edit state</td></tr>
+  <tr><td><strong>DELETE</strong></td><td>Re-inserts the feature with saved attributes</td><td>Deleted feature reappears in the layer</td></tr>
+  <tr><td><strong>INSERT</strong></td><td>Removes the incorrectly inserted feature</td><td>Feature deleted from the layer</td></tr>
+</tbody>
+</table></div>
 
 <div class="warn"><strong>Restore modifies data</strong>. It overwrites current values with the values stored in the journal. Make sure to select the correct rows before confirming.</div>
 
-<div class="danger"><strong>Restore on a repacked shapefile</strong>: If a shapefile was re-exported or packed between capture and restore, FIDs may have changed. The restore risks modifying the wrong feature. Use GeoPackage to avoid this risk.</div>
+<!-- ── PREFLIGHT DIAGRAM ── -->
+<h4>Preflight validation</h4>
+<div class="dia">
+<svg viewBox="0 0 520 160" xmlns="http://www.w3.org/2000/svg">
+  <rect class="nd" x="4" y="58" width="100" height="36"/>
+  <text x="54" y="80" text-anchor="middle" class="lbl" font-size="10.5">Select rows</text>
+  <line x1="104" y1="76" x2="140" y2="76" class="edge-ac"/>
+  <rect class="nd-ac" x="140" y="50" width="110" height="52"/>
+  <text x="195" y="72" text-anchor="middle" class="lbl" font-size="10.5">Preflight</text>
+  <text x="195" y="86" text-anchor="middle" class="dim">schema + caps + volume</text>
+  <line x1="250" y1="66" x2="290" y2="40" class="edge"/>
+  <line x1="250" y1="86" x2="290" y2="86" class="edge"/>
+  <line x1="250" y1="86" x2="290" y2="130" class="edge"/>
+  <rect class="nd-success" x="290" y="22" width="80" height="32"/>
+  <text x="330" y="42" text-anchor="middle" class="lbl-success" font-size="10">READY</text>
+  <rect class="nd-warn" x="290" y="70" width="80" height="32"/>
+  <text x="330" y="90" text-anchor="middle" class="lbl-warn" font-size="10">WARNINGS</text>
+  <rect class="nd-danger" x="290" y="115" width="80" height="32"/>
+  <text x="330" y="135" text-anchor="middle" class="lbl-danger" font-size="10">BLOCKED</text>
+  <line x1="370" y1="38" x2="410" y2="76" class="edge-ac"/>
+  <line x1="370" y1="86" x2="410" y2="76" class="edge-ac"/>
+  <rect class="nd-ac" x="410" y="58" width="100" height="36"/>
+  <text x="460" y="80" text-anchor="middle" class="lbl" font-size="10.5">Execute</text>
+  <text x="330" y="155" text-anchor="middle" class="dim" font-size="9">Blocked = button disabled</text>
+</svg>
+</div>
+
+<!-- ── LAST CARD ── -->
+<h3 id="btn-last">Last: undo the restore</h3>
+<div class="cards stagger">
+<div class="card">
+  <div class="card-tag tag-core">PURPOSE</div>
+  <div class="card-t">Revert to pre-restore state</div>
+  <p>After a Restore, the Last button puts your data back exactly as it was before the restore executed. It reverses the restore itself.</p>
+</div>
+<div class="card">
+  <div class="card-tag tag-strong">SAFE NET</div>
+  <div class="card-t">One-click undo, available once</div>
+  <p>Last is only enabled after a successful Restore. After clicking it, the button disables. It does not depend on date filters or search criteria.</p>
+</div>
+</div>
+
+<!-- Last mechanism diagram -->
+<div class="dia">
+<svg viewBox="0 0 520 110" xmlns="http://www.w3.org/2000/svg">
+  <rect class="nd" x="4" y="38" width="110" height="36"/>
+  <text x="59" y="52" text-anchor="middle" class="lbl" font-size="10">Data: state A</text>
+  <text x="59" y="64" text-anchor="middle" class="dim">current values</text>
+  <line x1="114" y1="56" x2="155" y2="56" class="edge-ac"/>
+  <text x="135" y="46" text-anchor="middle" font-size="9" fill="#D97706" font-weight="600">Restore</text>
+  <rect class="nd-ac" x="155" y="38" width="110" height="36"/>
+  <text x="210" y="52" text-anchor="middle" class="lbl" font-size="10">Data: state B</text>
+  <text x="210" y="64" text-anchor="middle" class="dim">old values restored</text>
+  <line x1="265" y1="56" x2="308" y2="56" class="edge-ac"/>
+  <text x="286" y="46" text-anchor="middle" font-size="9" fill="#16A34A" font-weight="600">Last</text>
+  <rect class="nd" x="308" y="38" width="110" height="36"/>
+  <text x="363" y="52" text-anchor="middle" class="lbl" font-size="10">Data: state A</text>
+  <text x="363" y="64" text-anchor="middle" class="dim">back to current</text>
+  <!-- Legend -->
+  <text x="4" y="100" font-size="9.5" fill="var(--tx3)">State A = your data before Restore was clicked</text>
+  <text x="4" y="14" font-size="9.5" fill="var(--tx3)">State B = data after Restore (old journal values applied)</text>
+</svg>
+</div>
+
+<div class="info"><strong>How it works internally</strong>: For UPDATE events, Last re-applies the post-edit values. For DELETE events (re-inserted by Restore), it deletes them again. For INSERT events (deleted by Restore), it re-inserts them. Each operation is reversed precisely.</div>
+
+<!-- ── RESTORE MODES ── -->
+<h3 id="time-travel">Restore modes</h3>
+<p>When results are loaded, a <strong>mode selector</strong> appears above the buttons:</p>
+<div class="tw"><table>
+<thead><tr><th>Mode</th><th>Use case</th><th>Behavior</th></tr></thead>
+<tbody>
+  <tr><td><strong>By event</strong></td><td>Undo specific changes</td><td>Each selected event is reversed individually. Failed events do not block others.</td></tr>
+  <tr><td><strong>To date / version</strong></td><td>Roll back to a point in time</td><td>All events after the cutoff are reversed in order. Strict atomicity: all succeed or all roll back.</td></tr>
+</tbody>
+</table></div>
+
+<h4>Retention coverage</h4>
+<p>If you request a temporal restore with a cutoff date before the oldest available event, the preflight blocks the operation. This prevents silent partial restores.</p>
+
+<h4>Session tracking</h4>
+<p>Every restore execution produces a <strong>RestoreSession</strong> record (session ID, mode, timestamps, success/failure counts, status). Each restored feature also generates a trace event in the journal for auditability.</p>
+
+<div class="danger"><strong>Restore on a repacked shapefile</strong>: If a shapefile was re-exported or packed between capture and restore, FIDs may have changed. Use GeoPackage to avoid this risk.</div>
 </section>
 
 <!-- ====== SCHEMA WARNING ====== -->
@@ -439,6 +614,8 @@
   <span class="fn-ac">Recover</span>
 </div>
 <p>The 50 changes appear. Select them all, then click <strong>Restore</strong>. The attributes revert to their previous state.</p>
+
+<div class="tip"><strong>Changed your mind?</strong> Click <strong>Last</strong> immediately after a Restore to undo it. Your data goes back to the state it was in before you clicked Restore.</div>
 </section>
 
 <section id="scenario-compare">
@@ -472,7 +649,7 @@
 </div>
 <p>The deleted feature appears with all its attributes and geometry at the time of deletion. Select it and click <strong>Restore</strong> to re-insert it into the layer.</p>
 
-<div class="tip"><strong>The restored feature</strong> is inserted as a new feature with a new FID. Attributes and geometry are identical to the saved state.</div>
+<div class="tip"><strong>The restored feature</strong> is inserted as a new feature with a new FID. Attributes and geometry are identical to the saved state. If the wrong feature was recovered, click <strong>Last</strong> to undo.</div>
 </section>
 
 </main>
@@ -490,7 +667,11 @@
   <a href="#tracking">Tracking</a>
   <a href="#search">Search</a>
   <a href="#results">Results</a>
-  <a href="#restore">Restore</a>
+  <a href="#restore">The three buttons</a>
+  <a href="#btn-recover" class="sub">Recover</a>
+  <a href="#btn-restore" class="sub">Restore</a>
+  <a href="#btn-last" class="sub">Last</a>
+  <a href="#time-travel" class="sub">Restore modes</a>
   <a href="#schema-warning">Schema drift</a>
   <a href="#retention-config">Retention</a>
   <a href="#maintenance">Maintenance</a>

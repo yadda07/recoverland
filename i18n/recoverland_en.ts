@@ -8,12 +8,30 @@
         <translation>RecoverLand - Audit data recovery</translation>
     </message>
     <message>
-        <source>Suppression massive detectee : {count} entite(s) supprimee(s) sur &apos;{layer}&apos;. Ouvrez RecoverLand pour verifier.</source>
-        <translation>Mass deletion detected: {count} feature(s) deleted on &apos;{layer}&apos;. Open RecoverLand to verify.</translation>
+        <source>Suppression massive: {count} entite(s) supprimee(s) sur &apos;{layer}&apos;.</source>
+        <translation>Mass deletion: {count} feature(s) deleted on &apos;{layer}&apos;.</translation>
     </message>
     <message>
         <source>{count} modification(s) enregistree(s) sur &apos;{layer}&apos;.</source>
         <translation>{count} modification(s) recorded on &apos;{layer}&apos;.</translation>
+    </message>
+    <message>
+        <source>Journal corrompu</source>
+        <translation>Corrupt journal</translation>
+    </message>
+    <message>
+        <source>Le journal d&apos;audit est corrompu.
+Voulez-vous le renommer et creer un nouveau journal ?
+
+Le fichier corrompu sera conserve pour analyse.</source>
+        <translation>The audit journal is corrupt.
+Do you want to rename it and create a new journal?
+
+The corrupt file will be kept for analysis.</translation>
+    </message>
+    <message>
+        <source>File d&apos;ecriture saturee: enregistrement desactive. Evenements en attente sauvegardes. Relancez le suivi manuellement.</source>
+        <translation>Write queue full: recording disabled. Pending events saved. Restart tracking manually.</translation>
     </message>
 </context>
 <context>
@@ -438,11 +456,11 @@ This action is irreversible.</translation>
         <translation>Period</translation>
     </message>
     <message>
-        <source>Dernières 10 minutes</source>
+        <source>Dernieres 10 minutes</source>
         <translation>Last 10 minutes</translation>
     </message>
     <message>
-        <source>Dernières 30 minutes</source>
+        <source>Dernieres 30 minutes</source>
         <translation>Last 30 minutes</translation>
     </message>
     <message>
@@ -450,7 +468,7 @@ This action is irreversible.</translation>
         <translation>1 hour</translation>
     </message>
     <message>
-        <source>Dernière heure</source>
+        <source>Derniere heure</source>
         <translation>Last hour</translation>
     </message>
     <message>
@@ -458,7 +476,7 @@ This action is irreversible.</translation>
         <translation>1 day</translation>
     </message>
     <message>
-        <source>Dernières 24 heures</source>
+        <source>Dernieres 24 heures</source>
         <translation>Last 24 hours</translation>
     </message>
     <message>
@@ -638,7 +656,7 @@ This action is irreversible.</translation>
         <translation>No events for these criteria. Check the period and layer.</translation>
     </message>
     <message>
-        <source>Arrêter</source>
+        <source>Arreter</source>
         <translation>Stop</translation>
     </message>
     <message>
@@ -700,7 +718,7 @@ Current: {new}</translation>
         <translation>Warning</translation>
     </message>
     <message>
-        <source>Sélectionnez au moins une ligne à restaurer.</source>
+        <source>Selectionnez au moins une ligne a restaurer.</source>
         <translation>Select at least one row to restore.</translation>
     </message>
     <message>
@@ -724,7 +742,7 @@ The target layer must be open in the QGIS project.</translation>
         <translation>Restore</translation>
     </message>
     <message>
-        <source>{count} entité(s) restaurée(s) avec succès.</source>
+        <source>{count} entite(s) restauree(s) avec succes.</source>
         <translation>{count} feature(s) successfully restored.</translation>
     </message>
     <message>
@@ -732,7 +750,7 @@ The target layer must be open in the QGIS project.</translation>
         <translation>Partial restore</translation>
     </message>
     <message>
-        <source>{ok} ok, {fail} échec(s).</source>
+        <source>{ok} ok, {fail} echec(s).</source>
         <translation>{ok} ok, {fail} failure(s).</translation>
     </message>
     <message>
@@ -784,6 +802,34 @@ The target layer must be open in the QGIS project.</translation>
         <translation>{what}: journal appears damaged. Open maintenance to check integrity.</translation>
     </message>
     <message>
+        <source>Annuler le dernier restore</source>
+        <translation>Undo last restore</translation>
+    </message>
+    <message>
+        <source>Annuler le restore</source>
+        <translation>Undo restore</translation>
+    </message>
+    <message>
+        <source>Remettre les {count} entite(s) dans leur etat avant le restore ?</source>
+        <translation>Revert {count} feature(s) to their state before the restore?</translation>
+    </message>
+    <message>
+        <source>Restauration annulee</source>
+        <translation>Restore undone</translation>
+    </message>
+    <message>
+        <source>{count} entite(s) remise(s) dans leur etat initial.</source>
+        <translation>{count} feature(s) reverted to their original state.</translation>
+    </message>
+    <message>
+        <source>Annulation partielle</source>
+        <translation>Partial undo</translation>
+    </message>
+    <message>
+        <source>{ok} ok, {fail} echec(s).</source>
+        <translation>{ok} ok, {fail} failure(s).</translation>
+    </message>
+    <message>
         <source>Valeur modifiee</source>
         <translation>Value modified</translation>
     </message>
@@ -798,6 +844,164 @@ The target layer must be open in the QGIS project.</translation>
     <message>
         <source>Geometrie modifiee</source>
         <translation>Geometry modified</translation>
+    </message>
+    <message>
+        <source>Aucune activité dans le périmètre courant.</source>
+        <translation>No activity in the current scope.</translation>
+    </message>
+    <message>
+        <source>Filtre {op} : aucun événement visible.</source>
+        <translation>Filter {op}: no visible events.</translation>
+    </message>
+    <message>
+        <source>Filtre {op} : le périmètre courant ne contient que ce type.</source>
+        <translation>Filter {op}: the current scope only contains this type.</translation>
+    </message>
+    <message>
+        <source>Filtre {op} : {selected} visible(s), {hidden} masqué(s).</source>
+        <translation>Filter {op}: {selected} visible, {hidden} hidden.</translation>
+    </message>
+    <message>
+        <source>Cette sélection ne contient que des mises à jour.</source>
+        <translation>This selection contains only updates.</translation>
+    </message>
+    <message>
+        <source>Cette sélection ne contient que des suppressions.</source>
+        <translation>This selection contains only deletions.</translation>
+    </message>
+    <message>
+        <source>Cette sélection ne contient que des ajouts.</source>
+        <translation>This selection contains only inserts.</translation>
+    </message>
+    <message>
+        <source>Activité d&apos;un seul utilisateur dans cette sélection.</source>
+        <translation>Activity from a single user in this selection.</translation>
+    </message>
+    <message>
+        <source>Activité répartie entre {count} utilisateur(s) dans cette sélection.</source>
+        <translation>Activity spread across {count} user(s) in this selection.</translation>
+    </message>
+    <message>
+        <source>Cochez les couches a restaurer</source>
+        <translation>Check the layers to restore</translation>
+    </message>
+    <message>
+        <source>Rewind</source>
+        <translation>Rewind</translation>
+    </message>
+    <message>
+        <source>Recover</source>
+        <translation>Recover</translation>
+    </message>
+    <message>
+        <source>Cochez au moins une couche.</source>
+        <translation>Check at least one layer.</translation>
+    </message>
+    <message>
+        <source>Aucun evenement apres cette date. Rien a restaurer.</source>
+        <translation>No events after this date. Nothing to restore.</translation>
+    </message>
+    <message>
+        <source>{count} evenements depassent la limite ({limit}). Choisissez une date plus recente.</source>
+        <translation>{count} events exceed the limit ({limit}). Choose a more recent date.</translation>
+    </message>
+    <message>
+        <source>Volume important</source>
+        <translation>Large volume</translation>
+    </message>
+    <message>
+        <source>{count} evenements seront analyses. Continuer ?</source>
+        <translation>{count} events will be analyzed. Continue?</translation>
+    </message>
+    <message>
+        <source>Confirmer la restauration</source>
+        <translation>Confirm restore</translation>
+    </message>
+    <message>
+        <source>Revenir au {date} ?
+
+{count} evenement(s) sur {n_layers} couche(s) seront rejoues en inverse.</source>
+        <translation>Revert to {date}?
+
+{count} event(s) on {n_layers} layer(s) will be replayed in reverse.</translation>
+    </message>
+    <message>
+        <source>Couche &apos;{name}&apos; non trouvee dans le projet.</source>
+        <translation>Layer &apos;{name}&apos; not found in project.</translation>
+    </message>
+    <message>
+        <source>{ok} restauree(s), {fail} echouee(s).</source>
+        <translation>{ok} restored, {fail} failed.</translation>
+    </message>
+    <message>
+        <source>Recuperation annulee.</source>
+        <translation>Recovery cancelled.</translation>
+    </message>
+    <message>
+        <source>Restauration annulee.</source>
+        <translation>Restore cancelled.</translation>
+    </message>
+    <message>
+        <source>Annulation partielle: {ok} ok, {fail} echec(s).</source>
+        <translation>Partial undo: {ok} ok, {fail} failure(s).</translation>
+    </message>
+    <message>
+        <source>Date de retour invalide. Deplacez le curseur temporel.</source>
+        <translation>Invalid return date. Move the time slider.</translation>
+    </message>
+    <message>
+        <source>Filtrer sur &apos;{name}&apos;</source>
+        <translation>Filter on &apos;{name}&apos;</translation>
+    </message>
+    <message>
+        <source>{count} ligne(s) copiee(s).</source>
+        <translation>{count} row(s) copied.</translation>
+    </message>
+</context>
+<context>
+    <name>RestoreModeSelector</name>
+    <message>
+        <source>Mode :</source>
+        <translation>Mode:</translation>
+    </message>
+    <message>
+        <source>Action</source>
+        <translation>Action</translation>
+    </message>
+    <message>
+        <source>Annuler un ou plusieurs evenements selectionnes</source>
+        <translation>Undo one or more selected events</translation>
+    </message>
+    <message>
+        <source>Version</source>
+        <translation>Version</translation>
+    </message>
+    <message>
+        <source>Retour a un point dans le temps (reverse replay)</source>
+        <translation>Return to a point in time (reverse replay)</translation>
+    </message>
+</context>
+<context>
+    <name>RestorePreflightDialog</name>
+    <message>
+        <source>RecoverLand - Pre-vol de restauration</source>
+        <translation>RecoverLand - Restore Preflight</translation>
+    </message>
+    <message>
+        <source>Annuler</source>
+        <translation>Cancel</translation>
+    </message>
+    <message>
+        <source>Executer la restauration</source>
+        <translation>Execute restore</translation>
+    </message>
+    <message>
+        <source>Restauration impossible</source>
+        <translation>Restore not possible</translation>
+    </message>
+    <message>
+        <source>Le pre-vol a detecte des problemes bloquants</source>
+        <translation>Preflight detected blocking issues</translation>
     </message>
 </context>
 <context>
@@ -959,6 +1163,100 @@ The target layer must be open in the QGIS project.</translation>
     <message>
         <source>{size} Go</source>
         <translation>{size} GB</translation>
+    </message>
+</context>
+<context>
+    <name>TimeSliderWidget</name>
+    <message>
+        <source>Revenir au :</source>
+        <translation>Revert to:</translation>
+    </message>
+    <message>
+        <source>{count} evenement(s)</source>
+        <translation>{count} event(s)</translation>
+    </message>
+    <message>
+        <source>Aucun evenement enregistre</source>
+        <translation>No recorded events</translation>
+    </message>
+</context>
+<context>
+    <name>RestorePreview</name>
+    <message>
+        <source>Evenement</source>
+        <translation>Event</translation>
+    </message>
+    <message>
+        <source>Temporel</source>
+        <translation>Temporal</translation>
+    </message>
+    <message>
+        <source>Mode: {mode}</source>
+        <translation>Mode: {mode}</translation>
+    </message>
+    <message>
+        <source>Entites: {count}</source>
+        <translation>Entities: {count}</translation>
+    </message>
+    <message>
+        <source>Evenements: {count}</source>
+        <translation>Events: {count}</translation>
+    </message>
+    <message>
+        <source>Operations: {ops}</source>
+        <translation>Operations: {ops}</translation>
+    </message>
+    <message>
+        <source>Atomicite: tout-ou-rien (rollback si echec)</source>
+        <translation>Atomicity: all-or-nothing (rollback on failure)</translation>
+    </message>
+    <message>
+        <source>Atomicite: par entite (isolation des erreurs)</source>
+        <translation>Atomicity: per entity (error isolation)</translation>
+    </message>
+    <message>
+        <source>Statut: PRET</source>
+        <translation>Status: READY</translation>
+    </message>
+    <message>
+        <source>Statut: PRET (avec avertissements)</source>
+        <translation>Status: READY (with warnings)</translation>
+    </message>
+    <message>
+        <source>Statut: BLOQUE</source>
+        <translation>Status: BLOCKED</translation>
+    </message>
+    <message>
+        <source>Avertissements:</source>
+        <translation>Warnings:</translation>
+    </message>
+    <message>
+        <source>evenement</source>
+        <translation>event</translation>
+    </message>
+    <message>
+        <source>temporel</source>
+        <translation>temporal</translation>
+    </message>
+    <message>
+        <source>Restauration bloquee: {reasons}</source>
+        <translation>Restore blocked: {reasons}</translation>
+    </message>
+    <message>
+        <source>Restauration {mode}: {event_count} evenement(s) sur {entity_count} entite(s)</source>
+        <translation>Restore {mode}: {event_count} event(s) on {entity_count} entity(ies)</translation>
+    </message>
+    <message>
+        <source>
+
+Avertissements ({count}):</source>
+        <translation>
+
+Warnings ({count}):</translation>
+    </message>
+    <message>
+        <source>Continuer ?</source>
+        <translation>Continue?</translation>
     </message>
 </context>
 </TS>

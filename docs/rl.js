@@ -61,11 +61,14 @@ document.addEventListener('keydown', function(e){
 var RL_SEARCH = [
   {t:'Introduction',k:'recoverland plugin qgis audit',h:'index.html#intro',p:'index'},
   {t:'Architecture',k:'architecture sqlite journal tracker',h:'index.html#architecture',p:'index'},
+  {t:'Frontiere locale',k:'local trust boundary local only workstation sqlite no service',h:'index.html#trust-boundary',p:'index'},
+  {t:'Modele de donnees local',k:'mcd data model sqlite audit_session datasource_registry backend_settings schema_version',h:'index.html#data-model',p:'index'},
   {t:'Journal SQLite',k:'sqlite journal wal audit_event',h:'index.html#journal',p:'index'},
   {t:'Capture automatique',k:'capture tracker edit commit signal',h:'index.html#capture',p:'index'},
   {t:'Tampon d\'edition',k:'edit buffer session snapshot net effect',h:'index.html#edit-buffer',p:'index'},
   {t:'Stockage delta',k:'delta update changed_only attributes storage',h:'index.html#delta-storage',p:'index'},
   {t:'Identification',k:'fingerprint datasource identity pk fid',h:'index.html#identification',p:'index'},
+  {t:'Restauration intelligente',k:'smart restore entity fingerprint restored_from_event_id suppress trace dedup',h:'index.html#restore-dedup',p:'index'},
   {t:'Force d\'identification',k:'strong medium weak none identity strength',h:'index.html#identity-strength',p:'index'},
   {t:'Mode dual backend',k:'backend router sqlite postgresql legacy dual',h:'index.html#dual-backend',p:'index'},
   {t:'Derive de schema',k:'schema drift migration champ ajoute supprime',h:'index.html#schema-drift',p:'index'},
@@ -184,6 +187,111 @@ function initHeadingReveal(){
   });
 }
 
+/* ===== SIDEBAR MORPHING PILL ===== */
+function initSidebarPill(){
+  var nav = document.querySelector('.side nav');
+  if(!nav) return;
+  var pill = document.createElement('div');
+  pill.className = 'side-pill';
+  nav.appendChild(pill);
+  function movePill(){
+    var active = nav.querySelector('a.on');
+    if(!active){
+      pill.classList.remove('active');
+      return;
+    }
+    var navRect = nav.getBoundingClientRect();
+    var aRect = active.getBoundingClientRect();
+    pill.style.top = (aRect.top - navRect.top + nav.scrollTop) + 'px';
+    pill.style.height = aRect.height + 'px';
+    pill.style.width = aRect.width + 'px';
+    pill.classList.add('active');
+  }
+  var mo = new MutationObserver(function(muts){
+    muts.forEach(function(m){
+      if(m.type === 'attributes' && m.attributeName === 'class') movePill();
+    });
+  });
+  nav.querySelectorAll('a').forEach(function(a){
+    mo.observe(a, {attributes:true, attributeFilter:['class']});
+  });
+  movePill();
+  window.addEventListener('resize', movePill, {passive:true});
+}
+
+/* ===== HERO SCROLL PARALLAX ===== */
+function initHeroParallax(){
+  var hero = document.querySelector('.hero');
+  if(!hero) return;
+  var logo = hero.querySelector('.hero-logo');
+  var sub = hero.querySelector('.hero-sub');
+  var badges = hero.querySelector('.hero-badges');
+  var line = hero.querySelector('.hero-line');
+  if(window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var ticking = false;
+  window.addEventListener('scroll', function(){
+    if(!ticking){
+      ticking = true;
+      requestAnimationFrame(function(){
+        var rect = hero.getBoundingClientRect();
+        var h = hero.offsetHeight;
+        if(rect.bottom < 0 || rect.top > window.innerHeight){ ticking = false; return; }
+        var progress = Math.max(0, Math.min(1, -rect.top / h));
+        var opacity = 1 - progress * 1.2;
+        var scale = 1 - progress * 0.08;
+        var ty = progress * 30;
+        if(logo && logo.classList.contains('vis')){
+          logo.style.transform = 'translateY(' + ty + 'px) scale(' + scale + ')';
+          logo.style.opacity = Math.max(0, opacity);
+        }
+        if(sub) sub.style.opacity = Math.max(0, 1 - progress * 1.8);
+        if(badges) badges.style.opacity = Math.max(0, 1 - progress * 2);
+        if(line) line.style.opacity = Math.max(0, (0.5 - progress * 1.5));
+        ticking = false;
+      });
+    }
+  }, {passive:true});
+}
+
+/* ===== VIEW TRANSITIONS NAVIGATION ===== */
+function initViewTransitions(){
+  if(!document.startViewTransition) return;
+  document.querySelectorAll('.bar-nav a[href], .side nav a[href]').forEach(function(a){
+    var href = a.getAttribute('href');
+    if(!href || href.charAt(0) === '#') return;
+    a.addEventListener('click', function(e){
+      e.preventDefault();
+      document.startViewTransition(function(){
+        window.location.href = href;
+      });
+    });
+  });
+}
+
+/* ===== CALLOUT MOUSE GLOW ===== */
+function initCalloutGlow(){
+  var prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if(prefersReduced) return;
+  document.querySelectorAll('.info,.warn,.tip,.danger').forEach(function(el){
+    var glow = document.createElement('div');
+    glow.style.cssText = 'position:absolute;width:180px;height:180px;border-radius:50%;pointer-events:none;z-index:0;opacity:0;transition:opacity .3s ease;';
+    glow.className = 'callout-glow-orb';
+    var c1 = getComputedStyle(el).getPropertyValue('--c1').trim() || '#2563EB';
+    glow.style.background = 'radial-gradient(circle,color-mix(in srgb,' + c1 + ' 12%,transparent) 0%,transparent 70%)';
+    el.appendChild(glow);
+    el.addEventListener('mousemove', function(e){
+      var rect = el.getBoundingClientRect();
+      var x = e.clientX - rect.left - 90;
+      var y = e.clientY - rect.top - 90;
+      glow.style.transform = 'translate(' + x + 'px,' + y + 'px)';
+      glow.style.opacity = '1';
+    });
+    el.addEventListener('mouseleave', function(){
+      glow.style.opacity = '0';
+    });
+  });
+}
+
 /* ===== CARD 3D TILT ===== */
 function initCardTilt(){
   var prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -222,6 +330,34 @@ function initSvgDraw(){
   });
 }
 
+/* ===== AUTO-GENERATE RIGHT SIDEBAR TOC ===== */
+function initRightToc(){
+  var container = document.getElementById('rp-toc');
+  if(!container) return;
+  var headings = document.querySelectorAll('.main h2, .main h3');
+  headings.forEach(function(h){
+    var id = h.id;
+    if(!id && h.tagName === 'H2'){
+      var sec = h.closest('section[id]');
+      if(sec) id = sec.id;
+    }
+    if(!id){
+      var slug = h.textContent.trim().toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      var base = slug; var i = 1;
+      while(document.getElementById(slug)){ slug = base + '-' + i; i++; }
+      h.id = slug;
+      id = slug;
+    }
+    if(!id) return;
+    var a = document.createElement('a');
+    a.href = '#' + id;
+    a.textContent = h.textContent;
+    if(h.tagName === 'H3') a.className = 'sub';
+    container.appendChild(a);
+  });
+}
+
 /* ===== SMOOTH SCROLL PROGRESS FOR TOC ===== */
 function initTocProgress(){
   var rpLinks = document.querySelectorAll('.rp a[href^="#"]');
@@ -248,14 +384,19 @@ function initTocProgress(){
 }
 
 document.addEventListener('DOMContentLoaded', function(){
+  initRightToc();
   initScroll();
   initProgressBar();
   initSearch(RL_SEARCH);
   initHeroOrbs();
   initReveal();
   initHeadingReveal();
+  initCalloutGlow();
   initCardTilt();
   initSvgDraw();
   initSmoothNav();
   initTocProgress();
+  initSidebarPill();
+  initHeroParallax();
+  initViewTransitions();
 });

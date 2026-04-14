@@ -2,8 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="view-transition" content="same-origin">
 <title>RecoverLand - Documentation</title>
-<link rel="stylesheet" href="rl.css?v=3">
+<link rel="stylesheet" href="rl.css?v=6">
 </head>
 <body>
 <svg style="position:absolute;width:0;height:0"><defs>
@@ -37,19 +38,16 @@
   <a href="#architecture">Architecture</a>
   <a href="#journal">SQLite Journal</a>
   <a href="#capture">Automatic capture</a>
-  <a href="#edit-buffer">Edit buffer</a>
   <a href="#delta-storage">Delta storage</a>
   <div class="cat">Identification</div>
   <a href="#identification">Identification system</a>
-  <a href="#fingerprint">Layer fingerprint</a>
+  <a href="#restore-dedup">Smart restore</a>
   <a href="#identity-strength">Identity strength</a>
   <div class="cat">Robustness</div>
   <a href="#dual-backend">Dual backend mode</a>
-  <a href="#schema-drift">Schema drift</a>
   <a href="#integrity">Integrity &amp; recovery</a>
   <a href="#retention">Retention &amp; purge</a>
   <a href="#health">Health monitoring</a>
-  <a href="#memory">Memory management</a>
   <a href="#event-lifecycle">Event lifecycle</a>
 </nav></aside>
 
@@ -133,7 +131,7 @@
   <li>Selective restore with schema compatibility report before applying</li>
   <li>Schema drift detection between the saved state and the current layer structure</li>
   <li>Dual backend mode: local SQLite (automatic) + PostgreSQL legacy (when server-side triggers exist)</li>
-  <li>Asynchronous batch writes in a dedicated thread (zero UI freeze)</li>
+  <li>Asynchronous batch writes in a dedicated thread (zero UI blocking)</li>
   <li>Startup integrity check (WAL checkpoint, pending-event recovery, schema version validation)</li>
   <li>Automatic user identification from: plugin config &rarr; env variable <code>RECOVERLAND_USER</code> &rarr; OS login &rarr; QGIS profile name</li>
   <li>Live health monitoring with thresholds on journal size (50&nbsp;MB / 200&nbsp;MB / 500&nbsp;MB) and event count</li>
@@ -207,6 +205,16 @@
 </svg>
 </div>
 
+<div class="trust-strip">
+  <div class="trust-pill">Runs inside QGIS</div>
+  <div class="trust-pill">Stores data locally</div>
+  <div class="trust-pill">No mandatory server</div>
+  <div class="trust-pill">No background system service</div>
+  <div class="trust-pill">User can export the journal</div>
+</div>
+
+<div class="tip"><strong>Trust boundary</strong>: In local mode, RecoverLand stays inside the QGIS process and writes to a SQLite file on the user's machine. It does not install a Windows service, does not inject code into the system, and does not require a remote database to protect local edits.</div>
+
 <h3>Main components</h3>
 <div class="tw"><table>
 <thead><tr><th>Component</th><th>Role</th><th>File</th></tr></thead>
@@ -227,6 +235,52 @@
 </table></div>
 </section>
 
+<!-- ====== TRUST BOUNDARY ====== -->
+<section id="trust-boundary">
+<h2>Local trust boundary</h2>
+<p>The design goal is simple: make the recovery system visible, local, and bounded. Users can understand where data lives, who writes it, and what RecoverLand does not touch.</p>
+
+<div class="dia">
+<svg viewBox="0 0 620 300" xmlns="http://www.w3.org/2000/svg">
+  <rect x="18" y="18" width="584" height="264" rx="16" fill="none" stroke="var(--ac)" stroke-width="1.8" stroke-dasharray="8,4"/>
+  <text x="36" y="42" class="lbl" font-size="13">User workstation boundary</text>
+
+  <rect x="42" y="64" width="240" height="78" class="nd-ac"/>
+  <text x="162" y="92" text-anchor="middle" class="lbl" font-size="13">QGIS + RecoverLand plugin</text>
+  <text x="162" y="112" text-anchor="middle" class="dim" font-size="10">Capture, search, restore, health checks</text>
+  <text x="162" y="128" text-anchor="middle" class="dim" font-size="10">All logic runs in the user session</text>
+
+  <rect x="338" y="64" width="236" height="78" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
+  <text x="456" y="92" text-anchor="middle" class="lbl" font-size="13">Local SQLite journal</text>
+  <text x="456" y="112" text-anchor="middle" class="dim" font-size="10">.recoverland/recoverland_audit.sqlite</text>
+  <text x="456" y="128" text-anchor="middle" class="dim" font-size="10">WAL mode, user-readable exportable file</text>
+
+  <line x1="282" y1="103" x2="338" y2="103" class="edge-ac"/>
+
+  <rect x="42" y="176" width="240" height="72" class="nd-success"/>
+  <text x="162" y="202" text-anchor="middle" class="lbl-success" font-size="13">Touches only project data + journal</text>
+  <text x="162" y="220" text-anchor="middle" class="dim" font-size="10">Editable layers and one local audit file</text>
+
+  <rect x="338" y="176" width="236" height="72" class="nd-danger"/>
+  <text x="456" y="202" text-anchor="middle" class="lbl-danger" font-size="13">Does not install system components</text>
+  <text x="456" y="220" text-anchor="middle" class="dim" font-size="10">No Windows service, no driver, no registry dependency</text>
+</svg>
+</div>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-strong">What users can verify</div>
+    <div class="card-t">Visible local artifact</div>
+    <p>The journal is a plain SQLite file stored next to the project or inside the QGIS profile for unsaved projects. It can be located, copied, exported, and inspected.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-medium">What remains bounded</div>
+    <div class="card-t">No hidden multiplication</div>
+    <p>RecoverLand records events and lightweight restore traces, not full duplicated datasets or uncontrolled background replicas of the project.</p>
+  </div>
+</div>
+</section>
+
 <!-- ====== JOURNAL ====== -->
 <section id="journal">
 <h2>SQLite Journal</h2>
@@ -237,7 +291,7 @@
 <thead><tr><th>Situation</th><th>Path</th></tr></thead>
 <tbody>
   <tr><td>Saved project at <code>C:/projects/site.qgz</code></td><td><code>C:/projects/.recoverland/recoverland_audit.sqlite</code></td></tr>
-  <tr><td>Unsaved project</td><td><code>[QGIS profile]/recoverland/audit/audit_&lt;hash&gt;.sqlite</code></td></tr>
+  <tr><td>Unsaved project</td><td><code>[QGIS profile]/recoverland/audit/audit_<hash>.sqlite</code></td></tr>
 </tbody>
 </table></div>
 <p style="font-size:13px;color:var(--tx3)">Unsaved-project journals older than 30 days that no longer correspond to an open project are automatically removed at startup (orphan cleanup).</p>
@@ -251,14 +305,74 @@
   <tr><td><code>project_fingerprint</code></td><td>TEXT</td><td>Identifies the source QGIS project</td></tr>
   <tr><td><code>datasource_fingerprint</code></td><td>TEXT</td><td>Uniquely identifies the source layer</td></tr>
   <tr><td><code>feature_identity_json</code></td><td>TEXT</td><td>Identifies the feature (FID + primary key when available)</td></tr>
+  <tr><td><code>entity_fingerprint</code></td><td>TEXT</td><td>Canonical restore key such as <code>pk:id=42</code> or <code>fid:7</code></td></tr>
   <tr><td><code>operation_type</code></td><td>TEXT</td><td>INSERT, UPDATE, or DELETE</td></tr>
   <tr><td><code>attributes_json</code></td><td>TEXT</td><td>Attribute state before the change (delta or full snapshot depending on operation)</td></tr>
   <tr><td><code>geometry_wkb</code></td><td>BLOB</td><td>Geometry in WKB format</td></tr>
+  <tr><td><code>new_geometry_wkb</code></td><td>BLOB</td><td>Post-edit geometry when the event schema provides forward geometry data</td></tr>
   <tr><td><code>user_name</code></td><td>TEXT</td><td>User who made the change (auto-resolved)</td></tr>
   <tr><td><code>created_at</code></td><td>TEXT</td><td>UTC timestamp of the event</td></tr>
+  <tr><td><code>restored_from_event_id</code></td><td>INTEGER</td><td>Reference used by lightweight restore trace events</td></tr>
+  <tr><td><code>event_schema_version</code></td><td>INTEGER</td><td>Schema version of the event payload written by the plugin</td></tr>
 </tbody>
 </table></div>
-<p style="font-size:13px;color:var(--tx3)">Simplified schema. The real table also contains: <code>layer_id_snapshot</code>, <code>layer_name_snapshot</code>, <code>provider_type</code>, <code>geometry_type</code>, <code>crs_authid</code>, <code>field_schema_json</code>, <code>session_id</code>, <code>restored_from_event_id</code>.</p>
+<p style="font-size:13px;color:var(--tx3)">Simplified schema. The real table also contains: <code>layer_id_snapshot</code>, <code>layer_name_snapshot</code>, <code>provider_type</code>, <code>geometry_type</code>, <code>crs_authid</code>, <code>field_schema_json</code>, and <code>session_id</code>.</p>
+</section>
+
+<!-- ====== DATA MODEL ====== -->
+<section id="data-model">
+<h2>Local data model</h2>
+<p>The local database is intentionally compact. A few tables cover settings, datasource registry, edit sessions, and the event stream. The center of gravity is <code>audit_event</code>, which stores the history at feature level.</p>
+
+<div class="dia">
+<svg viewBox="0 0 620 360" xmlns="http://www.w3.org/2000/svg">
+  <rect x="214" y="120" width="192" height="110" rx="10" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.8"/>
+  <text x="310" y="148" text-anchor="middle" class="lbl" font-size="14">audit_event</text>
+  <text x="310" y="168" text-anchor="middle" class="dim" font-size="10">event_id, datasource_fingerprint</text>
+  <text x="310" y="184" text-anchor="middle" class="dim" font-size="10">entity_fingerprint, operation_type</text>
+  <text x="310" y="200" text-anchor="middle" class="dim" font-size="10">attributes_json, geometry_wkb</text>
+  <text x="310" y="216" text-anchor="middle" class="dim" font-size="10">created_at, restored_from_event_id</text>
+
+  <rect x="36" y="34" width="176" height="72" class="nd"/>
+  <text x="124" y="60" text-anchor="middle" class="lbl" font-size="12">audit_session</text>
+  <text x="124" y="78" text-anchor="middle" class="dim" font-size="10">One logical edit session</text>
+  <text x="124" y="94" text-anchor="middle" class="dim" font-size="10">Links to many events</text>
+
+  <rect x="412" y="34" width="172" height="72" class="nd"/>
+  <text x="498" y="60" text-anchor="middle" class="lbl" font-size="12">datasource_registry</text>
+  <text x="498" y="78" text-anchor="middle" class="dim" font-size="10">Fingerprint to source URI</text>
+  <text x="498" y="94" text-anchor="middle" class="dim" font-size="10">Used to recreate layers safely</text>
+
+  <rect x="36" y="258" width="176" height="68" class="nd"/>
+  <text x="124" y="284" text-anchor="middle" class="lbl" font-size="12">backend_settings</text>
+  <text x="124" y="302" text-anchor="middle" class="dim" font-size="10">Retention, overrides, options</text>
+
+  <rect x="412" y="258" width="172" height="68" class="nd"/>
+  <text x="498" y="284" text-anchor="middle" class="lbl" font-size="12">schema_version</text>
+  <text x="498" y="302" text-anchor="middle" class="dim" font-size="10">Migration tracking</text>
+
+  <line x1="166" y1="106" x2="242" y2="146" class="edge"/>
+  <line x1="452" y1="106" x2="378" y2="146" class="edge"/>
+  <line x1="166" y1="258" x2="242" y2="222" class="edge"/>
+  <line x1="452" y1="258" x2="378" y2="222" class="edge"/>
+
+  <text x="205" y="116" class="dim" font-size="10">1 session</text>
+  <text x="206" y="128" class="dim" font-size="10">N events</text>
+  <text x="386" y="116" class="dim" font-size="10">1 datasource</text>
+  <text x="391" y="128" class="dim" font-size="10">N events</text>
+</svg>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Table</th><th>Responsibility</th><th>Why users should care</th></tr></thead>
+<tbody>
+  <tr><td><code>audit_event</code></td><td>Immutable event stream of edits and restore traces</td><td>Main recovery history, scoped at feature level</td></tr>
+  <tr><td><code>audit_session</code></td><td>Groups edits made in the same session</td><td>Makes large operations explainable and purgeable by session</td></tr>
+  <tr><td><code>datasource_registry</code></td><td>Remembers how to find the original layer source</td><td>Helps reconnect the history to the right layer later</td></tr>
+  <tr><td><code>backend_settings</code></td><td>Stores local project settings</td><td>Avoids hidden system-wide configuration</td></tr>
+  <tr><td><code>schema_version</code></td><td>Tracks database migrations</td><td>Prevents silent schema drift inside the journal</td></tr>
+</tbody>
+</table></div>
 </section>
 
 <!-- ====== CAPTURE ====== -->
@@ -411,6 +525,60 @@ INSERT: {"all_attributes": {"name": "Martin", "age": 35, "city": "Lyon"}}</pre>
 <div class="tip"><strong>Two layers named "vegetation"</strong> in different folders have different fingerprints. The layer display name is never used as an identifier: only the absolute source path matters.</div>
 </section>
 
+<!-- ====== RESTORE DEDUP ====== -->
+<section id="restore-dedup">
+<h2>Smart restore without actor multiplication</h2>
+<p>RecoverLand does not restore "by name" and does not create a new actor for every historical row. It restores against the current entity stream, grouped by <code>entity_fingerprint</code>, and writes only lightweight trace records for auditability.</p>
+
+<div class="dia">
+<svg viewBox="0 0 620 270" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20" y="20" width="580" height="52" rx="10" fill="var(--bg2)" stroke="var(--bg3)" stroke-width="1.2"/>
+  <text x="310" y="42" text-anchor="middle" class="lbl" font-size="13">Events of the same feature share one entity fingerprint</text>
+  <text x="310" y="58" text-anchor="middle" class="dim" font-size="10">Example: pk:id=42</text>
+
+  <rect x="42" y="104" width="116" height="54" class="nd"/>
+  <text x="100" y="126" text-anchor="middle" class="lbl" font-size="11">DELETE evt 120</text>
+  <text x="100" y="144" text-anchor="middle" class="dim" font-size="10">pk:id=42</text>
+
+  <rect x="182" y="104" width="116" height="54" class="nd"/>
+  <text x="240" y="126" text-anchor="middle" class="lbl" font-size="11">UPDATE evt 154</text>
+  <text x="240" y="144" text-anchor="middle" class="dim" font-size="10">pk:id=42</text>
+
+  <rect x="322" y="104" width="116" height="54" class="nd"/>
+  <text x="380" y="126" text-anchor="middle" class="lbl" font-size="11">UPDATE evt 201</text>
+  <text x="380" y="144" text-anchor="middle" class="dim" font-size="10">pk:id=42</text>
+
+  <rect x="462" y="104" width="116" height="54" class="nd-ac"/>
+  <text x="520" y="126" text-anchor="middle" class="lbl" font-size="11">Current live feature</text>
+  <text x="520" y="144" text-anchor="middle" class="dim" font-size="10">resolved once for restore</text>
+
+  <line x1="158" y1="131" x2="182" y2="131" class="edge"/>
+  <line x1="298" y1="131" x2="322" y2="131" class="edge"/>
+  <line x1="438" y1="131" x2="462" y2="131" class="edge-ac"/>
+
+  <rect x="70" y="196" width="220" height="48" class="nd-success"/>
+  <text x="180" y="216" text-anchor="middle" class="lbl-success" font-size="12">Tracker suppressed during restore</text>
+  <text x="180" y="232" text-anchor="middle" class="dim" font-size="10">Avoids re-recording the restore as a fresh user edit</text>
+
+  <rect x="330" y="196" width="220" height="48" class="nd-warn"/>
+  <text x="440" y="216" text-anchor="middle" class="lbl-warn" font-size="12">Trace event is reference-only</text>
+  <text x="440" y="232" text-anchor="middle" class="dim" font-size="10">Uses restored_from_event_id, not a full duplicate payload</text>
+</svg>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Mechanism</th><th>Implementation intent</th><th>User-facing effect</th></tr></thead>
+<tbody>
+  <tr><td><code>entity_fingerprint</code></td><td>Canonical key like <code>pk:id=42</code> or <code>fid:7</code></td><td>The same feature is followed across its event stream instead of being treated as unrelated rows</td></tr>
+  <tr><td>FID pre-resolution cache</td><td>Batch lookup before restore</td><td>Fewer repeated scans, more predictable restore time</td></tr>
+  <tr><td>Tracker suppression</td><td>Capture is disabled while restore runs</td><td>No feedback loop, no accidental re-audit inflation</td></tr>
+  <tr><td>Trace event</td><td>Reference to the original event via <code>restored_from_event_id</code></td><td>Restore remains auditable without cloning the full event history</td></tr>
+  <tr><td>Default search filters</td><td>Trace events excluded from standard totals and listings</td><td>The user sees the business history first, not technical bookkeeping noise</td></tr>
+</tbody>
+</table></div>
+
+<div class="info"><strong>Important nuance</strong>: RecoverLand keeps the original event history and may add a lightweight restore trace, but it does not multiply business entities. The feature identity stays anchored by the datasource fingerprint plus the entity fingerprint.</div>
+</section>
 <!-- ====== IDENTITY STRENGTH ====== -->
 <section id="identity-strength">
 <h2>Identity strength</h2>
@@ -622,6 +790,7 @@ INSERT: {"all_attributes": {"name": "Martin", "age": 35, "city": "Lyon"}}</pre>
 
 <h3>User identification</h3>
 <p>Every event carries a <code>user_name</code> resolved automatically by the <code>user_identity.py</code> module. Sources are tested in order:</p>
+
 <div class="flow">
   <span class="fn-ac">Plugin config override</span>
   <span class="fa">&rarr;</span>
@@ -648,24 +817,7 @@ INSERT: {"all_attributes": {"name": "Martin", "age": 35, "city": "Lyon"}}</pre>
     <div class="srch-res" id="sr"></div>
   </div>
   <h4>On this page</h4>
-  <a href="#intro">Introduction</a>
-  <a href="#what-it-does">What it does</a>
-  <a href="#what-it-doesnt">What it does not do</a>
-  <a href="#architecture">Architecture</a>
-  <a href="#journal">SQLite Journal</a>
-  <a href="#capture">Automatic capture</a>
-  <a href="#edit-buffer">Edit buffer</a>
-  <a href="#delta-storage">Delta storage</a>
-  <a href="#identification">Identification</a>
-  <a href="#fingerprint">Layer fingerprint</a>
-  <a href="#identity-strength">Identity strength</a>
-  <a href="#dual-backend">Dual backend</a>
-  <a href="#schema-drift">Schema drift</a>
-  <a href="#integrity">Integrity</a>
-  <a href="#retention">Retention &amp; purge</a>
-  <a href="#health">Health monitoring</a>
-  <a href="#memory">Memory management</a>
-  <a href="#event-lifecycle">Event lifecycle</a>
+  <div id="rp-toc"></div>
 </aside>
 </div>
 
