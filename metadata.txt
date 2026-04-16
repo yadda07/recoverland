@@ -12,7 +12,6 @@ email=youcef.geodesien@gmail.com
 category=Data Management
 tags=audit,recovery,restore,sketching,versioning,local,sqlite,temporal,rollback,health,preview
 icon=icon.svg
-supportsQt6=True
 qgisMaximumVersion=4.99
 experimental=False
 deprecated=False
