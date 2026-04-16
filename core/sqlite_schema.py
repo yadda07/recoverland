@@ -11,6 +11,9 @@ CURRENT_SCHEMA_VERSION = 3
 
 _PRAGMAS = [
     "PRAGMA journal_mode=WAL",
+    # WAL + synchronous=NORMAL: performance/durability trade-off.
+    # An OS crash may lose the last committed events.
+    # Acceptable for a local audit journal (source data remains intact).
     "PRAGMA synchronous=NORMAL",
     "PRAGMA busy_timeout=5000",
     "PRAGMA cache_size=-8000",

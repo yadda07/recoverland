@@ -13,6 +13,7 @@ if 'qgis' not in sys.modules:
         WARNING = 1
         CRITICAL = 2
         SUCCESS = 3
+
         @staticmethod
         def logMessage(msg, tag='', level=0):
             pass
@@ -28,9 +29,11 @@ if 'qgis' not in sys.modules:
         @staticmethod
         def qgisSettingsDirPath():
             return os.path.join(os.path.expanduser('~'), '.qgis_mock')
+
         @staticmethod
         def nullRepresentation():
             return 'NULL'
+
         @staticmethod
         def authManager():
             return None
@@ -38,25 +41,32 @@ if 'qgis' not in sys.modules:
     class _FakeQgsSettings:
         def __init__(self):
             self._groups = []
+
         def beginGroup(self, name):
             self._groups.append(name)
+
         def endGroup(self):
             if self._groups:
                 self._groups.pop()
+
         def childGroups(self):
             return []
+
         def value(self, key, default=''):
             return default
 
     class _FakeQgsProject:
         _instance = None
+
         @classmethod
         def instance(cls):
             if cls._instance is None:
                 cls._instance = cls()
             return cls._instance
+
         def absoluteFilePath(self):
             return ''
+
         def mapLayers(self):
             return {}
 
@@ -64,20 +74,26 @@ if 'qgis' not in sys.modules:
         class Flag:
             NoGeometry = 1
         NoGeometry = 1
+
         def __init__(self, *args):
             pass
+
         def setFilterFids(self, fids):
             return self
+
         def setSubsetOfAttributes(self, *args):
             return self
+
         def setFlags(self, *args):
             return self
+
         def setLimit(self, n):
             return self
 
     class _FakeQgsWkbTypes:
         NoGeometry = 100
         NullGeometry = 100
+
         @staticmethod
         def displayString(wkb_type):
             return 'Unknown'
@@ -85,16 +101,21 @@ if 'qgis' not in sys.modules:
     class _FakeQgsExpression:
         def __init__(self, expr_str=''):
             self._expr = expr_str
+
         @staticmethod
         def quotedColumnRef(col):
             return f'"{col}"'
+
         @staticmethod
         def quotedValue(val):
             return f"'{val}'"
+
         def hasParserError(self):
             return False
+
         def parserErrorString(self):
             return ''
+
         def prepare(self, fields):
             return True
 
@@ -105,12 +126,16 @@ if 'qgis' not in sys.modules:
     class _FakeQgsGeometry:
         def __init__(self):
             pass
+
         def isNull(self):
             return True
+
         def isEmpty(self):
             return True
+
         def asWkb(self):
             return b''
+
         @staticmethod
         def fromWkb(data):
             g = _FakeQgsGeometry()
@@ -119,12 +144,16 @@ if 'qgis' not in sys.modules:
     class _FakeQgsFields:
         def __init__(self):
             self._fields = []
+
         def __iter__(self):
             return iter(self._fields)
+
         def count(self):
             return len(self._fields)
+
         def at(self, idx):
             return self._fields[idx]
+
         def indexOf(self, name):
             return -1
 
@@ -132,12 +161,16 @@ if 'qgis' not in sys.modules:
         def __init__(self, fields=None):
             self._attrs = {}
             self._fid = 0
+
         def id(self):
             return self._fid
+
         def geometry(self):
             return _FakeQgsGeometry()
+
         def setAttribute(self, idx, val):
             self._attrs[idx] = val
+
         def __getitem__(self, key):
             return self._attrs.get(key)
 
@@ -159,6 +192,7 @@ if 'qgis' not in sys.modules:
     qgis_core.QgsGeometry = _FakeQgsGeometry
     qgis_core.QgsFields = _FakeQgsFields
     qgis_core.QgsFeature = _FakeQgsFeature
+
     class _FakeQgsVectorDataProvider:
         class Capability:
             AddFeatures = 1
@@ -211,44 +245,57 @@ if 'qgis' not in sys.modules:
         AlignRight = 0x0002
         AlignHCenter = 0x0004
         AlignVCenter = 0x0080
+
         class TransformationMode:
             SmoothTransformation = 1
         SmoothTransformation = 1
+
         class AspectRatioMode:
             KeepAspectRatio = 1
         KeepAspectRatio = 1
+
         class WindowType:
             WindowMaximizeButtonHint = 0x00010000
         WindowMaximizeButtonHint = 0x00010000
+
         class CursorShape:
             PointingHandCursor = 13
         PointingHandCursor = 13
+
         class ContextMenuPolicy:
             CustomContextMenu = 3
         CustomContextMenu = 3
+
         class TextInteractionFlag:
             TextSelectableByMouse = 1
         TextSelectableByMouse = 1
+
         class ItemDataRole:
             UserRole = 0x0100
         UserRole = 0x0100
+
         class PenStyle:
             NoPen = 0
         NoPen = 0
+
         class WidgetAttribute:
             WA_TransparentForMouseEvents = 76
         WA_TransparentForMouseEvents = 76
+
         class Orientation:
             Horizontal = 1
             Vertical = 2
         Horizontal = 1
         Vertical = 2
+
         class DateFormat:
             ISODate = 1
         ISODate = 1
+
         class ItemFlag:
             ItemIsUserCheckable = 16
         ItemIsUserCheckable = 16
+
         class CheckState:
             Unchecked = 0
             Checked = 2
@@ -277,23 +324,30 @@ if 'qgis' not in sys.modules:
     class _Signal:
         def __init__(self, *args):
             pass
+
         def connect(self, *args):
             pass
+
         def disconnect(self, *args):
             pass
+
         def emit(self, *args):
             pass
 
     class _QDateTime:
         pass
+
     class _QDate:
         pass
+
     class _QTime:
         pass
+
     class _QTimer:
         @staticmethod
         def singleShot(ms, callback):
             pass
+
     class _QByteArray:
         pass
 
@@ -301,6 +355,7 @@ if 'qgis' not in sys.modules:
         @staticmethod
         def translate(context, text, *args):
             return text
+
         @staticmethod
         def installTranslator(translator):
             pass
@@ -313,10 +368,13 @@ if 'qgis' not in sys.modules:
         @staticmethod
         def system():
             return _QLocale()
+
         def name(self):
             return 'en_US'
+
     class _QVariantAnimation:
         pass
+
     class _QRectF:
         pass
 
@@ -340,6 +398,7 @@ if 'qgis' not in sys.modules:
 
     # QtWidgets stub
     qtwidgets = types.ModuleType('qgis.PyQt.QtWidgets')
+
     class _QSizePolicy:
         class Policy:
             Preferred = 0
@@ -348,16 +407,19 @@ if 'qgis' not in sys.modules:
         Preferred = 0
         Fixed = 1
         Expanding = 2
+
     class _QAbstractItemView:
         class SelectionBehavior:
             SelectRows = 1
         SelectRows = 1
+
     class _QMessageBox:
         class StandardButton:
             Yes = 0x00004000
             No = 0x00010000
         Yes = 0x00004000
         No = 0x00010000
+
     class _QVBoxLayout:
         class SizeConstraint:
             SetMinimumSize = 1
@@ -375,6 +437,7 @@ if 'qgis' not in sys.modules:
                      'QButtonGroup', 'QScrollArea', 'QFrame', 'QMenu',
                      'QShortcut', 'QStackedWidget', 'QSlider'):
         setattr(qtwidgets, cls_name, type(cls_name, (), {}))
+
     def _widgets_getattr(name):
         cls = type(name, (), {'__init__': lambda self, *a, **kw: None})
         setattr(qtwidgets, name, cls)
@@ -384,15 +447,18 @@ if 'qgis' not in sys.modules:
 
     # QtGui stub
     qtgui = types.ModuleType('qgis.PyQt.QtGui')
+
     class _QPainter:
         class RenderHint:
             Antialiasing = 1
             SmoothPixmapTransform = 4
         Antialiasing = 1
         SmoothPixmapTransform = 4
+
         class CompositionMode:
             CompositionMode_Screen = 14
         CompositionMode_Screen = 14
+
     class _QPalette:
         class ColorRole:
             WindowText = 0
@@ -403,12 +469,14 @@ if 'qgis' not in sys.modules:
         Mid = 5
     qtgui.QPainter = _QPainter
     qtgui.QPalette = _QPalette
+
     class _FakeQColor:
         def __init__(self, *args, **kwargs):
             self._r = args[0] if len(args) > 0 else 0
             self._g = args[1] if len(args) > 1 else 0
             self._b = args[2] if len(args) > 2 else 0
             self._a = args[3] if len(args) > 3 else 255
+
         def red(self): return self._r
         def green(self): return self._g
         def blue(self): return self._b

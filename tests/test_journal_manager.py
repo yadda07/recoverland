@@ -1,5 +1,4 @@
 """Tests for core.journal_manager module (RLU-003)."""
-import sqlite3
 import tempfile
 import os
 import unittest

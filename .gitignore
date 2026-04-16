@@ -3,4 +3,5 @@ __pycache__/
 *.pyo
 *.log
 *.md
+flake8_report.txt
 .pytest_cache/

@@ -192,7 +192,7 @@ class TestWriteQueueLargeBatch(unittest.TestCase):
     def test_1500_events_all_persisted(self):
         wq = WriteQueue()
         wq.start(self.tmp_path)
-        events = [_make_event(created_at=f"2025-06-{(i%28)+1:02d}T{i%24:02d}:00:00") for i in range(1500)]
+        events = [_make_event(created_at=f"2025-06-{(i % 28)+1:02d}T{i % 24:02d}:00:00") for i in range(1500)]
         wq.enqueue(events)
         wq.stop()
         conn = sqlite3.connect(self.tmp_path)

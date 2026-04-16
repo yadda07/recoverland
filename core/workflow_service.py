@@ -157,20 +157,36 @@ def find_target_layer(event: AuditEvent, read_conn=None) -> object:
 
 
 def _try_restore_from_registry(event: AuditEvent, read_conn) -> object:
-    """Recreate a layer from the datasource registry."""
+    """Recreate a layer from the datasource registry.
+
+    For DB-backed layers (postgres, mssql, oracle): resolves credentials
+    from authcfg or QGIS saved connections. Falls back to None if the
+    connection cannot be established.
+    """
     try:
         from qgis.core import QgsProject
-        from .datasource_registry import lookup_datasource, create_layer_from_registry
+        from .datasource_registry import (
+            lookup_datasource, create_layer_from_registry, _DB_PROVIDERS,
+        )
 
         info = lookup_datasource(read_conn, event.datasource_fingerprint)
         if info is None:
             flog(f"find_target_layer: no registry for {event.datasource_fingerprint}")
             return None
+
+        flog(f"find_target_layer: registry hit provider={info.provider_type} "
+             f"layer={info.layer_name}")
+
         layer = create_layer_from_registry(info)
         if layer is not None and layer.isValid():
             QgsProject.instance().addMapLayer(layer, False)
-            flog("find_target_layer: temp layer added for restore")
+            flog(f"find_target_layer: temp layer added for restore "
+                 f"provider={info.provider_type}")
             return layer
+
+        if info.provider_type in _DB_PROVIDERS:
+            flog(f"find_target_layer: DB layer '{info.layer_name}' could not "
+                 f"reconnect; load it manually in the project first", "WARNING")
         return None
     except Exception as e:
         flog(f"find_target_layer: registry fallback failed: {e}", "WARNING")

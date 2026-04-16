@@ -269,7 +269,6 @@ class TestVacuumAsync(unittest.TestCase):
 
     def test_vacuum_no_callback_no_crash(self):
         import tempfile
-        import threading
         with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as tmp:
             tmp_path = tmp.name
         try:

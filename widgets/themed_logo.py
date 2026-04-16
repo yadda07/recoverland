@@ -142,11 +142,16 @@ class ThemedLogoWidget(QWidget):
         if alpha <= 0:
             return
         gradient = QLinearGradient(center_x - band_width / 2.0, 0.0, center_x + band_width / 2.0, 0.0)
-        gradient.setColorAt(0.0, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), 0))
-        gradient.setColorAt(0.4, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), int(alpha * 0.45)))
-        gradient.setColorAt(0.5, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), alpha))
-        gradient.setColorAt(0.6, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), int(alpha * 0.45)))
-        gradient.setColorAt(1.0, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), 0))
+        gradient.setColorAt(0.0, QColor(self._smoke_color.red(),
+                            self._smoke_color.green(), self._smoke_color.blue(), 0))
+        gradient.setColorAt(0.4, QColor(self._smoke_color.red(), self._smoke_color.green(),
+                            self._smoke_color.blue(), int(alpha * 0.45)))
+        gradient.setColorAt(0.5, QColor(self._smoke_color.red(),
+                            self._smoke_color.green(), self._smoke_color.blue(), alpha))
+        gradient.setColorAt(0.6, QColor(self._smoke_color.red(), self._smoke_color.green(),
+                            self._smoke_color.blue(), int(alpha * 0.45)))
+        gradient.setColorAt(1.0, QColor(self._smoke_color.red(),
+                            self._smoke_color.green(), self._smoke_color.blue(), 0))
         painter.save()
         painter.setClipRect(logo_rect)
         painter.setCompositionMode(QtCompat.COMPOSITION_SCREEN)
@@ -163,11 +168,16 @@ class ThemedLogoWidget(QWidget):
         if alpha <= 0:
             return
         gradient = QLinearGradient(center_x + band_width / 2.0, 0.0, center_x - band_width / 2.0, 0.0)
-        gradient.setColorAt(0.0, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), 0))
-        gradient.setColorAt(0.4, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), int(alpha * 0.45)))
-        gradient.setColorAt(0.5, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), alpha))
-        gradient.setColorAt(0.6, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), int(alpha * 0.45)))
-        gradient.setColorAt(1.0, QColor(self._smoke_color.red(), self._smoke_color.green(), self._smoke_color.blue(), 0))
+        gradient.setColorAt(0.0, QColor(self._smoke_color.red(),
+                            self._smoke_color.green(), self._smoke_color.blue(), 0))
+        gradient.setColorAt(0.4, QColor(self._smoke_color.red(), self._smoke_color.green(),
+                            self._smoke_color.blue(), int(alpha * 0.45)))
+        gradient.setColorAt(0.5, QColor(self._smoke_color.red(),
+                            self._smoke_color.green(), self._smoke_color.blue(), alpha))
+        gradient.setColorAt(0.6, QColor(self._smoke_color.red(), self._smoke_color.green(),
+                            self._smoke_color.blue(), int(alpha * 0.45)))
+        gradient.setColorAt(1.0, QColor(self._smoke_color.red(),
+                            self._smoke_color.green(), self._smoke_color.blue(), 0))
         painter.save()
         painter.setClipRect(logo_rect)
         painter.setCompositionMode(QtCompat.COMPOSITION_SCREEN)

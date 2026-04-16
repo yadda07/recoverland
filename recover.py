@@ -9,7 +9,7 @@ from .recover_dialog import RecoverDialog
 from .themed_action_icon import ThemedActionIconController
 from .core import (
     flog, qlog, JournalManager, WriteQueue, EditSessionTracker,
-    BackendRouter, SQLiteAuditBackend,
+    SQLiteAuditBackend,
     check_journal_integrity,
     get_journal_size_bytes, format_journal_size,
     get_journal_stats, evaluate_journal_health,
@@ -32,7 +32,6 @@ class RecoverPlugin:
         self._journal = JournalManager()
         self._write_queue = WriteQueue()
         self._tracker = None
-        self._router = BackendRouter()
         self._sqlite_backend = None
         self._status_indicator = None
         self._integrity_result = None
@@ -48,15 +47,16 @@ class RecoverPlugin:
             icon = QIcon(icon_path)
         elif os.path.exists(logo_path):
             icon = QIcon(logo_path)
-        
+
         if icon and not icon.isNull():
             self.action = QAction(icon, "RecoverLand", self.iface.mainWindow())
             self.action.setIconVisibleInMenu(True)
         else:
             self.action = QAction("RecoverLand", self.iface.mainWindow())
-        
+
         self.action.setIconVisibleInMenu(True)
-        self.action.setToolTip(QCoreApplication.translate("RecoverPlugin", "RecoverLand - Récupération de données d'audit"))
+        self.action.setToolTip(QCoreApplication.translate(
+            "RecoverPlugin", "RecoverLand - Récupération de données d'audit"))
         self.action.triggered.connect(self.run)
         self.iface.addPluginToMenu("RecoverLand", self.action)
         self.iface.addToolBarIcon(self.action)
@@ -100,7 +100,7 @@ class RecoverPlugin:
     def run(self):
         if self.dlg is None:
             self.dlg = RecoverDialog(
-                self.iface, self._router, self._journal,
+                self.iface, journal=self._journal,
                 tracker=self._tracker,
                 write_queue=self._write_queue,
             )
@@ -128,8 +128,6 @@ class RecoverPlugin:
 
             self._write_queue.start(journal_path)
             self._sqlite_backend = SQLiteAuditBackend(self._journal, self._write_queue)
-            self._router.set_sqlite_backend(self._sqlite_backend)
-            self._router.activate_local_mode()
 
             self._tracker = EditSessionTracker(self._write_queue, self._journal)
             self._tracker.set_commit_callback(self._on_events_committed)
@@ -196,8 +194,6 @@ class RecoverPlugin:
             self._sqlite_backend = None
 
         self._journal.close()
-        self._router.deactivate_local_mode()
-        self._router.clear_cache()
 
     def _connect_existing_layers(self) -> None:
         """Connect edit tracking to all currently loaded vector layers."""
@@ -221,7 +217,6 @@ class RecoverPlugin:
             return
         for lid in layer_ids:
             self._tracker.disconnect_layer_by_id(lid)
-            self._router.invalidate_layer(lid)
 
     def _on_project_opened(self) -> None:
         self._shutdown_local_backend()
@@ -272,8 +267,8 @@ class RecoverPlugin:
             tracking, health_level, event_count, size_str)
 
     def _on_events_committed(self, event_count, layer_name,
-                              is_mass_delete, delete_count,
-                              datasource_fp="") -> None:
+                             is_mass_delete, delete_count,
+                             datasource_fp="") -> None:
         """UX-G02 + UX-B04: Handle commit callback from tracker."""
         if is_mass_delete:
             qlog(QCoreApplication.translate(

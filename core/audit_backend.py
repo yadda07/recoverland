@@ -94,28 +94,3 @@ class AuditBackend(ABC):
     @abstractmethod
     def close(self) -> None:
         """Release resources."""
-
-    @property
-    def supports_search(self) -> bool:
-        """True if search/count/get_event return real data.
-
-        Backends that delegate search to an external mechanism (e.g.
-        legacy PG via RecoverThread) should return False so the UI
-        does not call search() expecting results.
-        """
-        return True
-
-
-class ReadOnlyBackend(AuditBackend):
-    """Backend that only supports reading (e.g. legacy PG via server triggers).
-
-    search/count/get_event are stubs that return empty results.
-    The legacy PG flow uses RecoverThread/RestoreThread directly.
-    """
-
-    def write_events(self, events: List[AuditEvent]) -> int:
-        raise NotImplementedError("This backend does not support local writes")
-
-    @property
-    def supports_search(self) -> bool:
-        return False

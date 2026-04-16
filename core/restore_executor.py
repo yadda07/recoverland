@@ -9,7 +9,7 @@ from typing import Dict, List
 
 from .audit_backend import AuditEvent, RestoreReport
 from .restore_contracts import (
-    RestorePlan, AtomicityPolicy, PreflightVerdict, COMPENSATORY_OPS,
+    RestorePlan, AtomicityPolicy, PreflightVerdict,
     RestoreSession,
 )
 from .restore_planner import preflight_check

@@ -13,6 +13,7 @@ from .restore_contracts import (
     RestoreCutoff, CutoffType, MAX_EVENTS_PER_RESTORE,
 )
 from .logger import flog, timed_op
+from .sql_safety import assert_safe_fragment
 
 _EVENT_COLUMNS = (
     "event_id, project_fingerprint, datasource_fingerprint,"
@@ -31,6 +32,7 @@ def fetch_entity_stream(
     limit: int = MAX_EVENTS_PER_RESTORE,
 ) -> List[AuditEvent]:
     """Fetch all events for a single entity, ordered by event_id ASC."""
+    assert_safe_fragment(_EVENT_COLUMNS)
     query = (
         f"SELECT {_EVENT_COLUMNS} FROM audit_event"
         " WHERE datasource_fingerprint = ? AND entity_fingerprint = ?"
@@ -56,6 +58,8 @@ def fetch_events_after_cutoff(
         where, params = _cutoff_where(datasource_fp, cutoff)
         if where is None:
             return []
+        assert_safe_fragment(_EVENT_COLUMNS)
+        assert_safe_fragment(where)
         query = (
             f"SELECT {_EVENT_COLUMNS} FROM audit_event"
             f" WHERE {where} ORDER BY event_id DESC LIMIT ?"
@@ -75,6 +79,7 @@ def count_events_after_cutoff(
         where, params = _cutoff_where(datasource_fp, cutoff)
         if where is None:
             return 0
+        assert_safe_fragment(where)
         row = conn.execute(
             f"SELECT COUNT(*) FROM audit_event WHERE {where}", params
         ).fetchone()
@@ -89,6 +94,8 @@ def fetch_events_by_ids(
     if not event_ids:
         return []
     placeholders = ",".join("?" for _ in event_ids)
+    assert_safe_fragment(_EVENT_COLUMNS)
+    assert_safe_fragment(placeholders)
     query = (
         f"SELECT {_EVENT_COLUMNS} FROM audit_event"
         f" WHERE event_id IN ({placeholders})"

@@ -12,7 +12,7 @@ import sys
 
 from recoverland.core.audit_backend import AuditEvent
 from recoverland.core.search_service import (
-    search_events, count_events, summarize_scope, _build_where_clause,
+    count_events, summarize_scope, _build_where_clause,
 )
 from recoverland.core.retention import get_journal_stats
 from recoverland.core.restore_service import restore_batch, undo_restore_batch
@@ -115,20 +115,25 @@ class TestTraceEventLightweight:
         class _Layer:
             def id(self):
                 return "l1"
+
             def name(self):
                 return "test"
+
             def dataProvider(self):
                 class _P:
                     def name(self):
                         return "ogr"
                 return _P()
+
             def fields(self):
                 class _F:
                     def __iter__(self):
                         return iter([])
                 return _F()
+
             def source(self):
                 return "/tmp/test.gpkg"
+
             def primaryKeyAttributes(self):
                 return []
 
@@ -235,6 +240,7 @@ class _EditableLayer:
 
 class _EditableCleanLayer:
     """Editable layer with no unsaved changes."""
+
     def __init__(self):
         self.committed = False
 
@@ -251,8 +257,10 @@ class _EditableCleanLayer:
         class _Stub:
             def pkAttributeIndexes(self):
                 return []
+
             def getFeatures(self, _req=None):
                 return iter([])
+
             def capabilities(self):
                 return 0
         return _Stub()
@@ -261,6 +269,7 @@ class _EditableCleanLayer:
         class _Fields:
             def count(self):
                 return 0
+
             def indexOf(self, _name):
                 return -1
         return _Fields()

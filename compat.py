@@ -24,12 +24,12 @@ from qgis.core import Qgis, QgsFeatureRequest, QgsVectorDataProvider
 
 def _resolve_enum(parent, scoped_attr, fallback_attr):
     """Resolve an enum value with Qt6 scoped name, falling back to Qt5 short name.
-    
+
     Args:
         parent: The class containing the enum (e.g. Qt, QSizePolicy)
         scoped_attr: Qt6 scoped intermediate (e.g. 'AlignmentFlag')
         fallback_attr: The enum value name (e.g. 'AlignCenter')
-    
+
     Returns:
         The resolved enum value.
     """

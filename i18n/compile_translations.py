@@ -11,6 +11,28 @@ import os
 import struct
 import xml.etree.ElementTree as ET
 
+try:
+    import defusedxml.ElementTree as _safe_ET
+    _HAS_DEFUSEDXML = True
+except ImportError:
+    _HAS_DEFUSEDXML = False
+
+_MAX_TS_FILE_SIZE = 50 * 1024 * 1024  # 50 MB hard limit
+
+
+def _safe_parse(path: str):
+    """Parse XML with XXE and entity expansion protections."""
+    size = os.path.getsize(path)
+    if size > _MAX_TS_FILE_SIZE:
+        raise ValueError(
+            f"TS file too large ({size} bytes, max {_MAX_TS_FILE_SIZE})"
+        )
+    if _HAS_DEFUSEDXML:
+        return _safe_ET.parse(path)
+    parser = ET.XMLParser()
+    parser.entity = {}
+    return ET.parse(path, parser=parser)
+
 
 _QM_MAGIC = (
     b"\x3c\xb8\x64\x18\xca\xef\x9c\x95"
@@ -61,7 +83,7 @@ def _build_message_entry(context: str, source: str, translation: str) -> bytes:
 
 def _parse_ts(ts_path: str):
     """Yield (context, source, translation) from a .ts file."""
-    tree = ET.parse(ts_path)
+    tree = _safe_parse(ts_path)
     root = tree.getroot()
     for ctx_el in root.iter("context"):
         name_el = ctx_el.find("name")

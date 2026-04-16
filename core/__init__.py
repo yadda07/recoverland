@@ -1,11 +1,6 @@
 """Core modules for RecoverLand plugin."""
-from .constants import (
-    DB_CONNECT_TIMEOUT, DB_STATEMENT_TIMEOUT, THREAD_STOP_TIMEOUT,
-    PLUGIN_NAME, SCHEMA_AUDIT_MAPPING, AVAILABLE_SCHEMAS, HAS_PSYCOPG2, psycopg2
-)
+from .constants import PLUGIN_NAME
 from .logger import flog, qlog, LoggerMixin, generate_trace_id, timed_op
-from .database import DatabaseMixin
-from .threads import RecoverThread, RestoreThread
 
 from .support_policy import (
     IdentityStrength, SupportLevel, ProviderPolicy,
@@ -52,9 +47,7 @@ from .restore_service import (
     pre_check_restore, restore_deleted_feature, restore_inserted_feature,
     restore_updated_feature, restore_batch, PreCheckResult,
 )
-from .pg_backend import PostgreSQLAuditBackend
 from .sqlite_backend import SQLiteAuditBackend
-from .backend_router import BackendRouter, BackendMode, format_mode_display
 from .retention import (
     purge_old_events, count_purgeable_events, get_journal_stats,
     purge_excess_events, vacuum_async,
