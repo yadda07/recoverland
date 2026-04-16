@@ -22,13 +22,19 @@ def extract_geometry_type(layer) -> str:
     """Get the geometry type string for a layer.
 
     Returns 'NoGeometry' for non-spatial layers.
+    QGIS 4.x: uses Qgis.WkbType (QgsWkbTypes deprecated)
+    QGIS 3.x: uses Qgis.WkbType or Qgis.WkbType
     """
     try:
-        from qgis.core import QgsWkbTypes
+        from qgis.core import Qgis
         wkb_type = layer.wkbType()
-        if wkb_type == QgsWkbTypes.NoGeometry:
-            return "NoGeometry"
-        return QgsWkbTypes.displayString(wkb_type)
+        if hasattr(Qgis, 'WkbType'):
+            if wkb_type == Qgis.WkbType.NoGeometry:
+                return "NoGeometry"
+            return Qgis.WkbType(wkb_type).name if isinstance(wkb_type, int) else str(wkb_type)
+        if hasattr(Qgis, 'displayString'):
+            return Qgis.displayString(wkb_type)
+        return str(wkb_type)
     except Exception:
         return "Unknown"
 

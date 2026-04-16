@@ -10,6 +10,7 @@ from qgis.core import QgsGeometry, QgsCoordinateReferenceSystem, QgsCoordinateTr
 from qgis.gui import QgsRubberBand, QgsMapCanvas
 
 from .logger import flog
+from ..compat import QtCompat
 
 try:
     from qgis.core import Qgis
@@ -64,12 +65,7 @@ class GeometryPreviewManager:
         self._band = QgsRubberBand(self._canvas, band_type)
         self._band.setColor(self._style_color())
         self._band.setWidth(2)
-        from qgis.PyQt.QtCore import Qt
-        try:
-            dash = Qt.PenStyle.DashLine
-        except AttributeError:
-            dash = Qt.DashLine
-        self._band.setLineStyle(dash)
+        self._band.setLineStyle(QtCompat.DASH_LINE)
         self._band.setToGeometry(geom)
         self._canvas.refresh()
         return True

@@ -58,8 +58,7 @@ class TimeSliderWidget(QWidget):
         self._newest_label.setStyleSheet("font-size: 10px;")
 
         self._slider = QSlider(QtCompat.HORIZONTAL, self)
-        self._slider.setTickPosition(QSlider.TicksBelow if hasattr(
-            QSlider, 'TicksBelow') else QSlider.TickPosition.TicksBelow)
+        self._slider.setTickPosition(QtCompat.TICK_BELOW)
         self._slider.setMinimum(0)
         self._slider.setMaximum(0)
         self._slider.setEnabled(False)
@@ -101,7 +100,7 @@ class TimeSliderWidget(QWidget):
         """
         if not oldest.isValid() or not newest.isValid():
             flog("time_slider: invalid bounds, disabling", "WARNING")
-            self._disable()
+            self.disable()
             return
 
         o_secs = int(oldest.toSecsSinceEpoch())

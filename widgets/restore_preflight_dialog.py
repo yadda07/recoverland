@@ -44,8 +44,7 @@ class RestorePreflightDialog(QDialog):
         layout.addWidget(self._verdict_label)
 
         sep = QFrame()
-        _hline = getattr(getattr(QFrame, 'Shape', None), 'HLine', None) or getattr(QFrame, 'HLine')
-        sep.setFrameShape(_hline)
+        sep.setFrameShape(QtCompat.HLINE)
         sep.setStyleSheet("color: palette(mid);")
         layout.addWidget(sep)
 

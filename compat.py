@@ -17,7 +17,8 @@ import sys
 from qgis.PyQt.QtCore import Qt, QEvent, QEasingCurve
 from qgis.PyQt.QtGui import QPainter, QPalette
 from qgis.PyQt.QtWidgets import (
-    QSizePolicy, QAbstractItemView, QMessageBox, QVBoxLayout
+    QSizePolicy, QAbstractItemView, QMessageBox, QVBoxLayout,
+    QSlider, QFrame,
 )
 from qgis.core import Qgis, QgsFeatureRequest, QgsVectorDataProvider
 
@@ -91,6 +92,10 @@ class QtCompat:
     TEXT_SELECTABLE_BY_MOUSE = _resolve_enum(Qt, 'TextInteractionFlag', 'TextSelectableByMouse')
     USER_ROLE = _resolve_enum(Qt, 'ItemDataRole', 'UserRole')
 
+    # --- Qt.MouseButton ---
+    LEFT_BUTTON = _resolve_enum(Qt, 'MouseButton', 'LeftButton')
+    RIGHT_BUTTON = _resolve_enum(Qt, 'MouseButton', 'RightButton')
+
     # --- Qt.PenStyle ---
     NO_PEN = _resolve_enum(Qt, 'PenStyle', 'NoPen')
 
@@ -122,6 +127,15 @@ class QtCompat:
     # --- QMessageBox.StandardButton ---
     MSG_YES = _resolve_enum(QMessageBox, 'StandardButton', 'Yes')
     MSG_NO = _resolve_enum(QMessageBox, 'StandardButton', 'No')
+
+    # --- QSlider.TickPosition ---
+    TICK_BELOW = _resolve_enum(QSlider, 'TickPosition', 'TicksBelow')
+
+    # --- QFrame.Shape ---
+    HLINE = _resolve_enum(QFrame, 'Shape', 'HLine')
+
+    # --- Qt.PenStyle ---
+    DASH_LINE = _resolve_enum(Qt, 'PenStyle', 'DashLine')
 
 
 class QgisCompat:
