@@ -28,6 +28,10 @@ def _normalize_source_uri(provider_name: str, raw_source: str) -> str:
     """Normalize a source URI for deterministic fingerprinting."""
     if provider_name == "postgres":
         return _normalize_pg_source(raw_source)
+    if provider_name == "mssql":
+        return _normalize_mssql_source(raw_source)
+    if provider_name == "oracle":
+        return _normalize_oracle_source(raw_source)
     if provider_name in ("ogr", "spatialite", "delimitedtext"):
         return _normalize_file_source(raw_source)
     return raw_source.strip()
@@ -66,6 +70,43 @@ def _normalize_file_source(raw: str) -> str:
     if "|" in raw:
         suffix = "|" + raw.split("|", 1)[1]
     return path + suffix
+
+
+def _normalize_mssql_source(raw: str) -> str:
+    """Extract stable parts from a MSSQL URI."""
+    parts = {}
+    for key in ("host", "port", "dbname", "schema", "table"):
+        match = re.search(rf"{key}='([^']*)'", raw)
+        if not match:
+            match = re.search(rf'{key}="([^"]*)"', raw)
+        if not match:
+            match = re.search(rf"{key}=(\S+)", raw)
+        if match:
+            parts[key] = match.group(1)
+    host = parts.get("host", "")
+    port = parts.get("port", "1433")
+    dbname = parts.get("dbname", "")
+    schema = parts.get("schema", "dbo")
+    table = parts.get("table", "")
+    return f"host={host} port={port} dbname={dbname} schema={schema} table={table}"
+
+
+def _normalize_oracle_source(raw: str) -> str:
+    """Extract stable parts from an Oracle URI."""
+    parts = {}
+    for key in ("host", "port", "dbname", "user", "table"):
+        match = re.search(rf"{key}='([^']*)'", raw)
+        if not match:
+            match = re.search(rf'{key}="([^"]*)"', raw)
+        if not match:
+            match = re.search(rf"{key}=(\S+)", raw)
+        if match:
+            parts[key] = match.group(1)
+    host = parts.get("host", "")
+    port = parts.get("port", "1521")
+    dbname = parts.get("dbname", "")
+    table = parts.get("table", "")
+    return f"host={host} port={port} dbname={dbname} table={table}"
 
 
 def compute_feature_identity(layer, feature) -> str:
@@ -127,10 +168,7 @@ def get_identity_strength_for_layer(layer) -> IdentityStrength:
     """Determine identity strength for a specific layer."""
     provider_name = layer.dataProvider().name()
 
-    if provider_name == "postgres":
-        return IdentityStrength.STRONG
-
-    if provider_name == "spatialite":
+    if provider_name in ("postgres", "spatialite", "mssql", "oracle"):
         return IdentityStrength.STRONG
 
     if provider_name == "ogr":

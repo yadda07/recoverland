@@ -6,7 +6,7 @@ import sqlite3
 
 from recoverland.core.sqlite_schema import initialize_schema
 from recoverland.core.restore_contracts import (
-    CutoffType, RestoreCutoff, MAX_EVENTS_PER_RESTORE,
+    CutoffType, RestoreCutoff,
 )
 from recoverland.core.event_stream_repository import (
     fetch_entity_stream, fetch_events_after_cutoff,

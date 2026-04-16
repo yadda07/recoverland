@@ -3,7 +3,7 @@
 Converts ISO timestamps to relative or short absolute representations.
 Pure Python, no Qt dependency.
 """
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 
 from qgis.PyQt.QtCore import QCoreApplication

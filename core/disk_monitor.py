@@ -15,6 +15,7 @@ from .health_monitor import _format_size
 def _tr(msg):
     return QCoreApplication.translate("DiskMonitor", msg)
 
+
 _CHECK_INTERVAL_SEC = 300  # 5 minutes
 
 

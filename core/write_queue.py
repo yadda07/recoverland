@@ -172,7 +172,7 @@ class WriteQueue:
         return items
 
     def _write_batch_with_retry(self, conn: sqlite3.Connection,
-                                  batch: List[AuditEvent]) -> None:
+                                batch: List[AuditEvent]) -> None:
         """Write a batch with retry on transient errors."""
         params = [_event_to_row(e) for e in batch]
         last_err: Optional[Exception] = None

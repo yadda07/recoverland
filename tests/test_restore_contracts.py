@@ -3,8 +3,8 @@
 Every branch, every boundary, every failure mode.
 """
 from recoverland.core.restore_contracts import (
-    RestoreMode, RestoreScope, CutoffType, ConflictPolicy,
-    AtomicityPolicy, PreflightVerdict,
+    RestoreMode, RestoreScope, CutoffType,
+    AtomicityPolicy,
     RestoreCutoff, COMPENSATORY_OPS,
     is_restore_allowed, validate_cutoff, check_volume_limits,
     default_atomicity, scope_requires_confirmation,

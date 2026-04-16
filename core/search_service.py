@@ -12,9 +12,11 @@ from typing import List, Optional, Dict, Any, Tuple
 from .audit_backend import AuditEvent, SearchCriteria, SearchResult
 from .logger import flog, timed_op
 from .serialization import is_layer_audit_field
+from .sql_safety import assert_safe_fragment
 
 _MAX_PAGE_SIZE = 500
 _DEFAULT_PAGE_SIZE = 100
+_MAX_PARAM_LEN = 1000
 
 
 @dataclass(frozen=True)
@@ -39,8 +41,9 @@ def search_events(conn: sqlite3.Connection,
 
         where_clause, params = _build_where_clause(criteria)
         total = _count_matching(conn, where_clause, params)
-        flog(f"search_events: where={where_clause!r} params={params!r} total={total}")
+        flog(f"search_events: conditions={len(params)} total={total}")
 
+        assert_safe_fragment(where_clause)
         query = f"""
             SELECT event_id, project_fingerprint, datasource_fingerprint,
                    layer_id_snapshot, layer_name_snapshot, provider_type,
@@ -135,6 +138,7 @@ def summarize_scope(conn: sqlite3.Connection, criteria: SearchCriteria) -> Journ
         page_size=1,
     )
     where_clause, params = _build_where_clause(scope_criteria)
+    assert_safe_fragment(where_clause)
     query = (
         "SELECT COUNT(*),"
         " COUNT(DISTINCT user_name),"
@@ -163,32 +167,37 @@ def _build_where_clause(criteria: SearchCriteria,
     conditions = []
     params = []
 
+    def _checked(value: str) -> str:
+        if len(value) > _MAX_PARAM_LEN:
+            raise ValueError(f"Search parameter too long: {len(value)}")
+        return value
+
     if not include_traces:
         conditions.append("restored_from_event_id IS NULL")
 
     if criteria.datasource_fingerprint:
         conditions.append("datasource_fingerprint = ?")
-        params.append(criteria.datasource_fingerprint)
+        params.append(_checked(criteria.datasource_fingerprint))
 
     if criteria.layer_name:
         conditions.append("layer_name_snapshot = ?")
-        params.append(criteria.layer_name)
+        params.append(_checked(criteria.layer_name))
 
     if criteria.operation_type:
         conditions.append("operation_type = ?")
-        params.append(criteria.operation_type)
+        params.append(_checked(criteria.operation_type))
 
     if criteria.user_name:
         conditions.append("user_name = ?")
-        params.append(criteria.user_name)
+        params.append(_checked(criteria.user_name))
 
     if criteria.start_date:
         conditions.append("created_at >= ?")
-        params.append(criteria.start_date)
+        params.append(_checked(criteria.start_date))
 
     if criteria.end_date:
         conditions.append("created_at <= ?")
-        params.append(criteria.end_date)
+        params.append(_checked(criteria.end_date))
 
     if not conditions:
         return "", params
@@ -197,6 +206,7 @@ def _build_where_clause(criteria: SearchCriteria,
 
 
 def _count_matching(conn: sqlite3.Connection, where_clause: str, params: list) -> int:
+    assert_safe_fragment(where_clause)
     query = f"SELECT COUNT(*) FROM audit_event {where_clause}"
     row = conn.execute(query, params).fetchone()
     return row[0] if row else 0

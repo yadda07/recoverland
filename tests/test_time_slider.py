@@ -1,5 +1,4 @@
 """Tests for TimeSliderWidget and RestoreModeSelector."""
-import pytest
 from recoverland.widgets.time_slider import _compute_granularity, _SECS_24H, _SECS_30D
 
 

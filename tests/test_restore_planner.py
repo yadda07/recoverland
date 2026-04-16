@@ -229,8 +229,8 @@ class TestPlanTemporalRestore:
         events = [
             _evt(1, "MERGE"),                      # blocked: unsupported op
             _evt(2, "DELETE", entity_fp=None),      # blocked: no fingerprint
-            _evt(3, "UPDATE", entity_fp="pk:id=3"), # valid
-            _evt(4, "INSERT", entity_fp="pk:id=4"), # valid
+            _evt(3, "UPDATE", entity_fp="pk:id=3"),  # valid
+            _evt(4, "INSERT", entity_fp="pk:id=4"),  # valid
         ]
         cutoff = RestoreCutoff(CutoffType.BY_EVENT_ID, 1, True)
         plan = plan_temporal_restore(events, "ds", "lyr", cutoff)

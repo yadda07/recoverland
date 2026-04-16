@@ -22,10 +22,13 @@ class _FakeProvider:
     def __init__(self, name, pk_indices=None):
         self._name = name
         self._pk = pk_indices or []
+
     def name(self):
         return self._name
+
     def pkAttributeIndexes(self):
         return self._pk
+
     def capabilities(self):
         return 15
 
@@ -33,6 +36,7 @@ class _FakeProvider:
 class _FakeField:
     def __init__(self, name):
         self._name = name
+
     def name(self):
         return self._name
 
@@ -40,10 +44,13 @@ class _FakeField:
 class _FakeFields:
     def __init__(self, fields):
         self._fields = [_FakeField(n) for n in fields]
+
     def __iter__(self):
         return iter(self._fields)
+
     def count(self):
         return len(self._fields)
+
     def at(self, idx):
         return self._fields[idx]
 
@@ -52,10 +59,13 @@ class _FakeFeature:
     def __init__(self, fid, attrs=None):
         self._fid = fid
         self._attrs = attrs or {}
+
     def id(self):
         return self._fid
+
     def geometry(self):
         return None
+
     def __getitem__(self, key):
         return self._attrs.get(key)
 
@@ -67,16 +77,22 @@ class _FakeLayer:
         self._source = source
         self._fields = _FakeFields(field_names or [])
         self._id = f"layer_{id(self)}"
+
     def id(self):
         return self._id
+
     def name(self):
         return self._name
+
     def source(self):
         return self._source
+
     def dataProvider(self):
         return self._provider
+
     def fields(self):
         return self._fields
+
     def crs(self):
         return None
 

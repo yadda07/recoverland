@@ -1,32 +1,31 @@
 from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-                              QComboBox, QMessageBox, QProgressBar,
-                              QCheckBox, QApplication,
-                              QTableWidget, QTableWidgetItem, QLineEdit,
-                              QGraphicsDropShadowEffect, QWidget,
-                              QScrollArea, QFrame, QMenu, QShortcut, QAction,
-                              QStackedWidget, QListWidget, QListWidgetItem)
+                                 QComboBox, QMessageBox, QProgressBar,
+                                 QCheckBox, QApplication,
+                                 QTableWidget, QTableWidgetItem, QLineEdit,
+                                 QGraphicsDropShadowEffect, QWidget,
+                                 QScrollArea, QFrame, QMenu, QShortcut,
+                                 QStackedWidget, QListWidget, QListWidgetItem)
 from qgis.PyQt.QtCore import (QDateTime, QDate, QTime, QTimer,
-                              QVariantAnimation, QRectF,
-                              QEasingCurve, Qt)
+                              QVariantAnimation)
 from qgis.PyQt.QtGui import QIcon, QColor, QKeySequence
 from qgis.core import (QgsVectorLayer, QgsProject, QgsApplication, QgsSettings)
 from qgis.gui import QgsCollapsibleGroupBox, QgsDateTimeEdit
 from .compat import QtCompat, QgisCompat
 from .core import (
     flog, qlog, LoggerMixin, LayerStatsCache,
-    search_events, SearchCriteria,
+    SearchCriteria,
     get_distinct_layers, summarize_scope, reconstruct_attributes,
     get_journal_size_bytes, format_journal_size,
     compute_datasource_fingerprint,
     is_geometry_only_update,
-    evaluate_journal_health, format_integrity_message,
-    get_journal_stats, HealthLevel,
-    format_relative_time, format_full_timestamp,
+    evaluate_journal_health,
+    get_journal_stats,
+    format_relative_time,
     check_disk_for_path, format_disk_message,
     GeometryPreviewManager,
     plan_event_restore, preflight_check,
     format_plan_summary, format_preflight_report,
-    execute_grouped_restore, execute_grouped_undo, find_target_layer,
+    find_target_layer,
     is_layer_audit_field,
     generate_trace_id,
 )
@@ -48,9 +47,12 @@ CHANGE_TYPE_COLORS = {
     "geometry":  QColor(255, 152, 0, 60),
 }
 
+
 def _change_type_labels():
     from qgis.PyQt.QtCore import QCoreApplication
-    _tr = lambda msg: QCoreApplication.translate("RecoverDialog", msg)
+
+    def _tr(msg):
+        return QCoreApplication.translate("RecoverDialog", msg)
     return {
         "modified":  _tr("Valeur modifiee"),
         "emptied":   _tr("Valeur videe"),
@@ -65,8 +67,8 @@ _MIN_RESTORE_ANIMATION_SEC = 1.8
 
 class RecoverDialog(QDialog, LoggerMixin):
     """Main dialog for RecoverLand plugin."""
-    
-    def __init__(self, iface, router=None, journal=None, tracker=None,
+
+    def __init__(self, iface, journal=None, tracker=None,
                  write_queue=None):
         flog("RecoverDialog.__init__: START")
         super().__init__(iface.mainWindow())
@@ -81,7 +83,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.setWindowFlags(self.windowFlags() | QtCompat.WINDOW_MAXIMIZE_BUTTON_HINT)
         self.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_PREFERRED)
         self.setStyleSheet("")
-        
+
         icon_path = os.path.join(os.path.dirname(__file__), "logo.svg")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
@@ -308,7 +310,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         """Return a reusable read connection with proper PRAGMAs."""
         if self._dialog_read_conn is not None:
             return self._dialog_read_conn
-            
+
         if self._journal is None or not self._journal.is_open:
             return None
         try:
@@ -579,7 +581,8 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.layers_status_label.setText(self.tr("Toutes les couches surveillées"))
         else:
             n = sum(1 for lyr in layers if compute_datasource_fingerprint(lyr) in allowed)
-            self.layers_status_label.setText(self.tr("{n} / {total} couche(s) surveillée(s)").format(n=n, total=len(layers)))
+            self.layers_status_label.setText(
+                self.tr("{n} / {total} couche(s) surveillée(s)").format(n=n, total=len(layers)))
 
         if self._tracker is not None:
             self._tracker.set_filter(set() if all_tracked else allowed)
@@ -611,10 +614,11 @@ class RecoverDialog(QDialog, LoggerMixin):
         if all_tracked:
             self.layers_status_label.setText(self.tr("Toutes les couches surveillées"))
         else:
-            self.layers_status_label.setText(self.tr("{n} / {total} couche(s) surveillée(s)").format(n=len(allowed), total=total))
+            self.layers_status_label.setText(
+                self.tr("{n} / {total} couche(s) surveillée(s)").format(n=len(allowed), total=total))
 
     def setup_ui(self):
-        
+
         main_layout = QVBoxLayout()
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(15, 15, 15, 15)
@@ -640,12 +644,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         tracking_layout = QHBoxLayout(tracking_panel)
         tracking_layout.setContentsMargins(4, 0, 0, 0)
         tracking_layout.setSpacing(6)
-        
+
         self.tracking_label = QLabel(self.tr("Enregistrement actif"))
         self.tracking_label.setStyleSheet("font-weight: bold;")
         self.tracking_toggle = AppleToggleSwitch()
         self.tracking_toggle.toggled.connect(self._on_tracking_toggled)
-        
+
         tracking_layout.addWidget(self.tracking_label)
         tracking_layout.addWidget(self.tracking_toggle)
 
@@ -842,15 +846,15 @@ class RecoverDialog(QDialog, LoggerMixin):
         options_group = QgsCollapsibleGroupBox(self.tr("Options"))
         options_layout = QHBoxLayout()
         options_layout.setSpacing(20)
-        
+
         self.auto_zoom_check = QCheckBox(self.tr("Zoomer automatiquement sur les résultats"))
         self.auto_zoom_check.setIcon(QgsApplication.getThemeIcon('/mActionZoomToSelected.svg'))
         self.auto_zoom_check.setChecked(True)
-        
+
         self.open_attribute_check = QCheckBox(self.tr("Ouvrir la table d'attributs après chargement"))
         self.open_attribute_check.setIcon(QgsApplication.getThemeIcon('/mActionOpenTable.svg'))
         self.open_attribute_check.setChecked(False)
-        
+
         options_layout.addWidget(self.auto_zoom_check)
         options_layout.addWidget(self.open_attribute_check)
         options_layout.addStretch()
@@ -860,17 +864,17 @@ class RecoverDialog(QDialog, LoggerMixin):
         results_group.setCollapsed(True)
         results_layout = QVBoxLayout()
         self.results_info_label = QLabel(self.tr("Aucune donnée récupérée"))
-        
+
         self.search_filter = QLineEdit()
         self.search_filter.setPlaceholderText(self.tr("Rechercher (GID, utilisateur, ...)"))
         self.search_filter.setClearButtonEnabled(True)
         self.search_filter.setToolTip(self.tr("Filtrer les résultats en temps réel"))
         self.search_filter.textChanged.connect(self._filter_results)
         self.search_filter.setVisible(False)
-        
+
         self.change_legend = self._build_change_legend()
         self.change_legend.setVisible(False)
-        
+
         self.table_widget = QTableWidget()
         self.table_widget.setSelectionBehavior(QtCompat.SELECT_ROWS)
         self.table_widget.setAlternatingRowColors(True)
@@ -891,47 +895,51 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.select_all_button.clicked.connect(self.select_all_rows)
         self.select_all_button.setEnabled(False)
         self.select_all_button.setToolTip(self.tr("Sélectionner toutes les lignes du tableau"))
-        self.select_none_button = QPushButton(self.tr("Tout désélectionner")) 
+        self.select_none_button = QPushButton(self.tr("Tout désélectionner"))
         deselect_icon = QgsApplication.getThemeIcon('/mActionDeselectAll.svg')
         self.select_none_button.setIcon(deselect_icon)
         self.select_none_button.setFixedHeight(selection_button_height)
         self.select_none_button.clicked.connect(self.select_none_rows)
         self.select_none_button.setEnabled(False)
         self.select_none_button.setToolTip(self.tr("Désélectionner toutes les lignes du tableau"))
-        
+
         self.selection_count_label = QLabel("")
         selection_buttons_layout.addWidget(self.select_all_button)
         selection_buttons_layout.addWidget(self.select_none_button)
         selection_buttons_layout.addStretch()
         selection_buttons_layout.addWidget(self.selection_count_label)
-        
+
         results_layout.addWidget(self.results_info_label)
         results_layout.addWidget(self.search_filter)
         results_layout.addWidget(self.change_legend)
         results_layout.addWidget(self.table_widget)
         results_layout.addLayout(selection_buttons_layout)
         results_group.setLayout(results_layout)
-        
+
         self.results_group = results_group
-        
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         self.progress_phase_label = QLabel("")
         self.progress_phase_label.setVisible(False)
-        flog(f"setup_ui: progress_bar created, id={id(self.progress_bar)}, visible={self.progress_bar.isVisible()}, parent={self.progress_bar.parent()}")
-        
+        flog(
+            f"setup_ui: progress_bar created, id={id(self.progress_bar)},"
+            f" visible={self.progress_bar.isVisible()},"
+            f" parent={self.progress_bar.parent()}"
+        )
+
         button_layout = QHBoxLayout()
         button_layout.setSpacing(10)
         button_width = 120
         button_height = 35
-        
+
         self.cancel_button = QPushButton(self.tr("Fermer"))
         self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
         self.cancel_button.setFixedSize(button_width, button_height)
         self.cancel_button.clicked.connect(self.cancel_operation)
-        
+
         self.undo_last_btn = QPushButton("Last")
         self.undo_last_btn.setIcon(QgsApplication.getThemeIcon('/mActionUndo.svg'))
         self.undo_last_btn.setFixedSize(button_width, button_height)
@@ -943,20 +951,20 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
         self.recover_button.setFixedSize(button_width, button_height)
         self.recover_button.clicked.connect(self.recover_and_load)
-        
+
         self.restore_button = QPushButton("Restore")
         self.restore_button.setIcon(QgsApplication.getThemeIcon('/mActionSaveAllEdits.svg'))
         self.restore_button.setFixedSize(button_width, button_height)
         self.restore_button.clicked.connect(self.restore_selected_data)
         self.restore_button.setEnabled(False)
-        
+
         pal_hl = self.palette().highlight().color()
         glow_color = QColor(pal_hl.red(), pal_hl.green(), pal_hl.blue(), 180)
         self._apply_glow_effect(self.recover_button, glow_color)
         self._apply_glow_effect(self.restore_button, glow_color)
         self._glow_color = glow_color
         self._apply_logo_glow_effect()
-        
+
         button_layout.addStretch()
         button_layout.addWidget(self.cancel_button)
         button_layout.addWidget(self.recover_button)
@@ -977,18 +985,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         main_layout.addLayout(button_layout)
         selection_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
         selection_group.setMinimumHeight(0)
-        
+
         date_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
         date_group.setMinimumHeight(0)
-        
+
         options_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
         options_group.setMinimumHeight(0)
-        
+
         self.results_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_EXPANDING)
         self.results_group.setMinimumHeight(0)
-        
+
         self.setLayout(main_layout)
-        
+
         self._on_period_mode_changed(self.restore_mode_selector.mode())
         self._setup_shortcuts()
 
@@ -1065,7 +1073,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         if idx >= 0:
             self.layer_input.setCurrentIndex(idx)
 
-
     def _get_write_queue_pending(self) -> int:
         """UX-A03: Return pending event count from write queue."""
         if self._write_queue is None:
@@ -1116,13 +1123,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         effect.setOffset(0, 0)
         effect.setColor(color)
         widget.setGraphicsEffect(effect)
-        
+
         widget.setProperty("glow_color", color)
         widget.setProperty("glow_base_blur", 12)
         widget.setProperty("glow_hover_blur", 25)
         widget.setProperty("glow_base_alpha", color.alpha())
         widget.setProperty("glow_hover_alpha", min(255, color.alpha() + 75))
-        
+
         widget.installEventFilter(self)
 
     def _apply_logo_glow_effect(self) -> None:
@@ -1172,7 +1179,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         self._animate_glow(self.logo_label, hover_in=True)
         QTimer.singleShot(260, lambda: self._animate_glow(self.logo_label, hover_in=False))
-    
+
     def changeEvent(self, event):
         """Re-render logo when QGIS theme/palette changes (dark mode)."""
         super().changeEvent(event)
@@ -1185,7 +1192,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self._refresh_smart_bar()
             finally:
                 self._refreshing_theme = False
-    
+
     def eventFilter(self, obj, event) -> bool:
         """Handle hover events for glow animation."""
         if event.type() == QtCompat.EVENT_ENTER:
@@ -1193,63 +1200,63 @@ class RecoverDialog(QDialog, LoggerMixin):
         elif event.type() == QtCompat.EVENT_LEAVE:
             self._animate_glow(obj, hover_in=False)
         return super().eventFilter(obj, event)
-    
+
     def _animate_glow(self, widget, hover_in: bool) -> None:
         """Animate glow effect on hover."""
         effect = widget.graphicsEffect()
         if not isinstance(effect, QGraphicsDropShadowEffect):
             return
-        
+
         base_blur = widget.property("glow_base_blur") or 12
         hover_blur = widget.property("glow_hover_blur") or 25
         base_alpha = widget.property("glow_base_alpha") or 180
         hover_alpha = widget.property("glow_hover_alpha") or 255
         color = widget.property("glow_color")
-        
+
         if not color:
             return
-        
+
         start_blur = effect.blurRadius()
         end_blur = hover_blur if hover_in else base_blur
         start_alpha = effect.color().alpha()
         end_alpha = hover_alpha if hover_in else base_alpha
-        
+
         anim = QVariantAnimation(widget)
         anim.setDuration(200)
         anim.setEasingCurve(QtCompat.EASE_IN_OUT_QUAD)
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
-        
+
         def update_effect(progress):
             blur = start_blur + (end_blur - start_blur) * progress
             alpha = int(start_alpha + (end_alpha - start_alpha) * progress)
             effect.setBlurRadius(blur)
             new_color = QColor(color.red(), color.green(), color.blue(), alpha)
             effect.setColor(new_color)
-        
+
         anim.valueChanged.connect(update_effect)
         anim.start()
-    
+
     def _load_themed_logo(self):
         """Load logo.svg with text color adapted to the current QGIS theme."""
         logo_path = os.path.join(os.path.dirname(__file__), "logo.svg")
         if not os.path.exists(logo_path):
             self.logo_label.update()
             return
-        
+
         try:
             text_color = self.palette().windowText().color()
             color_hex = text_color.name()
-            
+
             with open(logo_path, 'r', encoding='utf-8') as f:
                 svg_template = f.read()
-            
+
             svg_data = svg_template.replace("{TEXT_COLOR}", color_hex)
             self.logo_label.load_svg_data(svg_data)
         except Exception as e:
             flog(f"_load_themed_logo error: {e}", "WARNING")
             self.logo_label.update()
-    
+
     def _filter_results(self, text: str):
         """Filter results table rows based on search text."""
         search = text.lower().strip()
@@ -1264,7 +1271,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                         match = True
                         break
             self.table_widget.setRowHidden(row, not match)
-    
+
     def _build_change_legend(self):
         """Build color legend widget with icons for accessibility (UX-E03)."""
         container = QWidget()
@@ -1393,7 +1400,6 @@ class RecoverDialog(QDialog, LoggerMixin):
                     fps.append(fp)
         return fps
 
-
     def _validate_dates(self):
         """Real-time date validation: disable recover button if dates are invalid."""
         if hasattr(self, 'restore_mode_selector') and self.restore_mode_selector.mode() == "temporal":
@@ -1406,17 +1412,17 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self.recover_button.setEnabled(is_valid)
         if not is_valid and start_dt == end_dt:
             pass
-    
+
     def update_phase(self, phase_text: str):
         """Update progress phase label from thread signal."""
         self.progress_phase_label.setText(phase_text)
         self.progress_phase_label.setVisible(True)
-    
+
     def set_period(self, period):
         """Set period from shortcut buttons."""
         today = QDateTime.currentDateTime()
         self.end_input.setMaximumDateTime(today)
-        
+
         if period == "today":
             self.start_input.setDateTime(QDateTime(QDate.currentDate(), QTime(0, 0, 0)))
             self.end_input.setDateTime(today)
@@ -1521,7 +1527,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         criteria = self._build_search_criteria()
         trace_id = generate_trace_id()
         self._active_search_trace_id = trace_id
-        flog(f"[{trace_id}] recover_event: start layer={criteria.datasource_fingerprint} op={criteria.operation_type} start={criteria.start_date} end={criteria.end_date}")
+        flog(
+            f"[{trace_id}] recover_event: start"
+            f" layer={criteria.datasource_fingerprint}"
+            f" op={criteria.operation_type}"
+            f" start={criteria.start_date} end={criteria.end_date}"
+        )
 
         self.cancel_button.setText(self.tr("Arreter"))
         self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mTaskCancel.svg'))
@@ -1700,7 +1711,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.undo_last_btn.setEnabled(False)
 
         read_conn = self._get_dialog_read_conn()
-        resolver = lambda evt: find_target_layer(evt, read_conn)
+
+        def resolver(evt):
+            return find_target_layer(evt, read_conn)
 
         runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
         runner.progress.connect(self._on_restore_runner_progress)
@@ -1743,7 +1756,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         flog(f"[{trace_id}] recover_version: execute_restore events={len(events)}")
 
         read_conn = self._get_dialog_read_conn()
-        resolver = lambda evt: find_target_layer(evt, read_conn)
+
+        def resolver(evt):
+            return find_target_layer(evt, read_conn)
 
         runner = RestoreRunner(events, resolver, self._write_queue,
                                tracker=self._tracker, trace_id=trace_id,
@@ -1764,8 +1779,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.progress_bar.setValue(100)
         self._stop_logo_activity()
         if trace_id:
-            elapsed_ms = int((time.monotonic() - self._restore_started_at) * 1000) if self._restore_started_at else 0
-            flog(f"[{trace_id}] recover_version: done ok={result.total_ok} fail={result.total_fail} elapsed_ms={elapsed_ms}")
+            started = self._restore_started_at
+            elapsed_ms = int((time.monotonic() - started) * 1000) if started else 0
+            flog(
+                f"[{trace_id}] recover_version: done"
+                f" ok={result.total_ok} fail={result.total_fail}"
+                f" elapsed_ms={elapsed_ms}"
+            )
             self._active_restore_trace_id = ""
 
         events = getattr(self, '_version_restore_events', None)
@@ -1855,8 +1875,14 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         flog(f"_display_search_result: total_count={result.total_count} events={len(result.events)}")
         if trace_id:
-            elapsed_ms = int((time.monotonic() - self._recover_started_at) * 1000) if self._recover_started_at else 0
-            flog(f"[{trace_id}] recover_event: done total={result.total_count} returned={len(result.events)} elapsed_ms={elapsed_ms}")
+            started = self._recover_started_at
+            elapsed_ms = int((time.monotonic() - started) * 1000) if started else 0
+            flog(
+                f"[{trace_id}] recover_event: done"
+                f" total={result.total_count}"
+                f" returned={len(result.events)}"
+                f" elapsed_ms={elapsed_ms}"
+            )
             self._active_search_trace_id = ""
         if result.total_count == 0:
             suggestion = self._build_empty_result_suggestion()
@@ -1866,7 +1892,8 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         self._search_events = result.events
         self._populate_results_table(result.events, result.total_count)
-        self._smart_bar_message_override = self.tr("{count} événement(s) chargé(s) dans la table.").format(count=result.total_count)
+        self._smart_bar_message_override = self.tr(
+            "{count} événement(s) chargé(s) dans la table.").format(count=result.total_count)
         self._refresh_smart_bar()
 
     def _display_deferred_restore_feedback(self) -> None:
@@ -1972,7 +1999,8 @@ class RecoverDialog(QDialog, LoggerMixin):
                     if parsed_data is not None:
                         change = parsed_data.get("changed_only", {}).get(key, {})
                         if isinstance(change, dict):
-                            item.setToolTip(self.tr("Ancien: {old}\nActuel: {new}").format(old=val, new=change.get('new')))
+                            item.setToolTip(self.tr("Ancien: {old}\nActuel: {new}").format(
+                                old=val, new=change.get('new')))
                 self.table_widget.setItem(row_idx, col_idx, item)
 
         self.table_widget.setSortingEnabled(True)
@@ -1992,7 +2020,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             "RecoverLand/modified_columns_only", False, type=bool)
         if saved_mod_only and has_any_highlight:
             self._modified_only_check.setChecked(True)
-    
+
     def on_error(self, error_message):
         """Error handler with exploitable messages (UX-H01)."""
         trace_id = self._active_restore_trace_id or self._active_search_trace_id
@@ -2012,8 +2040,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.tr("Impossible de recuperer les donnees"),
             error_message)
         qlog(user_msg, "ERROR")
-    
-    
+
     def cancel_operation(self):
         """Cancel op: stop running thread, pending result, or close dialog."""
         if self._pending_search_result is not None:
@@ -2078,7 +2105,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             qlog(self.tr("Restauration annulee."))
         else:
             self.reject()
-    
+
     def enable_controls(self, enabled=True):
         """Toggle controls"""
         if enabled:
@@ -2088,17 +2115,16 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.operation_input.setEnabled(enabled)
         self.start_input.setEnabled(enabled)
         self.end_input.setEnabled(enabled)
-    
-    
+
     @staticmethod
     def _get_non_comparable_columns(column_names) -> set:
         """Return set of column indices to skip during UPDATE diff.
-        
+
         Skips: gid, user_name, audit_timestamp, geometry columns.
         """
         skip_names = {'gid', 'user_name', 'audit_timestamp', 'geom', 'the_geom', 'geometry', 'wkb_geometry'}
         return {i for i, name in enumerate(column_names) if name.lower() in skip_names}
-    
+
     @staticmethod
     def _values_differ(audit_val, current_val) -> bool:
         """Compare two cell values, handling None and type coercion."""
@@ -2159,10 +2185,15 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.selected_rows = self._resolve_event_indices()
         total = self.table_widget.rowCount()
         selected = len(self.selected_rows)
-        self.selection_count_label.setText(self.tr("{selected} / {total} sélectionnées").format(selected=selected, total=total) if selected > 0 else "")
+        label = (
+            self.tr("{selected} / {total} sélectionnées")
+            .format(selected=selected, total=total)
+            if selected > 0 else ""
+        )
+        self.selection_count_label.setText(label)
         self.restore_button.setEnabled(selected > 0)
         self._update_geometry_preview()
-    
+
     def _update_geometry_preview(self) -> None:
         """P1.1: Show old geometry on canvas when exactly one geometry event is selected."""
         if not self.selected_rows:
@@ -2184,11 +2215,11 @@ class RecoverDialog(QDialog, LoggerMixin):
     def select_all_rows(self):
         """Select all"""
         self.table_widget.selectAll()
-    
+
     def select_none_rows(self):
         """Select none"""
         self.table_widget.clearSelection()
-    
+
     def restore_selected_data(self):
         """Restore selected audit events to their source QGIS layers."""
         if getattr(self, '_restore_in_progress', False):
@@ -2239,11 +2270,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         flog(f"[{trace_id}] restore_event: start selected={len(selected_events)} datasources={len(ds_fps)}")
 
         read_conn = self._get_dialog_read_conn()
-        resolver = lambda evt: find_target_layer(evt, read_conn)
+
+        def resolver(evt):
+            return find_target_layer(evt, read_conn)
 
         runner = RestoreRunner(selected_events, resolver, self._write_queue,
-                                   tracker=self._tracker, trace_id=trace_id,
-                                   parent=self)
+                               tracker=self._tracker, trace_id=trace_id,
+                               parent=self)
         runner.progress.connect(self._on_restore_runner_progress)
         runner.finished.connect(self._on_event_restore_done)
         self._restore_runner = runner
@@ -2255,8 +2288,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._restore_runner = None
         self.progress_bar.setValue(100)
         if trace_id:
-            elapsed_ms = int((time.monotonic() - self._restore_started_at) * 1000) if self._restore_started_at else 0
-            flog(f"[{trace_id}] restore_event: done ok={result.total_ok} fail={result.total_fail} elapsed_ms={elapsed_ms}")
+            started = self._restore_started_at
+            elapsed_ms = int((time.monotonic() - started) * 1000) if started else 0
+            flog(
+                f"[{trace_id}] restore_event: done"
+                f" ok={result.total_ok} fail={result.total_fail}"
+                f" elapsed_ms={elapsed_ms}"
+            )
             self._active_restore_trace_id = ""
 
         events = getattr(self, '_event_restore_events', None)
@@ -2324,7 +2362,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._restore_in_progress = True
 
         read_conn = self._get_dialog_read_conn()
-        resolver = lambda evt: find_target_layer(evt, read_conn)
+
+        def resolver(evt):
+            return find_target_layer(evt, read_conn)
 
         runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
         runner.progress.connect(self._on_restore_runner_progress)
@@ -2341,7 +2381,8 @@ class RecoverDialog(QDialog, LoggerMixin):
         if result.total_fail == 0 and result.total_ok > 0:
             qlog(self.tr("{count} entite(s) remise(s) dans leur etat initial.").format(count=result.total_ok))
         elif result.total_ok > 0:
-            qlog(self.tr("Annulation partielle: {ok} ok, {fail} echec(s).").format(ok=result.total_ok, fail=result.total_fail), "WARNING")
+            qlog(self.tr("Annulation partielle: {ok} ok, {fail} echec(s).").format(
+                ok=result.total_ok, fail=result.total_fail), "WARNING")
         else:
             qlog("Annulation: " + " | ".join(result.errors[:5]), "ERROR")
 
@@ -2360,12 +2401,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         """Close event"""
         self.cleanup_resources()
         event.accept()
-    
+
     def reject(self):
         """Reject dialog"""
         self.cleanup_resources()
         super().reject()
-    
+
     def cleanup_resources(self) -> None:
         """Cleanup threads and resources."""
         try:
@@ -2382,7 +2423,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                 if self.worker_thread.isRunning():
                     self.worker_thread.stop()
                 self.worker_thread = None
-            
+
             # Cleanup async restore runner
             if self._restore_runner is not None:
                 self._restore_runner.cancel()
@@ -2396,7 +2437,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                 if self.restore_thread.isRunning():
                     self.restore_thread.stop()
                 self.restore_thread = None
-            
+
             # Stop progress timer
             if hasattr(self, 'progress_timer') and self.progress_timer.isActive():
                 self.progress_timer.stop()
@@ -2406,10 +2447,10 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self._geom_preview.clear()
         except Exception as e:
             self.log_error(f"Erreur cleanup: {e}")
-    
+
     def _disconnect_thread_signals(self, thread) -> None:
         """Safely disconnect all signals from a thread."""
-        signals = ['progress_updated', 'phase_changed', 'process_complete', 
+        signals = ['progress_updated', 'phase_changed', 'process_complete',
                    'restore_complete', 'error_occurred', 'log_message']
         for sig_name in signals:
             if hasattr(thread, sig_name):
@@ -2417,7 +2458,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                     getattr(thread, sig_name).disconnect()
                 except (TypeError, RuntimeError):
                     pass  # Signal was not connected
-    
+
     def validate_inputs(self):
         """Validate inputs with exploitable messages (UX-H01)."""
         if self._journal is None or not self._journal.is_open:
@@ -2447,17 +2488,17 @@ class RecoverDialog(QDialog, LoggerMixin):
         lower = technical.lower()
         if "connection" in lower or "connect" in lower:
             return self.tr("{what} : connexion au journal impossible. "
-                    "Verifiez que le fichier est accessible.").format(what=what)
+                           "Verifiez que le fichier est accessible.").format(what=what)
         if "locked" in lower or "busy" in lower:
             return self.tr("{what} : le journal est verrouille par un autre processus. "
-                    "Fermez les autres instances et reessayez.").format(what=what)
+                           "Fermez les autres instances et reessayez.").format(what=what)
         if "disk" in lower or "space" in lower or "full" in lower:
             return self.tr("{what} : espace disque insuffisant. "
-                    "Liberez de l'espace ou purgez les anciens evenements.").format(what=what)
+                           "Liberez de l'espace ou purgez les anciens evenements.").format(what=what)
         if "permission" in lower or "access" in lower:
             return self.tr("{what} : acces refuse au fichier journal. "
-                    "Verifiez les permissions du dossier.").format(what=what)
+                           "Verifiez les permissions du dossier.").format(what=what)
         if "corrupt" in lower or "malformed" in lower:
             return self.tr("{what} : le journal semble endommage. "
-                    "Ouvrez la maintenance pour verifier l'integrite.").format(what=what)
+                           "Ouvrez la maintenance pour verifier l'integrite.").format(what=what)
         return f"{what} : {technical}"

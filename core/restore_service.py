@@ -16,7 +16,7 @@ from .search_service import reconstruct_attributes, reconstruct_new_attributes
 from .geometry_utils import rebuild_geometry
 from .identity import get_identity_strength_for_layer
 from .support_policy import IdentityStrength
-from .serialization import deserialize_value, is_layer_audit_field
+from .serialization import is_layer_audit_field
 from .logger import flog
 from ..compat import QgisCompat
 
@@ -73,9 +73,13 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
     attrs = reconstruct_attributes(event)
     geom = rebuild_geometry(event.geometry_wkb)
     field_mapping = _build_safe_mapping(check.drift, event)
-    flog(f"restore_deleted[{eid}]: attrs={len(attrs)} keys, geom={'yes' if geom else 'no'}, mapping={len(field_mapping)} fields")
+    geom_str = 'yes' if geom else 'no'
+    flog(
+        f"restore_deleted[{eid}]: attrs={len(attrs)} keys,"
+        f" geom={geom_str}, mapping={len(field_mapping)} fields"
+    )
 
-    from qgis.core import QgsFeature, QgsFields
+    from qgis.core import QgsFeature
     new_feature = QgsFeature(layer.fields())
     _apply_attributes(new_feature, layer.fields(), attrs, field_mapping)
 
@@ -96,7 +100,7 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
 
 
 def restore_inserted_feature(layer, event: AuditEvent,
-                              fid_cache: Optional[Dict] = None) -> Dict[str, Any]:
+                             fid_cache: Optional[Dict] = None) -> Dict[str, Any]:
     """Undo an INSERT by deleting the inserted feature from the target layer."""
     if layer is None:
         return {"success": False, "message": "Target layer not found"}
@@ -127,7 +131,7 @@ def restore_inserted_feature(layer, event: AuditEvent,
 
 
 def restore_updated_feature(layer, event: AuditEvent,
-                             fid_cache: Optional[Dict] = None) -> Dict[str, Any]:
+                            fid_cache: Optional[Dict] = None) -> Dict[str, Any]:
     """Revert a modified feature to its pre-update state.
 
     Uses the old values from the delta to update the current feature.
@@ -221,7 +225,7 @@ def build_fid_cache(layer, events: List[AuditEvent]) -> Dict:
 
 
 def restore_batch(layer, events: List[AuditEvent],
-                   fid_cache: Optional[Dict] = None) -> RestoreReport:
+                  fid_cache: Optional[Dict] = None) -> RestoreReport:
     """Restore a batch of events with per-entity error isolation."""
     layer_error = validate_restore_layer_state(layer)
     if layer_error:
@@ -307,7 +311,7 @@ def undo_restore_batch(layer, events: List[AuditEvent]) -> RestoreReport:
 
 
 def _undo_update_restore(layer, event: AuditEvent,
-                          fid_cache: Optional[Dict] = None) -> Dict[str, Any]:
+                         fid_cache: Optional[Dict] = None) -> Dict[str, Any]:
     """Re-apply post-edit values to reverse a previous UPDATE restore."""
     check = pre_check_restore(layer, event)
     if not check.can_restore:
@@ -436,7 +440,7 @@ def _parse_identity(identity_json: str) -> Dict[str, Any]:
 
 
 def _find_target_feature(layer, identity: Dict,
-                          fid_cache: Optional[Dict] = None) -> Optional[int]:
+                         fid_cache: Optional[Dict] = None) -> Optional[int]:
     """Find the FID of the target feature using identity info.
 
     If fid_cache is provided, checks it first to avoid redundant provider queries.
@@ -494,7 +498,7 @@ def _apply_attributes(feature, fields, attrs: Dict, mapping: Dict) -> None:
 
 
 def _build_attribute_changes(layer, fid: int, old_attrs: Dict,
-                              mapping: Dict) -> Dict[int, Dict[int, Any]]:
+                             mapping: Dict) -> Dict[int, Dict[int, Any]]:
     """Build the change dict for provider.changeAttributeValues()."""
     fields = layer.fields()
     changes = {}

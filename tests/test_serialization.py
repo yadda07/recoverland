@@ -1,6 +1,5 @@
 """Tests for core.serialization module (RLU-029)."""
 import json
-import math
 import base64
 import unittest
 import sys

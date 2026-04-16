@@ -30,6 +30,7 @@ class TestGeometriesEqual(unittest.TestCase):
 
 class _FakeWkbTypes:
     NoGeometry = 100
+
     @staticmethod
     def displayString(wkb_type):
         if wkb_type == 100:
@@ -41,8 +42,10 @@ class _FakeCrs:
     def __init__(self, valid=True, authid="EPSG:4326"):
         self._valid = valid
         self._authid = authid
+
     def isValid(self):
         return self._valid
+
     def authid(self):
         return self._authid
 
@@ -51,8 +54,10 @@ class _FakeLayer:
     def __init__(self, wkb_type=1, crs=None):
         self._wkb_type = wkb_type
         self._crs = crs or _FakeCrs()
+
     def wkbType(self):
         return self._wkb_type
+
     def crs(self):
         return self._crs
 
@@ -120,6 +125,7 @@ class TestExtractGeometryWkb(unittest.TestCase):
                 class _Geom:
                     def isNull(self):
                         return True
+
                     def isEmpty(self):
                         return False
                 return _Geom()
@@ -143,6 +149,7 @@ class TestExtractGeometryWkb(unittest.TestCase):
                 class _Geom:
                     def isNull(self):
                         return False
+
                     def isEmpty(self):
                         return True
                 return _Geom()
@@ -157,8 +164,10 @@ class TestExtractGeometryWkb(unittest.TestCase):
                 class _Geom:
                     def isNull(self):
                         return False
+
                     def isEmpty(self):
                         return False
+
                     def asWkb(self):
                         return b'\x01\x02\x03'
                 return _Geom()
@@ -210,8 +219,10 @@ class TestCaptureGeometryInfo(unittest.TestCase):
                 class _Geom:
                     def isNull(self):
                         return False
+
                     def isEmpty(self):
                         return False
+
                     def asWkb(self):
                         return b'\x01\x02\x03'
                 return _Geom()

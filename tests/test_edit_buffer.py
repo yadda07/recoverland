@@ -99,7 +99,6 @@ class TestEditSessionBuffer(unittest.TestCase):
             self.buf.record_modification(_make_snapshot(i, big_attrs))
         self.assertGreater(self.buf.approx_memory_mb, 0)
 
-
     def test_committed_additions_empty_by_default(self):
         self.assertEqual(self.buf.get_committed_additions(), [])
 

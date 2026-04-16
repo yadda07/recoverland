@@ -26,8 +26,10 @@ class _FakeCrs:
     def __init__(self, valid=True, authid="EPSG:4326"):
         self._valid = valid
         self._authid = authid
+
     def isValid(self):
         return self._valid
+
     def authid(self):
         return self._authid
 
@@ -35,8 +37,10 @@ class _FakeCrs:
 class _FakeProvider:
     def __init__(self, name="ogr"):
         self._name = name
+
     def name(self):
         return self._name
+
     def capabilities(self):
         return 15
 
@@ -50,18 +54,25 @@ class _FakeLayer:
         self._crs = crs or _FakeCrs()
         self._wkb_type = wkb_type
         self._id = f"layer_{id(self)}"
+
     def id(self):
         return self._id
+
     def name(self):
         return self._name
+
     def source(self):
         return self._source
+
     def dataProvider(self):
         return self._provider
+
     def crs(self):
         return self._crs
+
     def wkbType(self):
         return self._wkb_type
+
     def fields(self):
         return []
 

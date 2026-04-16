@@ -166,7 +166,11 @@ class RestoreRunner(QObject):
             if self._traces and self._write_queue is not None:
                 accepted = self._write_queue.enqueue(list(self._traces))
                 if not accepted:
-                    msg = "Journal trace write failed; restore data changes succeeded but trace events were saved for pending recovery"
+                    msg = (
+                        "Journal trace write failed; restore data changes"
+                        " succeeded but trace events were saved"
+                        " for pending recovery"
+                    )
                     self._errors.append(msg)
                     flog(f"RestoreRunner: {msg}", "ERROR")
 

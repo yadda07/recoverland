@@ -14,6 +14,38 @@ from .logger import flog, timed_op
 
 _PENDING_FILENAME = "recoverland_pending.json"
 
+_VALID_OP_TYPES = frozenset({"INSERT", "UPDATE", "DELETE"})
+
+_KNOWN_EVENT_KEYS = frozenset({
+    "project_fingerprint", "datasource_fingerprint", "layer_id_snapshot",
+    "layer_name_snapshot", "provider_type", "feature_identity_json",
+    "operation_type", "attributes_json", "geometry_wkb", "geometry_type",
+    "crs_authid", "field_schema_json", "user_name", "session_id",
+    "created_at", "restored_from_event_id", "entity_fingerprint",
+    "event_schema_version", "new_geometry_wkb",
+})
+
+_REQUIRED_EVENT_KEYS = frozenset({
+    "operation_type", "created_at", "user_name",
+})
+
+
+def _validate_pending_event(evt: dict) -> str:
+    """Return empty string if valid, or a reason string if rejected."""
+    if not isinstance(evt, dict):
+        return "not a dict"
+    missing = _REQUIRED_EVENT_KEYS - evt.keys()
+    if missing:
+        return f"missing keys: {missing}"
+    unknown = evt.keys() - _KNOWN_EVENT_KEYS
+    if unknown:
+        return f"unknown keys: {unknown}"
+    if evt.get("operation_type") not in _VALID_OP_TYPES:
+        return f"invalid operation_type: {evt.get('operation_type')!r}"
+    if not evt.get("created_at"):
+        return "empty created_at"
+    return ""
+
 
 class IntegrityResult(NamedTuple):
     is_healthy: bool
@@ -130,8 +162,9 @@ def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
     remaining = []
     with conn:
         for evt in events:
-            if not isinstance(evt, dict):
-                flog("integrity: skip pending event with invalid payload", "WARNING")
+            reason = _validate_pending_event(evt)
+            if reason:
+                flog(f"integrity: reject pending event: {reason}", "WARNING")
                 remaining.append(evt)
                 continue
             try:

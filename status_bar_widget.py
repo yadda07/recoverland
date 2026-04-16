@@ -4,7 +4,7 @@ Shows a persistent icon in the QGIS status bar reflecting
 tracking state and journal health. Click opens the dialog.
 """
 from qgis.PyQt.QtWidgets import QLabel, QWidget, QHBoxLayout
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtGui import QColor
 
 from .compat import QtCompat

@@ -11,9 +11,25 @@ from qgis.core import QgsMessageLog
 from .constants import PLUGIN_NAME
 from ..compat import QgisCompat, get_environment_info
 
-# --- File Logger Setup (writes to plugin directory) ---
+# --- File Logger Setup (writes to QGIS profile directory, not plugin dir) ---
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_LOG_FILE = os.path.join(_PLUGIN_DIR, "recoverland_debug.log")
+
+
+def _resolve_log_path() -> str:
+    """Determine log file path: profile dir preferred, plugin dir fallback."""
+    try:
+        from qgis.core import QgsApplication
+        profile_dir = QgsApplication.qgisSettingsDirPath()
+        if profile_dir and os.path.isdir(profile_dir):
+            log_dir = os.path.join(profile_dir, "recoverland")
+            os.makedirs(log_dir, exist_ok=True)
+            return os.path.join(log_dir, "recoverland_debug.log")
+    except Exception:
+        pass
+    return os.path.join(_PLUGIN_DIR, "recoverland_debug.log")
+
+
+_LOG_FILE = _resolve_log_path()
 
 _file_logger = logging.getLogger("RecoverLand.FileDebug")
 _file_logger.setLevel(logging.DEBUG)
@@ -32,8 +48,6 @@ _file_logger.info(f"RecoverLand module loaded - PID={os.getpid()} Thread={thread
 _file_logger.info(f"Plugin dir: {_PLUGIN_DIR}")
 _file_logger.info(f"Log file: {_LOG_FILE}")
 try:
-    from .constants import HAS_PSYCOPG2, psycopg2
-    _file_logger.info(f"psycopg2: {'v' + psycopg2.__version__ if HAS_PSYCOPG2 else 'NOT INSTALLED'}")
     _file_logger.info(get_environment_info())
 except Exception:
     pass
@@ -99,15 +113,15 @@ def timed_op(operation: str, trace_id: str = ""):
 
 class LoggerMixin:
     """Mixin for centralized logging (QGIS log panel + file)."""
-    
+
     def log_info(self, message: str) -> None:
         flog(message, "INFO")
         QgsMessageLog.logMessage(message, PLUGIN_NAME, QgisCompat.MSG_INFO)
-    
+
     def log_warning(self, message: str) -> None:
         flog(message, "WARNING")
         QgsMessageLog.logMessage(message, PLUGIN_NAME, QgisCompat.MSG_WARNING)
-    
+
     def log_error(self, message: str) -> None:
         flog(message, "ERROR")
         QgsMessageLog.logMessage(message, PLUGIN_NAME, QgisCompat.MSG_CRITICAL)

@@ -43,35 +43,48 @@ def _make_event(op="UPDATE", geom_wkb=None):
 
 class _FakeProvider:
     """Mock provider with controllable capabilities."""
+
     def __init__(self, caps):
         self._caps = caps
+
     def capabilities(self):
         return self._caps
+
     def name(self):
         return "ogr"
+
     def errors(self):
         return []
+
     def deleteFeatures(self, fids):
         return True
+
     def changeAttributeValues(self, changes):
         return True
+
     def changeGeometryValues(self, changes):
         return True
 
 
 class _FakeLayer:
     """Mock layer wrapping a FakeProvider."""
+
     def __init__(self, caps):
         self._provider = _FakeProvider(caps)
         self._pk_idx = 0
+
     def dataProvider(self):
         return self._provider
+
     def id(self):
         return "layer_1"
+
     def fields(self):
         return _FakeFields()
+
     def primaryKeyAttributes(self):
         return [0]
+
     def source(self):
         return "/tmp/test.gpkg|layername=test"
 
@@ -79,12 +92,16 @@ class _FakeLayer:
 class _FakeFields:
     def __init__(self):
         self._names = ["id", "name"]
+
     def __iter__(self):
         return iter([_FakeField(n) for n in self._names])
+
     def count(self):
         return len(self._names)
+
     def at(self, idx):
         return _FakeField(self._names[idx])
+
     def indexOf(self, name):
         try:
             return self._names.index(name)
@@ -95,14 +112,19 @@ class _FakeFields:
 class _FakeField:
     def __init__(self, name):
         self._name = name
+
     def name(self):
         return self._name
+
     def typeName(self):
         return "String" if self._name != "id" else "Integer"
+
     def type(self):
         return 10 if self._name != "id" else 2
+
     def length(self):
         return 0
+
     def precision(self):
         return 0
 
@@ -161,7 +183,8 @@ class TestBug03RegressionGeometryCapability:
         src = inspect.getsource(restore_updated_feature)
         assert "CAP_CHANGE_GEOMETRIES" in src or "ChangeGeometries" in src
         # The check must happen BEFORE changeGeometryValues
-        geom_check_idx = src.index("CAP_CHANGE_GEOMETRIES") if "CAP_CHANGE_GEOMETRIES" in src else src.index("ChangeGeometries")
+        geom_check_idx = src.index(
+            "CAP_CHANGE_GEOMETRIES") if "CAP_CHANGE_GEOMETRIES" in src else src.index("ChangeGeometries")
         change_call_idx = src.index("changeGeometryValues")
         assert geom_check_idx < change_call_idx, \
             "ChangeGeometries capability check must happen BEFORE changeGeometryValues call"

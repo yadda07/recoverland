@@ -5,7 +5,6 @@ humanize_error, empty result suggestions, health monitor integration,
 status bar states, column memory persistence.
 """
 import sqlite3
-import json
 import os
 import tempfile
 
@@ -22,7 +21,7 @@ from recoverland.core.sqlite_schema import initialize_schema
 from recoverland.core.journal_manager import JournalManager
 from recoverland.core.retention import (
     RetentionPolicy, purge_old_events, count_purgeable_events,
-    get_journal_stats, vacuum_async,
+    get_journal_stats,
 )
 from recoverland.core.audit_backend import AuditEvent
 

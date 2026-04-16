@@ -5,9 +5,7 @@ Produces a mapping report: matched fields, missing fields, added fields,
 and type-incompatible fields. Used before restore to decide strategy.
 """
 import json
-from typing import Dict, List, NamedTuple, Optional
-
-from .logger import flog
+from typing import Dict, List, NamedTuple
 
 
 class FieldInfo(NamedTuple):

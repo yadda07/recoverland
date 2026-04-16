@@ -5,7 +5,6 @@ Covers all critical use cases from the backlog.
 """
 import sqlite3
 import tempfile
-import time
 import json
 import os
 import unittest
@@ -17,7 +16,7 @@ from recoverland.core.sqlite_schema import initialize_schema
 from recoverland.core.audit_backend import AuditEvent, SearchCriteria
 from recoverland.core.write_queue import WriteQueue
 from recoverland.core.search_service import (
-    search_events, count_events, get_event_by_id,
+    search_events, get_event_by_id,
     get_distinct_layers, get_distinct_users, reconstruct_attributes,
 )
 from recoverland.core.schema_drift import (
@@ -195,7 +194,7 @@ class TestE2EWriteAndSearch(unittest.TestCase):
     def test_pagination_large_result(self):
         wq = WriteQueue()
         wq.start(self.tmp_path)
-        events = [_event(created_at=f"2025-03-{(i%28)+1:02d}T{i%24:02d}:00:00") for i in range(250)]
+        events = [_event(created_at=f"2025-03-{(i % 28)+1:02d}T{i % 24:02d}:00:00") for i in range(250)]
         wq.enqueue(events)
         wq.stop()
 

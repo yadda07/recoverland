@@ -1,10 +1,9 @@
 """Tests for schema migration v1->v2 (BL-02) and entity fingerprint backfill."""
 import sqlite3
-import json
 
 from recoverland.core.sqlite_schema import (
     initialize_schema, get_schema_version, apply_pragmas,
-    CURRENT_SCHEMA_VERSION, _backfill_entity_fingerprint, _extract_entity_fp,
+    CURRENT_SCHEMA_VERSION, _extract_entity_fp,
 )
 
 

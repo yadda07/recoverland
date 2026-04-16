@@ -1,6 +1,5 @@
 """Tests for core.search_service module (RLU-030, RLU-031, RLU-032)."""
 import sqlite3
-import json
 import unittest
 import sys
 import os

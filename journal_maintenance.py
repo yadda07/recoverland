@@ -11,10 +11,10 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import QTimer
 from qgis.core import QgsApplication, QgsSettings
 
-from .compat import QtCompat, QgisCompat
+from .compat import QtCompat
 from .core import (
     flog,
-    get_journal_size_bytes, format_journal_size,
+    get_journal_size_bytes,
     get_journal_stats, count_purgeable_events,
     purge_old_events, vacuum_async,
     RetentionPolicy, check_journal_integrity,
@@ -246,7 +246,7 @@ class JournalMaintenanceDialog(QDialog):
         reply = QMessageBox.question(
             self, self.tr("Confirmer la purge"),
             self.tr("Supprimer {count} evenement(s) anciens ?\n"
-            "Cette action est irreversible.").format(count=purgeable),
+                    "Cette action est irreversible.").format(count=purgeable),
             QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_NO)
         if reply != QtCompat.MSG_YES:
             return
@@ -258,7 +258,11 @@ class JournalMaintenanceDialog(QDialog):
                 self, self.tr("Purge terminee"),
                 self.tr("{count} evenement(s) supprime(s).").format(count=result.deleted_count))
         except Exception as e:
-            QMessageBox.warning(self, self.tr("Erreur de purge"), str(e))
+            flog(f"purge error: {e}", "ERROR")
+            QMessageBox.warning(
+                self, self.tr("Erreur de purge"),
+                self.tr("Une erreur est survenue lors de la purge. "
+                        "Consultez le journal de logs."))
         self._refresh_stats()
 
     def _vacuum_journal(self) -> None:
@@ -312,7 +316,10 @@ class JournalMaintenanceDialog(QDialog):
                     name=os.path.basename(dest)))
         except (sqlite3.Error, OSError) as e:
             flog(f"_export_journal: backup failed: {e}", "ERROR")
-            QMessageBox.warning(self, self.tr("Erreur d'export"), str(e))
+            QMessageBox.warning(
+                self, self.tr("Erreur d'export"),
+                self.tr("Une erreur est survenue lors de l'export. "
+                        "Consultez le journal de logs."))
         finally:
             if dst_conn:
                 try:
@@ -328,6 +335,6 @@ class JournalMaintenanceDialog(QDialog):
     def _open_journal_folder(self) -> None:
         if not self._journal or not self._journal.path:
             return
-        folder = os.path.dirname(self._journal.path)
+        folder = os.path.realpath(os.path.dirname(self._journal.path))
         if os.path.isdir(folder):
             os.startfile(folder)

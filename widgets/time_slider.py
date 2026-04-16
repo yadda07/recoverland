@@ -9,7 +9,7 @@ Qt5/Qt6 compatible via qgis.PyQt. Granularity adapts to range width:
 - < 30 d  : 1 minute
 - >= 30 d : 1 hour
 """
-from qgis.PyQt.QtCore import pyqtSignal, Qt, QDateTime
+from qgis.PyQt.QtCore import pyqtSignal, QDateTime
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel,
 )
@@ -58,7 +58,8 @@ class TimeSliderWidget(QWidget):
         self._newest_label.setStyleSheet("font-size: 10px;")
 
         self._slider = QSlider(QtCompat.HORIZONTAL, self)
-        self._slider.setTickPosition(QSlider.TicksBelow if hasattr(QSlider, 'TicksBelow') else QSlider.TickPosition.TicksBelow)
+        self._slider.setTickPosition(QSlider.TicksBelow if hasattr(
+            QSlider, 'TicksBelow') else QSlider.TickPosition.TicksBelow)
         self._slider.setMinimum(0)
         self._slider.setMaximum(0)
         self._slider.setEnabled(False)

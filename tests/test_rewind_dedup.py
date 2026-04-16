@@ -11,7 +11,7 @@ def _evt(event_id, op, entity_fp="pk:id=1", ds_fp="ogr::test"):
         layer_id_snapshot="l1",
         layer_name_snapshot="layer",
         provider_type="ogr",
-        feature_identity_json=f'{{"pk_field":"id","pk_value":1}}',
+        feature_identity_json='{"pk_field":"id","pk_value":1}',
         operation_type=op,
         attributes_json='{"all_attributes":{"id":1,"name":"a"}}',
         geometry_wkb=None,

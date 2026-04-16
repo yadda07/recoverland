@@ -599,13 +599,17 @@ class EditSessionTracker:
 
 class _StubFeature:
     """Minimal stand-in for compute_feature_identity when using a snapshot."""
+
     def __init__(self, fid, attrs):
         self._fid = fid
         self._attrs = attrs
+
     def id(self):
         return self._fid
+
     def geometry(self):
         return None
+
     def __getitem__(self, key):
         return self._attrs.get(key)
 

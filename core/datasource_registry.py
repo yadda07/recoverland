@@ -14,6 +14,14 @@ from typing import Optional, NamedTuple
 
 from .logger import flog
 
+_DB_PROVIDERS = frozenset({"postgres", "mssql", "oracle"})
+
+_SETTINGS_PREFIX = {
+    "postgres": "PostgreSQL/connections",
+    "mssql": "MSSQL/connections",
+    "oracle": "Oracle/connections",
+}
+
 
 class DatasourceInfo(NamedTuple):
     fingerprint: str
@@ -97,17 +105,19 @@ def create_layer_from_registry(info: DatasourceInfo):
     """Create a temporary QgsVectorLayer from stored datasource info.
 
     Returns the layer (caller must check isValid()) or None on error.
-    Uses the QGIS auth system for credentials (authcfg).
+    For DB providers: resolves credentials via authcfg or QGIS saved connections.
     """
-    from qgis.core import QgsVectorLayer, QgsDataSourceUri
+    from qgis.core import QgsVectorLayer
 
-    uri = info.source_uri
+    if info.provider_type in _DB_PROVIDERS:
+        uri = _enrich_db_uri(info)
+    else:
+        uri = info.source_uri
 
-    if info.provider_type == "postgres" and info.authcfg:
-        if "authcfg=" not in uri:
-            parsed = QgsDataSourceUri(uri)
-            parsed.setAuthConfigId(info.authcfg)
-            uri = parsed.uri()
+    if uri is None:
+        flog(f"datasource_registry: no credentials for {info.fingerprint} "
+             f"provider={info.provider_type}; load the layer manually", "WARNING")
+        return None
 
     display_name = f"{info.layer_name} (restore)"
     try:
@@ -123,21 +133,111 @@ def create_layer_from_registry(info: DatasourceInfo):
         return None
 
 
+def _enrich_db_uri(info: DatasourceInfo) -> Optional[str]:
+    """Build a connectable URI for a DB-backed layer.
+
+    Priority: (1) authcfg from registry, (2) QGIS saved connections, (3) None.
+    Credentials are used transiently; never persisted.
+    """
+    from qgis.core import QgsDataSourceUri
+
+    parsed = QgsDataSourceUri(info.source_uri)
+
+    if info.authcfg:
+        parsed.setAuthConfigId(info.authcfg)
+        return parsed.uri()
+
+    saved = _find_matching_saved_connection(info)
+    if saved is None:
+        return None
+
+    if saved.get("authcfg"):
+        parsed.setAuthConfigId(saved["authcfg"])
+    elif saved.get("username"):
+        parsed.setUsername(saved["username"])
+        parsed.setPassword(saved.get("password", ""))
+    else:
+        return None
+
+    return parsed.uri()
+
+
+def _find_matching_saved_connection(info: DatasourceInfo) -> Optional[dict]:
+    """Match stored URI against QGIS saved connections by host/port/db.
+
+    Returns dict with 'authcfg' or 'username'+'password', or None.
+    """
+    prefix = _SETTINGS_PREFIX.get(info.provider_type)
+    if not prefix:
+        return None
+
+    try:
+        from qgis.core import QgsSettings, QgsDataSourceUri
+    except ImportError:
+        return None
+
+    parsed = QgsDataSourceUri(info.source_uri)
+    target_host = parsed.host().lower()
+    target_port = parsed.port() or _default_port(info.provider_type)
+    target_db = parsed.database().lower()
+
+    if not target_host or not target_db:
+        return None
+
+    settings = QgsSettings()
+    settings.beginGroup(prefix)
+    names = settings.childGroups()
+    settings.endGroup()
+
+    for name in names:
+        p = f"{prefix}/{name}"
+        host = (settings.value(f"{p}/host", "") or "").lower()
+        port = str(settings.value(f"{p}/port", target_port))
+        db = (settings.value(f"{p}/database", "") or "").lower()
+
+        if host != target_host or port != str(target_port) or db != target_db:
+            continue
+
+        authcfg = settings.value(f"{p}/authcfg", "")
+        if authcfg:
+            flog(f"datasource_registry: matched saved connection '{name}' via authcfg")
+            return {"authcfg": authcfg}
+
+        username = settings.value(f"{p}/username", "")
+        if username:
+            flog(f"datasource_registry: matched saved connection '{name}' via user")
+            return {
+                "username": username,
+                "password": settings.value(f"{p}/password", "") or "",
+            }
+
+    return None
+
+
+def _default_port(provider_type: str) -> str:
+    return {"postgres": "5432", "mssql": "1433", "oracle": "1521"}.get(
+        provider_type, "5432"
+    )
+
+
 def _extract_authcfg(source_uri: str) -> str:
     """Extract authcfg ID from a QGIS source URI, or return empty string."""
     match = re.search(r"authcfg=([A-Za-z0-9]+)", source_uri)
     return match.group(1) if match else ""
 
 
+_PASSWORD_RE = re.compile(
+    r"""\b(?:ssl)?passw(?:ord|d)?='[^']*'"""
+    r'|\b(?:ssl)?passw(?:ord|d)?="[^"]*"'
+    r"""|\b(?:ssl)?passw(?:ord|d)?=[^'"\s]+""",
+    re.IGNORECASE,
+)
+
+
 def _strip_password_from_uri(uri: str) -> str:
-    """Remove password= from a source URI before storing.
+    """Remove password= variants from a source URI before storing.
 
     Passwords must NEVER be persisted. QGIS resolves them via authcfg.
-    Single alternation regex tries quoted variants first to avoid the
-    unquoted pattern swallowing the quotes.
+    Covers: password, sslpassword, passwd, PASSWD (case-insensitive).
     """
-    return re.sub(
-        r"""\bpassword='[^']*'|\bpassword="[^"]*"|\bpassword=[^'"\s]+""",
-        "password=***",
-        uri,
-    )
+    return _PASSWORD_RE.sub("password=***", uri)
