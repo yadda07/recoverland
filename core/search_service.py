@@ -44,18 +44,18 @@ def search_events(conn: sqlite3.Connection,
         flog(f"search_events: conditions={len(params)} total={total}")
 
         assert_safe_fragment(where_clause)
-        query = f"""
-            SELECT event_id, project_fingerprint, datasource_fingerprint,
-                   layer_id_snapshot, layer_name_snapshot, provider_type,
-                   feature_identity_json, operation_type, attributes_json,
-                   geometry_wkb, geometry_type, crs_authid, field_schema_json,
-                   user_name, session_id, created_at, restored_from_event_id,
-                   entity_fingerprint, event_schema_version, new_geometry_wkb
-            FROM audit_event
-            {where_clause}
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-        """
+        # B608: static columns list; `where_clause` built with whitelist; values via `?`.
+        query = (
+            "SELECT event_id, project_fingerprint, datasource_fingerprint,"  # nosec B608
+            " layer_id_snapshot, layer_name_snapshot, provider_type,"
+            " feature_identity_json, operation_type, attributes_json,"
+            " geometry_wkb, geometry_type, crs_authid, field_schema_json,"
+            " user_name, session_id, created_at, restored_from_event_id,"
+            " entity_fingerprint, event_schema_version, new_geometry_wkb"
+            " FROM audit_event "
+            + where_clause
+            + " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        )
         all_params = params + [page_size, offset]
         rows = conn.execute(query, all_params).fetchall()
         events = [_row_to_event(row) for row in rows]
@@ -139,14 +139,15 @@ def summarize_scope(conn: sqlite3.Connection, criteria: SearchCriteria) -> Journ
     )
     where_clause, params = _build_where_clause(scope_criteria)
     assert_safe_fragment(where_clause)
+    # B608: static aggregate; `where_clause` is internally built and asserted; values via `params`.
     query = (
-        "SELECT COUNT(*),"
+        "SELECT COUNT(*),"  # nosec B608
         " COUNT(DISTINCT user_name),"
         " COUNT(DISTINCT datasource_fingerprint),"
         " SUM(CASE WHEN operation_type='UPDATE' THEN 1 ELSE 0 END),"
         " SUM(CASE WHEN operation_type='DELETE' THEN 1 ELSE 0 END),"
         " SUM(CASE WHEN operation_type='INSERT' THEN 1 ELSE 0 END)"
-        f" FROM audit_event {where_clause}"
+        " FROM audit_event " + where_clause
     )
     row = conn.execute(query, params).fetchone() or (0, 0, 0, 0, 0, 0)
     total_count = int(row[0] or 0)
@@ -207,7 +208,9 @@ def _build_where_clause(criteria: SearchCriteria,
 
 def _count_matching(conn: sqlite3.Connection, where_clause: str, params: list) -> int:
     assert_safe_fragment(where_clause)
-    query = f"SELECT COUNT(*) FROM audit_event {where_clause}"
+    # Bandit B608: `where_clause` is internally generated with column whitelist
+    # and validated by assert_safe_fragment. User values via `params` list.
+    query = "SELECT COUNT(*) FROM audit_event " + where_clause  # nosec B608
     row = conn.execute(query, params).fetchone()
     return row[0] if row else 0
 
