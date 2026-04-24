@@ -15,7 +15,7 @@
 <header class="bar">
   <a class="bar-logo" href="index.html">
     <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
-    <span class="bar-name">RecoverLand</span><span class="bar-ver">3.0</span>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">4.4.0</span>
   </a>
   <nav class="bar-nav">
     <a href="index.html" class="on">Overview</a>
@@ -44,7 +44,6 @@
   <a href="#restore-dedup">Smart restore</a>
   <a href="#identity-strength">Identity strength</a>
   <div class="cat">Robustness</div>
-  <a href="#dual-backend">Dual backend mode</a>
   <a href="#integrity">Integrity &amp; recovery</a>
   <a href="#retention">Retention &amp; purge</a>
   <a href="#health">Health monitoring</a>
@@ -74,17 +73,18 @@
   </div>
   <p class="hero-sub">Smart local audit, delta storage, surgical restore: travel back in time through your QGIS edits</p>
   <div class="hero-badges">
-    <span class="hero-badge hero-badge-ac">v3.0</span>
-    <span class="hero-badge">QGIS 3.44+</span>
+    <span class="hero-badge hero-badge-ac">v4.3</span>
+    <span class="hero-badge">QGIS 3.44 - 4.x</span>
     <span class="hero-badge">Local SQLite</span>
     <span class="hero-badge">Automatic capture</span>
     <span class="hero-badge">Multi-format</span>
     <span class="hero-badge">Health monitoring</span>
+    <span class="hero-badge">Multi-writer safe</span>
   </div>
   <div class="hero-line"></div>
 </div>
 
-<div class="info"><strong>Version 3.0</strong>: 100% local journal (SQLite). Smart delta storage (only changed attributes are recorded). Automatic schema drift detection. Dual backend mode (local SQLite + PostgreSQL legacy). Asynchronous writes with no UI freeze. Health monitoring with disk space alerts. Maintenance dialog with export. Automatic user identity resolution. Works with all editable formats: GeoPackage, Shapefile, PostgreSQL, SpatiaLite, GeoJSON, CSV, and more.</div>
+<div class="info"><strong>Version 4.3</strong>: 100% local journal (SQLite, schema v4). Smart delta storage (only changed attributes are recorded). Automatic schema drift detection. Datasource alias resolver (reconcile fingerprints after path moves). PID-based writer lock preventing concurrent QGIS instances from corrupting the journal. Consolidated audit report (top users, top layers, operation counts). Asynchronous writes with no UI freeze. Health monitoring with disk space alerts. Maintenance dialog with export. Automatic user identity resolution. Works with all editable formats: GeoPackage, Shapefile, PostgreSQL, SpatiaLite, MSSQL, Oracle, GeoJSON, CSV, and more.</div>
 
 <div class="cards">
   <div class="card">
@@ -130,7 +130,8 @@
   <li>Paginated history search by layer, operation type, time window, and user</li>
   <li>Selective restore with schema compatibility report before applying</li>
   <li>Schema drift detection between the saved state and the current layer structure</li>
-  <li>Dual backend mode: local SQLite (automatic) + PostgreSQL legacy (when server-side triggers exist)</li>
+  <li>Datasource alias resolver: reconcile fingerprints after a project path move without losing history</li>
+  <li>Writer lock: refuses to open the journal when another live QGIS instance is already writing to it (PID-based, Windows and POSIX)</li>
   <li>Asynchronous batch writes in a dedicated thread (zero UI blocking)</li>
   <li>Startup integrity check (WAL checkpoint, pending-event recovery, schema version validation)</li>
   <li>Automatic user identification from: plugin config &rarr; env variable <code>RECOVERLAND_USER</code> &rarr; OS login &rarr; QGIS profile name</li>
@@ -225,7 +226,8 @@
   <tr><td><strong>JournalManager</strong></td><td>Resolves journal path (project folder or QGIS profile), opens/creates the SQLite file, manages read/write connections and orphan cleanup</td><td><code>core/journal_manager.py</code></td></tr>
   <tr><td><strong>SearchService</strong></td><td>Paginated search and attribute reconstruction from the journal</td><td><code>core/search_service.py</code></td></tr>
   <tr><td><strong>RestoreService</strong></td><td>Compatibility check, selective restore with per-batch isolation and rollback on error</td><td><code>core/restore_service.py</code></td></tr>
-  <tr><td><strong>BackendRouter</strong></td><td>Routes each layer to the correct backend (local SQLite or PostgreSQL legacy)</td><td><code>core/backend_router.py</code></td></tr>
+  <tr><td><strong>JournalAudit</strong></td><td>Consolidated read-only introspection: operation counts, top users, top layers, time range</td><td><code>core/journal_audit.py</code></td></tr>
+  <tr><td><strong>DatasourceAlias</strong></td><td>Reconciles datasource fingerprints across project moves via a transitive alias table</td><td><code>core/datasource_alias.py</code></td></tr>
   <tr><td><strong>HealthMonitor</strong></td><td>Evaluates journal health (size, event count, disk space) and produces actionable messages for the UI</td><td><code>core/health_monitor.py</code></td></tr>
   <tr><td><strong>DiskMonitor</strong></td><td>Periodically checks free disk space on the journal volume; disables tracking at the critical threshold</td><td><code>core/disk_monitor.py</code></td></tr>
   <tr><td><strong>SupportPolicy</strong></td><td>Defines capture/restore support level and identity strength for each QGIS provider</td><td><code>core/support_policy.py</code></td></tr>
@@ -445,7 +447,7 @@
 <!-- ====== DELTA STORAGE ====== -->
 <section id="delta-storage">
 <h2>Delta storage</h2>
-<p>The legacy PostgreSQL mode stored the entire row on every change (<code>row_to_json(OLD)</code>). On a 50-column table, changing one field stored 50 values. The local mode uses a differentiated strategy:</p>
+<p>A naive audit would store the entire row on every change. On a 50-column table, changing one field would store 50 values. RecoverLand uses a differentiated strategy:</p>
 
 <div class="tw"><table>
 <thead><tr><th>Operation</th><th>Strategy</th><th>Content stored</th></tr></thead>
@@ -595,48 +597,6 @@ INSERT: {"all_attributes": {"name": "Martin", "age": 35, "city": "Lyon"}}</pre>
 </table></div>
 </section>
 
-<!-- ====== DUAL BACKEND ====== -->
-<section id="dual-backend">
-<h2>Dual backend mode</h2>
-<p>RecoverLand supports two audit backends simultaneously. The <code>BackendRouter</code> automatically decides which backend to use for each layer.</p>
-
-<div class="dia">
-<svg viewBox="0 0 620 200" xmlns="http://www.w3.org/2000/svg">
-  <rect x="200" y="10" width="220" height="40" class="nd-ac"/>
-  <text x="310" y="35" text-anchor="middle" class="lbl" font-size="12">BackendRouter</text>
-
-  <line x1="210" y1="50" x2="110" y2="90" class="edge-ac"/>
-  <line x1="410" y1="50" x2="510" y2="90" class="edge-ac"/>
-
-  <rect x="20" y="90" width="200" height="44" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.5"/>
-  <text x="120" y="110" text-anchor="middle" class="lbl" font-size="11">Local SQLite</text>
-  <text x="120" y="124" text-anchor="middle" class="dim" font-size="9">GeoPackage, Shapefile, SpatiaLite, GeoJSON...</text>
-
-  <rect x="400" y="90" width="200" height="44" rx="6" fill="var(--bg2)" stroke="var(--brd)" stroke-width="1.2"/>
-  <text x="500" y="110" text-anchor="middle" class="lbl" font-size="11">PostgreSQL legacy</text>
-  <text x="500" y="124" text-anchor="middle" class="dim" font-size="9">Existing server-side triggers</text>
-
-  <text x="120" y="160" text-anchor="middle" class="dim" font-size="10">Automatic, no configuration</text>
-  <text x="120" y="174" text-anchor="middle" class="dim" font-size="10">Capture via QGIS signals</text>
-  <text x="500" y="160" text-anchor="middle" class="dim" font-size="10">Requires server-side triggers</text>
-  <text x="500" y="174" text-anchor="middle" class="dim" font-size="10">Search via SQL functions</text>
-</svg>
-</div>
-
-<h3>Routing rules</h3>
-<div class="tw"><table>
-<thead><tr><th>Situation</th><th>Backend chosen</th><th>Reason</th></tr></thead>
-<tbody>
-  <tr><td>PostgreSQL layer with audit triggers</td><td>PostgreSQL legacy</td><td>Server-side triggers already capture the changes</td></tr>
-  <tr><td>PostgreSQL layer without triggers</td><td>Local SQLite</td><td>No server capture; the plugin takes over</td></tr>
-  <tr><td>GeoPackage, Shapefile, SpatiaLite, GeoJSON</td><td>Local SQLite</td><td>Local files; no server</td></tr>
-  <tr><td>Non-editable or virtual layer</td><td>None</td><td>Explicit refusal with a message</td></tr>
-</tbody>
-</table></div>
-
-<div class="warn"><strong>No double auditing</strong>: A layer is never audited by both backends simultaneously. The router guarantees that only one backend is active per layer per session.</div>
-</section>
-
 <!-- ====== SCHEMA DRIFT ====== -->
 <section id="schema-drift">
 <h2>Schema drift</h2>
@@ -699,7 +659,7 @@ INSERT: {"all_attributes": {"name": "Martin", "age": 35, "city": "Lyon"}}</pre>
   <div class="card">
     <div class="card-tag tag-core">By age</div>
     <div class="card-t">Age-based purge</div>
-    <p>Delete events older than a configurable threshold (7 to 3650 days). The default retention policy is 365 days.</p>
+    <p>Delete events older than a configurable threshold. The default retention policy is <strong>365 days</strong> (up to 10 years).</p>
   </div>
   <div class="card">
     <div class="card-tag tag-core">By count</div>
@@ -821,7 +781,7 @@ INSERT: {"all_attributes": {"name": "Martin", "age": 35, "city": "Lyon"}}</pre>
 </aside>
 </div>
 
-<footer>RecoverLand 3.0 &middot; GEODECI &middot; Technical documentation</footer>
+<footer>RecoverLand 4.3 &middot; GEODECI &middot; Technical documentation</footer>
 <script src="rl.js"></script>
 </body>
 </html>

@@ -70,7 +70,6 @@ var RL_SEARCH = [
   {t:'Identification',k:'fingerprint datasource identity pk fid',h:'index.html#identification',p:'index'},
   {t:'Restauration intelligente',k:'smart restore entity fingerprint restored_from_event_id suppress trace dedup',h:'index.html#restore-dedup',p:'index'},
   {t:'Force d\'identification',k:'strong medium weak none identity strength',h:'index.html#identity-strength',p:'index'},
-  {t:'Mode dual backend',k:'backend router sqlite postgresql legacy dual',h:'index.html#dual-backend',p:'index'},
   {t:'Derive de schema',k:'schema drift migration champ ajoute supprime',h:'index.html#schema-drift',p:'index'},
   {t:'Integrite et recuperation',k:'integrity wal checkpoint pending recovery crash',h:'index.html#integrity',p:'index'},
   {t:'Retention et purge',k:'retention purge vacuum age session compactage',h:'index.html#retention',p:'index'},

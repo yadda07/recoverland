@@ -15,7 +15,7 @@
 <header class="bar">
   <a class="bar-logo" href="index.html">
     <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
-    <span class="bar-name">RecoverLand</span><span class="bar-ver">3.0</span>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">4.4.0</span>
   </a>
   <nav class="bar-nav">
     <a href="index.html">Overview</a>
@@ -49,7 +49,6 @@
   <a href="#maintenance">Maintenance dialog</a>
   <a href="#health-alerts">Health alerts</a>
   <a href="#user-identity">User identity</a>
-  <a href="#dual-mode">PostgreSQL mode</a>
   <div class="cat">Scenarios</div>
   <a href="#scenario-undo">Undo a mistake</a>
   <a href="#scenario-compare">Compare before/after</a>
@@ -487,7 +486,7 @@
 <p>The SQLite journal grows over time. RecoverLand provides tools to control its size via the Maintenance dialog.</p>
 
 <h3>Age-based purge</h3>
-<p>Delete events older than a threshold: 7 to 3650 days (configurable). Purged events are permanently deleted.</p>
+<p>Delete events older than a configurable threshold (default: <strong>365 days</strong>, up to 10 years). Purged events are permanently deleted.</p>
 
 <h3>Max-events cap</h3>
 <p>Set a maximum event count. When the cap is exceeded, the oldest events are automatically removed. The default cap is 1,000,000 events.</p>
@@ -575,28 +574,6 @@
 <div class="info">The resolved user name is shown in the <strong>User</strong> column of the results table. It cannot be empty: if all sources fail, the fallback value <code>"unknown"</code> is used.</div>
 </section>
 
-<!-- ====== DUAL MODE ====== -->
-<section id="dual-mode">
-<h2>PostgreSQL mode (legacy)</h2>
-<p>If your project uses PostgreSQL layers with server-side audit triggers installed (schema <code>suppressions</code>), RecoverLand automatically detects this backend and uses it for those layers.</p>
-
-<h3>Coexistence of both modes</h3>
-<div class="flow">
-  <span class="fn">GeoPackage layer</span>
-  <span class="fa">&rarr;</span>
-  <span class="fn-ac">Local SQLite</span>
-</div>
-<div class="flow" style="margin-top:6px">
-  <span class="fn">PostGIS layer + triggers</span>
-  <span class="fa">&rarr;</span>
-  <span class="fn-ac">PostgreSQL legacy</span>
-</div>
-
-<p style="margin-top:12px">Both modes coexist in the same project. The <code>BackendRouter</code> decides the backend for each layer. Nothing needs to be configured: detection is automatic.</p>
-
-<div class="info"><strong>Recommendation</strong>: The local SQLite mode is preferred because it does not depend on server availability to browse the history. The PostgreSQL mode is kept for compatibility with existing installations.</div>
-</section>
-
 <!-- ====== SCENARIOS ====== -->
 <section id="scenario-undo">
 <h2>Scenario: Undo a mistake</h2>
@@ -677,14 +654,13 @@
   <a href="#maintenance">Maintenance</a>
   <a href="#health-alerts">Health alerts</a>
   <a href="#user-identity">User identity</a>
-  <a href="#dual-mode">PostgreSQL mode</a>
   <a href="#scenario-undo">Undo mistake</a>
   <a href="#scenario-compare">Compare</a>
   <a href="#scenario-deleted">Recover deletion</a>
 </aside>
 </div>
 
-<footer>RecoverLand 3.0 &middot; GEODECI &middot; Technical documentation</footer>
+<footer>RecoverLand 4.3 &middot; GEODECI &middot; Technical documentation</footer>
 <script src="rl.js"></script>
 </body>
 </html>

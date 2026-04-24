@@ -15,7 +15,7 @@
 <header class="bar">
   <a class="bar-logo" href="index.html">
     <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
-    <span class="bar-name">RecoverLand</span><span class="bar-ver">3.0</span>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">4.4.0</span>
   </a>
   <nav class="bar-nav">
     <a href="index.html">Overview</a>
@@ -292,7 +292,7 @@
 <p>Use the Maintenance dialog to configure a retention policy. For example: keep 90 days of history and purge the rest. The health monitor alerts you when the journal is growing too large before it becomes a problem.</p>
 
 <h3>Impact of delta storage</h3>
-<p>The local v3.0 mode uses delta storage for UPDATE: only the attributes that actually changed are recorded. On a 50-column table, changing one field stores 1 value instead of 50. This reduces journal volume by 10 to 50 times compared to the legacy PostgreSQL mode (which stored the full row).</p>
+<p>RecoverLand uses delta storage for UPDATE: only the attributes that actually changed are recorded. On a 50-column table, changing one field stores 1 value instead of 50, reducing journal volume by 10 to 50 times compared to a full-row audit.</p>
 
 <div class="tw"><table>
 <thead><tr><th>Event type</th><th>Estimated size</th></tr></thead>
@@ -390,7 +390,7 @@
 </aside>
 </div>
 
-<footer>RecoverLand 3.0 &middot; GEODECI &middot; Technical documentation</footer>
+<footer>RecoverLand 4.3 &middot; GEODECI &middot; Technical documentation</footer>
 <script src="rl.js"></script>
 </body>
 </html>
