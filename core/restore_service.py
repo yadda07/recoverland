@@ -217,11 +217,42 @@ def build_fid_cache(layer, events: List[AuditEvent]) -> Dict:
         request = QgsFeatureRequest(expr)
         if field_idx >= 0:
             request.setSubsetOfAttributes([field_idx])
-        request.setFlags(QgsFeatureRequest.NoGeometry)
+        request.setFlags(QgisCompat.NO_GEOMETRY)
         for feat in provider.getFeatures(request):
             cache[(pk_field, str(feat[pk_field]))] = feat.id()
 
     return cache
+
+
+# -----------------------------------------------------------------------
+# Dispatch tables (BLK-02). Declared lazily via accessor functions because
+# the UNDO table references _undo_update_restore / _undo_insert_restore
+# which are defined further down. Module-level eager construction would
+# work but keeping the lookup behind helper functions also makes the
+# intent explicit: all 3 operations must stay covered in both directions.
+# -----------------------------------------------------------------------
+
+def _restore_dispatch():
+    """Return {operation_type: handler(layer, event, fid_cache) -> dict}."""
+    return {
+        "DELETE": lambda layer, event, fid_cache:
+            restore_deleted_feature(layer, event),
+        "UPDATE": restore_updated_feature,
+        "INSERT": restore_inserted_feature,
+    }
+
+
+def _undo_dispatch():
+    """Return {operation_type: handler(layer, event) -> dict}."""
+    return {
+        "UPDATE": _undo_update_restore,
+        "DELETE": lambda layer, event: restore_inserted_feature(layer, event),
+        "INSERT": _undo_insert_restore,
+    }
+
+
+def _unsupported_result(operation_type: str) -> Dict[str, Any]:
+    return {"success": False, "message": f"Unsupported: {operation_type}"}
 
 
 def restore_batch(layer, events: List[AuditEvent],
@@ -236,18 +267,16 @@ def restore_batch(layer, events: List[AuditEvent],
     succeeded = []
     failed = {}
     traces = []
+    dispatch = _restore_dispatch()
 
     for event in events:
         eid = event.event_id or 0
         try:
-            if event.operation_type == "DELETE":
-                result = restore_deleted_feature(layer, event)
-            elif event.operation_type == "UPDATE":
-                result = restore_updated_feature(layer, event, fid_cache)
-            elif event.operation_type == "INSERT":
-                result = restore_inserted_feature(layer, event, fid_cache)
+            handler = dispatch.get(event.operation_type)
+            if handler is None:
+                result = _unsupported_result(event.operation_type)
             else:
-                result = {"success": False, "message": f"Unsupported: {event.operation_type}"}
+                result = handler(layer, event, fid_cache)
 
             if result["success"]:
                 succeeded.append(eid)
@@ -281,18 +310,16 @@ def undo_restore_batch(layer, events: List[AuditEvent]) -> RestoreReport:
         return RestoreReport([], failed, len(events), ())
     succeeded = []
     failed = {}
+    dispatch = _undo_dispatch()
 
     for event in events:
         eid = event.event_id or 0
         try:
-            if event.operation_type == "UPDATE":
-                result = _undo_update_restore(layer, event)
-            elif event.operation_type == "DELETE":
-                result = restore_inserted_feature(layer, event)
-            elif event.operation_type == "INSERT":
-                result = _undo_insert_restore(layer, event)
+            handler = dispatch.get(event.operation_type)
+            if handler is None:
+                result = _unsupported_result(event.operation_type)
             else:
-                result = {"success": False, "message": f"Unsupported: {event.operation_type}"}
+                result = handler(layer, event)
 
             if result["success"]:
                 succeeded.append(eid)
@@ -443,30 +470,43 @@ def _find_target_feature(layer, identity: Dict,
                          fid_cache: Optional[Dict] = None) -> Optional[int]:
     """Find the FID of the target feature using identity info.
 
-    If fid_cache is provided, checks it first to avoid redundant provider queries.
+    Lookup priority:
+      1. fid_cache (batched PK resolution).
+      2. PK-based search (pk_field + pk_value).
+      3. Raw FID fallback — only when no PK was captured for this event.
+
+    When a PK was captured at capture time, the FID fallback is intentionally
+    refused: FIDs are not stable after commits on many providers (ogr,
+    postgres without oid), so a stale FID could address a different feature.
     """
     from qgis.core import QgsFeatureRequest, QgsExpression
 
     pk_field = identity.get("pk_field")
     pk_value = identity.get("pk_value")
+    has_pk = bool(pk_field) and pk_value is not None
 
-    if fid_cache is not None and pk_field and pk_value is not None:
+    if fid_cache is not None and has_pk:
         cached = fid_cache.get((pk_field, str(pk_value)))
         if cached is not None:
             return cached
 
     provider = layer.dataProvider()
-    if pk_field and pk_value is not None:
+    if has_pk:
         escaped_field = QgsExpression.quotedColumnRef(str(pk_field))
         escaped_value = QgsExpression.quotedValue(pk_value)
         expr = QgsExpression(f"{escaped_field} = {escaped_value}")
         if expr.hasParserError():
             flog(f"restore: invalid PK expression for field={pk_field} "
                  f"value={pk_value!r}: {expr.parserErrorString()}", "WARNING")
-        else:
-            request = QgsFeatureRequest(expr).setLimit(1)
-            for feat in provider.getFeatures(request):
-                return feat.id()
+            return None
+        request = QgsFeatureRequest(expr).setLimit(1)
+        for feat in provider.getFeatures(request):
+            return feat.id()
+        # PK was expected but not found: do not fall back to FID, which is
+        # unstable and could point at an unrelated feature.
+        flog(f"restore: PK {pk_field}={pk_value!r} not found; "
+             f"refusing FID fallback (safety)", "DEBUG")
+        return None
 
     fid = identity.get("fid")
     if fid is not None:

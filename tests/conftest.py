@@ -25,6 +25,44 @@ if 'qgis' not in sys.modules:
         Critical = 2
         Success = 3
 
+        class MessageLevel:
+            Info = 0
+            Warning = 1
+            Critical = 2
+            Success = 3
+
+        class GeometryType:
+            Polygon = 2
+            Line = 1
+            Point = 0
+
+        class _WkbTypeValue:
+            def __init__(self, value):
+                self.value = value
+
+            @property
+            def name(self):
+                return _FakeQgis._WKB_NAMES.get(self.value, 'Unknown')
+
+            def __eq__(self, other):
+                if isinstance(other, _FakeQgis._WkbTypeValue):
+                    return self.value == other.value
+                return self.value == other
+
+            def __hash__(self):
+                return hash(self.value)
+
+        _WKB_NAMES = {100: 'NoGeometry', 1: 'Point', 2: 'LineString', 3: 'Polygon'}
+
+        class WkbType:
+            NoGeometry = 100
+            Point = 1
+            LineString = 2
+            Polygon = 3
+
+            def __new__(cls, value):
+                return _FakeQgis._WkbTypeValue(value)
+
     class _FakeQgsApplication:
         @staticmethod
         def qgisSettingsDirPath():
@@ -276,7 +314,15 @@ if 'qgis' not in sys.modules:
 
         class PenStyle:
             NoPen = 0
+            DashLine = 2
         NoPen = 0
+        DashLine = 2
+
+        class MouseButton:
+            LeftButton = 1
+            RightButton = 2
+        LeftButton = 1
+        RightButton = 2
 
         class WidgetAttribute:
             WA_TransparentForMouseEvents = 76
@@ -301,6 +347,10 @@ if 'qgis' not in sys.modules:
             Checked = 2
         Unchecked = 0
         Checked = 2
+
+        class TimeSpec:
+            UTC = 1
+        UTC = 1
 
     class _QEvent:
         class Type:
@@ -378,6 +428,15 @@ if 'qgis' not in sys.modules:
     class _QRectF:
         pass
 
+    class _QAbstractAnimation:
+        class State:
+            Stopped = 0
+            Paused = 1
+            Running = 2
+        Stopped = 0
+        Paused = 1
+        Running = 2
+
     qtcore.Qt = _Qt
     qtcore.QEvent = _QEvent
     qtcore.QEasingCurve = _QEasingCurve
@@ -394,6 +453,7 @@ if 'qgis' not in sys.modules:
     qtcore.QLocale = _QLocale
     qtcore.QVariantAnimation = _QVariantAnimation
     qtcore.QRectF = _QRectF
+    qtcore.QAbstractAnimation = _QAbstractAnimation
     sys.modules['qgis.PyQt.QtCore'] = qtcore
 
     # QtWidgets stub
@@ -429,13 +489,26 @@ if 'qgis' not in sys.modules:
     qtwidgets.QAbstractItemView = _QAbstractItemView
     qtwidgets.QMessageBox = _QMessageBox
     qtwidgets.QVBoxLayout = _QVBoxLayout
+
+    class _QSlider:
+        class TickPosition:
+            TicksBelow = 2
+        TicksBelow = 2
+
+    class _QFrame:
+        class Shape:
+            HLine = 4
+        HLine = 4
+
+    qtwidgets.QSlider = _QSlider
+    qtwidgets.QFrame = _QFrame
     for cls_name in ('QDialog', 'QHBoxLayout', 'QLabel', 'QPushButton',
                      'QComboBox', 'QProgressBar', 'QFormLayout', 'QCheckBox',
                      'QApplication', 'QTableWidget', 'QTableWidgetItem',
                      'QLineEdit', 'QFileDialog', 'QGraphicsDropShadowEffect',
                      'QWidget', 'QAction', 'QSpinBox', 'QGroupBox',
-                     'QButtonGroup', 'QScrollArea', 'QFrame', 'QMenu',
-                     'QShortcut', 'QStackedWidget', 'QSlider'):
+                     'QButtonGroup', 'QScrollArea', 'QMenu',
+                     'QShortcut', 'QStackedWidget', 'QListWidget', 'QListWidgetItem'):
         setattr(qtwidgets, cls_name, type(cls_name, (), {}))
 
     def _widgets_getattr(name):
@@ -485,7 +558,22 @@ if 'qgis' not in sys.modules:
     qtgui.QColor = _FakeQColor
     for cls_name in ('QIcon', 'QLinearGradient', 'QAction'):
         setattr(qtgui, cls_name, type(cls_name, (), {'__init__': lambda self, *a, **kw: None}))
+
+    class _QDesktopServices:
+        @staticmethod
+        def openUrl(url):
+            return True
+    qtgui.QDesktopServices = _QDesktopServices
     sys.modules['qgis.PyQt.QtGui'] = qtgui
+
+    class _QUrl:
+        def __init__(self, s=''):
+            self._s = s
+
+        @staticmethod
+        def fromLocalFile(path):
+            return _QUrl(f'file:///{path}')
+    qtcore.QUrl = _QUrl
 
     # QtSvg stub
     qtsvg = types.ModuleType('qgis.PyQt.QtSvg')

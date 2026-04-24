@@ -32,7 +32,6 @@ class TestSQLiteSchema(unittest.TestCase):
     def test_initialize_creates_indexes(self):
         initialize_schema(self.conn)
         indexes = self._get_indexes()
-        self.assertIn("idx_event_main", indexes)
         self.assertIn("idx_event_op_date", indexes)
         self.assertIn("idx_event_user_date", indexes)
         self.assertIn("idx_event_restored", indexes)

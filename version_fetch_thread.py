@@ -32,7 +32,7 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback, is_cance
             if is_cancelled():
                 return None
             events.extend(fetch_events_after_cutoff(conn, fp, cutoff, trace_id=trace_id))
-        events.sort(key=lambda e: e.event_id, reverse=True)
+        events.sort(key=lambda e: (e.created_at or "", e.event_id or 0), reverse=True)
         flog(f"{prefix}VersionFetchThread: fetched {len(events)} events")
         if is_cancelled():
             return None

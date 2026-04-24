@@ -309,7 +309,7 @@ class TestE2ERetention(unittest.TestCase):
         wq.enqueue([
             _event(created_at="2020-01-01T00:00:00"),
             _event(created_at="2020-06-01T00:00:00"),
-            _event(created_at="2026-03-23T10:00:00"),
+            _event(created_at="2099-01-01T10:00:00"),
         ])
         wq.stop()
 

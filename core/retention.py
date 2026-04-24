@@ -69,6 +69,8 @@ def purge_old_events(conn: sqlite3.Connection,
 
             if total_deleted > 0:
                 _post_purge_maintenance(conn)
+                from .datasource_registry import purge_orphan_datasources
+                purge_orphan_datasources(conn)
 
             return PurgeResult(deleted_count=total_deleted, vacuum_done=False, error="")
 

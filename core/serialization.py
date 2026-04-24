@@ -92,13 +92,15 @@ def _is_null(value: Any) -> bool:
         null_repr = QgsApplication.nullRepresentation()
         if isinstance(value, str) and value == null_repr:
             return True
-    except Exception:
+    except (ImportError, AttributeError, RuntimeError):
+        # Benign: QGIS not initialized (unit tests) or app unavailable.
         pass
 
     try:
         if hasattr(value, 'isNull') and value.isNull():
             return True
-    except Exception:
+    except (TypeError, RuntimeError):
+        # Benign: isNull not callable on this object variant.
         pass
 
     return False

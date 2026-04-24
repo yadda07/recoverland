@@ -75,7 +75,14 @@ _DEFAULT_POLICY = ProviderPolicy(
     False, False, 99, "Unknown provider"
 )
 
-_EDIT_CAPABILITIES_MASK = 1 | 2 | 4 | 8
+def _edit_capabilities_mask():
+    from ..compat import QgisCompat
+    return (
+        QgisCompat.CAP_ADD_FEATURES
+        | QgisCompat.CAP_DELETE_FEATURES
+        | QgisCompat.CAP_CHANGE_ATTRIBUTE_VALUES
+        | QgisCompat.CAP_CHANGE_GEOMETRIES
+    )
 
 
 def get_provider_policy(provider_name: str) -> ProviderPolicy:
@@ -112,7 +119,7 @@ def evaluate_layer_support(layer) -> ProviderPolicy:
 
 def _has_edit_capabilities(provider) -> bool:
     caps = provider.capabilities()
-    return bool(caps & _EDIT_CAPABILITIES_MASK)
+    return bool(caps & _edit_capabilities_mask())
 
 
 def refine_ogr_identity(source_uri: str) -> IdentityStrength:

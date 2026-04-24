@@ -58,7 +58,14 @@ from .local_settings import LocalSettings
 from .audit_field_policy import is_layer_audit_field
 from .datasource_registry import (
     register_datasource, lookup_datasource, create_layer_from_registry,
-    DatasourceInfo,
+    purge_orphan_datasources, DatasourceInfo,
+)
+from .datasource_alias import (
+    add_alias, remove_alias, list_aliases, resolve_fingerprints,
+)
+from .journal_audit import (
+    build_journal_audit_report, JournalAuditReport,
+    UserActivity, LayerActivity,
 )
 from .restore_service import build_restore_trace_event
 from .restore_contracts import (
@@ -105,3 +112,4 @@ from .workflow_service import (
     execute_grouped_restore, execute_grouped_undo,
     find_target_layer, GroupedRestoreResult,
 )
+from .rewind_dedup import collapse_rewind_events

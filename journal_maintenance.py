@@ -8,7 +8,8 @@ from qgis.PyQt.QtWidgets import (
     QSpinBox, QGroupBox, QFormLayout, QMessageBox, QFileDialog,
     QProgressBar, QCheckBox,
 )
-from qgis.PyQt.QtCore import QTimer
+from qgis.PyQt.QtCore import QTimer, QUrl
+from qgis.PyQt.QtGui import QDesktopServices
 from qgis.core import QgsApplication, QgsSettings
 
 from .compat import QtCompat
@@ -336,5 +337,8 @@ class JournalMaintenanceDialog(QDialog):
         if not self._journal or not self._journal.path:
             return
         folder = os.path.realpath(os.path.dirname(self._journal.path))
-        if os.path.isdir(folder):
-            os.startfile(folder)
+        if not os.path.isdir(folder):
+            return
+        url = QUrl.fromLocalFile(folder)
+        if not QDesktopServices.openUrl(url):
+            flog(f"journal_maintenance: cannot open folder {folder}", "WARNING")

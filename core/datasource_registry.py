@@ -51,7 +51,7 @@ def register_datasource(conn: sqlite3.Connection, layer) -> None:
     geom_type = extract_geometry_type(layer)
     now = datetime.now(timezone.utc).isoformat()
 
-    source_clean = _strip_password_from_uri(source_uri)
+    source_clean = _strip_password_from_uri(source_uri, provider_type)
 
     try:
         with conn:
@@ -72,6 +72,28 @@ def register_datasource(conn: sqlite3.Connection, layer) -> None:
             )
     except sqlite3.Error as e:
         flog(f"datasource_registry: register error: {e}", "WARNING")
+
+
+def purge_orphan_datasources(conn: sqlite3.Connection) -> int:
+    """Remove datasource_registry rows with no referencing events.
+
+    Keeps the registry small after retention purges drop the last event
+    of a datasource. Safe: live datasources are re-registered on every
+    commit.
+    """
+    try:
+        with conn:
+            cursor = conn.execute(
+                "DELETE FROM datasource_registry WHERE datasource_fingerprint "
+                "NOT IN (SELECT DISTINCT datasource_fingerprint FROM audit_event)"
+            )
+            deleted = cursor.rowcount or 0
+        if deleted:
+            flog(f"datasource_registry: gc removed {deleted} orphan(s)")
+        return deleted
+    except sqlite3.Error as e:
+        flog(f"datasource_registry: gc error: {e}", "WARNING")
+        return 0
 
 
 def lookup_datasource(conn: sqlite3.Connection,
@@ -234,10 +256,21 @@ _PASSWORD_RE = re.compile(
 )
 
 
-def _strip_password_from_uri(uri: str) -> str:
+def _strip_password_from_uri(uri: str, provider_type: str = "") -> str:
     """Remove password= variants from a source URI before storing.
 
     Passwords must NEVER be persisted. QGIS resolves them via authcfg.
-    Covers: password, sslpassword, passwd, PASSWD (case-insensitive).
+    For DB providers, use QgsDataSourceUri.setPassword('') which is the
+    canonical QGIS-side parser and handles all quoting corner cases.
+    Falls back to a regex for non-DB URIs (files, delimited text, etc.).
     """
+    if provider_type in _DB_PROVIDERS:
+        try:
+            from qgis.core import QgsDataSourceUri
+            parsed = QgsDataSourceUri(uri)
+            parsed.setPassword("")
+            return parsed.uri()
+        except Exception as exc:
+            flog(f"datasource_registry: QgsDataSourceUri strip failed ({exc}); "
+                 f"falling back to regex", "WARNING")
     return _PASSWORD_RE.sub("password=***", uri)
