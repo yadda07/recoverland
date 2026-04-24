@@ -33,6 +33,14 @@ The corrupt file will be kept for analysis.</translation>
         <source>File d&apos;ecriture saturee: enregistrement desactive. Evenements en attente sauvegardes. Relancez le suivi manuellement.</source>
         <translation>Write queue full: recording disabled. Pending events saved. Restart tracking manually.</translation>
     </message>
+    <message>
+        <source>Une autre instance de QGIS enregistre deja dans ce journal. Fermez-la pour activer l&apos;enregistrement ici.</source>
+        <translation>Another QGIS instance is already recording to this journal. Close it to enable recording here.</translation>
+    </message>
+    <message>
+        <source>Initialisation du journal impossible. L&apos;enregistrement est desactive pour cette session.</source>
+        <translation>Cannot initialize the audit journal. Recording is disabled for this session.</translation>
+    </message>
 </context>
 <context>
     <name>StatusBarIndicator</name>
