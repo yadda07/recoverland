@@ -2,6 +2,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
-*.md
 flake8_report.txt
+flake8_report.md
 .pytest_cache/
