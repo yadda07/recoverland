@@ -128,8 +128,11 @@ def compute_feature_identity(layer, feature) -> str:
                         identity["pk_field"] = field.name()
                         identity["pk_value"] = _safe_pk_value(val)
                         break
-                except (KeyError, IndexError):
-                    pass
+                except (KeyError, IndexError) as exc:
+                    # PK field declared by provider but not on this feature;
+                    # fall through to the next candidate.
+                    from .logger import flog
+                    flog(f"identity: PK field {field.name()!r} not available on feature: {exc}", "DEBUG")
 
     return json.dumps(identity, ensure_ascii=False)
 

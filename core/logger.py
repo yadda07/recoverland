@@ -1,6 +1,7 @@
 """Logging infrastructure for RecoverLand plugin."""
 import os
 import logging
+import logging.handlers
 import threading
 import time
 import uuid
@@ -10,6 +11,9 @@ from qgis.core import QgsMessageLog
 
 from .constants import PLUGIN_NAME
 from ..compat import QgisCompat, get_environment_info
+
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+_LOG_BACKUP_COUNT = 5
 
 # --- File Logger Setup (writes to QGIS profile directory, not plugin dir) ---
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,8 +28,12 @@ def _resolve_log_path() -> str:
             log_dir = os.path.join(profile_dir, "recoverland")
             os.makedirs(log_dir, exist_ok=True)
             return os.path.join(log_dir, "recoverland_debug.log")
-    except Exception:
-        pass
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        import sys
+        print(
+            f"[RecoverLand] log path fallback to plugin dir: {exc}",
+            file=sys.stderr,
+        )
     return os.path.join(_PLUGIN_DIR, "recoverland_debug.log")
 
 
@@ -35,11 +43,17 @@ _file_logger = logging.getLogger("RecoverLand.FileDebug")
 _file_logger.setLevel(logging.DEBUG)
 _file_logger.propagate = False
 if not _file_logger.handlers:
-    _fh = logging.FileHandler(_LOG_FILE, mode='w', encoding='utf-8')
+    _fh = logging.handlers.RotatingFileHandler(
+        _LOG_FILE,
+        mode='a',
+        maxBytes=_LOG_MAX_BYTES,
+        backupCount=_LOG_BACKUP_COUNT,
+        encoding='utf-8',
+    )
     _fh.setLevel(logging.DEBUG)
     _fh.setFormatter(logging.Formatter(
         '%(asctime)s.%(msecs)03d [%(levelname)-7s] [%(threadName)-15s] %(message)s',
-        datefmt='%H:%M:%S'
+        datefmt='%Y-%m-%dT%H:%M:%S'
     ))
     _file_logger.addHandler(_fh)
 
@@ -49,8 +63,8 @@ _file_logger.info(f"Plugin dir: {_PLUGIN_DIR}")
 _file_logger.info(f"Log file: {_LOG_FILE}")
 try:
     _file_logger.info(get_environment_info())
-except Exception:
-    pass
+except Exception as exc:
+    _file_logger.warning("get_environment_info failed: %s", exc)
 _file_logger.info("=" * 80)
 
 
@@ -83,8 +97,8 @@ def qlog(message: str, level: str = "INFO") -> None:
     try:
         qgis_level = _QLOG_LEVELS.get(level, QgisCompat.MSG_INFO)
         QgsMessageLog.logMessage(message, PLUGIN_NAME, qgis_level)
-    except Exception:
-        pass
+    except Exception as exc:  # QGIS message log unavailable (shutdown, no UI)
+        _file_logger.debug("QgsMessageLog unavailable: %s", exc)
 
 
 def generate_trace_id() -> str:

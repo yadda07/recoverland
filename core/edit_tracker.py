@@ -116,8 +116,9 @@ class EditSessionTracker:
             for layer in QgsProject.instance().mapLayers().values():
                 if isinstance(layer, QgsVectorLayer):
                     self.connect_layer(layer)
-        except Exception:
-            pass
+        except (ImportError, RuntimeError) as exc:
+            # Benign during shutdown or in unit test harness without QgsProject.
+            flog(f"EditSessionTracker.set_filter: reconnect skipped: {exc}", "DEBUG")
         flog(f"EditSessionTracker: filter set, {len(self._allowed_layer_fingerprints)} layer(s)")
 
     def connect_layer(self, layer) -> None:

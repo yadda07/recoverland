@@ -16,11 +16,12 @@ from .core import (
     format_integrity_message,
     generate_trace_id,
 )
-from .core.journal_manager import cleanup_orphan_journals
+from .core.journal_manager import cleanup_orphan_journals, JournalLockError
 from .core.user_identity import invalidate_cache as _invalidate_user_cache
 from .status_bar_widget import StatusBarIndicator
 import os
 import json
+from typing import Optional
 
 
 class RecoverPlugin:
@@ -84,8 +85,8 @@ class RecoverPlugin:
             QgsProject.instance().layersRemoved.disconnect(self._on_layers_removed)
             QgsProject.instance().readProject.disconnect(self._on_project_opened)
             QgsProject.instance().cleared.disconnect(self._on_project_closed)
-        except (TypeError, RuntimeError):
-            pass
+        except (TypeError, RuntimeError) as exc:
+            flog(f"RecoverPlugin.unload: disconnect issue: {exc}", "DEBUG")
 
         if self._status_indicator is not None:
             self.iface.statusBarIface().removeWidget(self._status_indicator)
@@ -150,8 +151,8 @@ class RecoverPlugin:
                     and all(isinstance(val, str) and "::" in val for val in ids)
                 ):
                     self._tracker.set_filter(set(ids))
-            except Exception:
-                pass
+            except (ValueError, TypeError) as exc:
+                flog(f"RecoverPlugin: cannot parse tracked_layer_fingerprints: {exc}", "WARNING")
 
             self._connect_existing_layers()
 
@@ -167,6 +168,15 @@ class RecoverPlugin:
             self._start_disk_monitor(journal_path)
 
             flog("RecoverPlugin: local backend initialized")
+        except JournalLockError as lock_err:
+            flog(f"RecoverPlugin: journal locked by another instance: {lock_err}", "ERROR")
+            qlog(QCoreApplication.translate(
+                "RecoverPlugin",
+                "Une autre instance de QGIS enregistre deja dans ce journal. "
+                "Fermez-la pour activer l'enregistrement ici."
+            ), "ERROR")
+            if self._status_indicator is not None:
+                self._status_indicator.set_no_project()
         except Exception as e:
             flog(f"RecoverPlugin: local backend init failed: {e}", "ERROR")
             qlog(QCoreApplication.translate(
@@ -222,17 +232,31 @@ class RecoverPlugin:
         self._shutdown_local_backend()
         self._init_local_backend()
         self._update_status_bar()
+        self._notify_dialog_project_switched()
 
     def _on_project_closed(self) -> None:
         self._shutdown_local_backend()
         if self._status_indicator is not None:
             self._status_indicator.set_no_project()
+        self._notify_dialog_project_switched()
+
+    def _notify_dialog_project_switched(self) -> None:
+        """Tell the dialog (if open) to fully reset for the new project."""
+        if self.dlg is None:
+            return
+        switch = getattr(self.dlg, 'on_project_switched', None)
+        if callable(switch):
+            try:
+                switch(tracker=self._tracker)
+            except Exception as e:
+                flog(f"RecoverPlugin: on_project_switched failed: {e}", "WARNING")
 
     def _setup_status_bar(self) -> None:
         """UX-G01: Add persistent status indicator to QGIS status bar."""
         try:
             self._status_indicator = StatusBarIndicator()
-            self._status_indicator.clicked.connect(self.run)
+            self._status_indicator.toggle_requested.connect(self._toggle_tracking)
+            self._status_indicator.open_dialog_requested.connect(self.run)
             self.iface.statusBarIface().addPermanentWidget(self._status_indicator)
             self._update_status_bar()
         except Exception as e:
@@ -261,8 +285,8 @@ class RecoverPlugin:
                 stats.get("newest_event", ""))
             health_level = health.level
             conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            flog(f"RecoverPlugin._update_status_bar: stats read failed: {exc}", "WARNING")
         self._status_indicator.update_state(
             tracking, health_level, event_count, size_str)
 
@@ -283,9 +307,29 @@ class RecoverPlugin:
         if self._sqlite_backend is not None:
             self._sqlite_backend.invalidate_read_cache()
         self._update_status_bar()
+        if self._status_indicator is not None:
+            self._status_indicator.pulse()
         if self.dlg is not None:
             fp = datasource_fp
             QTimer.singleShot(500, lambda: self.dlg.on_events_committed(fp))
+
+    def _toggle_tracking(self) -> None:
+        """Toggle tracking on/off from status bar click."""
+        if self._tracker is None:
+            return
+        settings = QgsSettings()
+        currently_on = settings.value(
+            "RecoverLand/tracking_enabled", True, type=bool,
+        )
+        if currently_on:
+            self._tracker.deactivate()
+            settings.setValue("RecoverLand/tracking_enabled", False)
+            flog("RecoverPlugin: tracking disabled by user")
+        else:
+            self._tracker.activate()
+            settings.setValue("RecoverLand/tracking_enabled", True)
+            flog("RecoverPlugin: tracking enabled by user")
+        self._update_status_bar()
 
     def _run_auto_purge_if_enabled(self) -> None:
         """P1.2 / P0.4: Execute auto-purge at startup if the setting is enabled."""
@@ -418,3 +462,54 @@ class RecoverPlugin:
             qlog(msg, level)
         except Exception as e:
             flog(f"RecoverPlugin: notify integrity failed: {e}", "WARNING")
+
+    # -----------------------------------------------------------------
+    # Public API (FEAT-05): read-only observability surface for
+    # PyQGIS console, other plugins, and external monitoring.
+    # These methods never mutate plugin state.
+    # -----------------------------------------------------------------
+
+    def api_journal_path(self) -> Optional[str]:
+        """Return the current journal file path, or None if none is open."""
+        if self._journal is None:
+            return None
+        return self._journal.path
+
+    def api_log_path(self) -> str:
+        """Return the absolute path of the RecoverLand debug log file."""
+        from .core.logger import _LOG_FILE
+        return _LOG_FILE
+
+    def api_is_tracking(self) -> bool:
+        """Return True if edit-session tracking is active (non-suppressed)."""
+        if self._tracker is None:
+            return False
+        return self._tracker.is_active and not self._tracker.is_suppressed
+
+    def api_stats(self) -> dict:
+        """Return a read-only snapshot of journal + queue + tracker stats.
+
+        Keys: 'journal_path', 'journal_bytes', 'queue_pending',
+              'tracker_active', 'session_events'.
+        All values are safe to serialize (int, str, bool, None).
+        """
+        journal_path = self.api_journal_path()
+        journal_bytes = 0
+        if journal_path:
+            try:
+                journal_bytes = get_journal_size_bytes(journal_path)
+            except OSError as exc:
+                flog(f"api_stats: size read failed: {exc}", "DEBUG")
+        queue_pending = 0
+        if self._write_queue is not None:
+            queue_pending = self._write_queue.pending_count
+        session_events = 0
+        if self._tracker is not None:
+            session_events = self._tracker.session_event_count
+        return {
+            "journal_path": journal_path,
+            "journal_bytes": journal_bytes,
+            "queue_pending": queue_pending,
+            "tracker_active": self.api_is_tracking(),
+            "session_events": session_events,
+        }

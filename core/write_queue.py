@@ -79,19 +79,30 @@ class WriteQueue:
         """Add events to the write queue.
 
         Validates JSON fields before accepting. Returns False and saves
-        events to the pending recovery file if the queue exceeds the
+        events to the pending recovery file if the queue would exceed the
         hard limit, signaling that tracking should be halted.
         """
         qsize = self._queue.qsize()
-        if qsize > _QUEUE_HARD_LIMIT:
-            flog(f"WriteQueue: queue size={qsize} exceeds hard limit, "
-                 f"saving {len(events)} events to pending recovery", "ERROR")
+        # Pre-check capacity against the batch size to prevent a huge single
+        # call (e.g. 100k mass deletes) from silently overflowing after the
+        # put loop. The check is a best-effort upper bound: qsize is racy
+        # by design in queue.Queue, but since the writer thread only drains,
+        # qsize + len(events) is still a safe upper bound for this producer.
+        if qsize + len(events) > _QUEUE_HARD_LIMIT:
+            flog(
+                f"WriteQueue: queue size={qsize} + batch={len(events)} "
+                f"exceeds hard limit {_QUEUE_HARD_LIMIT}, "
+                f"saving {len(events)} events to pending recovery",
+                "ERROR",
+            )
             self._save_lost_events(events)
             return False
+        accepted = 0
         for event in events:
             if not _validate_event(event):
                 continue
             self._queue.put(event)
+            accepted += 1
         qsize = self._queue.qsize()
         if qsize > _QUEUE_EARLY_WARNING and not self._early_warning_emitted:
             self._early_warning_emitted = True
@@ -100,6 +111,12 @@ class WriteQueue:
                 self._on_early_warning()
         elif qsize > _QUEUE_WARNING_THRESHOLD:
             flog(f"WriteQueue: queue size={qsize} exceeds threshold", "WARNING")
+        if accepted < len(events):
+            flog(
+                f"WriteQueue: accepted {accepted}/{len(events)} events "
+                f"(rest rejected by validator)",
+                "WARNING",
+            )
         return True
 
     def set_early_warning_callback(self, callback) -> None:

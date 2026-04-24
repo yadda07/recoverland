@@ -10,7 +10,9 @@ Rules:
 """
 import os
 import hashlib
+import socket
 import sqlite3
+import time
 import uuid
 from typing import Optional
 
@@ -21,6 +23,88 @@ _JOURNAL_FILENAME = "recoverland_audit.sqlite"
 _JOURNAL_SUBDIR = ".recoverland"
 _UNSAVED_SUBDIR = "recoverland"
 _AUDIT_SUBDIR = "audit"
+
+_LOCK_SUFFIX = ".rlwriter"
+
+
+class JournalLockError(RuntimeError):
+    """Raised when another live QGIS instance already holds the writer lock."""
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if the given PID is a running process on this machine.
+
+    Platform split is mandatory: on Windows, os.kill(pid, 0) is NOT a
+    benign signal check; it calls TerminateProcess() and would kill the
+    target (including ourselves when pid == getpid()). We use OpenProcess
+    via ctypes there. On POSIX, os.kill(pid, 0) is the canonical probe.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _is_pid_alive_windows(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we cannot signal it; still alive.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _is_pid_alive_windows(pid: int) -> bool:
+    """Windows-only PID liveness check using OpenProcess + GetExitCodeProcess."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # ERROR_INVALID_PARAMETER (87) = no such process;
+        # ERROR_ACCESS_DENIED (5) = process exists but locked down.
+        return ctypes.get_last_error() == 5
+    try:
+        exit_code = wintypes.DWORD()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        if not ok:
+            return False
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _read_lock_file(lock_path: str) -> Optional[tuple]:
+    """Parse a lock-file. Returns (pid:int, host:str, ts:int) or None."""
+    try:
+        with open(lock_path, "r", encoding="utf-8") as fh:
+            content = fh.read().strip()
+    except OSError:
+        return None
+    if not content:
+        return None
+    parts = content.split("|")
+    if len(parts) < 3:
+        return None
+    try:
+        pid = int(parts[0])
+        host = parts[1]
+        ts = int(parts[2])
+    except (ValueError, IndexError):
+        return None
+    return (pid, host, ts)
 
 
 class JournalManager:
@@ -45,6 +129,8 @@ class JournalManager:
         Returns the journal file path.
         Raises OSError if the directory cannot be created.
         Raises sqlite3.Error if the database cannot be opened.
+        Raises JournalLockError if another live QGIS instance holds the
+        writer lock for this journal (multi-writer protection).
         """
         self.close()
         unsaved_token = ""
@@ -53,7 +139,12 @@ class JournalManager:
             unsaved_token = self._unsaved_session_token
         journal_path = _resolve_journal_path(project_path, profile_path, unsaved_token)
         self._ensure_directory(journal_path)
-        self._open_connection(journal_path)
+        self._acquire_writer_lock(journal_path)
+        try:
+            self._open_connection(journal_path)
+        except Exception:
+            self._release_writer_lock(journal_path)
+            raise
         self._path = journal_path
         flog(f"JournalManager: opened {journal_path}")
         return journal_path
@@ -65,16 +156,19 @@ class JournalManager:
         return self._conn
 
     def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-                flog(f"JournalManager: closed {self._path}")
-            except sqlite3.Error as e:
-                flog(f"JournalManager: close error: {e}", "WARNING")
-            finally:
-                self._conn = None
-                self._path = None
-        self._unsaved_session_token = None
+        if self._conn is None:
+            return
+        try:
+            self._conn.close()
+            flog(f"JournalManager: closed {self._path}")
+        except sqlite3.Error as e:
+            flog(f"JournalManager: close error: {e}", "WARNING")
+        finally:
+            if self._path is not None:
+                self._release_writer_lock(self._path)
+            self._conn = None
+            self._path = None
+            self._unsaved_session_token = None
 
     def create_read_connection(self) -> sqlite3.Connection:
         """Create a separate read-only connection for search threads."""
@@ -102,16 +196,93 @@ class JournalManager:
             initialize_schema(conn)
             version = get_schema_version(conn)
             flog(f"JournalManager: schema version={version}")
+            self._refresh_planner_stats(conn)
         except Exception:
             conn.close()
             raise
         self._conn = conn
 
     @staticmethod
+    def _refresh_planner_stats(conn: sqlite3.Connection) -> None:
+        """Run ANALYZE at startup so the query planner has fresh statistics.
+
+        analysis_limit=1000 (set in PRAGMAs) caps the sample size,
+        keeping this under 50ms even on journals with 10^6+ events.
+        """
+        try:
+            conn.execute("ANALYZE")
+            flog("JournalManager: startup ANALYZE completed")
+        except sqlite3.Error as exc:
+            flog(f"JournalManager: startup ANALYZE failed: {exc}", "WARNING")
+
+    @staticmethod
     def _ensure_directory(path: str) -> None:
         directory = os.path.dirname(path)
         if not os.path.isdir(directory):
             os.makedirs(directory, exist_ok=True)
+
+    @staticmethod
+    def _acquire_writer_lock(journal_path: str) -> None:
+        """Write a PID lock-file next to the journal.
+
+        If a lock-file already exists and its PID is alive on this host,
+        refuse to open: another live QGIS instance is already writing.
+        Stale locks (dead PID or different host) are reclaimed.
+        """
+        lock_path = journal_path + _LOCK_SUFFIX
+        me_pid = os.getpid()
+        me_host = socket.gethostname()
+
+        if os.path.isfile(lock_path):
+            info = _read_lock_file(lock_path)
+            if info is not None:
+                other_pid, other_host, _ = info
+                if other_host == me_host and other_pid != me_pid and _is_pid_alive(other_pid):
+                    raise JournalLockError(
+                        f"Another live QGIS instance (pid={other_pid}) is "
+                        f"already writing to {journal_path}. Close it before "
+                        f"opening the project in this instance."
+                    )
+                # Stale: dead PID or different host. Log and reclaim.
+                flog(
+                    f"JournalManager: stale writer lock reclaimed "
+                    f"(pid={other_pid}, host={other_host}) on {journal_path}",
+                    "WARNING",
+                )
+
+        payload = f"{me_pid}|{me_host}|{int(time.time())}\n"
+        try:
+            with open(lock_path, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+        except OSError as exc:
+            # Non-fatal: log and proceed. A missing lock just disables
+            # multi-writer detection for this session.
+            flog(f"JournalManager: cannot write lock-file {lock_path}: {exc}", "WARNING")
+
+    @staticmethod
+    def _release_writer_lock(journal_path: str) -> None:
+        """Remove the lock-file when closing the journal.
+
+        Only removes the lock if it still matches this process; otherwise
+        leaves it alone so a concurrent owner is not evicted.
+        """
+        lock_path = journal_path + _LOCK_SUFFIX
+        if not os.path.isfile(lock_path):
+            return
+        info = _read_lock_file(lock_path)
+        if info is not None:
+            pid, host, _ = info
+            if pid != os.getpid() or host != socket.gethostname():
+                flog(
+                    f"JournalManager: lock-file not owned by us "
+                    f"(pid={pid}); skipping remove",
+                    "DEBUG",
+                )
+                return
+        try:
+            os.remove(lock_path)
+        except OSError as exc:
+            flog(f"JournalManager: cannot remove lock-file {lock_path}: {exc}", "DEBUG")
 
 
 def _resolve_journal_path(project_path: str,

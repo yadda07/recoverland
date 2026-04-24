@@ -29,9 +29,9 @@ def _safe_parse(path: str):
         )
     if _HAS_DEFUSEDXML:
         return _safe_ET.parse(path)
-    parser = ET.XMLParser()
+    parser = ET.XMLParser()  # nosec B314 - fallback with entity expansion disabled
     parser.entity = {}
-    return ET.parse(path, parser=parser)
+    return ET.parse(path, parser=parser)  # nosec B320 - size-limited, entities stripped
 
 
 _QM_MAGIC = (

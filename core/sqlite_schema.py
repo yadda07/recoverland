@@ -7,7 +7,9 @@ import json
 import sqlite3
 from typing import List, Optional, Tuple
 
-CURRENT_SCHEMA_VERSION = 3
+from .logger import flog
+
+CURRENT_SCHEMA_VERSION = 4
 
 _PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -17,8 +19,10 @@ _PRAGMAS = [
     "PRAGMA synchronous=NORMAL",
     "PRAGMA busy_timeout=5000",
     "PRAGMA cache_size=-8000",
+    # page_size only takes effect on a new database; ignored on existing files.
     "PRAGMA page_size=4096",
     "PRAGMA foreign_keys=OFF",
+    "PRAGMA temp_store=MEMORY",
     "PRAGMA journal_size_limit=67108864",
     "PRAGMA mmap_size=268435456",
     "PRAGMA analysis_limit=1000",
@@ -76,11 +80,16 @@ _TABLE_DDL = [
         event_schema_version INTEGER,
         new_geometry_wkb BLOB
     )""",
+    """CREATE TABLE IF NOT EXISTS datasource_alias (
+        alias_fingerprint TEXT PRIMARY KEY,
+        target_fingerprint TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        note TEXT,
+        CHECK(alias_fingerprint != target_fingerprint)
+    )""",
 ]
 
 _INDEX_DDL = [
-    """CREATE INDEX IF NOT EXISTS idx_event_main
-       ON audit_event(datasource_fingerprint, layer_name_snapshot, operation_type, created_at)""",
     """CREATE INDEX IF NOT EXISTS idx_event_op_date
        ON audit_event(operation_type, created_at)""",
     """CREATE INDEX IF NOT EXISTS idx_event_user_date
@@ -101,6 +110,8 @@ _INDEX_DDL = [
     """CREATE INDEX IF NOT EXISTS idx_event_active_created
        ON audit_event(created_at)
        WHERE restored_from_event_id IS NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_datasource_alias_target
+       ON datasource_alias(target_fingerprint)""",
 ]
 
 
@@ -164,6 +175,8 @@ def get_migration_plan(current_version: int) -> List[Tuple[int, str, str]]:
                            _V2_MIGRATION_SQL))
     if current_version < 3:
         migrations.append((3, "Add partial indexes and performance PRAGMAs", ""))
+    if current_version < 4:
+        migrations.append((4, "Add datasource_alias table", _V4_MIGRATION_SQL))
     return migrations
 
 
@@ -172,6 +185,15 @@ _V2_MIGRATION_SQL = ";".join([
     "ALTER TABLE audit_event ADD COLUMN event_schema_version INTEGER",
     "ALTER TABLE audit_event ADD COLUMN new_geometry_wkb BLOB",
 ])
+
+_V4_MIGRATION_SQL = (
+    "CREATE TABLE IF NOT EXISTS datasource_alias ("
+    "alias_fingerprint TEXT PRIMARY KEY, "
+    "target_fingerprint TEXT NOT NULL, "
+    "created_at TEXT NOT NULL, "
+    "note TEXT, "
+    "CHECK(alias_fingerprint != target_fingerprint))"
+)
 
 
 def _run_migrations(conn: sqlite3.Connection, current_version: int) -> None:
@@ -193,8 +215,10 @@ def _run_migrations(conn: sqlite3.Connection, current_version: int) -> None:
         for ddl in _INDEX_DDL:
             try:
                 conn.execute(ddl)
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as exc:
+                # Index may already exist or column may be missing on older
+                # schema. Log at DEBUG so upgrade issues stay traceable.
+                flog(f"sqlite_schema: index DDL skipped: {exc} ({ddl[:60]}...)", "DEBUG")
         conn.execute(
             "INSERT OR REPLACE INTO schema_version "
             "(version_number, applied_at, description) VALUES (?, ?, ?)",

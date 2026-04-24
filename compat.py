@@ -14,7 +14,7 @@ Usage dans le plugin :
 """
 import sys
 
-from qgis.PyQt.QtCore import Qt, QEvent, QEasingCurve
+from qgis.PyQt.QtCore import Qt, QEvent, QEasingCurve, QAbstractAnimation
 from qgis.PyQt.QtGui import QPainter, QPalette
 from qgis.PyQt.QtWidgets import (
     QSizePolicy, QAbstractItemView, QMessageBox, QVBoxLayout,
@@ -137,6 +137,13 @@ class QtCompat:
     # --- Qt.PenStyle ---
     DASH_LINE = _resolve_enum(Qt, 'PenStyle', 'DashLine')
 
+    # --- QAbstractAnimation.State ---
+    ANIM_STATE_RUNNING = _resolve_enum(QAbstractAnimation, 'State', 'Running')
+    ANIM_STATE_STOPPED = _resolve_enum(QAbstractAnimation, 'State', 'Stopped')
+
+    # --- Qt.TimeSpec ---
+    UTC = _resolve_enum(Qt, 'TimeSpec', 'UTC')
+
 
 class QgisCompat:
     """Namespace for cross-version QGIS enum constants."""
@@ -159,11 +166,11 @@ class QgisCompat:
         CAP_CHANGE_ATTRIBUTE_VALUES = QgsVectorDataProvider.ChangeAttributeValues
         CAP_CHANGE_GEOMETRIES = QgsVectorDataProvider.ChangeGeometries
 
-    # --- Qgis.MessageLevel (stable 3.28-3.44, guard for 4.0) ---
-    MSG_INFO = getattr(Qgis, 'Info', 0)
-    MSG_WARNING = getattr(Qgis, 'Warning', 1)
-    MSG_CRITICAL = getattr(Qgis, 'Critical', 2)
-    MSG_SUCCESS = getattr(Qgis, 'Success', 3)
+    # --- Qgis.MessageLevel (scoped in 4.0, short in 3.x) ---
+    MSG_INFO = _resolve_enum(Qgis, 'MessageLevel', 'Info')
+    MSG_WARNING = _resolve_enum(Qgis, 'MessageLevel', 'Warning')
+    MSG_CRITICAL = _resolve_enum(Qgis, 'MessageLevel', 'Critical')
+    MSG_SUCCESS = _resolve_enum(Qgis, 'MessageLevel', 'Success')
 
 
 def get_environment_info() -> str:

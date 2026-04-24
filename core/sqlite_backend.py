@@ -56,8 +56,8 @@ class SQLiteAuditBackend(AuditBackend):
         if self._read_conn is not None:
             try:
                 self._read_conn.close()
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as exc:
+                flog(f"SQLiteAuditBackend.invalidate_read_cache: close failed: {exc}", "DEBUG")
             self._read_conn = None
 
     def close(self) -> None:

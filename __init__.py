@@ -21,8 +21,12 @@ def classFactory(iface):
         try:
             from .i18n.compile_translations import compile_ts_to_qm
             compile_ts_to_qm(ts_path, qm_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            import sys
+            print(
+                f"[RecoverLand] classFactory: failed to compile {ts_path} -> {qm_path}: {exc}",
+                file=sys.stderr,
+            )
 
     if os.path.exists(qm_path):
         _translator = QTranslator()
