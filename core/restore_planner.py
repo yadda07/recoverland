@@ -77,6 +77,8 @@ def plan_temporal_restore(
             entities.add(event.entity_fingerprint)
             actions.append(action)
 
+    actions.sort(key=_temporal_action_order)
+
     return RestorePlan(
         mode=RestoreMode.TEMPORAL,
         scope=scope,
@@ -199,3 +201,26 @@ def _build_action(
         has_attribute_changes=True,
     )
     return action, conflict
+
+
+def _temporal_action_order(action: PlannedAction) -> tuple:
+    """Order of compensatory actions for atomic temporal restore.
+
+    Phase 0: INSERT compensatory (re-insert deleted features) so later
+             UPDATE/DELETE actions can target them via fid_remap.
+    Phase 1: UPDATE compensatory in event_id DESC (undo most recent edit
+             first; otherwise reverting the oldest UPDATE leaves the
+             feature in an intermediate state and breaks the post-state
+             fallback for subsequent UPDATEs).
+    Phase 2: DELETE compensatory in event_id ASC (delete inserted
+             features last so any prior UPDATE can still target them).
+    """
+    eid = action.event_id or 0
+    op = action.compensatory_op
+    if op == "INSERT":
+        return (0, eid, 0)
+    if op == "UPDATE":
+        return (1, -eid, 0)
+    if op == "DELETE":
+        return (2, eid, 0)
+    return (99, eid, 0)

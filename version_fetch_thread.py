@@ -12,7 +12,8 @@ from .core.logger import flog
 from .qgs_task_support import TaskEnabledThread, trace_prefix
 
 
-def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback, is_cancelled):
+def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
+               is_cancelled, include_traces=False):
     conn = None
     prefix = trace_prefix(trace_id)
     try:
@@ -21,7 +22,9 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback, is_cance
         for fp in fingerprints:
             if is_cancelled():
                 return None
-            total += count_events_after_cutoff(conn, fp, cutoff, trace_id=trace_id)
+            total += count_events_after_cutoff(conn, fp, cutoff,
+                                               trace_id=trace_id,
+                                               include_traces=include_traces)
         if is_cancelled():
             return None
         count_callback(total)
@@ -31,9 +34,12 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback, is_cance
         for fp in fingerprints:
             if is_cancelled():
                 return None
-            events.extend(fetch_events_after_cutoff(conn, fp, cutoff, trace_id=trace_id))
+            events.extend(fetch_events_after_cutoff(conn, fp, cutoff,
+                                                   trace_id=trace_id,
+                                                   include_traces=include_traces))
         events.sort(key=lambda e: (e.created_at or "", e.event_id or 0), reverse=True)
-        flog(f"{prefix}VersionFetchThread: fetched {len(events)} events")
+        flog(f"{prefix}VersionFetchThread: fetched {len(events)} events "
+             f"(include_traces={include_traces})")
         if is_cancelled():
             return None
         return events
@@ -45,8 +51,10 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback, is_cance
                 flog(f"{prefix}VersionFetchThread: close error: {e}", "WARNING")
 
 
-def _run_fetch_task(task, journal, fingerprints, cutoff, trace_id, count_callback):
-    return _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback, task.isCanceled)
+def _run_fetch_task(task, journal, fingerprints, cutoff, trace_id, count_callback,
+                    include_traces=False):
+    return _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
+                      task.isCanceled, include_traces=include_traces)
 
 
 class VersionFetchThread(TaskEnabledThread):
@@ -56,11 +64,13 @@ class VersionFetchThread(TaskEnabledThread):
     events_ready = pyqtSignal(list)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, journal, fingerprints, cutoff, trace_id: str = ""):
+    def __init__(self, journal, fingerprints, cutoff, trace_id: str = "",
+                 include_traces: bool = False):
         super().__init__(trace_id=trace_id)
         self._journal = journal
         self._fingerprints = list(fingerprints)
         self._cutoff = cutoff
+        self._include_traces = include_traces
 
     def run(self):
         try:
@@ -71,6 +81,7 @@ class VersionFetchThread(TaskEnabledThread):
                 self._trace_id,
                 self.count_ready.emit,
                 lambda: self._stopped,
+                include_traces=self._include_traces,
             )
             if not self._stopped and events is not None:
                 self.events_ready.emit(events)
@@ -93,6 +104,7 @@ class VersionFetchThread(TaskEnabledThread):
             cutoff=self._cutoff,
             trace_id=self._trace_id,
             count_callback=self.count_ready.emit,
+            include_traces=self._include_traces,
         )
         flog(f"{prefix}VersionFetchThread: submitted to QgsTaskManager")
 

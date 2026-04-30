@@ -13,25 +13,46 @@ _DEFAULT_MEMORY_MB_THRESHOLD = 200
 
 
 class FeatureSnapshot:
-    """Immutable snapshot of a feature's state before modification."""
+    """Immutable snapshot of a feature's state before modification.
 
-    __slots__ = ("fid", "attributes", "geometry_wkb", "field_names", "changed_field_names")
+    For UPDATE captures, also stores the post-edit state (new_attributes,
+    new_geometry_wkb) and the identity computed at capture time. This is
+    required on providers with unstable FIDs (shapefiles) where reading
+    the provider post-commit cannot reliably locate the same feature.
+    """
+
+    __slots__ = (
+        "fid", "attributes", "geometry_wkb", "field_names",
+        "changed_field_names",
+        "new_attributes", "new_geometry_wkb", "identity_json",
+    )
 
     def __init__(self, fid: int, attributes: Dict[str, Any],
                  geometry_wkb: Optional[bytes], field_names: List[str],
-                 changed_field_names: Optional[List[str]] = None):
+                 changed_field_names: Optional[List[str]] = None,
+                 new_attributes: Optional[Dict[str, Any]] = None,
+                 new_geometry_wkb: Optional[bytes] = None,
+                 identity_json: Optional[str] = None):
         self.fid = fid
         self.attributes = attributes
         self.geometry_wkb = geometry_wkb
         self.field_names = field_names
         self.changed_field_names = list(changed_field_names or [])
+        self.new_attributes = new_attributes
+        self.new_geometry_wkb = new_geometry_wkb
+        self.identity_json = identity_json
 
 
 class EditSessionBuffer:
     """In-memory buffer for one editing session on one layer.
 
     Tracks initial state of modified features, deleted features,
-    and added feature IDs. Discarded on rollback.
+    and added feature IDs. Also tracks the AUTHORITATIVE post-commit
+    state captured from QGIS committed*Changes signals so the generated
+    audit events reflect what the provider actually persisted, not what
+    the pre-commit edit buffer projected.
+
+    Discarded on rollback.
     """
 
     def __init__(self, layer_id: str, session_id: str):
@@ -42,6 +63,10 @@ class EditSessionBuffer:
         self._added_fids: Set[int] = set()
         self._committed_additions: List[Dict] = []
         self._approx_bytes = 0
+        # Authoritative post-commit captures (filled by committed*Changes signals).
+        self._committed_geom_changes: Dict[int, Optional[bytes]] = {}
+        self._committed_attr_changes: Dict[int, Dict[int, Any]] = {}
+        self._committed_deletions: Set[int] = set()
 
     @property
     def modified_count(self) -> int:
@@ -91,6 +116,36 @@ class EditSessionBuffer:
     def get_committed_additions(self) -> List[Dict]:
         return list(self._committed_additions)
 
+    def record_committed_geom_change(self, fid: int,
+                                     geom_wkb: Optional[bytes]) -> None:
+        """Store authoritative post-commit geometry from committedGeometriesChanges."""
+        self._committed_geom_changes[fid] = geom_wkb
+
+    def record_committed_attr_change(self, fid: int,
+                                     idx_to_value: Dict[int, Any]) -> None:
+        """Store authoritative post-commit attribute changes.
+
+        committedAttributeValuesChanges emits the dict in {idx: value} form;
+        we keep that representation and merge if the same fid receives
+        several signal calls (defensive: should not happen on a single
+        commit but providers may stage attribute changes).
+        """
+        existing = self._committed_attr_changes.setdefault(fid, {})
+        existing.update(idx_to_value)
+
+    def record_committed_deletion(self, fid: int) -> None:
+        """Mark a feature as authoritatively deleted by the provider."""
+        self._committed_deletions.add(fid)
+
+    def get_committed_geom_changes(self) -> Dict[int, Optional[bytes]]:
+        return dict(self._committed_geom_changes)
+
+    def get_committed_attr_changes(self) -> Dict[int, Dict[int, Any]]:
+        return {fid: dict(v) for fid, v in self._committed_attr_changes.items()}
+
+    def get_committed_deletions(self) -> Set[int]:
+        return set(self._committed_deletions)
+
     def get_modified_snapshots(self) -> Dict[int, FeatureSnapshot]:
         return dict(self._modified)
 
@@ -114,6 +169,9 @@ class EditSessionBuffer:
         self._deleted.clear()
         self._added_fids.clear()
         self._committed_additions.clear()
+        self._committed_geom_changes.clear()
+        self._committed_attr_changes.clear()
+        self._committed_deletions.clear()
         self._approx_bytes = 0
         flog(f"EditSessionBuffer: cleared for layer {self.layer_id}")
 
@@ -153,6 +211,20 @@ def _estimate_snapshot_size(snapshot: FeatureSnapshot) -> int:
             size += 28
     if snapshot.geometry_wkb:
         size += len(snapshot.geometry_wkb) + 40
+    if snapshot.new_geometry_wkb:
+        size += len(snapshot.new_geometry_wkb) + 40
+    if snapshot.new_attributes:
+        size += _DICT_BASE_OVERHEAD
+        for key, val in snapshot.new_attributes.items():
+            size += _ENTRY_OVERHEAD + len(key)
+            if isinstance(val, str):
+                size += len(val) + 50
+            elif isinstance(val, (bytes, bytearray)):
+                size += len(val) + 40
+            else:
+                size += 28
+    if snapshot.identity_json:
+        size += len(snapshot.identity_json) + 40
     size += _LIST_ITEM_OVERHEAD * (len(snapshot.field_names) + len(snapshot.changed_field_names))
     for name in snapshot.field_names:
         size += len(name) + 50

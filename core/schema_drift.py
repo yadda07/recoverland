@@ -5,7 +5,7 @@ Produces a mapping report: matched fields, missing fields, added fields,
 and type-incompatible fields. Used before restore to decide strategy.
 """
 import json
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional
 
 
 class FieldInfo(NamedTuple):
@@ -126,6 +126,33 @@ def build_field_mapping(drift: DriftReport, historical: List[FieldInfo]) -> Dict
     for name in drift.matched:
         mapping[name] = name
     return mapping
+
+
+def safe_field_mapping(event, layer=None,
+                       drift: Optional[DriftReport] = None) -> Dict[str, str]:
+    """Build a field-name mapping for restore handling schema drift.
+
+    Resolution order:
+      1. If *drift* is supplied, reuse it (caller already paid for the
+         compare). This is the fast path used by restore_service after
+         pre_check_restore.
+      2. Else if *layer* is supplied, compute drift from the layer's
+         current schema. This is the path used by restore_executor's
+         buffer ops which do not have a precomputed drift.
+      3. Else fall back to identity mapping (every historical field
+         maps to itself). Defensive default for callers that proceed
+         without a precheck (legacy undo paths).
+
+    Reuses parse_field_schema / extract_current_schema / compare_schemas
+    so the mapping behaviour is identical across restore_service and
+    restore_executor (DUP-04 consolidation).
+    """
+    hist = parse_field_schema(event.field_schema_json)
+    if drift is None and layer is not None:
+        drift = compare_schemas(hist, extract_current_schema(layer))
+    if drift is None:
+        return {f.name: f.name for f in hist}
+    return build_field_mapping(drift, hist)
 
 
 def format_drift_message(drift: DriftReport) -> str:

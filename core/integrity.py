@@ -9,21 +9,20 @@ import base64
 import sqlite3
 from typing import NamedTuple, List
 
-from .sqlite_schema import apply_pragmas, get_schema_version, CURRENT_SCHEMA_VERSION
+from .sqlite_schema import (
+    apply_pragmas, get_schema_version, CURRENT_SCHEMA_VERSION,
+    AUDIT_EVENT_INSERT_SQL, AUDIT_EVENT_INSERT_PLACEHOLDERS,
+    AUDIT_EVENT_INSERT_COLUMNS,
+)
 from .logger import flog, timed_op
 
 _PENDING_FILENAME = "recoverland_pending.json"
 
 _VALID_OP_TYPES = frozenset({"INSERT", "UPDATE", "DELETE"})
 
-_KNOWN_EVENT_KEYS = frozenset({
-    "project_fingerprint", "datasource_fingerprint", "layer_id_snapshot",
-    "layer_name_snapshot", "provider_type", "feature_identity_json",
-    "operation_type", "attributes_json", "geometry_wkb", "geometry_type",
-    "crs_authid", "field_schema_json", "user_name", "session_id",
-    "created_at", "restored_from_event_id", "entity_fingerprint",
-    "event_schema_version", "new_geometry_wkb",
-})
+# Authoritative key set for pending events: derived from the schema column
+# list so a column rename/addition propagates without manual updates here.
+_KNOWN_EVENT_KEYS = frozenset(AUDIT_EVENT_INSERT_COLUMNS)
 
 _REQUIRED_EVENT_KEYS = frozenset({
     "operation_type", "created_at", "user_name",
@@ -147,17 +146,16 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> int:
 
 
 def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
-    """Insert recovered events into audit_event table (v2 schema)."""
-    sql = """
-        INSERT INTO audit_event (
-            project_fingerprint, datasource_fingerprint, layer_id_snapshot,
-            layer_name_snapshot, provider_type, feature_identity_json,
-            operation_type, attributes_json, geometry_wkb, geometry_type,
-            crs_authid, field_schema_json, user_name, session_id,
-            created_at, restored_from_event_id,
-            entity_fingerprint, event_schema_version, new_geometry_wkb
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """Insert recovered events into audit_event table.
+
+    Uses the shared AUDIT_EVENT_INSERT_* constants so the column list
+    stays in lockstep with WriteQueue and the schema definition.
     """
+    sql = (
+        "INSERT INTO audit_event ("  # nosec B608: column list is a module constant
+        + AUDIT_EVENT_INSERT_SQL
+        + ") VALUES (" + AUDIT_EVENT_INSERT_PLACEHOLDERS + ")"
+    )
     count = 0
     remaining = []
     with conn:

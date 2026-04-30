@@ -11,7 +11,10 @@ import time
 from typing import Optional, List
 
 from .audit_backend import AuditEvent
-from .sqlite_schema import apply_pragmas
+from .sqlite_schema import (
+    apply_pragmas,
+    AUDIT_EVENT_INSERT_SQL, AUDIT_EVENT_INSERT_PLACEHOLDERS,
+)
 from .logger import flog
 
 _MAX_BATCH_SIZE = 500
@@ -23,16 +26,11 @@ _BATCH_RETRY_COUNT = 3
 _BATCH_RETRY_BASE_SEC = 0.2
 _WAL_CHECKPOINT_INTERVAL_SEC = 60
 
-_INSERT_SQL = """
-    INSERT INTO audit_event (
-        project_fingerprint, datasource_fingerprint, layer_id_snapshot,
-        layer_name_snapshot, provider_type, feature_identity_json,
-        operation_type, attributes_json, geometry_wkb, geometry_type,
-        crs_authid, field_schema_json, user_name, session_id,
-        created_at, restored_from_event_id,
-        entity_fingerprint, event_schema_version, new_geometry_wkb
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-"""
+_INSERT_SQL = (
+    "INSERT INTO audit_event ("  # nosec B608: column list is a module constant
+    + AUDIT_EVENT_INSERT_SQL
+    + ") VALUES (" + AUDIT_EVENT_INSERT_PLACEHOLDERS + ")"
+)
 
 
 class WriteQueue:
@@ -112,11 +110,13 @@ class WriteQueue:
         elif qsize > _QUEUE_WARNING_THRESHOLD:
             flog(f"WriteQueue: queue size={qsize} exceeds threshold", "WARNING")
         if accepted < len(events):
+            rejected = len(events) - accepted
             flog(
                 f"WriteQueue: accepted {accepted}/{len(events)} events "
-                f"(rest rejected by validator)",
-                "WARNING",
+                f"({rejected} rejected by validator)",
+                "ERROR",
             )
+            return False
         return True
 
     def set_early_warning_callback(self, callback) -> None:

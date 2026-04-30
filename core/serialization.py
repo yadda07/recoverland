@@ -204,6 +204,34 @@ def build_full_snapshot(attrs: Dict) -> str:
     return json.dumps({"all_attributes": attrs}, ensure_ascii=False)
 
 
+def iter_mapped_attributes(mapping: Dict[str, str], attrs: Dict, fields):
+    """Yield ``(idx, value)`` for every restorable attribute.
+
+    Centralises the iteration shape duplicated 5 times across
+    restore_service and restore_executor (DUP-05): for each
+    ``(historical_name, current_name)`` mapping entry, the value is
+    yielded only when:
+      - the historical name is present in *attrs* (event captured it),
+      - the historical name is not a layer-only audit field
+        (preserved by the policy),
+      - the current name still exists in the target layer's fields
+        (``fields.indexOf`` returns >= 0).
+
+    Each caller decides what to do with the yielded ``(idx, value)``:
+    set on a buffered feature, accumulate a ``changeAttributeValues``
+    dict, or call ``layer.changeAttributeValue`` directly.
+    """
+    for hist_name, curr_name in mapping.items():
+        if hist_name not in attrs:
+            continue
+        if is_layer_audit_field(hist_name):
+            continue
+        idx = fields.indexOf(curr_name)
+        if idx < 0:
+            continue
+        yield idx, attrs[hist_name]
+
+
 def _values_equal(val_a: Any, val_b: Any) -> bool:
     if val_a is None and val_b is None:
         return True

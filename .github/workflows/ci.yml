@@ -7,9 +7,11 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  unit-tests:
+    name: Unit tests (mocked QGIS)
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
 
@@ -32,10 +34,19 @@ jobs:
           PYTHONPATH: .
 
   qgis-runtime:
+    name: QGIS runtime smoke
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        qgis-image: ["qgis/qgis:latest", "qgis/qgis:4.0-trixie"]
+        # Floating tags only. No fixed minor/patch versions.
+        # ltr        : current LTR (Qt5 today, will move forward over time)
+        # latest     : current stable (rolling)
+        # 4.0-trixie : Qt6 development build
+        qgis-image:
+          - "qgis/qgis:ltr"
+          - "qgis/qgis:latest"
+          - "qgis/qgis:4.0-trixie"
 
     steps:
       - uses: actions/checkout@v6
@@ -45,4 +56,10 @@ jobs:
 
       - name: Run QGIS runtime smoke test
         run: |
-          docker run --rm --volume "${{ github.workspace }}:/app" -w /app ${{ matrix.qgis-image }} sh -c "python3 -m pip install --upgrade pip && python3 -m pip install pytest pytest-qgis && PYTHONPATH=/app xvfb-run -s '+extension GLX -screen 0 1024x768x24' pytest tests/test_qgis_runtime_smoke.py -v --tb=short"
+          docker run --rm \
+            --volume "${{ github.workspace }}:/app" \
+            -w /app ${{ matrix.qgis-image }} sh -c "\
+              python3 -m pip install --upgrade pip --break-system-packages 2>/dev/null || python3 -m pip install --upgrade pip; \
+              python3 -m pip install pytest pytest-qgis --break-system-packages 2>/dev/null || python3 -m pip install pytest pytest-qgis; \
+              PYTHONPATH=/app xvfb-run -s '+extension GLX -screen 0 1024x768x24' \
+                pytest tests/test_qgis_runtime_smoke.py tests/test_compat.py -v --tb=short"

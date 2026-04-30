@@ -114,6 +114,7 @@ class JournalManager:
         self._conn: Optional[sqlite3.Connection] = None
         self._path: Optional[str] = None
         self._unsaved_session_token: Optional[str] = None
+        self._lock_acquired: bool = False
 
     @property
     def path(self) -> Optional[str]:
@@ -122,6 +123,11 @@ class JournalManager:
     @property
     def is_open(self) -> bool:
         return self._conn is not None
+
+    @property
+    def is_lock_degraded(self) -> bool:
+        """True if the journal is open but the writer lock could not be acquired."""
+        return self.is_open and not self._lock_acquired
 
     def open_for_project(self, project_path: str, profile_path: str) -> str:
         """Open or create the journal for the given project context.
@@ -169,6 +175,7 @@ class JournalManager:
             self._conn = None
             self._path = None
             self._unsaved_session_token = None
+            self._lock_acquired = False
 
     def create_read_connection(self) -> sqlite3.Connection:
         """Create a separate read-only connection for search threads."""
@@ -221,8 +228,7 @@ class JournalManager:
         if not os.path.isdir(directory):
             os.makedirs(directory, exist_ok=True)
 
-    @staticmethod
-    def _acquire_writer_lock(journal_path: str) -> None:
+    def _acquire_writer_lock(self, journal_path: str) -> None:
         """Write a PID lock-file next to the journal.
 
         If a lock-file already exists and its PID is alive on this host,
@@ -254,10 +260,11 @@ class JournalManager:
         try:
             with open(lock_path, "w", encoding="utf-8") as fh:
                 fh.write(payload)
+            self._lock_acquired = True
         except OSError as exc:
-            # Non-fatal: log and proceed. A missing lock just disables
-            # multi-writer detection for this session.
-            flog(f"JournalManager: cannot write lock-file {lock_path}: {exc}", "WARNING")
+            self._lock_acquired = False
+            flog(f"JournalManager: cannot write lock-file {lock_path}: {exc}. "
+                 f"Multi-writer protection disabled for this session.", "ERROR")
 
     @staticmethod
     def _release_writer_lock(journal_path: str) -> None:

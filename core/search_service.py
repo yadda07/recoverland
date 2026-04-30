@@ -13,10 +13,18 @@ from .audit_backend import AuditEvent, SearchCriteria, SearchResult
 from .logger import flog, timed_op
 from .serialization import is_layer_audit_field
 from .sql_safety import assert_safe_fragment
+from .sqlite_schema import (
+    AUDIT_EVENT_SELECT_SQL, build_lightweight_select_sql,
+)
 
 _MAX_PAGE_SIZE = 500
 _DEFAULT_PAGE_SIZE = 100
 _MAX_PARAM_LEN = 1000
+
+_SELECT_COLS = AUDIT_EVENT_SELECT_SQL
+_SELECT_COLS_LIGHTWEIGHT = build_lightweight_select_sql()
+
+_BLOB_MARKER = b'\x00'
 
 
 @dataclass(frozen=True)
@@ -32,8 +40,16 @@ class JournalScopeSummary:
 
 def search_events(conn: sqlite3.Connection,
                   criteria: SearchCriteria,
-                  trace_id: str = "") -> SearchResult:
-    """Execute a bounded, paginated search on the audit journal."""
+                  trace_id: str = "",
+                  exclude_blobs: bool = False) -> SearchResult:
+    """Execute a bounded, paginated search on the audit journal.
+
+    When *exclude_blobs* is True, geometry BLOBs are replaced by boolean
+    markers (BL-PERF-003). Returned events have ``geometry_wkb`` set to a
+    1-byte sentinel when the column is non-NULL, otherwise ``None``.
+    Use ``get_event_by_id`` or ``fetch_events_by_ids`` to obtain full BLOBs
+    when needed (e.g. restore or geometry preview).
+    """
     with timed_op("search_events", trace_id):
         page_size = min(criteria.page_size or _DEFAULT_PAGE_SIZE, _MAX_PAGE_SIZE)
         page = max(criteria.page, 1)
@@ -43,16 +59,12 @@ def search_events(conn: sqlite3.Connection,
         total = _count_matching(conn, where_clause, params)
         flog(f"search_events: conditions={len(params)} total={total}")
 
+        cols = _SELECT_COLS_LIGHTWEIGHT if exclude_blobs else _SELECT_COLS
         assert_safe_fragment(where_clause)
         # B608: static columns list; `where_clause` built with whitelist; values via `?`.
         query = (
-            "SELECT event_id, project_fingerprint, datasource_fingerprint,"  # nosec B608
-            " layer_id_snapshot, layer_name_snapshot, provider_type,"
-            " feature_identity_json, operation_type, attributes_json,"
-            " geometry_wkb, geometry_type, crs_authid, field_schema_json,"
-            " user_name, session_id, created_at, restored_from_event_id,"
-            " entity_fingerprint, event_schema_version, new_geometry_wkb"
-            " FROM audit_event "
+            "SELECT " + cols  # nosec B608
+            + " FROM audit_event "
             + where_clause
             + " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         )
@@ -73,15 +85,11 @@ def count_events(conn: sqlite3.Connection, criteria: SearchCriteria) -> int:
 
 def get_event_by_id(conn: sqlite3.Connection, event_id: int) -> Optional[AuditEvent]:
     """Retrieve a single event by its ID."""
-    query = """
-        SELECT event_id, project_fingerprint, datasource_fingerprint,
-               layer_id_snapshot, layer_name_snapshot, provider_type,
-               feature_identity_json, operation_type, attributes_json,
-               geometry_wkb, geometry_type, crs_authid, field_schema_json,
-               user_name, session_id, created_at, restored_from_event_id,
-               entity_fingerprint, event_schema_version, new_geometry_wkb
-        FROM audit_event WHERE event_id = ?
-    """
+    # B608: AUDIT_EVENT_SELECT_SQL is a module-level whitelist; value via `?`.
+    query = (
+        "SELECT " + AUDIT_EVENT_SELECT_SQL  # nosec B608
+        + " FROM audit_event WHERE event_id = ?"
+    )
     row = conn.execute(query, (event_id,)).fetchone()
     if row is None:
         return None
@@ -216,6 +224,12 @@ def _count_matching(conn: sqlite3.Connection, where_clause: str, params: list) -
 
 
 def _row_to_event(row: tuple) -> AuditEvent:
+    geom_wkb = row[9]
+    if isinstance(geom_wkb, int):
+        geom_wkb = _BLOB_MARKER if geom_wkb else None
+    new_geom = row[19] if len(row) > 19 else None
+    if isinstance(new_geom, int):
+        new_geom = _BLOB_MARKER if new_geom else None
     return AuditEvent(
         event_id=row[0],
         project_fingerprint=row[1],
@@ -226,7 +240,7 @@ def _row_to_event(row: tuple) -> AuditEvent:
         feature_identity_json=row[6],
         operation_type=row[7],
         attributes_json=row[8],
-        geometry_wkb=row[9],
+        geometry_wkb=geom_wkb,
         geometry_type=row[10],
         crs_authid=row[11],
         field_schema_json=row[12],
@@ -236,7 +250,7 @@ def _row_to_event(row: tuple) -> AuditEvent:
         restored_from_event_id=row[16],
         entity_fingerprint=row[17] if len(row) > 17 else None,
         event_schema_version=row[18] if len(row) > 18 else None,
-        new_geometry_wkb=row[19] if len(row) > 19 else None,
+        new_geometry_wkb=new_geom,
     )
 
 

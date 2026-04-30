@@ -19,7 +19,8 @@ def _run_search(journal, criteria, trace_id, phase_callback, is_cancelled):
             f" op={criteria.operation_type} start={criteria.start_date}"
             f" end={criteria.end_date}"
         )
-        result = search_events(conn, criteria, trace_id=trace_id)
+        result = search_events(conn, criteria, trace_id=trace_id,
+                               exclude_blobs=True)
         flog(f"{prefix}LocalSearchThread: found {result.total_count} events, {len(result.events)} returned")
         if is_cancelled():
             return None

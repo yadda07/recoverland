@@ -9,28 +9,23 @@ from typing import Optional
 from qgis.core import QgsGeometry, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
 from qgis.gui import QgsRubberBand, QgsMapCanvas
 
+from .geometry_utils import is_geometry_present
 from .logger import flog
-from ..compat import QtCompat
-
-try:
-    from qgis.core import Qgis
-    _POLYGON_TYPE = Qgis.GeometryType.Polygon
-    _LINE_TYPE = Qgis.GeometryType.Line
-    _POINT_TYPE = Qgis.GeometryType.Point
-except (AttributeError, ImportError):
-    _POLYGON_TYPE = 2
-    _LINE_TYPE = 1
-    _POINT_TYPE = 0
+from ..compat import QtCompat, QgisCompat
 
 
 def _geom_band_type(geom: QgsGeometry):
-    """Return the QgsRubberBand geometry type matching the QgsGeometry."""
+    """Return the QgsRubberBand geometry type matching the QgsGeometry.
+
+    Uses QgisCompat.GEOM_* which resolves to Qgis.GeometryType (3.30+),
+    QgsWkbTypes.GeometryType (3.22-3.28 fallback), or int (test stubs only).
+    """
     g_type = geom.type()
-    if g_type == _POLYGON_TYPE:
-        return _POLYGON_TYPE
-    if g_type == _LINE_TYPE:
-        return _LINE_TYPE
-    return _POINT_TYPE
+    if g_type == QgisCompat.GEOM_POLYGON:
+        return QgisCompat.GEOM_POLYGON
+    if g_type == QgisCompat.GEOM_LINE:
+        return QgisCompat.GEOM_LINE
+    return QgisCompat.GEOM_POINT
 
 
 class GeometryPreviewManager:
@@ -47,7 +42,7 @@ class GeometryPreviewManager:
             return False
         geom = QgsGeometry()
         geom.fromWkb(wkb)
-        if geom.isNull() or geom.isEmpty():
+        if not is_geometry_present(geom):
             flog("GeometryPreview: empty geometry from WKB", "WARNING")
             return False
 
