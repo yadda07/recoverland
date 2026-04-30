@@ -24,6 +24,27 @@ import json
 from typing import Optional
 
 
+def _detect_duplicate_recoverland(my_package: str) -> Optional[str]:
+    """Return name of another loaded RecoverLand-class plugin, or None.
+
+    Inspects qgis.utils.plugins for any entry whose plugin instance class is
+    named 'RecoverPlugin' but whose package name differs from ours.
+    Called at initGui() so QGIS has already filled qgis.utils.plugins for
+    every plugin loaded before us in alphabetical order. Plugins loaded
+    after us will run their own initGui later and detect us symmetrically.
+    """
+    try:
+        import qgis.utils  # type: ignore
+        for name, plugin_obj in dict(qgis.utils.plugins).items():
+            if name == my_package:
+                continue
+            if type(plugin_obj).__name__ == 'RecoverPlugin':
+                return name
+    except Exception as exc:  # pragma: no cover - defensive: never block init
+        flog(f"RecoverPlugin: duplicate detection error: {exc}", "WARNING")
+    return None
+
+
 class RecoverPlugin:
     def __init__(self, iface):
         self.iface = iface
@@ -38,8 +59,30 @@ class RecoverPlugin:
         self._integrity_result = None
         self._disk_timer = None
         self._disk_journal_path = None
+        self._duplicate_of: Optional[str] = None
 
     def initGui(self):
+        my_package = __package__ or os.path.basename(os.path.dirname(__file__))
+        self._duplicate_of = _detect_duplicate_recoverland(my_package)
+        if self._duplicate_of is not None:
+            flog(
+                f"RecoverPlugin: duplicate plugin detected my_package={my_package} "
+                f"other_package={self._duplicate_of} mode=degraded",
+                "CRITICAL",
+            )
+            qlog(QCoreApplication.translate(
+                "RecoverPlugin",
+                "RecoverLand : un autre plugin RecoverLand est deja charge "
+                "(dossier '{other}'). Cette instance ('{mine}') est desactivee "
+                "pour eviter la double capture des editions. Desactivez '{other}' "
+                "dans le gestionnaire d'extensions puis redemarrez QGIS."
+            ).format(other=self._duplicate_of, mine=my_package), "CRITICAL")
+            self.action = QAction(
+                "RecoverLand (desactive: doublon)", self.iface.mainWindow())
+            self.action.triggered.connect(self._show_duplicate_warning)
+            self.iface.addPluginToMenu("RecoverLand", self.action)
+            return
+
         icon_path = os.path.join(os.path.dirname(__file__), "icon.svg")
         logo_path = os.path.join(os.path.dirname(__file__), "logo.svg")
         theme_icon_path = icon_path if os.path.exists(icon_path) else None
@@ -76,8 +119,35 @@ class RecoverPlugin:
 
         self._init_local_backend()
         self._setup_status_bar()
+        flog("RecoverPlugin: initGui complete")
+
+    def _show_duplicate_warning(self):
+        """Triggered when user clicks the disabled-duplicate menu entry."""
+        try:
+            from qgis.PyQt.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self.iface.mainWindow(),
+                QCoreApplication.translate("RecoverPlugin", "RecoverLand : doublon detecte"),
+                QCoreApplication.translate(
+                    "RecoverPlugin",
+                    "Cette instance de RecoverLand est desactivee car un autre "
+                    "plugin RecoverLand est deja charge dans le dossier '{other}'.\n\n"
+                    "Pour resoudre :\n"
+                    "1. Extensions > Gerer et installer les extensions > Installees\n"
+                    "2. Decocher la version dans le dossier '{other}'\n"
+                    "3. Redemarrer QGIS"
+                ).format(other=self._duplicate_of or "?"),
+            )
+        except Exception as exc:  # pragma: no cover
+            flog(f"RecoverPlugin: duplicate warning dialog error: {exc}", "WARNING")
 
     def unload(self):
+        flog("RecoverPlugin: unload requested")
+        if self._duplicate_of is not None:
+            if self.action is not None:
+                self.iface.removePluginMenu("RecoverLand", self.action)
+            return
+
         self._shutdown_local_backend()
 
         try:
@@ -99,6 +169,11 @@ class RecoverPlugin:
         self.iface.removeToolBarIcon(self.action)
 
     def run(self):
+        if self._duplicate_of is not None:
+            self._show_duplicate_warning()
+            return
+        first_open = self.dlg is None
+        flog(f"RecoverPlugin: dialog requested first_open={first_open}")
         if self.dlg is None:
             self.dlg = RecoverDialog(
                 self.iface, journal=self._journal,
@@ -167,6 +242,13 @@ class RecoverPlugin:
             self._run_auto_purge_if_enabled()
             self._start_disk_monitor(journal_path)
 
+            if self._journal.is_lock_degraded:
+                qlog(QCoreApplication.translate(
+                    "RecoverPlugin",
+                    "Protection multi-instance indisponible. "
+                    "Evitez d'ouvrir ce projet dans plusieurs QGIS simultanement."
+                ), "WARNING")
+
             flog("RecoverPlugin: local backend initialized")
         except JournalLockError as lock_err:
             flog(f"RecoverPlugin: journal locked by another instance: {lock_err}", "ERROR")
@@ -229,12 +311,15 @@ class RecoverPlugin:
             self._tracker.disconnect_layer_by_id(lid)
 
     def _on_project_opened(self) -> None:
+        path = QgsProject.instance().absoluteFilePath() or "<unsaved>"
+        flog(f"RecoverPlugin: project_opened path={path}")
         self._shutdown_local_backend()
         self._init_local_backend()
         self._update_status_bar()
         self._notify_dialog_project_switched()
 
     def _on_project_closed(self) -> None:
+        flog("RecoverPlugin: project_closed")
         self._shutdown_local_backend()
         if self._status_indicator is not None:
             self._status_indicator.set_no_project()

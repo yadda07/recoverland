@@ -10,13 +10,16 @@ from typing import List, Dict, Optional, NamedTuple, Any
 from .audit_backend import AuditEvent, RestoreReport
 from .schema_drift import (
     parse_field_schema, extract_current_schema,
-    compare_schemas, build_field_mapping, DriftReport,
+    compare_schemas, DriftReport, safe_field_mapping,
 )
 from .search_service import reconstruct_attributes, reconstruct_new_attributes
-from .geometry_utils import rebuild_geometry
+from .geometry_utils import (
+    rebuild_geometry, is_geometry_present,
+    feature_matches_geometry, get_feature_source,
+)
 from .identity import get_identity_strength_for_layer
 from .support_policy import IdentityStrength
-from .serialization import is_layer_audit_field
+from .serialization import is_layer_audit_field, iter_mapped_attributes
 from .logger import flog
 from ..compat import QgisCompat
 
@@ -101,7 +104,19 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
 
 def restore_inserted_feature(layer, event: AuditEvent,
                              fid_cache: Optional[Dict] = None) -> Dict[str, Any]:
-    """Undo an INSERT by deleting the inserted feature from the target layer."""
+    """Undo an INSERT by deleting the inserted feature from the target layer.
+
+    Lookup strategy for layers without a stable PK:
+      1. Try the FID stored in the identity. Verify it matches the captured
+         snapshot (geom + attrs). If yes, delete it.
+      2. Otherwise, scan the layer for a feature that exactly matches the
+         snapshot. This is needed when the provider has reused the original
+         FID for another feature (shapefile recycles), or when the
+         re-inserted feature received a fresh FID at commit time.
+      3. Refuse only when neither path yields a confidently-identified
+         target. This avoids the silent feature accumulation observed
+         when repeated rewinds re-create the same feature each time.
+    """
     if layer is None:
         return {"success": False, "message": "Target layer not found"}
 
@@ -118,16 +133,239 @@ def restore_inserted_feature(layer, event: AuditEvent,
     if strength == IdentityStrength.NONE:
         return {"success": False, "message": "No stable identity for restore"}
 
+    has_pk = bool(identity.get("pk_field")) and identity.get("pk_value") is not None
     target_fid = _find_target_feature(layer, identity, fid_cache)
-    if target_fid is None:
-        return {"success": False, "message": "Target feature not found"}
 
+    if has_pk:
+        if target_fid is None:
+            return {"success": False, "message": "Target feature not found"}
+        return _delete_target_or_fail(provider, target_fid, event)
+
+    if target_fid is not None and _verify_insert_snapshot(
+            layer, target_fid, event):
+        flog(f"restore_inserted_feature: matched by FID and snapshot "
+             f"eid={event.event_id} fid={target_fid}")
+        return _delete_target_or_fail(provider, target_fid, event)
+
+    fallback_fid = _find_by_snapshot(layer, event, resolve_ambiguity=True)
+    if fallback_fid is not None:
+        flog(f"restore_inserted_feature: FID mismatch, recovered by "
+             f"snapshot scan eid={event.event_id} "
+             f"identity_fid={identity.get('fid')} "
+             f"recovered_fid={fallback_fid}")
+        return _delete_target_or_fail(provider, fallback_fid, event)
+
+    flog(f"restore_inserted_feature: target absent (FID lookup miss and "
+         f"no snapshot match) eid={event.event_id} "
+         f"identity_fid={identity.get('fid')}", "WARNING")
+    _diagnose_snapshot_miss(layer, event)
+    return {"success": True, "message": "Already absent (no snapshot match)",
+            "skipped": True}
+
+
+def _delete_target_or_fail(provider, target_fid: int,
+                           event: AuditEvent) -> Dict[str, Any]:
     if not provider.deleteFeatures([target_fid]):
         errors = provider.errors()
         msg = "; ".join(errors) if errors else "Delete failed"
+        flog(f"restore_inserted_feature: deleteFeatures failed "
+             f"eid={event.event_id} fid={target_fid} msg={msg}", "ERROR")
         return {"success": False, "message": msg}
+    return {"success": True, "message": "Deleted (undo insert)",
+            "fid": target_fid}
 
-    return {"success": True, "message": "Deleted (undo insert)"}
+
+def _find_by_snapshot(
+    layer, event: AuditEvent,
+    resolve_ambiguity: bool = False,
+) -> Optional[int]:
+    """Scan the layer for the single feature that matches event's snapshot.
+
+    When *resolve_ambiguity* is False (default): returns the FID of the
+    unique match, or None when no feature matches or several do (ambiguous:
+    refuse to act blindly).
+
+    When *resolve_ambiguity* is True: in case of multiple strict matches
+    (geometry + every captured attribute identical), returns the highest
+    FID, which is the most recently inserted feature and therefore the
+    duplicate created by a previous rewind. The risk of destroying
+    unrelated data is bounded because matches are strictly identical on
+    geometry AND every attribute, so the kept feature carries the same
+    semantics as the deleted one.
+
+    Strict matching is used because callers may use the result for a
+    *destructive* operation (undo of a previous insert).
+    """
+    from qgis.core import QgsFeatureRequest
+
+    expected_geom = rebuild_geometry(event.geometry_wkb) \
+        if event.geometry_wkb is not None else None
+    expected_attrs = reconstruct_attributes(event)
+    fields = layer.fields()
+    relevant = [
+        (hist_name, fields.indexOf(hist_name))
+        for hist_name in expected_attrs.keys()
+        if not is_layer_audit_field(hist_name)
+        and fields.indexOf(hist_name) >= 0
+    ]
+
+    matches: List[int] = []
+    request = QgsFeatureRequest()
+    if expected_geom is not None and hasattr(request, "setFilterRect") \
+            and hasattr(expected_geom, "boundingBox"):
+        request.setFilterRect(expected_geom.boundingBox())
+    source = get_feature_source(layer)
+    try:
+        for feature in source(request):
+            if expected_geom is not None and not feature_matches_geometry(
+                    feature, expected_geom):
+                continue
+            attrs_ok = True
+            for hist_name, idx in relevant:
+                if feature[idx] != expected_attrs.get(hist_name):
+                    attrs_ok = False
+                    break
+            if attrs_ok:
+                matches.append(feature.id())
+                if not resolve_ambiguity and len(matches) > 1:
+                    break
+    except Exception as exc:
+        flog(f"_find_by_snapshot: scan failed "
+             f"eid={event.event_id}: {exc}", "WARNING")
+        return None
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        if resolve_ambiguity:
+            chosen = max(matches)
+            flog(f"_find_by_snapshot: ambiguity resolved by max-fid heuristic "
+                 f"eid={event.event_id} candidates={matches[:5]} chosen={chosen} "
+                 f"identity_fid={_identity_fid(event)}", "WARNING")
+            return chosen
+        flog(f"_find_by_snapshot: ambiguous, {len(matches)} matches found "
+             f"eid={event.event_id} fids={matches[:5]}", "WARNING")
+    return None
+
+
+def _diagnose_snapshot_miss(layer, event: AuditEvent) -> None:
+    """Log why _find_by_snapshot found 0 strict matches.
+
+    Re-scans the layer using *geometry only* (same bbox prefilter) and,
+    for every geom-only candidate, lists the historical attribute keys
+    whose persisted value diverges from the captured snapshot. The first
+    five candidates and the first five diverging attributes per candidate
+    are reported. Side-effect free: only writes WARNING-level log lines.
+
+    Used immediately after a snapshot lookup miss to expose the cause
+    (typical: trigger-altered fields, NULL vs None, datetime serialization)
+    without changing resolution logic.
+    """
+    from qgis.core import QgsFeatureRequest
+
+    expected_geom = rebuild_geometry(event.geometry_wkb) \
+        if event.geometry_wkb is not None else None
+    if not is_geometry_present(expected_geom):
+        flog(f"_diagnose_snapshot_miss: eid={event.event_id} no expected "
+             f"geom, cannot diagnose", "WARNING")
+        return
+
+    expected_attrs = reconstruct_attributes(event)
+    fields = layer.fields()
+    relevant = [
+        (hist_name, fields.indexOf(hist_name))
+        for hist_name in expected_attrs.keys()
+        if not is_layer_audit_field(hist_name)
+        and fields.indexOf(hist_name) >= 0
+    ]
+
+    request = QgsFeatureRequest()
+    if hasattr(request, "setFilterRect") \
+            and hasattr(expected_geom, "boundingBox"):
+        request.setFilterRect(expected_geom.boundingBox())
+    source = get_feature_source(layer)
+
+    _DIAG_SCAN_CAP = 100
+    candidates: List[tuple] = []
+    scanned = 0
+    try:
+        for feature in source(request):
+            scanned += 1
+            if scanned > _DIAG_SCAN_CAP:
+                break
+            if not feature_matches_geometry(feature, expected_geom):
+                continue
+            diffs = []
+            for hist_name, idx in relevant:
+                actual = feature[idx]
+                expected = expected_attrs.get(hist_name)
+                if actual != expected:
+                    diffs.append(
+                        f"{hist_name}: actual={actual!r} expected={expected!r}"
+                    )
+            candidates.append((feature.id(), diffs))
+    except Exception as exc:
+        flog(f"_diagnose_snapshot_miss: scan failed "
+             f"eid={event.event_id}: {exc}", "WARNING")
+        return
+
+    if not candidates:
+        flog(f"_diagnose_snapshot_miss: eid={event.event_id} "
+             f"0 geom-only candidates in bbox "
+             f"identity_fid={_identity_fid(event)}", "WARNING")
+        return
+
+    flog(f"_diagnose_snapshot_miss: eid={event.event_id} "
+         f"{len(candidates)} geom-only candidate(s) "
+         f"identity_fid={_identity_fid(event)}", "WARNING")
+    for fid, diffs in candidates[:5]:
+        if not diffs:
+            flog(f"  fid={fid} attrs all match (audit-field exclusion?)",
+                 "WARNING")
+        else:
+            flog(f"  fid={fid} attr_diffs={diffs[:5]}", "WARNING")
+
+
+def _identity_fid(event: AuditEvent) -> Optional[int]:
+    """Return the historical FID stored in feature_identity_json, or None."""
+    try:
+        identity = json.loads(event.feature_identity_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(identity, dict):
+        return None
+    fid = identity.get("fid")
+    return fid if isinstance(fid, int) else None
+
+
+def _verify_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:
+    """Return True when feature fid matches the event's INSERT snapshot."""
+    from qgis.core import QgsFeatureRequest
+
+    try:
+        request = QgsFeatureRequest(fid)
+        source = get_feature_source(layer)
+        feature = next(iter(source(request)), None)
+        if feature is None:
+            return False
+        if event.geometry_wkb is not None:
+            expected = rebuild_geometry(event.geometry_wkb)
+            if not feature_matches_geometry(feature, expected):
+                return False
+        attrs = reconstruct_attributes(event)
+        fields = layer.fields()
+        for hist_name, value in attrs.items():
+            if is_layer_audit_field(hist_name):
+                continue
+            idx = fields.indexOf(hist_name)
+            if idx < 0:
+                continue
+            if feature[hist_name] != value:
+                return False
+        return True
+    except Exception as exc:
+        flog(f"_verify_insert_snapshot failed fid={fid}: {exc}", "WARNING")
+        return False
 
 
 def restore_updated_feature(layer, event: AuditEvent,
@@ -155,14 +393,16 @@ def restore_updated_feature(layer, event: AuditEvent,
     attr_changes = _build_attribute_changes(layer, target_fid, old_attrs, field_mapping)
 
     provider = layer.dataProvider()
+    has_geom = event.geometry_wkb is not None
+    if has_geom and not bool(provider.capabilities() & QgisCompat.CAP_CHANGE_GEOMETRIES):
+        return {"success": False, "message": "Provider lacks geometry change capability"}
+
     if attr_changes:
         success = provider.changeAttributeValues(attr_changes)
         if not success:
             return {"success": False, "message": "Attribute update failed"}
 
-    if event.geometry_wkb is not None:
-        if not bool(provider.capabilities() & QgisCompat.CAP_CHANGE_GEOMETRIES):
-            return {"success": False, "message": "Provider lacks geometry change capability"}
+    if has_geom:
         geom = rebuild_geometry(event.geometry_wkb)
         if geom is not None:
             geom_changes = {target_fid: geom}
@@ -518,40 +758,28 @@ def _find_target_feature(layer, identity: Dict,
 
 
 def _build_safe_mapping(drift: Optional[DriftReport], event: AuditEvent) -> Dict[str, str]:
-    if drift is None:
-        hist = parse_field_schema(event.field_schema_json)
-        return {f.name: f.name for f in hist}
-    return build_field_mapping(drift, parse_field_schema(event.field_schema_json))
+    """Thin shim kept for in-module call sites that already hold a drift.
+
+    Delegates to schema_drift.safe_field_mapping so the mapping logic
+    lives in one place across restore_service and restore_executor.
+    """
+    return safe_field_mapping(event, drift=drift)
 
 
 def _apply_attributes(feature, fields, attrs: Dict, mapping: Dict) -> None:
     """Apply restored attributes to a QgsFeature using the field mapping."""
-    for hist_name, curr_name in mapping.items():
-        if hist_name not in attrs:
-            continue
-        if is_layer_audit_field(hist_name):
-            continue
-        idx = fields.indexOf(curr_name)
-        if idx < 0:
-            continue
-        feature.setAttribute(idx, attrs[hist_name])
+    for idx, value in iter_mapped_attributes(mapping, attrs, fields):
+        feature.setAttribute(idx, value)
 
 
 def _build_attribute_changes(layer, fid: int, old_attrs: Dict,
                              mapping: Dict) -> Dict[int, Dict[int, Any]]:
     """Build the change dict for provider.changeAttributeValues()."""
     fields = layer.fields()
-    changes = {}
-    for hist_name, curr_name in mapping.items():
-        if hist_name not in old_attrs:
-            continue
-        if is_layer_audit_field(hist_name):
-            continue
-        idx = fields.indexOf(curr_name)
-        if idx < 0:
-            continue
-        changes[idx] = old_attrs[hist_name]
-
+    changes = {
+        idx: value
+        for idx, value in iter_mapped_attributes(mapping, old_attrs, fields)
+    }
     if not changes:
         return {}
     return {fid: changes}

@@ -24,36 +24,69 @@ def compute_datasource_fingerprint(layer) -> str:
     return f"{provider_name}::{normalized}"
 
 
+# DB source normalization profiles.
+# Each profile lists (key, default) tuples in the EXACT order they must
+# appear in the normalized fingerprint string. Order matters: the
+# resulting string is the canonical key for the audit datasource and
+# any reordering would change every fingerprint already stored.
+_DB_NORMALIZATION_PROFILES = {
+    "postgres": (
+        ("host", ""),
+        ("port", "5432"),
+        ("dbname", ""),
+        ("schema", "public"),
+        ("table", ""),
+    ),
+    "mssql": (
+        ("host", ""),
+        ("port", "1433"),
+        ("dbname", ""),
+        ("schema", "dbo"),
+        ("table", ""),
+    ),
+    "oracle": (
+        ("host", ""),
+        ("port", "1521"),
+        ("dbname", ""),
+        ("table", ""),
+    ),
+}
+
+
 def _normalize_source_uri(provider_name: str, raw_source: str) -> str:
     """Normalize a source URI for deterministic fingerprinting."""
-    if provider_name == "postgres":
-        return _normalize_pg_source(raw_source)
-    if provider_name == "mssql":
-        return _normalize_mssql_source(raw_source)
-    if provider_name == "oracle":
-        return _normalize_oracle_source(raw_source)
+    profile = _DB_NORMALIZATION_PROFILES.get(provider_name)
+    if profile is not None:
+        return _normalize_db_source(raw_source, profile)
     if provider_name in ("ogr", "spatialite", "delimitedtext"):
         return _normalize_file_source(raw_source)
     return raw_source.strip()
 
 
-def _normalize_pg_source(raw: str) -> str:
-    """Extract stable parts from a PostgreSQL URI."""
+def _normalize_db_source(raw: str, profile) -> str:
+    """Extract stable parts from a DB URI according to a normalization profile.
+
+    Same regex pipeline used historically for postgres / mssql / oracle:
+      key='value'  -> single-quoted form
+      key="value"  -> double-quoted form
+      key=value    -> bare token form (whitespace-terminated)
+
+    Output keeps the historical key=value space-separated layout so
+    every fingerprint already stored stays valid byte-for-byte.
+    """
     parts = {}
-    for key in ("host", "port", "dbname", "schema", "table"):
-        match = re.search(rf"""{key}='([^']*)'""", raw)
+    for key, _default in profile:
+        match = re.search(rf"{key}='([^']*)'", raw)
         if not match:
             match = re.search(rf'{key}="([^"]*)"', raw)
         if not match:
             match = re.search(rf"{key}=(\S+)", raw)
         if match:
             parts[key] = match.group(1)
-    host = parts.get("host", "")
-    port = parts.get("port", "5432")
-    dbname = parts.get("dbname", "")
-    schema = parts.get("schema", "public")
-    table = parts.get("table", "")
-    return f"host={host} port={port} dbname={dbname} schema={schema} table={table}"
+    return " ".join(
+        f"{key}={parts.get(key, default)}"
+        for key, default in profile
+    )
 
 
 def _normalize_file_source(raw: str) -> str:
@@ -70,43 +103,6 @@ def _normalize_file_source(raw: str) -> str:
     if "|" in raw:
         suffix = "|" + raw.split("|", 1)[1]
     return path + suffix
-
-
-def _normalize_mssql_source(raw: str) -> str:
-    """Extract stable parts from a MSSQL URI."""
-    parts = {}
-    for key in ("host", "port", "dbname", "schema", "table"):
-        match = re.search(rf"{key}='([^']*)'", raw)
-        if not match:
-            match = re.search(rf'{key}="([^"]*)"', raw)
-        if not match:
-            match = re.search(rf"{key}=(\S+)", raw)
-        if match:
-            parts[key] = match.group(1)
-    host = parts.get("host", "")
-    port = parts.get("port", "1433")
-    dbname = parts.get("dbname", "")
-    schema = parts.get("schema", "dbo")
-    table = parts.get("table", "")
-    return f"host={host} port={port} dbname={dbname} schema={schema} table={table}"
-
-
-def _normalize_oracle_source(raw: str) -> str:
-    """Extract stable parts from an Oracle URI."""
-    parts = {}
-    for key in ("host", "port", "dbname", "user", "table"):
-        match = re.search(rf"{key}='([^']*)'", raw)
-        if not match:
-            match = re.search(rf'{key}="([^"]*)"', raw)
-        if not match:
-            match = re.search(rf"{key}=(\S+)", raw)
-        if match:
-            parts[key] = match.group(1)
-    host = parts.get("host", "")
-    port = parts.get("port", "1521")
-    dbname = parts.get("dbname", "")
-    table = parts.get("table", "")
-    return f"host={host} port={port} dbname={dbname} table={table}"
 
 
 def compute_feature_identity(layer, feature) -> str:

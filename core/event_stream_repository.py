@@ -14,15 +14,9 @@ from .restore_contracts import (
 )
 from .logger import flog, timed_op
 from .sql_safety import assert_safe_fragment
+from .sqlite_schema import AUDIT_EVENT_SELECT_SQL
 
-_EVENT_COLUMNS = (
-    "event_id, project_fingerprint, datasource_fingerprint,"
-    " layer_id_snapshot, layer_name_snapshot, provider_type,"
-    " feature_identity_json, operation_type, attributes_json,"
-    " geometry_wkb, geometry_type, crs_authid, field_schema_json,"
-    " user_name, session_id, created_at, restored_from_event_id,"
-    " entity_fingerprint, event_schema_version, new_geometry_wkb"
-)
+_EVENT_COLUMNS = AUDIT_EVENT_SELECT_SQL
 
 
 def fetch_entity_stream(
@@ -49,6 +43,7 @@ def fetch_events_after_cutoff(
     cutoff: RestoreCutoff,
     limit: int = MAX_EVENTS_PER_RESTORE,
     trace_id: str = "",
+    include_traces: bool = False,
 ) -> List[AuditEvent]:
     """Fetch events after a cutoff, ordered for reverse replay (DESC).
 
@@ -56,9 +51,15 @@ def fetch_events_after_cutoff(
     apply compensatory operations from most recent to oldest. event_id is
     only a tie-breaker because late pending-recovery inserts may hold an
     event_id that no longer reflects chronological order.
+
+    When *include_traces* is True, restore_trace_events are included in the
+    result. The rewind planner needs them to detect that an entity has
+    already been restored by a previous rewind and to avoid re-applying
+    a compensatory action (which causes feature accumulation).
     """
     with timed_op("fetch_events_after_cutoff", trace_id):
-        where, params = _cutoff_where(datasource_fp, cutoff)
+        where, params = _cutoff_where(datasource_fp, cutoff,
+                                      include_traces=include_traces)
         if where is None:
             return []
         assert_safe_fragment(_EVENT_COLUMNS)
@@ -78,10 +79,17 @@ def count_events_after_cutoff(
     datasource_fp: str,
     cutoff: RestoreCutoff,
     trace_id: str = "",
+    include_traces: bool = False,
 ) -> int:
-    """Count events after a cutoff without loading them."""
+    """Count events after a cutoff without loading them.
+
+    When *include_traces* is True, restore_trace_events are counted as well.
+    Must match the value used at fetch time so the count and the fetched
+    list stay consistent.
+    """
     with timed_op("count_events_after_cutoff", trace_id):
-        where, params = _cutoff_where(datasource_fp, cutoff)
+        where, params = _cutoff_where(datasource_fp, cutoff,
+                                      include_traces=include_traces)
         if where is None:
             return 0
         assert_safe_fragment(where)
@@ -133,16 +141,18 @@ def get_oldest_event_date(
 
 def _cutoff_where(
     datasource_fp: Optional[str], cutoff: RestoreCutoff,
+    include_traces: bool = False,
 ) -> tuple:
     """Build WHERE clause and params for a cutoff filter.
 
     When datasource_fp is None, the clause applies to all layers.
+    When *include_traces* is True, restore_trace_events are included.
     Returns (where_clause, params) or (None, []) if cutoff type is invalid.
     """
     op = ">=" if cutoff.inclusive else ">"
     ds_cond = "datasource_fingerprint = ? AND " if datasource_fp else ""
     ds_params = [datasource_fp] if datasource_fp else []
-    trace_filter = "restored_from_event_id IS NULL AND "
+    trace_filter = "" if include_traces else "restored_from_event_id IS NULL AND "
     if cutoff.cutoff_type == CutoffType.BY_EVENT_ID:
         clause = ds_cond + trace_filter + "event_id " + op + " ?"
         return clause, ds_params + [cutoff.value]

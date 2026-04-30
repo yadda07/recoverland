@@ -3,13 +3,44 @@
 Provides DDL statements and idempotent schema creation.
 All PRAGMAs are applied at every connection open.
 """
-import json
 import sqlite3
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from .logger import flog
 
 CURRENT_SCHEMA_VERSION = 4
+
+# Authoritative column order for the audit_event table. Every SELECT/INSERT
+# site (search_service, event_stream_repository, write_queue, integrity)
+# MUST consume these constants instead of redeclaring the column list, so
+# that adding/removing a column stays a one-line change.
+AUDIT_EVENT_COLUMNS = (
+    "event_id", "project_fingerprint", "datasource_fingerprint",
+    "layer_id_snapshot", "layer_name_snapshot", "provider_type",
+    "feature_identity_json", "operation_type", "attributes_json",
+    "geometry_wkb", "geometry_type", "crs_authid", "field_schema_json",
+    "user_name", "session_id", "created_at", "restored_from_event_id",
+    "entity_fingerprint", "event_schema_version", "new_geometry_wkb",
+)
+AUDIT_EVENT_INSERT_COLUMNS = AUDIT_EVENT_COLUMNS[1:]  # event_id is autoincrement
+AUDIT_EVENT_SELECT_SQL = ", ".join(AUDIT_EVENT_COLUMNS)
+AUDIT_EVENT_INSERT_SQL = ", ".join(AUDIT_EVENT_INSERT_COLUMNS)
+AUDIT_EVENT_INSERT_PLACEHOLDERS = ",".join(["?"] * len(AUDIT_EVENT_INSERT_COLUMNS))
+
+
+def build_lightweight_select_sql() -> str:
+    """SELECT fragment with geometry BLOBs replaced by NULL/NOT-NULL booleans.
+
+    Used by the search service when callers (search list, paginated UI)
+    do not need the raw WKB bytes. The lightweight projection keeps the
+    column order identical so _row_to_event can decode either projection
+    with the same indices.
+    """
+    cols = list(AUDIT_EVENT_COLUMNS)
+    cols[cols.index("geometry_wkb")] = "(geometry_wkb IS NOT NULL)"
+    cols[cols.index("new_geometry_wkb")] = "(new_geometry_wkb IS NOT NULL)"
+    return ", ".join(cols)
+
 
 _PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -232,7 +263,13 @@ _BACKFILL_BATCH = 50000
 
 
 def _backfill_entity_fingerprint(conn: sqlite3.Connection) -> int:
-    """Best-effort backfill of entity_fingerprint from feature_identity_json."""
+    """Best-effort backfill of entity_fingerprint from feature_identity_json.
+
+    Reuses identity.compute_entity_fingerprint as the single source of
+    truth for the fingerprint format. Lazy import to avoid any chance
+    of import cycle during early schema initialisation.
+    """
+    from .identity import compute_entity_fingerprint
     total = 0
     while True:
         rows = conn.execute(
@@ -246,7 +283,7 @@ def _backfill_entity_fingerprint(conn: sqlite3.Connection) -> int:
             break
         updates = []
         for event_id, identity_json in rows:
-            fp = _extract_entity_fp(identity_json)
+            fp = compute_entity_fingerprint(identity_json)
             if fp is not None:
                 updates.append((fp, event_id))
         if updates:
@@ -258,21 +295,3 @@ def _backfill_entity_fingerprint(conn: sqlite3.Connection) -> int:
         if len(rows) < _BACKFILL_BATCH:
             break
     return total
-
-
-def _extract_entity_fp(identity_json: str) -> Optional[str]:
-    """Extract entity fingerprint from identity JSON (stdlib only)."""
-    try:
-        identity = json.loads(identity_json)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(identity, dict):
-        return None
-    pk_field = identity.get("pk_field")
-    pk_value = identity.get("pk_value")
-    if pk_field and pk_value is not None:
-        return f"pk:{pk_field}={pk_value}"
-    fid = identity.get("fid")
-    if fid is not None:
-        return f"fid:{fid}"
-    return None
