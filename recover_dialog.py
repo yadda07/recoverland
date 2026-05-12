@@ -2679,81 +2679,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._stats_debounce_timer.stop()
 
     def closeEvent(self, event):
-        """Close event"""
-        self._cleanup_orphaned_traces()
+        """Close event — data stays in its current state (rewound or not)."""
         flog("RecoverDialog: closing")
         self.cleanup_resources()
         event.accept()
 
-    def _cleanup_orphaned_traces(self) -> None:
-        """Synchronously undo active rewind + delete traces on close.
-
-        Without this, closing the dialog leaves data in a rewound state,
-        causing baseline drift (e.g. 499→559) because the tracker then
-        records new user edits against the rewound data.
-        """
-        from .core.restore_service import undo_restore_batch
-        from .core.workflow_service import find_target_layer
-
-        by_ds = self._last_restore_by_ds
-        if not by_ds:
-            return
-        total_ok = 0
-        total_fail = 0
-        if self._tracker is not None:
-            self._tracker.suppress()
-        try:
-            read_conn = self._get_dialog_read_conn()
-            for fp, events in by_ds.items():
-                if not events:
-                    continue
-                layer = find_target_layer(events[0], read_conn)
-                if layer is None:
-                    flog(f"closeEvent: undo skip fp={fp[:40]} "
-                         f"layer_not_found", "WARNING")
-                    total_fail += len(events)
-                    continue
-                count_before = layer.featureCount()
-                report = undo_restore_batch(layer, events)
-                total_ok += len(report.succeeded)
-                total_fail += len(report.failed)
-                if report.succeeded:
-                    layer.reload()
-                    layer.triggerRepaint()
-                count_after = layer.featureCount()
-                flog(f"closeEvent: undo layer={layer.name()!r} "
-                     f"ok={len(report.succeeded)} fail={len(report.failed)} "
-                     f"feat {count_before}→{count_after}")
-        except Exception as exc:
-            flog(f"closeEvent: sync undo failed: {exc}", "WARNING")
-        finally:
-            if self._tracker is not None:
-                self._tracker.unsuppress()
-        event_ids = [
-            e.event_id for evts in by_ds.values()
-            for e in evts if e.event_id is not None
-        ]
-        if event_ids:
-            try:
-                conn = getattr(self._journal, '_conn', None)
-                if conn is not None:
-                    ph = ','.join('?' * len(event_ids))
-                    conn.execute(
-                        f"DELETE FROM audit_event "
-                        f"WHERE restored_from_event_id IN ({ph})",
-                        event_ids,
-                    )
-                    conn.commit()
-            except Exception as exc:
-                flog(f"closeEvent: trace cleanup failed: {exc}", "WARNING")
-        flog(f"closeEvent: sync undo done ok={total_ok} fail={total_fail} "
-             f"traces_cleaned={len(event_ids)}")
-        self._last_restore_by_ds = None
-        self._last_restore_events = None
-
     def reject(self):
         """Reject dialog"""
-        self._cleanup_orphaned_traces()
         self.cleanup_resources()
         super().reject()
 
