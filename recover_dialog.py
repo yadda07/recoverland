@@ -1655,8 +1655,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         undo_layers = len(self._last_restore_by_ds) if self._last_restore_by_ds else 0
         undo_events = (sum(len(v) for v in self._last_restore_by_ds.values())
                        if self._last_restore_by_ds else 0)
+        include_traces = False
         flog(f"[{trace_id}] recover_version: start scope={len(checked_fps)} layer(s) "
-             f"cutoff={cutoff_iso} undo_state=layers={undo_layers}/events={undo_events}")
+             f"cutoff={cutoff_iso} undo_state=layers={undo_layers}/events={undo_events} "
+             f"include_traces={include_traces}")
 
         self.progress_bar.setVisible(True)
         self._start_logo_activity(self._glow_color, "recover")
@@ -1669,7 +1671,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         self._version_fetch_thread = VersionFetchThread(
             self._journal, checked_fps, cutoff, trace_id=trace_id,
-            include_traces=True)
+            include_traces=include_traces)
         self._version_fetch_thread.count_ready.connect(self._on_version_fetch_count_ready)
         self._version_fetch_thread.events_ready.connect(self._on_version_fetch_done)
         self._version_fetch_thread.error_occurred.connect(self._on_version_fetch_error)
@@ -1702,9 +1704,15 @@ class RecoverDialog(QDialog, LoggerMixin):
         total_count = len(events)
         cutoff_dt = getattr(self, '_version_cutoff_dt', None)
         trace_id = self._active_restore_trace_id
-        if trace_id:
-            flog(f"[{trace_id}] recover_version: fetched raw={raw_count} "
-                 f"collapsed={total_count}")
+        prior_rewind = bool(self._last_restore_by_ds)
+        prior_count = (sum(len(v) for v in self._last_restore_by_ds.values())
+                       if self._last_restore_by_ds else 0)
+        flog(f"[{trace_id}] on_version_fetch_done: raw={raw_count} "
+             f"collapsed={total_count} "
+             f"prior_rewind={prior_rewind} prior_events={prior_count}")
+        for e in events:
+            flog(f"  -> active eid={e.event_id} op={e.operation_type} "
+                 f"identity={(e.feature_identity_json or '')[:80]}")
 
         if total_count == 0:
             if self._last_restore_by_ds:
@@ -1803,6 +1811,15 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _auto_undo_for_rewind(self) -> None:
         """Silently undo the previous Rewind, then apply the pending new one."""
         by_ds = self._last_restore_by_ds
+        total_undo = sum(len(v) for v in by_ds.values()) if by_ds else 0
+        flog(f"auto_undo_for_rewind: START layers={len(by_ds) if by_ds else 0} "
+             f"events_to_undo={total_undo}")
+        for fp, evts in (by_ds or {}).items():
+            for e in evts:
+                flog(f"  undo op={e.operation_type} eid={e.event_id} "
+                     f"identity={(e.feature_identity_json or '')[:80]}")
+        self._undo_counts_before = self._rewind_count_snapshot(
+            "before_undo", by_ds)
         self._last_restore_events = None
         self._last_restore_by_ds = None
         self.undo_last_btn.setEnabled(False)
@@ -1831,7 +1848,17 @@ class RecoverDialog(QDialog, LoggerMixin):
             ).format(fail=result.total_fail), "WARNING")
         events = getattr(self, '_pending_rewind_events', None)
         self._pending_rewind_events = None
+        undo_by_ds = getattr(result, 'by_ds', {}) or {}
+        before = getattr(self, '_undo_counts_before', {})
+        self._rewind_count_snapshot("after_undo", undo_by_ds, before=before)
+        self._undo_counts_before = {}
+        flog(f"on_auto_undo_then_rewind: undo_ok={result.total_ok} "
+             f"undo_fail={result.total_fail} "
+             f"pending_events={len(events) if events else 0}")
         if events:
+            for e in events:
+                flog(f"  -> pending eid={e.event_id} op={e.operation_type} "
+                     f"identity={(e.feature_identity_json or '')[:80]}")
             self._execute_version_restore(events)
         else:
             self._restore_in_progress = False
@@ -1843,7 +1870,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             if result.total_ok > 0:
                 qlog(self.tr("{count} entite(s) remise(s) a l'etat actuel.").format(
                     count=result.total_ok))
-                self.iface.mapCanvas().refreshAllLayers()
+                self.iface.mapCanvas().refresh()
 
     def _execute_version_restore(self, events) -> None:
         """Execute reverse replay restore (async, strict atomic per layer)."""
@@ -1858,10 +1885,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._restore_started_at = time.monotonic()
 
         cutoff = self._version_restore_cutoff
-        flog(f"[{trace_id}] recover_version: execute_strict_restore "
-             f"events={len(events)} cutoff={'set' if cutoff else 'MISSING'}")
-
+        flog(f"[{trace_id}] execute_version_restore: "
+             f"n={len(events)} cutoff={'set' if cutoff else 'MISSING'}")
+        for e in events:
+            flog(f"  -> restore eid={e.event_id} op={e.operation_type} "
+                 f"identity={(e.feature_identity_json or '')[:80]}")
+        events_by_ds_preview: dict = {}
         read_conn = self._get_dialog_read_conn()
+        for e in events:
+            fp = e.datasource_fingerprint or ''
+            events_by_ds_preview.setdefault(fp, []).append(e)
+        self._restore_counts_before = self._rewind_count_snapshot(
+            "before_restore", events_by_ds_preview)
 
         def resolver(evt):
             return find_target_layer(evt, read_conn)
@@ -1897,12 +1932,23 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
             self._active_restore_trace_id = ""
 
+        before = getattr(self, '_restore_counts_before', {})
+        restore_by_ds = result.by_ds or {}
+        self._rewind_count_snapshot("after_restore", restore_by_ds, before=before)
+        self._restore_counts_before = {}
         events = getattr(self, '_version_restore_events', None)
         if result.total_ok > 0 and events:
             self._last_restore_events = events
             self._last_restore_by_ds = result.by_ds
             self.undo_last_btn.setEnabled(True)
             flog(f"undo_last_btn: ENABLED ({result.total_ok} events)")
+            for fp, evts in (result.by_ds or {}).items():
+                layer_name = evts[0].layer_name_snapshot if evts else '?'
+                flog(f"  stored_undo layer={layer_name!r} "
+                     f"fp={fp[:16]}... n={len(evts)}")
+        else:
+            flog(f"on_version_restore_done: ok=0 or no events "
+                 f"-> undo state NOT updated")
         self._version_restore_events = None
 
         detail_lines = self._build_restore_summary(result.by_ds)
@@ -1917,11 +1963,56 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         if result.total_ok > 0:
             flog(f"recover_version: refreshing canvas for {result.total_ok} ok")
-            self.iface.mapCanvas().refreshAllLayers()
+            self.iface.mapCanvas().refresh()
 
         self.progress_bar.setVisible(False)
         self.enable_controls(True)
         self.recover_button.setEnabled(True)
+
+    def _rewind_count_snapshot(self, label: str, by_ds: dict,
+                                before: dict = None) -> dict:
+        """Log feature counts per layer at a Rewind transition.
+
+        Returns {fp: feat_count} for later comparison.
+        For undo:    expected_delta = +1 per DELETE orig, -1 per INSERT orig
+        For restore: expected_delta = +1 per DELETE event, -1 per INSERT event
+        """
+        if not by_ds:
+            return {}
+        read_conn = self._get_dialog_read_conn()
+        counts = {}
+        is_undo = 'undo' in label
+        flog(f"=== REWIND_STATE [{label}] ===")
+        for fp, evts in by_ds.items():
+            if not evts:
+                continue
+            layer_name = evts[0].layer_name_snapshot or '?'
+            layer = find_target_layer(evts[0], read_conn)
+            feat_now = layer.featureCount() if layer else -1
+            counts[fp] = feat_now
+            op_counts = {}
+            for e in evts:
+                op_counts[e.operation_type] = op_counts.get(e.operation_type, 0) + 1
+            ops_str = ' '.join(
+                f"{op}x{n}" for op, n in sorted(op_counts.items()))
+            n_del = op_counts.get('DELETE', 0)
+            n_ins = op_counts.get('INSERT', 0)
+            if is_undo:
+                exp_delta = n_ins - n_del
+            else:
+                exp_delta = n_del - n_ins
+            line = (f"  layer={layer_name!r} feat={feat_now} "
+                    f"n={len(evts)} ({ops_str}) expected_delta={exp_delta:+d}")
+            if before is not None and fp in before:
+                actual_delta = feat_now - before[fp]
+                match = "OK" if actual_delta == exp_delta else "MISMATCH"
+                line += (f" actual_delta={actual_delta:+d} [{match}]")
+                if match == "MISMATCH":
+                    missing = exp_delta - actual_delta
+                    line += f" missing={missing:+d}"
+            flog(line)
+        flog(f"=== END REWIND_STATE [{label}] ===")
+        return counts
 
     def _build_restore_summary(self, by_ds: dict) -> str:
         """Build per-layer operation breakdown from by_ds event groups."""
@@ -2516,6 +2607,27 @@ class RecoverDialog(QDialog, LoggerMixin):
         if result.total_ok > 0:
             self.iface.mapCanvas().refreshAllLayers()
 
+        if result.total_ok > 0 and result.by_ds:
+            undone_ids = [
+                e.event_id for evts in result.by_ds.values()
+                for e in evts if e.event_id is not None
+            ]
+            if undone_ids:
+                try:
+                    conn = getattr(self._journal, '_conn', None)
+                    if conn is not None:
+                        ph = ','.join('?' * len(undone_ids))
+                        conn.execute(
+                            f"DELETE FROM audit_event "
+                            f"WHERE restored_from_event_id IN ({ph})",
+                            undone_ids,
+                        )
+                        conn.commit()
+                        flog(f"undo_last: deleted trace events for "
+                             f"{len(undone_ids)} undone event(s)")
+                except Exception as exc:
+                    flog(f"undo_last: trace cleanup failed: {exc}", "WARNING")
+
     def reset_undo_state(self) -> None:
         """Drop the last-restore memory (called by the plugin on project switch).
 
@@ -2568,12 +2680,80 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def closeEvent(self, event):
         """Close event"""
+        self._cleanup_orphaned_traces()
         flog("RecoverDialog: closing")
         self.cleanup_resources()
         event.accept()
 
+    def _cleanup_orphaned_traces(self) -> None:
+        """Synchronously undo active rewind + delete traces on close.
+
+        Without this, closing the dialog leaves data in a rewound state,
+        causing baseline drift (e.g. 499→559) because the tracker then
+        records new user edits against the rewound data.
+        """
+        from .core.restore_service import undo_restore_batch
+        from .core.workflow_service import find_target_layer
+
+        by_ds = self._last_restore_by_ds
+        if not by_ds:
+            return
+        total_ok = 0
+        total_fail = 0
+        if self._tracker is not None:
+            self._tracker.suppress()
+        try:
+            read_conn = self._get_dialog_read_conn()
+            for fp, events in by_ds.items():
+                if not events:
+                    continue
+                layer = find_target_layer(events[0], read_conn)
+                if layer is None:
+                    flog(f"closeEvent: undo skip fp={fp[:40]} "
+                         f"layer_not_found", "WARNING")
+                    total_fail += len(events)
+                    continue
+                count_before = layer.featureCount()
+                report = undo_restore_batch(layer, events)
+                total_ok += len(report.succeeded)
+                total_fail += len(report.failed)
+                if report.succeeded:
+                    layer.reload()
+                    layer.triggerRepaint()
+                count_after = layer.featureCount()
+                flog(f"closeEvent: undo layer={layer.name()!r} "
+                     f"ok={len(report.succeeded)} fail={len(report.failed)} "
+                     f"feat {count_before}→{count_after}")
+        except Exception as exc:
+            flog(f"closeEvent: sync undo failed: {exc}", "WARNING")
+        finally:
+            if self._tracker is not None:
+                self._tracker.unsuppress()
+        event_ids = [
+            e.event_id for evts in by_ds.values()
+            for e in evts if e.event_id is not None
+        ]
+        if event_ids:
+            try:
+                conn = getattr(self._journal, '_conn', None)
+                if conn is not None:
+                    ph = ','.join('?' * len(event_ids))
+                    conn.execute(
+                        f"DELETE FROM audit_event "
+                        f"WHERE restored_from_event_id IN ({ph})",
+                        event_ids,
+                    )
+                    conn.commit()
+            except Exception as exc:
+                flog(f"closeEvent: trace cleanup failed: {exc}", "WARNING")
+        flog(f"closeEvent: sync undo done ok={total_ok} fail={total_fail} "
+             f"traces_cleaned={len(event_ids)}")
+        self._last_restore_by_ds = None
+        self._last_restore_events = None
+
     def reject(self):
         """Reject dialog"""
+        self._cleanup_orphaned_traces()
         self.cleanup_resources()
         super().reject()
 

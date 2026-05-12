@@ -24,6 +24,38 @@ from .logger import flog
 from ..compat import QgisCompat
 
 
+def _qgis_vals_equal(actual, expected) -> bool:
+    """Type-aware equality for QGIS layer values vs SQLite-stored strings.
+
+    QGIS reads date/time fields as QDate/QDateTime/QTime objects, but the
+    audit journal stores them as ISO strings.  A direct ``!=`` comparison
+    always returns True (unequal types), causing snapshot matching to fail
+    and re-inserted features to never be found during undo, which leads to
+    feature accumulation on repeated rewinds (BUG-REWIND-02).
+    """
+    if actual == expected:
+        return True
+    try:
+        from qgis.PyQt.QtCore import QDate, QDateTime, QTime
+        if isinstance(actual, QDate) and not isinstance(actual, QDateTime):
+            return actual.toString('yyyy-MM-dd') == expected
+        if isinstance(actual, QDateTime):
+            iso = actual.toString('yyyy-MM-ddTHH:mm:ss')
+            return iso == expected or iso.replace('T', ' ') == expected
+        if isinstance(actual, QTime):
+            return actual.toString('HH:mm:ss') == expected
+        if isinstance(expected, QDate) and not isinstance(expected, QDateTime):
+            return expected.toString('yyyy-MM-dd') == actual
+        if isinstance(expected, QDateTime):
+            iso = expected.toString('yyyy-MM-ddTHH:mm:ss')
+            return iso == actual or iso.replace('T', ' ') == actual
+        if isinstance(expected, QTime):
+            return expected.toString('HH:mm:ss') == actual
+    except ImportError:
+        pass
+    return False
+
+
 class PreCheckResult(NamedTuple):
     can_restore: bool
     reason: str
@@ -202,38 +234,115 @@ def _find_by_snapshot(
         if event.geometry_wkb is not None else None
     expected_attrs = reconstruct_attributes(event)
     fields = layer.fields()
+    pk_field_indices = set(layer.dataProvider().pkAttributeIndexes())
     relevant = [
         (hist_name, fields.indexOf(hist_name))
         for hist_name in expected_attrs.keys()
         if not is_layer_audit_field(hist_name)
         and fields.indexOf(hist_name) >= 0
+        and fields.indexOf(hist_name) not in pk_field_indices
+    ]
+    pk_skipped = [
+        hist_name for hist_name in expected_attrs.keys()
+        if fields.indexOf(hist_name) in pk_field_indices
     ]
 
     matches: List[int] = []
     request = QgsFeatureRequest()
-    if expected_geom is not None and hasattr(request, "setFilterRect") \
-            and hasattr(expected_geom, "boundingBox"):
+    has_geom_filter = (expected_geom is not None
+                       and hasattr(request, "setFilterRect")
+                       and hasattr(expected_geom, "boundingBox"))
+    if has_geom_filter:
         request.setFilterRect(expected_geom.boundingBox())
     source = get_feature_source(layer)
+    scanned = 0
+    _diffs: List[str] = []
+    _null_skips: List[str] = []
+    _geom_ok_fids: List[int] = []
     try:
         for feature in source(request):
+            scanned += 1
             if expected_geom is not None and not feature_matches_geometry(
                     feature, expected_geom):
                 continue
+            _geom_ok_fids.append(feature.id())
             attrs_ok = True
             for hist_name, idx in relevant:
-                if feature[idx] != expected_attrs.get(hist_name):
+                expected_val = expected_attrs.get(hist_name)
+                if expected_val is None:
+                    _null_skips.append(hist_name)
+                    continue
+                actual_val = feature[idx]
+                if actual_val is None:
+                    _null_skips.append(hist_name)
+                    continue
+                if not _qgis_vals_equal(actual_val, expected_val):
                     attrs_ok = False
+                    av = repr(actual_val)[:30]
+                    ev = repr(expected_val)[:30]
+                    _diffs.append(f"f{feature.id()}:{hist_name}({av}\u2260{ev})")
                     break
             if attrs_ok:
                 matches.append(feature.id())
                 if not resolve_ambiguity and len(matches) > 1:
                     break
     except Exception as exc:
-        flog(f"_find_by_snapshot: scan failed "
-             f"eid={event.event_id}: {exc}", "WARNING")
+        flog(f"SNAP_SCAN eid={event.event_id} phase=geom SCAN_ERR={exc}", "WARNING")
         return None
 
+    null_skip_set = list(set(_null_skips))[:4]
+    flog(f"SNAP_SCAN eid={event.event_id} phase=geom "
+         f"geom_filter={has_geom_filter} scanned={scanned} matches={len(matches)} "
+         f"pk_skip={pk_skipped} null_skip={null_skip_set} "
+         f"diffs={_diffs[:5] if _diffs else '[]'} result={matches[:5] if matches else 'none'}",
+         "DEBUG" if matches else "INFO")
+
+    if not matches and _geom_ok_fids and _diffs:
+        _failing_fields = set(
+            d.split(':')[1].split('(')[0] for d in _diffs if ':' in d
+        )
+        if len(_failing_fields) == 1:
+            _lenient_fid = max(_geom_ok_fids)
+            flog(f"SNAP_SCAN eid={event.event_id} lenient_match: "
+                 f"{len(_geom_ok_fids)} geom candidate(s) all fail on field "
+                 f"'{next(iter(_failing_fields))}' → max-fid={_lenient_fid} accepted "
+                 f"diffs={_diffs[:3]}", "WARNING")
+            return _lenient_fid
+
+    if scanned == 0 and has_geom_filter and not matches:
+        _diffs_fb: List[str] = []
+        _null_skips_fb: List[str] = []
+        try:
+            for feature in source(QgsFeatureRequest()):
+                scanned += 1
+                attrs_ok = True
+                for hist_name, idx in relevant:
+                    expected_val = expected_attrs.get(hist_name)
+                    if expected_val is None:
+                        _null_skips_fb.append(hist_name)
+                        continue
+                    actual_val = feature[idx]
+                    if actual_val is None:
+                        _null_skips_fb.append(hist_name)
+                        continue
+                    if not _qgis_vals_equal(actual_val, expected_val):
+                        attrs_ok = False
+                        av = repr(actual_val)[:30]
+                        ev = repr(expected_val)[:30]
+                        _diffs_fb.append(f"f{feature.id()}:{hist_name}({av}\u2260{ev})")
+                        break
+                if attrs_ok:
+                    matches.append(feature.id())
+                    if not resolve_ambiguity and len(matches) > 1:
+                        break
+        except Exception as exc:
+            flog(f"SNAP_SCAN eid={event.event_id} phase=fallback SCAN_ERR={exc}", "WARNING")
+        null_skip_fb_set = list(set(_null_skips_fb))[:4]
+        flog(f"SNAP_SCAN eid={event.event_id} phase=fallback "
+             f"scanned={scanned} matches={len(matches)} "
+             f"pk_skip={pk_skipped} null_skip={null_skip_fb_set} "
+             f"diffs={_diffs_fb[:5] if _diffs_fb else '[]'} result={matches[:5] if matches else 'none'}",
+             "DEBUG" if matches else "INFO")
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -360,7 +469,7 @@ def _verify_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:
             idx = fields.indexOf(hist_name)
             if idx < 0:
                 continue
-            if feature[hist_name] != value:
+            if not _qgis_vals_equal(feature[hist_name], value):
                 return False
         return True
     except Exception as exc:
@@ -385,9 +494,13 @@ def restore_updated_feature(layer, event: AuditEvent,
         return {"success": False, "message": "No stable identity for restore"}
 
     target_fid = _find_target_feature(layer, identity, fid_cache)
+    eid = event.event_id or 0
     if target_fid is None:
+        flog(f"restore_updated[{eid}]: target not found "
+             f"identity={(event.feature_identity_json or '')[:80]}", "WARNING")
         return {"success": False, "message": "Target feature not found"}
 
+    flog(f"restore_updated[{eid}]: target_fid={target_fid}")
     old_attrs = reconstruct_attributes(event)
     field_mapping = _build_safe_mapping(check.drift, event)
     attr_changes = _build_attribute_changes(layer, target_fid, old_attrs, field_mapping)
@@ -407,8 +520,13 @@ def restore_updated_feature(layer, event: AuditEvent,
         if geom is not None:
             geom_changes = {target_fid: geom}
             if not provider.changeGeometryValues(geom_changes):
+                flog(f"restore_updated[{eid}]: geom update failed fid={target_fid}",
+                     "ERROR")
                 return {"success": False, "message": "Geometry update failed"}
 
+    geom_status = "geom_restored" if has_geom else "no_geom"
+    flog(f"restore_updated[{eid}]: OK fid={target_fid} "
+         f"attr_changes={len(attr_changes)} {geom_status}")
     return {"success": True, "message": "Reverted"}
 
 
@@ -552,15 +670,24 @@ def undo_restore_batch(layer, events: List[AuditEvent]) -> RestoreReport:
     failed = {}
     dispatch = _undo_dispatch()
 
+    layer_name = layer.name() if layer and hasattr(layer, 'name') else '?'
+    flog(f"undo_restore_batch: layer={layer_name!r} n_events={len(events)}")
     for event in events:
         eid = event.event_id or 0
         try:
+            identity_short = (event.feature_identity_json or '')[:80]
+            flog(f"undo_restore_batch: dispatch op={event.operation_type} "
+                 f"eid={eid} identity={identity_short}")
             handler = dispatch.get(event.operation_type)
             if handler is None:
                 result = _unsupported_result(event.operation_type)
             else:
                 result = handler(layer, event)
 
+            skipped = result.get('skipped', False)
+            flog(f"undo_restore_batch: result op={event.operation_type} eid={eid} "
+                 f"success={result['success']} skipped={skipped} "
+                 f"msg={result.get('message', '')!r}")
             if result["success"]:
                 succeeded.append(eid)
             else:
@@ -591,6 +718,7 @@ def _undo_update_restore(layer, event: AuditEvent,
 
     target_fid = _find_target_feature(layer, identity, fid_cache)
     if target_fid is None:
+        flog(f"UNDO_UPD eid={event.event_id} target=not_found", "WARNING")
         return {"success": False, "message": "Target feature not found"}
 
     new_attrs = reconstruct_new_attributes(event)
@@ -600,17 +728,27 @@ def _undo_update_restore(layer, event: AuditEvent,
     provider = layer.dataProvider()
     if attr_changes:
         if not provider.changeAttributeValues(attr_changes):
+            flog(f"UNDO_UPD eid={event.event_id} fid={target_fid} attr_FAILED", "ERROR")
             return {"success": False, "message": "Attribute update failed"}
 
     new_geom_wkb = getattr(event, 'new_geometry_wkb', None)
     if new_geom_wkb is not None:
         if not bool(provider.capabilities() & QgisCompat.CAP_CHANGE_GEOMETRIES):
+            flog(f"UNDO_UPD eid={event.event_id} fid={target_fid} geom=no_cap", "WARNING")
             return {"success": False, "message": "Provider lacks geometry change capability"}
         geom = rebuild_geometry(new_geom_wkb)
         if geom is not None:
-            if not provider.changeGeometryValues({target_fid: geom}):
+            from .geometry_utils import wkb_short_repr, feature_geom_short_repr
+            before_repr = feature_geom_short_repr(layer, target_fid)
+            applying_repr = wkb_short_repr(bytes(geom.asWkb()))
+            ok = bool(provider.changeGeometryValues({target_fid: geom}))
+            flog(f"UNDO_UPD eid={event.event_id} fid={target_fid} "
+                 f"before={before_repr} applying={applying_repr} geom_write={'ok' if ok else 'FAILED'}")
+            if not ok:
                 return {"success": False, "message": "Geometry update failed"}
-
+    else:
+        flog(f"UNDO_UPD eid={event.event_id} fid={target_fid} "
+             f"attrs={len(attr_changes)} new_geom=none")
     return {"success": True, "message": "Undo reverted"}
 
 
