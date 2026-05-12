@@ -79,11 +79,17 @@ def collapse_rewind_events(events: List[AuditEvent]) -> List[AuditEvent]:
     active = [e for e in user_events
               if e.event_id is None or e.event_id not in neutralised_user_eids]
 
-    if trace_count or len(active) != len(user_events):
-        flog(f"rewind_dedup: {len(events)} raw "
-             f"({len(user_events)} user, {trace_count} traces) -> "
-             f"{len(active)} active "
-             f"({len(neutralised_user_eids)} neutralised by traces)")
+    dropped = [e for e in user_events
+               if e.event_id is not None and e.event_id in neutralised_user_eids]
+
+    flog(f"rewind_dedup: {len(events)} raw "
+         f"({len(user_events)} user, {trace_count} traces) -> "
+         f"{len(active)} active "
+         f"({len(neutralised_user_eids)} neutralised by traces)")
+    for e in dropped:
+        flog(f"rewind_dedup: neutralised eid={e.event_id} "
+             f"op={e.operation_type} "
+             f"identity={(e.feature_identity_json or '')[:80]}")
 
     return _collapse_user_chain(active)
 

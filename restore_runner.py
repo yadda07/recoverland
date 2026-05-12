@@ -344,6 +344,7 @@ class StrictRestoreRunner(QObject):
         self._strict_count_before = -1
         self._strict_fid_remap: Dict = {}
         self._strict_skipped: List[int] = []
+        self._all_succeeded_ids: set = set()
 
     def start(self) -> None:
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
@@ -422,6 +423,42 @@ class StrictRestoreRunner(QObject):
 
         events_by_id = {e.event_id: e for e in group}
 
+        import json as _json_collapse
+        _upd_by_fid: dict = {}
+        for action in plan.actions:
+            if action.compensatory_op != "UPDATE":
+                continue
+            evt = events_by_id.get(action.event_id)
+            if evt is None:
+                continue
+            try:
+                fid = _json_collapse.loads(
+                    evt.feature_identity_json or "{}").get("fid")
+            except (ValueError, TypeError):
+                fid = None
+            if fid is None:
+                continue
+            prev = _upd_by_fid.get(fid)
+            if prev is None or action.event_id < prev.event_id:
+                _upd_by_fid[fid] = action
+        _keep_eids = {a.event_id for a in _upd_by_fid.values()}
+        _collapsed = [
+            a for a in plan.actions
+            if a.compensatory_op != "UPDATE"
+            or a.event_id in _keep_eids
+        ]
+        _n_removed = len(plan.actions) - len(_collapsed)
+        if _n_removed > 0:
+            flog(f"{prefix}StrictRestoreRunner: collapsed {_n_removed} "
+                 f"redundant UPDATE(s) on same FID "
+                 f"(kept oldest per FID, {len(_keep_eids)} unique)")
+            plan = plan._replace(
+                actions=_collapsed,
+                event_count=len(_collapsed),
+            )
+            self._processed += _n_removed
+            self._total_ok += _n_removed
+
         self._strict_plan = plan
         self._strict_events_by_id = events_by_id
         self._strict_layer = layer
@@ -445,6 +482,19 @@ class StrictRestoreRunner(QObject):
 
         count_before = layer.featureCount()
         self._strict_count_before = count_before
+
+        upd_geom_state = {}
+        for a in group:
+            wkb = getattr(a, 'new_geometry_wkb', None)
+            if not wkb:
+                continue
+            try:
+                fid = _json_collapse.loads(a.feature_identity_json).get('fid')
+                if fid is not None:
+                    upd_geom_state[fid] = feature_geom_short_repr(layer, fid)
+            except Exception as exc:
+                flog(f"EDIT_START err eid={getattr(a,'event_id','?')} exc={exc}", "WARNING")
+        flog(f"EDIT_START layer={layer_name} n_geom_upd={len(upd_geom_state)} geom_at_start={upd_geom_state}")
 
         layer.beginEditCommand("RecoverLand: temporal restore")
 
@@ -483,10 +533,18 @@ class StrictRestoreRunner(QObject):
                 self._strict_fid_remap,
             )
             if result["success"]:
-                if result.get("skipped"):
+                skipped = result.get("skipped", False)
+                flog(f"{prefix}StrictRestoreRunner: action_ok "
+                     f"eid={action.event_id} "
+                     f"comp_op={action.compensatory_op} "
+                     f"orig_op={action.operation_type} "
+                     f"skipped={skipped} "
+                     f"fid={result.get('fid', '?')}")
+                if skipped:
                     self._strict_skipped.append(action.event_id)
                 else:
                     self._strict_succeeded.append(action.event_id)
+                    self._all_succeeded_ids.add(action.event_id)
             else:
                 flog(f"{prefix}StrictRestoreRunner: action_failed "
                      f"eid={action.event_id} comp_op={action.compensatory_op} "
@@ -519,6 +577,9 @@ class StrictRestoreRunner(QObject):
         layer.destroyEditCommand()
         if not self._strict_was_editing:
             layer.rollBack()
+
+        for eid in self._strict_succeeded:
+            self._all_succeeded_ids.discard(eid)
 
         self._total_fail += total_actions
         remaining = total_actions - self._strict_action_idx
@@ -607,6 +668,8 @@ class StrictRestoreRunner(QObject):
                 flog(f"{prefix}StrictRestoreRunner: commit_failed "
                      f"msg={msg}", "ERROR")
                 layer.rollBack()
+                for eid in self._strict_succeeded:
+                    self._all_succeeded_ids.discard(eid)
                 self._errors.append(f"Commit failed: {msg}")
                 self._total_fail += len(self._strict_plan.actions)
                 layer.triggerRepaint()
@@ -652,10 +715,21 @@ class StrictRestoreRunner(QObject):
     def _finish(self) -> None:
         status = "cancelled" if self._cancelled else (
             "completed" if self._total_fail == 0 else "partial")
+        succeeded_by_ds: Dict[str, list] = {}
+        for fp, events in self._by_ds.items():
+            ok_events = [e for e in events
+                         if e.event_id in self._all_succeeded_ids]
+            if ok_events:
+                succeeded_by_ds[fp] = ok_events
+        skipped_total = sum(len(v) for v in self._by_ds.values()) - sum(
+            len(v) for v in succeeded_by_ds.values())
+        if skipped_total > 0:
+            flog(f"StrictRestoreRunner: by_ds filtered: "
+                 f"{skipped_total} skipped event(s) excluded from undo scope")
         _finish_runner(
             self,
             runner_name="StrictRestoreRunner",
-            by_ds=self._by_ds,
+            by_ds=succeeded_by_ds,
             total_ok=self._total_ok,
             total_fail=self._total_fail,
             errors=self._errors,
@@ -697,6 +771,9 @@ class UndoRunner(QObject):
         self._processed = 0
 
     def start(self) -> None:
+        total_events = sum(len(g) for g in self._by_ds.values())
+        flog(f"UndoRunner: start layers={len(self._groups)} "
+             f"total_events={total_events}")
         if self._tracker is not None:
             self._tracker.suppress()
         self._process_next_group()
@@ -710,6 +787,12 @@ class UndoRunner(QObject):
             return
 
         fp, group = self._groups[self._group_idx]
+        layer_name_hint = group[0].layer_name_snapshot if group else '?'
+        flog(f"UndoRunner: process_group idx={self._group_idx} "
+             f"layer={layer_name_hint!r} n_events={len(group)}")
+        for e in group:
+            flog(f"  UndoRunner event: op={e.operation_type} eid={e.event_id} "
+                 f"identity={(e.feature_identity_json or '')[:80]}")
         layer, errors = _resolve_runner_layer(
             self._find_layer_fn, group, fp,
             runner_name="UndoRunner",
@@ -724,6 +807,7 @@ class UndoRunner(QObject):
             QTimer.singleShot(0, self._process_next_group)
             return
 
+        count_before = layer.featureCount()
         report = undo_restore_batch(layer, group)
         self._total_ok += len(report.succeeded)
         self._total_fail += len(report.failed)
@@ -731,6 +815,22 @@ class UndoRunner(QObject):
             self._errors.append(f"Evt {eid}: {msg}")
         if report.succeeded:
             layer.reload()
+            import json as _json
+            geom_check = {}
+            for ev in group:
+                if getattr(ev, 'new_geometry_wkb', None) is not None:
+                    try:
+                        fid = _json.loads(ev.feature_identity_json).get('fid')
+                        if fid is not None:
+                            geom_check[fid] = feature_geom_short_repr(layer, fid)
+                    except Exception:
+                        pass
+            flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
+                 f"geom_after_reload={geom_check}")
+        count_after = layer.featureCount()
+        flog(f"UndoRunner: group_done layer={layer_name_hint!r} "
+             f"ok={len(report.succeeded)} fail={len(report.failed)} "
+             f"feat_before={count_before} feat_after={count_after}")
         layer.triggerRepaint()
 
         self._processed += len(group)

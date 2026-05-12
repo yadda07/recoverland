@@ -216,6 +216,11 @@ def _apply_via_buffer(layer, compensatory_op: str, event: AuditEvent,
     layers where re-inserted features get fresh negative FIDs in the buffer
     that no longer match the historical FID stored in the event.
     """
+    layer_name = layer.name() if layer and hasattr(layer, 'name') else '?'
+    flog(f"_apply_via_buffer: comp_op={compensatory_op} "
+         f"eid={event.event_id} orig_op={event.operation_type} "
+         f"layer={layer_name!r} "
+         f"identity={(event.feature_identity_json or '')[:80]}")
     if compensatory_op == "INSERT":
         return _buffer_insert(layer, event, fid_remap)
     if compensatory_op == "DELETE":
@@ -252,9 +257,16 @@ def _buffer_insert(layer, event: AuditEvent,
         feature.setGeometry(geom)
 
     if not layer.addFeature(feature):
+        flog(f"_buffer_insert: addFeature failed eid={event.event_id}", "ERROR")
         return {"success": False, "message": "Buffer addFeature failed"}
-    _record_remap(fid_remap, event, feature.id())
-    return {"success": True, "message": "Inserted via buffer", "fid": feature.id()}
+    new_fid = feature.id()
+    fp = event.entity_fingerprint or '?'
+    prev = fid_remap.get(fp) if fid_remap and fp != '?' else None
+    _record_remap(fid_remap, event, new_fid)
+    collision = f' COLLISION:prev={prev}' if prev is not None else ''
+    geom_repr = feature_geom_short_repr(layer, new_fid) if new_fid else '?'
+    flog(f"BUF_INS eid={event.event_id} fp={fp} buf_fid={new_fid} geom={geom_repr}{collision}")
+    return {"success": True, "message": "Inserted via buffer", "fid": new_fid}
 
 
 def _record_remap(fid_remap: Optional[Dict], event: AuditEvent,
@@ -289,8 +301,13 @@ def _resolve_target_fid(layer, event: AuditEvent,
         return None
     key = event.entity_fingerprint
     if not key:
+        flog(f"REMAP_LOOKUP eid={event.event_id} fp=none→None", "DEBUG")
         return None
-    return fid_remap.get(key)
+    result = fid_remap.get(key)
+    remap_keys = list(fid_remap.keys())[:6]
+    flog(f"REMAP_LOOKUP eid={event.event_id} fp={key} "
+         f"result={result} remap_size={len(fid_remap)} remap_keys={remap_keys}", "DEBUG")
+    return result
 
 
 def _buffer_delete(layer, event: AuditEvent,
@@ -308,46 +325,49 @@ def _buffer_delete(layer, event: AuditEvent,
     )
 
     identity = _parse_identity(event.feature_identity_json)
+    fp = event.entity_fingerprint or '?'
     remapped = _resolve_target_fid(layer, event, fid_remap)
     target_fid = remapped if remapped is not None \
         else _find_target_feature(layer, identity)
     if target_fid is None:
         snapshot_fid = _find_by_snapshot(layer, event, resolve_ambiguity=True)
         if snapshot_fid is not None:
-            flog(f"_buffer_delete: identity miss, recovered by snapshot scan "
-                 f"eid={event.event_id} identity_fid={identity.get('fid')} "
-                 f"recovered_fid={snapshot_fid}", "WARNING")
+            flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
+                 f"target=none→snap={snapshot_fid}")
             target_fid = snapshot_fid
         else:
-            flog(f"_buffer_delete: target already absent eid={event.event_id} "
-                 f"identity_fid={identity.get('fid')} "
-                 f"pk_field={identity.get('pk_field')!r} "
-                 f"pk_value={identity.get('pk_value')!r}")
+            flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
+                 f"target=none snap=none→ABSENT", "WARNING")
             _diagnose_snapshot_miss(layer, event)
             return {"success": True, "message": "Already absent"}
+    else:
+        flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} target={target_fid}", "DEBUG")
 
     has_pk = bool(identity.get("pk_field")) and identity.get("pk_value") is not None
     trusted = remapped is not None or has_pk
     if not trusted and not _target_matches_insert_snapshot(layer, target_fid, event):
         fallback_fid = _find_by_snapshot(layer, event, resolve_ambiguity=True)
         if fallback_fid is None:
-            flog(f"_buffer_delete: identity mismatch, skipping delete "
-                 f"eid={event.event_id} fid={target_fid}", "WARNING")
+            flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid}"
+                 f"→SKIP snap_mismatch trusted={trusted}", "WARNING")
             return {"success": True,
                     "skipped": True,
                     "message": "Skipped: identity mismatch (FID-only)"}
-        flog(f"_buffer_delete: FID mismatch, recovered by snapshot scan "
-             f"eid={event.event_id} identity_fid={target_fid} "
-             f"recovered_fid={fallback_fid}")
+        flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid}→snap={fallback_fid} recovered")
         target_fid = fallback_fid
 
     if not layer.deleteFeature(target_fid):
-        return {"success": False, "message": "Buffer deleteFeature failed"}
+        flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
+             f"DELETE_FAILED→SKIP (buffer refused)", "WARNING")
+        return {"success": True, "skipped": True,
+                "message": "Skipped: buffer deleteFeature refused"}
+    flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid}→deleted")
     return {"success": True, "message": "Deleted via buffer"}
 
 
 def _target_matches_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:
     """Check that feature fid matches the INSERT-time snapshot of event."""
+    from .restore_service import _qgis_vals_equal
     attrs = reconstruct_attributes(event)
     geom = rebuild_geometry(event.geometry_wkb) if event.geometry_wkb else None
     mapping = _safe_field_mapping(layer, event)
@@ -360,7 +380,7 @@ def _target_matches_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:
                 return False
             fields = layer.fields()
             for idx, value in iter_mapped_attributes(mapping, attrs, fields):
-                if feature[idx] != value:
+                if not _qgis_vals_equal(feature[idx], value):
                     return False
             return True
     except Exception as exc:
@@ -385,27 +405,33 @@ def _buffer_update(layer, event: AuditEvent,
     from .restore_service import _parse_identity, _find_target_feature
 
     identity = _parse_identity(event.feature_identity_json)
+    fp = event.entity_fingerprint or '?'
     remapped = _resolve_target_fid(layer, event, fid_remap)
+    remap_verdict = 'none'
+    if remapped is not None:
+        if not _target_matches_update_post_state(layer, remapped, event):
+            flog(f"REMAP_GUARD eid={event.event_id} fp={fp} remap={remapped}→discarded", "WARNING")
+            remapped = None
+            remap_verdict = 'discarded'
+        else:
+            remap_verdict = f'ok→{remapped}'
     target_fid = remapped if remapped is not None \
         else _find_target_feature(layer, identity)
 
     has_pk = bool(identity.get("pk_field")) and identity.get("pk_value") is not None
     trusted = remapped is not None or has_pk
+    flog(f"BUF_UPD eid={event.event_id} fp={fp} remap={remap_verdict} "
+         f"target={target_fid} trusted={trusted}", "DEBUG")
 
     if target_fid is not None and not trusted:
         if not _target_matches_update_post_state(layer, target_fid, event):
             fallback_fid = _find_update_target_by_post_state(layer, event)
             if fallback_fid is None:
-                flog(f"_buffer_update: post-state mismatch and no snapshot "
-                     f"match, skipping eid={event.event_id} "
-                     f"historical_fid={target_fid}", "WARNING")
-                return {"success": True,
-                        "skipped": True,
-                        "message": "Skipped: post-state mismatch (FID-only)"}
-            flog(f"_buffer_update: FID mismatch, recovered by post-state "
-                 f"scan eid={event.event_id} historical_fid={target_fid} "
-                 f"recovered_fid={fallback_fid}")
-            target_fid = fallback_fid
+                flog(f"BUF_UPD eid={event.event_id} fid={target_fid} "
+                     f"post_chk=fail no_fallback → force_apply (stale geom)", "WARNING")
+            else:
+                flog(f"BUF_UPD eid={event.event_id} fid={target_fid}→fallback={fallback_fid} post_chk=recovered")
+                target_fid = fallback_fid
 
     if target_fid is None:
         fallback_fid = _find_update_target_by_post_state(layer, event)
@@ -594,11 +620,17 @@ def _target_matches_update_post_state(layer, fid: int, event) -> bool:
     """
     new_wkb = getattr(event, "new_geometry_wkb", None)
     if new_wkb is None:
+        flog(f"POST_CHK eid={event.event_id} fid={fid} new_wkb=none→skip=True", "DEBUG")
         return True
     geom = rebuild_geometry(new_wkb)
     if not is_geometry_present(geom):
+        flog(f"POST_CHK eid={event.event_id} fid={fid} new_wkb=unparseable→skip=True", "DEBUG")
         return True
-    return _current_geom_matches(layer, fid, geom)
+    expected_repr = wkb_short_repr(bytes(geom.asWkb())) if geom else '?'
+    match = _current_geom_matches(layer, fid, geom)
+    flog(f"POST_CHK eid={event.event_id} fid={fid} "
+         f"new={expected_repr} match={match}", "DEBUG")
+    return match
 
 
 def _feature_geometry_matches(feature, expected_geom) -> bool:
@@ -626,8 +658,13 @@ def _current_geom_matches(layer, fid: int, expected_geom) -> bool:
         request = QgsFeatureRequest(fid)
         source = get_feature_source(layer)
         for feature in source(request):
-            return _feature_geometry_matches(feature, expected_geom)
+            actual = feature.geometry()
+            actual_repr = wkb_short_repr(bytes(actual.asWkb())) \
+                if actual and not actual.isNull() and not actual.isEmpty() else 'absent'
+            result = _feature_geometry_matches(feature, expected_geom)
+            flog(f"CUR_GEOM fid={fid} actual={actual_repr} match={result}", "DEBUG")
+            return result
+        flog(f"CUR_GEOM fid={fid} actual=fid_not_found match=False", "DEBUG")
     except Exception as exc:
-        flog(f"_buffer_update: current geometry lookup failed "
-             f"fid={fid}: {exc}", "WARNING")
+        flog(f"CUR_GEOM fid={fid} lookup_err={exc} match=False", "WARNING")
     return False

@@ -16,6 +16,10 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
                is_cancelled, include_traces=False):
     conn = None
     prefix = trace_prefix(trace_id)
+    cutoff_str = cutoff.isoformat() if hasattr(cutoff, 'isoformat') else str(cutoff)
+    flog(f"{prefix}VersionFetchThread: _run_fetch START "
+         f"n_fingerprints={len(fingerprints)} "
+         f"cutoff={cutoff_str} include_traces={include_traces}")
     try:
         conn = journal.create_read_connection()
         total = 0
