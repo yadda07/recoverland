@@ -54,7 +54,14 @@ COMPENSATORY_OPS: Dict[str, str] = {
 class RestoreCutoff(NamedTuple):
     cutoff_type: CutoffType
     value: Any
-    inclusive: bool
+    # Inclusive cutoff: events with `created_at >= value` are included.
+    # SQLite stores timestamps with second precision: an event committed
+    # within the same second as the cutoff would otherwise be silently
+    # dropped, which is the dominant rewind regression pattern (see
+    # SESSION_REWIND.md §17.1 H-S3).  Default True is the safe behaviour;
+    # callers needing a strict `>` filter must pass `inclusive=False`
+    # explicitly.
+    inclusive: bool = True
 
 
 class PlannedAction(NamedTuple):
