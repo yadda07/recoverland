@@ -7,6 +7,7 @@ QGIS layer operations (provider.addFeatures, etc.) must run on the
 main thread; this runner respects that constraint while avoiding freeze.
 """
 from collections import defaultdict
+import json
 import time
 from typing import List, Dict, Optional, Callable
 
@@ -22,11 +23,23 @@ from .core.restore_service import (
 from .core.restore_executor import _apply_via_buffer
 from .core.workflow_service import GroupedRestoreResult
 from .core.logger import flog
+from .core.observability import log_cycle_summary
 from .core.geometry_utils import (
     feature_geom_short_repr, wkb_short_repr,
 )
 
 _CHUNK_SIZE = 20
+
+_RUNNER_TO_CYCLE: Dict[str, str] = {
+    "RestoreRunner": "event_restore",
+    "StrictRestoreRunner": "rewind",
+    "UndoRunner": "undo",
+}
+
+
+def _cycle_for_runner(runner_name: str) -> str:
+    """Map a runner class to its CYCLE_SUMMARY cycle name."""
+    return _RUNNER_TO_CYCLE.get(runner_name, runner_name.lower())
 
 
 def _finish_runner(
@@ -43,6 +56,11 @@ def _finish_runner(
     tracker,
     trace_id: str = "",
     status_label: Optional[str] = None,
+    failed_eids: Optional[List[int]] = None,
+    cycle: Optional[str] = None,
+    extra_stats: Optional[Dict[str, int]] = None,
+    # BL-RW-P3-18: per-category breakdown propagated to runner.finished.
+    breakdown: Optional[Dict[str, int]] = None,
 ) -> None:
     """Common end-of-run pipeline for the three QObject runners.
 
@@ -59,6 +77,30 @@ def _finish_runner(
          the emit raises, otherwise tracking stays paused indefinitely.
     """
     prefix = f"[{trace_id}] " if trace_id else ""
+    bd = breakdown or {}
+    applied = int(bd.get("applied", 0))
+    skipped_idempotent = int(bd.get("skipped_idempotent", 0))
+    failed_other = int(bd.get("failed", 0))
+    failed_target_absent = int(bd.get("failed_target_absent", 0))
+    failed_geometry_drift = int(bd.get("failed_geometry_drift", 0))
+
+    # BL-RW-P3-18 antithesis: conservation invariant.
+    # Any drift between total_ok+total_fail and the 5-bucket sum exposes
+    # a classification bug. We log a WARNING but do not raise; the user
+    # gets correct restore results, just without trustworthy metrics.
+    bucket_sum = (applied + skipped_idempotent + failed_other
+                  + failed_target_absent + failed_geometry_drift)
+    expected = total_ok + total_fail
+    if breakdown is not None and bucket_sum != expected:
+        flog(
+            f"{prefix}{runner_name}: BREAKDOWN_INVARIANT_VIOLATION "
+            f"bucket_sum={bucket_sum} total_ok+total_fail={expected} "
+            f"delta={bucket_sum - expected} "
+            f"applied={applied} skipped_idempotent={skipped_idempotent} "
+            f"failed={failed_other} target_absent={failed_target_absent} "
+            f"geometry_drift={failed_geometry_drift}",
+            "WARNING",
+        )
     try:
         if traces and write_queue is not None:
             accepted = write_queue.enqueue(list(traces))
@@ -77,6 +119,12 @@ def _finish_runner(
             errors=errors,
             by_ds=dict(by_ds),
             trace_events=traces,
+            failed_eids=failed_eids or [],
+            applied=applied,
+            skipped_idempotent=skipped_idempotent,
+            failed=failed_other,
+            failed_target_absent=failed_target_absent,
+            failed_geometry_drift=failed_geometry_drift,
         )
         elapsed_ms = (
             int((time.monotonic() - started_at) * 1000)
@@ -84,10 +132,34 @@ def _finish_runner(
         )
         if status_label is not None:
             flog(f"{prefix}{runner_name}: finish status={status_label} "
-                 f"ok={total_ok} fail={total_fail} elapsed_ms={elapsed_ms}")
+                 f"ok={total_ok} fail={total_fail} elapsed_ms={elapsed_ms} "
+                 f"applied={applied} skipped_idempotent={skipped_idempotent} "
+                 f"failed={failed_other} "
+                 f"failed_target_absent={failed_target_absent} "
+                 f"failed_geometry_drift={failed_geometry_drift}")
         else:
             flog(f"{prefix}{runner_name}: finish ok={total_ok} "
-                 f"fail={total_fail} elapsed_ms={elapsed_ms}")
+                 f"fail={total_fail} elapsed_ms={elapsed_ms} "
+                 f"applied={applied} skipped_idempotent={skipped_idempotent} "
+                 f"failed={failed_other} "
+                 f"failed_target_absent={failed_target_absent} "
+                 f"failed_geometry_drift={failed_geometry_drift}")
+
+        cycle_name = cycle or _cycle_for_runner(runner_name)
+        cycle_stats: Dict[str, int] = {
+            "apply_ok": total_ok,
+            "apply_fail": total_fail,
+            "traces_written": len(traces) if traces else 0,
+            "applied": applied,
+            "skipped_idempotent": skipped_idempotent,
+            "failed": failed_other,
+            "failed_target_absent": failed_target_absent,
+            "failed_geometry_drift": failed_geometry_drift,
+        }
+        if extra_stats:
+            cycle_stats.update(extra_stats)
+        log_cycle_summary(trace_id, cycle_name, cycle_stats, elapsed_ms)
+
         runner.finished.emit(result)
     finally:
         if tracker is not None:
@@ -189,6 +261,13 @@ class RestoreRunner(QObject):
         self._group_ok = 0
         self._group_fid_cache: Dict = {}
 
+        # BL-RW-P3-18: per-category breakdown accumulator.
+        self._applied = 0
+        self._skipped_idempotent = 0
+        self._failed_other = 0
+        self._failed_target_absent = 0
+        self._failed_geometry_drift = 0
+
     def start(self) -> None:
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
         self._started_at = time.monotonic()
@@ -249,6 +328,22 @@ class RestoreRunner(QObject):
         for eid, msg in report.failed.items():
             self._errors.append(f"Evt {eid}: {msg}")
 
+        # BL-RW-P3-18: per-category accumulation.
+        target_absent_set = set(report.failed_target_absent or [])
+        drift_set = set(report.failed_geometry_drift or [])
+        skipped_set = set(report.skipped_idempotent or [])
+        self._skipped_idempotent += len(skipped_set)
+        self._failed_target_absent += len(target_absent_set)
+        self._failed_geometry_drift += len(drift_set)
+        for eid in report.succeeded:
+            if eid in skipped_set or eid in target_absent_set or eid in drift_set:
+                continue
+            self._applied += 1
+        for eid in report.failed.keys():
+            if eid in target_absent_set or eid in drift_set:
+                continue
+            self._failed_other += 1
+
         self._event_idx = end
         self._processed += len(chunk)
         self.progress.emit(self._processed, len(self._events))
@@ -280,6 +375,13 @@ class RestoreRunner(QObject):
             started_at=self._started_at,
             tracker=self._tracker,
             trace_id=self._trace_id,
+            breakdown={
+                "applied": self._applied,
+                "skipped_idempotent": self._skipped_idempotent,
+                "failed": self._failed_other,
+                "failed_target_absent": self._failed_target_absent,
+                "failed_geometry_drift": self._failed_geometry_drift,
+            },
         )
 
 
@@ -309,6 +411,7 @@ class StrictRestoreRunner(QObject):
         tracker=None,
         trace_id: str = "",
         parent: Optional[QObject] = None,
+        extra_stats: Optional[Dict[str, int]] = None,
     ):
         super().__init__(parent)
         self._events = events
@@ -317,6 +420,7 @@ class StrictRestoreRunner(QObject):
         self._write_queue = write_queue
         self._tracker = tracker
         self._trace_id = trace_id
+        self._extra_stats = dict(extra_stats) if extra_stats else {}
         self._cancelled = False
 
         self._by_ds: Dict[str, list] = defaultdict(list)
@@ -345,6 +449,14 @@ class StrictRestoreRunner(QObject):
         self._strict_fid_remap: Dict = {}
         self._strict_skipped: List[int] = []
         self._all_succeeded_ids: set = set()
+
+        # BL-RW-P3-18: per-category breakdown accumulator (mirror of
+        # RestoreRunner). Decremented when a layer rolls back.
+        self._applied = 0
+        self._skipped_idempotent = 0
+        self._failed_other = 0
+        self._failed_target_absent = 0
+        self._failed_geometry_drift = 0
 
     def start(self) -> None:
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
@@ -423,42 +535,6 @@ class StrictRestoreRunner(QObject):
 
         events_by_id = {e.event_id: e for e in group}
 
-        import json as _json_collapse
-        _upd_by_fid: dict = {}
-        for action in plan.actions:
-            if action.compensatory_op != "UPDATE":
-                continue
-            evt = events_by_id.get(action.event_id)
-            if evt is None:
-                continue
-            try:
-                fid = _json_collapse.loads(
-                    evt.feature_identity_json or "{}").get("fid")
-            except (ValueError, TypeError):
-                fid = None
-            if fid is None:
-                continue
-            prev = _upd_by_fid.get(fid)
-            if prev is None or action.event_id < prev.event_id:
-                _upd_by_fid[fid] = action
-        _keep_eids = {a.event_id for a in _upd_by_fid.values()}
-        _collapsed = [
-            a for a in plan.actions
-            if a.compensatory_op != "UPDATE"
-            or a.event_id in _keep_eids
-        ]
-        _n_removed = len(plan.actions) - len(_collapsed)
-        if _n_removed > 0:
-            flog(f"{prefix}StrictRestoreRunner: collapsed {_n_removed} "
-                 f"redundant UPDATE(s) on same FID "
-                 f"(kept oldest per FID, {len(_keep_eids)} unique)")
-            plan = plan._replace(
-                actions=_collapsed,
-                event_count=len(_collapsed),
-            )
-            self._processed += _n_removed
-            self._total_ok += _n_removed
-
         self._strict_plan = plan
         self._strict_events_by_id = events_by_id
         self._strict_layer = layer
@@ -489,7 +565,7 @@ class StrictRestoreRunner(QObject):
             if not wkb:
                 continue
             try:
-                fid = _json_collapse.loads(a.feature_identity_json).get('fid')
+                fid = json.loads(a.feature_identity_json).get('fid')
                 if fid is not None:
                     upd_geom_state[fid] = feature_geom_short_repr(layer, fid)
             except Exception as exc:
@@ -508,6 +584,16 @@ class StrictRestoreRunner(QObject):
 
     def _process_strict_chunk(self) -> None:
         """Process a chunk of strict restore actions (BL-PERF-009)."""
+        try:
+            self._process_strict_chunk_inner()
+        except Exception as exc:
+            prefix = f"[{self._trace_id}] " if self._trace_id else ""
+            flog(f"{prefix}StrictRestoreRunner: CRASH in chunk: {exc}", "CRITICAL")
+            self._errors.append(f"Internal error: {exc}")
+            self._rollback_strict(prefix, "internal_crash")
+
+    def _process_strict_chunk_inner(self) -> None:
+        """Inner chunk logic, called by _process_strict_chunk with crash guard."""
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
         plan = self._strict_plan
         events_by_id = self._strict_events_by_id
@@ -532,26 +618,45 @@ class StrictRestoreRunner(QObject):
                 layer, action.compensatory_op, event,
                 self._strict_fid_remap,
             )
+            # BL-RW-P3-18: classify the action result for the breakdown.
+            from .core.restore_service import _classify_restore_result
+            reason = _classify_restore_result(result)
+
             if result["success"]:
                 skipped = result.get("skipped", False)
                 flog(f"{prefix}StrictRestoreRunner: action_ok "
                      f"eid={action.event_id} "
                      f"comp_op={action.compensatory_op} "
                      f"orig_op={action.operation_type} "
-                     f"skipped={skipped} "
+                     f"skipped={skipped} reason={reason} "
                      f"fid={result.get('fid', '?')}")
                 if skipped:
                     self._strict_skipped.append(action.event_id)
                 else:
                     self._strict_succeeded.append(action.event_id)
                     self._all_succeeded_ids.add(action.event_id)
+                if reason == "target_absent":
+                    self._failed_target_absent += 1
+                elif reason == "geometry_drift":
+                    self._failed_geometry_drift += 1
+                elif reason == "skipped_idempotent":
+                    self._skipped_idempotent += 1
+                else:
+                    self._applied += 1
             else:
                 flog(f"{prefix}StrictRestoreRunner: action_failed "
                      f"eid={action.event_id} comp_op={action.compensatory_op} "
-                     f"orig_op={action.operation_type} msg={result['message']}",
+                     f"orig_op={action.operation_type} reason={reason} "
+                     f"msg={result['message']}",
                      "ERROR")
                 self._errors.append(
                     f"Evt {action.event_id}: {result['message']}")
+                if reason == "target_absent":
+                    self._failed_target_absent += 1
+                elif reason == "geometry_drift":
+                    self._failed_geometry_drift += 1
+                else:
+                    self._failed_other += 1
                 self._rollback_strict(prefix, "apply_failed")
                 return
 
@@ -726,6 +831,12 @@ class StrictRestoreRunner(QObject):
         if skipped_total > 0:
             flog(f"StrictRestoreRunner: by_ds filtered: "
                  f"{skipped_total} skipped event(s) excluded from undo scope")
+        plan_actions_total = sum(len(v) for v in self._by_ds.values())
+        merged_extra: Dict[str, int] = dict(self._extra_stats)
+        merged_extra.update({
+            "plan_actions": plan_actions_total,
+            "apply_skipped": skipped_total,
+        })
         _finish_runner(
             self,
             runner_name="StrictRestoreRunner",
@@ -739,6 +850,14 @@ class StrictRestoreRunner(QObject):
             tracker=self._tracker,
             trace_id=self._trace_id,
             status_label=status,
+            extra_stats=merged_extra,
+            breakdown={
+                "applied": self._applied,
+                "skipped_idempotent": self._skipped_idempotent,
+                "failed": self._failed_other,
+                "failed_target_absent": self._failed_target_absent,
+                "failed_geometry_drift": self._failed_geometry_drift,
+            },
         )
 
 
@@ -768,6 +887,7 @@ class UndoRunner(QObject):
         self._total_ok = 0
         self._total_fail = 0
         self._errors: List[str] = []
+        self._failed_eids: List[int] = []
         self._processed = 0
 
     def start(self) -> None:
@@ -813,6 +933,7 @@ class UndoRunner(QObject):
         self._total_fail += len(report.failed)
         for eid, msg in report.failed.items():
             self._errors.append(f"Evt {eid}: {msg}")
+            self._failed_eids.append(eid)
         if report.succeeded:
             layer.reload()
             import json as _json
@@ -850,4 +971,5 @@ class UndoRunner(QObject):
             write_queue=None,
             started_at=0.0,
             tracker=self._tracker,
+            failed_eids=self._failed_eids,
         )

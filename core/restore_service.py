@@ -210,6 +210,7 @@ def _delete_target_or_fail(provider, target_fid: int,
 def _find_by_snapshot(
     layer, event: AuditEvent,
     resolve_ambiguity: bool = False,
+    exclude_fids: Optional[set] = None,
 ) -> Optional[int]:
     """Scan the layer for the single feature that matches event's snapshot.
 
@@ -224,6 +225,12 @@ def _find_by_snapshot(
     unrelated data is bounded because matches are strictly identical on
     geometry AND every attribute, so the kept feature carries the same
     semantics as the deleted one.
+
+    When *exclude_fids* is provided, features whose ``id()`` is in the set
+    are skipped during the scan. Used by ``_buffer_delete`` to avoid
+    matching freshly-inserted compensatory features (their geometry equals
+    the OLD snapshot of the user DELETE event and can mascarade as the
+    INSERT target we want to undo).
 
     Strict matching is used because callers may use the result for a
     *destructive* operation (undo of a previous insert).
@@ -259,9 +266,13 @@ def _find_by_snapshot(
     _diffs: List[str] = []
     _null_skips: List[str] = []
     _geom_ok_fids: List[int] = []
+    excluded_count = 0
     try:
         for feature in source(request):
             scanned += 1
+            if exclude_fids and feature.id() in exclude_fids:
+                excluded_count += 1
+                continue
             if expected_geom is not None and not feature_matches_geometry(
                     feature, expected_geom):
                 continue
@@ -289,6 +300,10 @@ def _find_by_snapshot(
     except Exception as exc:
         flog(f"SNAP_SCAN eid={event.event_id} phase=geom SCAN_ERR={exc}", "WARNING")
         return None
+    if excluded_count > 0:
+        flog(f"SNAP_SCAN eid={event.event_id} phase=geom "
+             f"excluded={excluded_count} fids (comp-INSERT collision guard)",
+             "DEBUG")
 
     null_skip_set = list(set(_null_skips))[:4]
     flog(f"SNAP_SCAN eid={event.event_id} phase=geom "
@@ -302,12 +317,26 @@ def _find_by_snapshot(
             d.split(':')[1].split('(')[0] for d in _diffs if ':' in d
         )
         if len(_failing_fields) == 1:
-            _lenient_fid = max(_geom_ok_fids)
-            flog(f"SNAP_SCAN eid={event.event_id} lenient_match: "
-                 f"{len(_geom_ok_fids)} geom candidate(s) all fail on field "
-                 f"'{next(iter(_failing_fields))}' → max-fid={_lenient_fid} accepted "
-                 f"diffs={_diffs[:3]}", "WARNING")
-            return _lenient_fid
+            if len(_geom_ok_fids) == 1:
+                _lenient_fid = _geom_ok_fids[0]
+                flog(f"SNAP_SCAN eid={event.event_id} lenient_match: "
+                     f"1 geom candidate fails on field "
+                     f"'{next(iter(_failing_fields))}' → fid={_lenient_fid} accepted "
+                     f"diffs={_diffs[:3]}", "WARNING")
+                return _lenient_fid
+            elif resolve_ambiguity and len(_geom_ok_fids) <= 5:
+                _lenient_fid = max(_geom_ok_fids)
+                flog(f"SNAP_SCAN eid={event.event_id} lenient_match+max_fid: "
+                     f"{len(_geom_ok_fids)} geom candidates fail on field "
+                     f"'{next(iter(_failing_fields))}' → chosen={_lenient_fid} "
+                     f"fids={_geom_ok_fids[:5]} (RW-15)", "WARNING")
+                return _lenient_fid
+            else:
+                flog(f"SNAP_SCAN eid={event.event_id} lenient_REFUSED: "
+                     f"{len(_geom_ok_fids)} geom candidates fail on field "
+                     f"'{next(iter(_failing_fields))}' → ambiguous, skip "
+                     f"fids={_geom_ok_fids[:5]}", "WARNING")
+                return None
 
     if scanned == 0 and has_geom_filter and not matches:
         _diffs_fb: List[str] = []
@@ -315,6 +344,8 @@ def _find_by_snapshot(
         try:
             for feature in source(QgsFeatureRequest()):
                 scanned += 1
+                if exclude_fids and feature.id() in exclude_fids:
+                    continue
                 attrs_ok = True
                 for hist_name, idx in relevant:
                     expected_val = expected_attrs.get(hist_name)
@@ -600,17 +631,36 @@ def _restore_dispatch():
     }
 
 
-def _undo_dispatch():
-    """Return {operation_type: handler(layer, event) -> dict}."""
-    return {
-        "UPDATE": _undo_update_restore,
-        "DELETE": lambda layer, event: restore_inserted_feature(layer, event),
-        "INSERT": _undo_insert_restore,
-    }
-
-
 def _unsupported_result(operation_type: str) -> Dict[str, Any]:
     return {"success": False, "message": f"Unsupported: {operation_type}"}
+
+
+def _classify_restore_result(result: Dict[str, Any]) -> str:
+    """Map a restore step result dict to a stable reason code.
+
+    See `core.restore_executor` for the reason code constants. The mapping
+    is intentionally based on STABLE substrings of the message field plus
+    the explicit `status` field for geometry drift, so legacy code paths
+    that did not yet tag results still classify correctly.
+    """
+    msg = (result.get("message") or "").lower()
+    status = (result.get("status") or "")
+    skipped = bool(result.get("skipped"))
+    success = bool(result.get("success"))
+
+    if status == "SKIPPED_GEOMETRY_DRIFT" or "drift" in msg and "tolerance" in msg:
+        return "geometry_drift"
+    if (
+        "target feature absent" in msg
+        or "feature already absent" in msg
+        or "identity mismatch" in msg
+    ):
+        return "target_absent"
+    if success and skipped:
+        return "skipped_idempotent"
+    if success:
+        return "applied"
+    return "failed"
 
 
 def restore_batch(layer, events: List[AuditEvent],
@@ -624,6 +674,9 @@ def restore_batch(layer, events: List[AuditEvent],
         fid_cache = build_fid_cache(layer, events)
     succeeded = []
     failed = {}
+    skipped_idempotent: List[int] = []
+    failed_target_absent: List[int] = []
+    failed_geometry_drift: List[int] = []
     traces = []
     dispatch = _restore_dispatch()
 
@@ -636,6 +689,14 @@ def restore_batch(layer, events: List[AuditEvent],
             else:
                 result = handler(layer, event, fid_cache)
 
+            reason = _classify_restore_result(result)
+            if reason == "target_absent":
+                failed_target_absent.append(eid)
+            elif reason == "geometry_drift":
+                failed_geometry_drift.append(eid)
+            elif reason == "skipped_idempotent":
+                skipped_idempotent.append(eid)
+
             if result["success"]:
                 succeeded.append(eid)
                 trace = build_restore_trace_event(event, layer)
@@ -647,11 +708,22 @@ def restore_batch(layer, events: List[AuditEvent],
             failed[eid] = str(e)
             flog(f"restore_batch: error on event {eid}: {e}", "ERROR")
 
+    flog(
+        f"restore_batch: breakdown succeeded={len(succeeded)} "
+        f"failed={len(failed)} skipped_idempotent={len(skipped_idempotent)} "
+        f"failed_target_absent={len(failed_target_absent)} "
+        f"failed_geometry_drift={len(failed_geometry_drift)}",
+        "INFO",
+    )
+
     return RestoreReport(
         succeeded=succeeded,
         failed=failed,
         total_requested=len(events),
         trace_events=tuple(traces),
+        skipped_idempotent=skipped_idempotent,
+        failed_target_absent=failed_target_absent,
+        failed_geometry_drift=failed_geometry_drift,
     )
 
 
@@ -661,6 +733,11 @@ def undo_restore_batch(layer, events: List[AuditEvent]) -> RestoreReport:
     UPDATE  -> re-apply post-edit ('new') attribute values + new_geometry_wkb
     DELETE  -> delete the feature that was re-inserted by the restore
     INSERT  -> re-insert the feature that was deleted by the restore
+
+    Events are reversed before processing (RW-16): the Rewind applies
+    compensations in reverse-chronological order; the undo must unwind
+    them in forward-chronological order so that a re-INSERT precedes
+    the UPDATE that depends on its existence.
     """
     layer_error = validate_restore_layer_state(layer)
     if layer_error:
@@ -668,21 +745,28 @@ def undo_restore_batch(layer, events: List[AuditEvent]) -> RestoreReport:
         return RestoreReport([], failed, len(events), ())
     succeeded = []
     failed = {}
-    dispatch = _undo_dispatch()
+
+    ordered_events = list(reversed(events))
+    fid_cache = build_fid_cache(layer, ordered_events)
 
     layer_name = layer.name() if layer and hasattr(layer, 'name') else '?'
-    flog(f"undo_restore_batch: layer={layer_name!r} n_events={len(events)}")
-    for event in events:
+    flog(f"undo_restore_batch: layer={layer_name!r} n_events={len(ordered_events)} "
+         f"fid_cache_size={len(fid_cache)}")
+    for event in ordered_events:
         eid = event.event_id or 0
         try:
             identity_short = (event.feature_identity_json or '')[:80]
             flog(f"undo_restore_batch: dispatch op={event.operation_type} "
                  f"eid={eid} identity={identity_short}")
-            handler = dispatch.get(event.operation_type)
-            if handler is None:
-                result = _unsupported_result(event.operation_type)
+            op = event.operation_type
+            if op == "UPDATE":
+                result = _undo_update_restore(layer, event, fid_cache)
+            elif op == "DELETE":
+                result = restore_inserted_feature(layer, event, fid_cache)
+            elif op == "INSERT":
+                result = _undo_insert_restore(layer, event)
             else:
-                result = handler(layer, event)
+                result = _unsupported_result(op)
 
             skipped = result.get('skipped', False)
             flog(f"undo_restore_batch: result op={event.operation_type} eid={eid} "
@@ -718,8 +802,14 @@ def _undo_update_restore(layer, event: AuditEvent,
 
     target_fid = _find_target_feature(layer, identity, fid_cache)
     if target_fid is None:
-        flog(f"UNDO_UPD eid={event.event_id} target=not_found", "WARNING")
-        return {"success": False, "message": "Target feature not found"}
+        target_fid = _find_by_snapshot(layer, event, resolve_ambiguity=True)
+        if target_fid is not None:
+            flog(f"UNDO_UPD eid={event.event_id} fid_miss→snapshot_hit "
+                 f"fid={target_fid}")
+        else:
+            flog(f"UNDO_UPD eid={event.event_id} target=not_found "
+                 f"(fid_miss + snapshot_miss)", "WARNING")
+            return {"success": False, "message": "Target feature not found"}
 
     new_attrs = reconstruct_new_attributes(event)
     field_mapping = _build_safe_mapping(check.drift, event)
