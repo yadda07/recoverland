@@ -22,12 +22,13 @@ from .core import (
     GeometryPreviewManager,
     plan_event_restore, preflight_check,
     format_plan_summary, format_preflight_report,
-    find_target_layer,
+    find_target_layer, cleanup_temp_layers,
     is_layer_audit_field,
     generate_trace_id,
     get_event_by_id, fetch_events_by_ids,
     _BLOB_MARKER,
 )
+from .core.observability import log_state_transition
 from .journal_info_bar import JournalInfoBar, SmartBarState, SmartBarTileState
 from .journal_maintenance import JournalMaintenanceDialog
 from .local_search_thread import LocalSearchThread
@@ -68,6 +69,28 @@ _MIN_RESTORE_ANIMATION_SEC = 1.8
 class RecoverDialog(QDialog, LoggerMixin):
     """Main dialog for RecoverLand plugin."""
 
+    # Critical lifecycle flags whose every transition is logged. Stuck
+    # values here are the root cause of "rewind blocked" / "undo button
+    # never re-enables" classes of bug, so we trace them automatically.
+    _WATCHED_ATTRS = (
+        "_is_recovering",
+        "_restore_in_progress",
+        "_last_restore_by_ds",
+        "_last_restore_events",
+        "_pending_rewind_events",
+        "_active_restore_trace_id",
+        "_restore_runner",
+    )
+
+    def __setattr__(self, name: str, value):
+        if name in type(self)._WATCHED_ATTRS:
+            try:
+                old = self.__dict__.get(name, "<unset>")
+                log_state_transition("RecoverDialog", name, old, value)
+            except Exception:  # pragma: no cover - logging never breaks setters
+                pass
+        super().__setattr__(name, value)
+
     def __init__(self, iface, journal=None, tracker=None,
                  write_queue=None):
         flog("RecoverDialog.__init__: START")
@@ -105,6 +128,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._last_restore_events = None
         self._last_restore_by_ds = None
         self._pending_rewind_events = None
+        self._pending_cycle_stats = None
         self._active_search_trace_id = ""
         self._active_restore_trace_id = ""
         self._dialog_read_conn = None
@@ -1167,7 +1191,10 @@ class RecoverDialog(QDialog, LoggerMixin):
             dlg.exec()
         else:
             dlg.exec_()
-        self._refresh_smart_bar()
+        self._stats_cache.invalidate()
+        self._close_dialog_read_conn()
+        self._refresh_journal_status()
+        flog("_open_maintenance: stats invalidated and refresh requested after maintenance")
 
     def _build_empty_result_suggestion(self) -> str:
         """UX-B02: Build contextual suggestion when search returns 0 results."""
@@ -1430,7 +1457,14 @@ class RecoverDialog(QDialog, LoggerMixin):
     _SLIDER_DEFAULT_OFFSET_SECS = 600
 
     def _refresh_slider_bounds(self) -> None:
-        """Configure slider bounds from the stats cache (no live query)."""
+        """Configure slider bounds from the stats cache (no live query).
+
+        The slider minimum is set 1 second before the oldest event so that
+        when the slider is at its lowest position, the exclusive cutoff (>)
+        still includes the oldest event.  Without this offset, events at
+        exactly the oldest timestamp are excluded and the rewind finds 0
+        results — the root cause of "rewind broken after purge".
+        """
         if self._stats_cache.is_empty():
             self.time_slider.disable()
             return
@@ -1443,6 +1477,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             flog(f"slider_bounds: cannot parse cached min date: {oldest_str}", "WARNING")
             self.time_slider.disable()
             return
+        oldest_dt = oldest_dt.addSecs(-1)
         newest_dt = QDateTime.currentDateTime()
         max_str = self._stats_cache.global_max_date()
         initial_dt = None
@@ -1592,6 +1627,8 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.recover_button.setEnabled(True)
             return
         if self._is_recovering:
+            flog("recover_and_load: blocked, restore already in progress", "WARNING")
+            self.recover_button.setEnabled(True)
             return
         self._is_recovering = True
         self.enable_controls(False)
@@ -1648,14 +1685,16 @@ class RecoverDialog(QDialog, LoggerMixin):
             qlog(self.tr("Cochez au moins une couche."), "WARNING")
             return
 
-        cutoff = RestoreCutoff(CutoffType.BY_DATE, cutoff_iso, inclusive=False)
+        # Inclusive=True: rewind compensates events committed within the
+        # same second as the snapshot (cf. core.restore_contracts).
+        cutoff = RestoreCutoff(CutoffType.BY_DATE, cutoff_iso, inclusive=True)
         self._version_restore_cutoff = cutoff
         trace_id = generate_trace_id()
         self._active_restore_trace_id = trace_id
         undo_layers = len(self._last_restore_by_ds) if self._last_restore_by_ds else 0
         undo_events = (sum(len(v) for v in self._last_restore_by_ds.values())
                        if self._last_restore_by_ds else 0)
-        include_traces = False
+        include_traces = True
         flog(f"[{trace_id}] recover_version: start scope={len(checked_fps)} layer(s) "
              f"cutoff={cutoff_iso} undo_state=layers={undo_layers}/events={undo_events} "
              f"include_traces={include_traces}")
@@ -1697,16 +1736,18 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _on_version_fetch_done(self, events) -> None:
         """Handle events fetched by background thread; run confirmations on main thread."""
         from .core.restore_contracts import MAX_EVENTS_PER_RESTORE, WARN_EVENTS_THRESHOLD
-        from .core import collapse_rewind_events
+        from .core import collapse_rewind_events_with_stats
 
         raw_count = len(events)
-        events = collapse_rewind_events(events)
+        events, dedup_stats = collapse_rewind_events_with_stats(events)
         total_count = len(events)
         cutoff_dt = getattr(self, '_version_cutoff_dt', None)
         trace_id = self._active_restore_trace_id
         prior_rewind = bool(self._last_restore_by_ds)
         prior_count = (sum(len(v) for v in self._last_restore_by_ds.values())
                        if self._last_restore_by_ds else 0)
+        # Stash dedup stats so the runner can fold them into CYCLE_SUMMARY.
+        self._pending_cycle_stats = dict(dedup_stats)
         flog(f"[{trace_id}] on_version_fetch_done: raw={raw_count} "
              f"collapsed={total_count} "
              f"prior_rewind={prior_rewind} prior_events={prior_count}")
@@ -1716,6 +1757,17 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         if total_count == 0:
             if self._last_restore_by_ds:
+                dropped = dedup_stats.get('dedup_dropped', 0)
+                traces_active = dedup_stats.get('traces_active', 0)
+                if dropped > 0 and traces_active > 0:
+                    flog(f"[{trace_id}] on_version_fetch_done: "
+                         f"dedup_dropped={dropped} traces_active={traces_active} "
+                         f"events neutralized by prior rewind traces; "
+                         f"auto-undo + re-fetch")
+                    self._pending_rewind_events = None
+                    self._force_refetch_after_undo = True
+                    self._auto_undo_for_rewind()
+                    return
                 n_undo = sum(len(v) for v in self._last_restore_by_ds.values())
                 reply = QMessageBox.question(
                     self,
@@ -1730,8 +1782,10 @@ class RecoverDialog(QDialog, LoggerMixin):
                     self.enable_controls(True)
                     self.recover_button.setEnabled(True)
                     return
-                flog(f"auto-undo: slider at current date, returning to current state ({n_undo} entities)")
+                flog(f"auto-undo: slider at current date, returning to current state ({n_undo} entities) "
+                     f"force_refetch=True (RW-18)")
                 self._pending_rewind_events = None
+                self._force_refetch_after_undo = True
                 self._auto_undo_for_rewind()
                 return
             if trace_id:
@@ -1843,23 +1897,46 @@ class RecoverDialog(QDialog, LoggerMixin):
             flog(f"auto-undo: {result.total_fail} failures: {result.errors[:5]}", "WARNING")
             qlog(self.tr(
                 "Annulation du Rewind precedent partielle: {fail} entite(s) "
-                "n'ont pas pu etre remises a l'etat actuel. Le nouveau Rewind "
-                "part d'un etat possiblement incoherent."
+                "n'ont pas pu etre localisees (FID deplace). "
+                "Le Rewind continue malgre tout."
             ).format(fail=result.total_fail), "WARNING")
         events = getattr(self, '_pending_rewind_events', None)
         self._pending_rewind_events = None
+        force_refetch = getattr(self, '_force_refetch_after_undo', False)
+        self._force_refetch_after_undo = False
         undo_by_ds = getattr(result, 'by_ds', {}) or {}
         before = getattr(self, '_undo_counts_before', {})
         self._rewind_count_snapshot("after_undo", undo_by_ds, before=before)
         self._undo_counts_before = {}
         flog(f"on_auto_undo_then_rewind: undo_ok={result.total_ok} "
              f"undo_fail={result.total_fail} "
-             f"pending_events={len(events) if events else 0}")
-        if events:
-            for e in events:
-                flog(f"  -> pending eid={e.event_id} op={e.operation_type} "
-                     f"identity={(e.feature_identity_json or '')[:80]}")
-            self._execute_version_restore(events)
+             f"pending_events_stale={len(events) if events else 0} "
+             f"force_refetch={force_refetch}")
+        if events or force_refetch:
+            # RW-stale-dedup fix: the `_pending_rewind_events` list was produced
+            # by `collapse_rewind_events_with_stats` BEFORE this auto-undo.
+            # It dropped every user event whose trace (from the prior rewind we
+            # just undid) was still flagged active. Applying it now would
+            # re-play only the residual "always-skipped" events, masking the
+            # actual rewind. Discard the stale plan, invalidate the undone
+            # events' traces, and re-run fetch+dedup against the current state.
+            undone_eids = [
+                e.event_id for evts in undo_by_ds.values()
+                for e in evts if e.event_id
+            ]
+            invalidated_n = 0
+            if undone_eids:
+                invalidated_n = self._invalidate_trace_events(undone_eids)
+                flog(f"auto-undo: trace invalidation: "
+                     f"undone_eids_n={len(undone_eids)} "
+                     f"rows_updated={invalidated_n} "
+                     f"(re-fetch will dedup against current state)")
+                if invalidated_n == 0:
+                    flog("auto-undo: WARNING no traces invalidated despite "
+                         f"{len(undone_eids)} undone event(s); next fetch "
+                         "will likely still see stale dedup",
+                         "WARNING")
+            self._refetch_after_auto_undo()
         else:
             self._restore_in_progress = False
             self._is_recovering = False
@@ -1871,6 +1948,88 @@ class RecoverDialog(QDialog, LoggerMixin):
                 qlog(self.tr("{count} entite(s) remise(s) a l'etat actuel.").format(
                     count=result.total_ok))
                 self.iface.mapCanvas().refresh()
+
+    def _refetch_after_auto_undo(self) -> None:
+        """Re-run the version fetch after auto-undo invalidated stale traces.
+
+        Routes the result to ``_on_post_undo_fetch_done`` which re-runs dedup
+        and applies the fresh plan without re-prompting the user (they already
+        confirmed before the auto-undo).
+        """
+        cutoff = self._version_restore_cutoff
+        trace_id = self._active_restore_trace_id
+        if cutoff is None:
+            flog("refetch_after_auto_undo: no cutoff saved -> abort", "ERROR")
+            self._restore_in_progress = False
+            self._is_recovering = False
+            self._stop_logo_activity()
+            self.progress_bar.setVisible(False)
+            self.enable_controls(True)
+            self.recover_button.setEnabled(True)
+            return
+        checked_fps = self._get_version_checked_fingerprints()
+        if not checked_fps:
+            flog("refetch_after_auto_undo: no checked layers -> abort",
+                 "WARNING")
+            self._restore_in_progress = False
+            self._is_recovering = False
+            self._stop_logo_activity()
+            self.progress_bar.setVisible(False)
+            self.enable_controls(True)
+            self.recover_button.setEnabled(True)
+            return
+        flog(f"[{trace_id}] refetch_after_auto_undo: "
+             f"scope={len(checked_fps)} layer(s) cutoff_reuse=True")
+
+        if (self._version_fetch_thread
+                and self._version_fetch_thread.isRunning()):
+            self._version_fetch_thread.stop()
+            self._version_fetch_thread.wait(500)
+
+        self._version_fetch_thread = VersionFetchThread(
+            self._journal, checked_fps, cutoff, trace_id=trace_id,
+            include_traces=True)
+        self._version_fetch_thread.events_ready.connect(
+            self._on_post_undo_fetch_done)
+        self._version_fetch_thread.error_occurred.connect(
+            self._on_version_fetch_error)
+        self._version_fetch_thread.start()
+
+    def _on_post_undo_fetch_done(self, events) -> None:
+        """Handle re-fetched events after auto-undo: re-dedup and execute.
+
+        User already confirmed before the auto-undo, so skip volume warnings
+        and the date confirmation dialog. The cutoff is unchanged.
+        """
+        from .core import collapse_rewind_events_with_stats
+
+        raw_count = len(events)
+        events, dedup_stats = collapse_rewind_events_with_stats(events)
+        self._pending_cycle_stats = dict(dedup_stats)
+        trace_id = self._active_restore_trace_id
+        flog(f"[{trace_id}] on_post_undo_fetch_done: raw={raw_count} "
+             f"collapsed={len(events)}")
+        for e in events:
+            flog(f"  -> active eid={e.event_id} op={e.operation_type} "
+                 f"identity={(e.feature_identity_json or '')[:80]}")
+
+        if not events:
+            flog("on_post_undo_fetch_done: no active events after re-dedup "
+                 "-> finish")
+            self._restore_in_progress = False
+            self._is_recovering = False
+            self._stop_logo_activity()
+            self.progress_bar.setVisible(False)
+            self.enable_controls(True)
+            self.recover_button.setEnabled(True)
+            if trace_id:
+                self._active_restore_trace_id = ""
+            qlog(self.tr(
+                "Auto-undo termine. Aucun evenement supplementaire a rejouer."
+            ))
+            return
+
+        self._execute_version_restore(events)
 
     def _execute_version_restore(self, events) -> None:
         """Execute reverse replay restore (async, strict atomic per layer)."""
@@ -1906,7 +2065,10 @@ class RecoverDialog(QDialog, LoggerMixin):
             write_queue=self._write_queue,
             tracker=self._tracker, trace_id=trace_id,
             parent=self,
+            extra_stats=getattr(self, '_pending_cycle_stats', None),
         )
+        # Consume the stash; subsequent runs must repopulate it.
+        self._pending_cycle_stats = None
         runner.progress.connect(self._on_restore_runner_progress)
         runner.finished.connect(self._on_version_restore_done)
         self._restore_runner = runner
@@ -1920,6 +2082,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         trace_id = self._active_restore_trace_id
         self._restore_in_progress = False
         self._restore_runner = None
+        cleanup_temp_layers()
         self.progress_bar.setValue(100)
         self._stop_logo_activity()
         if trace_id:
@@ -2489,6 +2652,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         trace_id = self._active_restore_trace_id
         self._restore_in_progress = False
         self._restore_runner = None
+        cleanup_temp_layers()
         self.progress_bar.setValue(100)
         if trace_id:
             started = self._restore_started_at
@@ -2608,25 +2772,107 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.iface.mapCanvas().refreshAllLayers()
 
         if result.total_ok > 0 and result.by_ds:
-            undone_ids = [
+            # RW-stale-dedup symmetry: a manual undo that reverts a previous
+            # rewind's data MUST also invalidate the corresponding traces.
+            # Otherwise the next rewind on the same scope would see those
+            # traces as still "active", dedup would neutralise the matching
+            # user events, and the rewind would collapse to a no-op (or to
+            # the residual always-skipped events). Until 2026-05 this branch
+            # said "kept traces active so dedup will neutralize them", but
+            # the actual UPDATE silently failed (readonly DB), so the
+            # documented behaviour never took effect. Restoring DB
+            # consistency makes the latent bug visible; invalidate instead.
+            ok_eids = [
                 e.event_id for evts in result.by_ds.values()
-                for e in evts if e.event_id is not None
+                for e in evts if e.event_id
             ]
-            if undone_ids:
+            if result.failed_eids:
+                n_failed = self._invalidate_trace_events(result.failed_eids)
+                flog(f"undo_done: trace invalidation (failed): "
+                     f"failed_eids_n={len(result.failed_eids)} "
+                     f"rows_updated={n_failed}")
+            n_ok = self._invalidate_trace_events(ok_eids) if ok_eids else 0
+            flog(f"undo_done: trace invalidation (succeeded): "
+                 f"ok_eids_n={len(ok_eids)} rows_updated={n_ok} "
+                 f"(rewind on same scope will now see those events as "
+                 f"active again)")
+
+    def _invalidate_trace_events(self, undone_ids: list) -> int:
+        """Soft-delete trace events referencing undone event IDs (RW-02).
+
+        Uses a dedicated write connection (NOT a read-only one) because the
+        ``audit_event`` table is being mutated. SQLite WAL serialises writers
+        so concurrent activity from the WriteQueue is safe but may briefly
+        block on the file lock.
+
+        Returns the number of rows actually invalidated. Returns 0 on
+        failure or when no matching trace exists.
+        """
+        from datetime import datetime, timezone
+        if not undone_ids:
+            return 0
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = None
+        try:
+            conn = self._journal.create_write_connection()
+            ph = ','.join('?' * len(undone_ids))
+            cursor = conn.execute(
+                f"UPDATE audit_event SET invalidated_at = ? "  # nosec B608
+                f"WHERE restored_from_event_id IN ({ph}) "
+                f"AND invalidated_at IS NULL",
+                [now_iso] + undone_ids,
+            )
+            rowcount = cursor.rowcount
+            conn.commit()
+            flog(f"_invalidate_trace_events: undone_ids_n={len(undone_ids)} "
+                 f"rows_updated={rowcount} at={now_iso}")
+            return rowcount if rowcount is not None and rowcount >= 0 else 0
+        except Exception as exc:
+            flog(f"_invalidate_trace_events: trace invalidation failed: "
+                 f"{exc}", "WARNING")
+            return 0
+        finally:
+            if conn is not None:
                 try:
-                    conn = getattr(self._journal, '_conn', None)
-                    if conn is not None:
-                        ph = ','.join('?' * len(undone_ids))
-                        conn.execute(
-                            f"DELETE FROM audit_event "
-                            f"WHERE restored_from_event_id IN ({ph})",
-                            undone_ids,
-                        )
-                        conn.commit()
-                        flog(f"undo_last: deleted trace events for "
-                             f"{len(undone_ids)} undone event(s)")
-                except Exception as exc:
-                    flog(f"undo_last: trace cleanup failed: {exc}", "WARNING")
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _invalidate_orphan_traces_on_open(self) -> None:
+        """Purge all active trace events that have no in-memory undo state.
+
+        Called at dialog open (when _last_restore_by_ds is None) and on every
+        project switch so that the rewind dedup never sees traces from a
+        previous QGIS session that were never invalidated.
+        """
+        if self._journal is None or not getattr(self._journal, 'is_open', False):
+            flog("_invalidate_orphan_traces_on_open: skipped journal=None or closed")
+            return
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn = None
+        try:
+            conn = self._journal.create_write_connection()
+            cursor = conn.execute(
+                "UPDATE audit_event SET invalidated_at = ? "
+                "WHERE restored_from_event_id IS NOT NULL "
+                "AND invalidated_at IS NULL",
+                [now_iso],
+            )
+            rowcount = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
+            conn.commit()
+            flog(
+                f"_invalidate_orphan_traces_on_open: "
+                f"legacy_traces_purged={rowcount} at={now_iso}"
+            )
+        except Exception as exc:
+            flog(f"_invalidate_orphan_traces_on_open: failed: {exc}", "WARNING")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def reset_undo_state(self) -> None:
         """Drop the last-restore memory (called by the plugin on project switch).
@@ -2639,6 +2885,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._pending_rewind_events = None
         if hasattr(self, 'undo_last_btn'):
             self.undo_last_btn.setEnabled(False)
+        self._invalidate_orphan_traces_on_open()
         if had_state:
             flog("RecoverDialog: undo state reset (project switched)")
 
@@ -2667,6 +2914,9 @@ class RecoverDialog(QDialog, LoggerMixin):
     def showEvent(self, event):
         super().showEvent(event)
         flog("RecoverDialog: shown")
+        self._stats_cache.invalidate()
+        if not self._last_restore_by_ds:
+            self._invalidate_orphan_traces_on_open()
         if hasattr(self, '_layer_refresh_timer'):
             self._layer_refresh_timer.start()
         self._refresh_journal_status()
@@ -2680,12 +2930,34 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def closeEvent(self, event):
         """Close event — data stays in its current state (rewound or not)."""
+        if getattr(self, '_restore_in_progress', False):
+            from qgis.PyQt.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self,
+                self.tr("Restauration en cours"),
+                self.tr(
+                    "Une restauration est en cours.\n"
+                    "Fermer maintenant annulera la couche en cours "
+                    "et perdra les modifications non encore appliquees.\n\n"
+                    "Fermer quand meme ?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                flog("closeEvent: restore in progress, user chose to keep open")
+                event.ignore()
+                return
+            flog("closeEvent: restore in progress, user confirmed close")
         flog("RecoverDialog: closing")
         self.cleanup_resources()
         event.accept()
 
     def reject(self):
-        """Reject dialog"""
+        """Reject dialog (Escape key or external close)."""
+        if getattr(self, '_restore_in_progress', False):
+            flog("reject: restore in progress, ignoring Escape/reject")
+            return
         self.cleanup_resources()
         super().reject()
 
