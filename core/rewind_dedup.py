@@ -30,7 +30,7 @@ the captured NEW.
 
 Zero QGIS dependency. Pure deterministic logic.
 """
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from .audit_backend import AuditEvent
 from .logger import flog
@@ -42,8 +42,91 @@ def _entity_key(event: AuditEvent) -> str:
     return f"{event.datasource_fingerprint}::{event.feature_identity_json}"
 
 
+def _detect_fid_recycle(
+    events: List[AuditEvent],
+) -> Tuple[Dict[str, int], List[Tuple[str, int, int]]]:
+    """Detect FID-recycle patterns within a single fp lifeline.
+
+    Pattern of interest (BL-RW-P1-07, CR-1):
+        INSERT(fp=X, eid=A) -> DELETE(fp=X, eid=B>A) -> INSERT(fp=X, eid=C>B)
+
+    Two distinct logical entities share entity_fingerprint='fid:X'
+    because OGR/GPKG recycles the FID after the first DELETE. Without
+    splitting, both end up in the same dedup bucket.
+
+    Walks events ordered ASC by event_id and runs a per-fp state machine:
+        None        --INSERT--> open
+        open        --DELETE--> closed
+        closed      --INSERT--> open + SPLIT recorded
+        any         --UPDATE--> unchanged
+
+    Args:
+        events: any iterable of AuditEvent. event_id=None and missing
+            entity_fingerprint are skipped (defensive).
+
+    Returns:
+        fp_split_eid: dict {fp -> event_id of the most recent SPLIT}.
+        splits: list of (fp, first_eid, second_eid) for logging.
+    """
+    fp_split_eid: Dict[str, int] = {}
+    splits: List[Tuple[str, int, int]] = []
+    sorted_events = sorted(
+        [e for e in events
+         if e.event_id is not None and e.entity_fingerprint],
+        key=lambda e: e.event_id,
+    )
+    fp_state: Dict[str, str] = {}
+    fp_first_eid: Dict[str, int] = {}
+    for e in sorted_events:
+        fp = e.entity_fingerprint
+        op = e.operation_type
+        state = fp_state.get(fp)
+        if op == "INSERT":
+            if state == "closed":
+                fp_split_eid[fp] = e.event_id
+                splits.append((fp, fp_first_eid[fp], e.event_id))
+                fp_first_eid[fp] = e.event_id
+            elif state is None:
+                fp_first_eid[fp] = e.event_id
+            fp_state[fp] = "open"
+        elif op == "DELETE":
+            if state == "open":
+                fp_state[fp] = "closed"
+        # UPDATE: state unchanged
+    return fp_split_eid, splits
+
+
+def _apply_fid_recycle_rewrite(
+    events: List[AuditEvent],
+    fp_split_eid: Dict[str, int],
+) -> List[AuditEvent]:
+    """Rewrite entity_fingerprint to fp@<split_eid> for events on or
+    after a detected FID-recycle split.
+
+    Returns a new list; input is not mutated. Events without a matching
+    split are returned unchanged.
+    """
+    if not fp_split_eid:
+        return events
+    rewritten: List[AuditEvent] = []
+    for e in events:
+        fp = e.entity_fingerprint
+        if (fp and fp in fp_split_eid
+                and e.event_id is not None
+                and e.event_id >= fp_split_eid[fp]):
+            new_fp = f"{fp}@{fp_split_eid[fp]}"
+            rewritten.append(e._replace(entity_fingerprint=new_fp))
+        else:
+            rewritten.append(e)
+    return rewritten
+
+
 def _is_trace(event: AuditEvent) -> bool:
     return getattr(event, "restored_from_event_id", None) is not None
+
+
+def _is_invalidated(event: AuditEvent) -> bool:
+    return getattr(event, "invalidated_at", None) is not None
 
 
 def collapse_rewind_events(events: List[AuditEvent]) -> List[AuditEvent]:
@@ -61,40 +144,108 @@ def collapse_rewind_events(events: List[AuditEvent]) -> List[AuditEvent]:
         from the active set, so the same rewind can be replayed without
         accumulating duplicate features.
     """
-    if not events:
-        return []
+    active, _stats = collapse_rewind_events_with_stats(events)
+    return active
 
-    neutralised_user_eids = set()
+
+def collapse_rewind_events_with_stats(
+    events: List[AuditEvent],
+) -> Tuple[List[AuditEvent], Dict[str, int]]:
+    """Same as collapse_rewind_events but also returns canonical stats
+    suitable for ``log_cycle_summary`` consumption.
+
+    Stats keys:
+        raw, user, traces, traces_invalidated, traces_active,
+        dedup_active, dedup_dropped, dedup_redundant
+    """
+    if not events:
+        return [], {
+            "raw": 0, "user": 0,
+            "traces": 0, "traces_invalidated": 0, "traces_active": 0,
+            "dedup_active": 0, "dedup_dropped": 0, "dedup_redundant": 0,
+        }
+
+    # Pre-pass: detect FID-recycle (INSERT -> DELETE -> INSERT on the
+    # same entity_fingerprint) and rewrite entity_fingerprint of the
+    # second cycle so the per-entity bucketing below sees two distinct
+    # entities. CR-1 / BL-RW-P1-07.
+    fp_split_eid, fid_recycle_splits = _detect_fid_recycle(events)
+    for fp, first_eid, second_eid in fid_recycle_splits:
+        flog(f"rewind_dedup: fid_recycle_detected fp={fp} splits=2 "
+             f"first_eid={first_eid} second_eid={second_eid}")
+    if fp_split_eid:
+        events = _apply_fid_recycle_rewrite(events, fp_split_eid)
+
+    neutralised_user_eids: set = set()
+    neutralised_entity_keys: set = set()
+    eid_to_entity_key: Dict[int, str] = {}
     user_events: List[AuditEvent] = []
     trace_count = 0
+    invalidated_count = 0
     for event in events:
         if _is_trace(event):
             trace_count += 1
+            if _is_invalidated(event):
+                invalidated_count += 1
+                continue
             ref = event.restored_from_event_id
             if ref is not None:
                 neutralised_user_eids.add(ref)
+                key = _entity_key(event)
+                neutralised_entity_keys.add(key)
             continue
         user_events.append(event)
+        if event.event_id is not None:
+            eid_to_entity_key[event.event_id] = _entity_key(event)
 
-    active = [e for e in user_events
-              if e.event_id is None or e.event_id not in neutralised_user_eids]
-
-    dropped = [e for e in user_events
-               if e.event_id is not None and e.event_id in neutralised_user_eids]
+    active = []
+    dropped = []
+    for e in user_events:
+        if e.event_id is None:
+            active.append(e)
+            continue
+        eid_key = eid_to_entity_key.get(e.event_id)
+        if e.event_id in neutralised_user_eids or eid_key in neutralised_entity_keys:
+            dropped.append(e)
+        else:
+            active.append(e)
 
     flog(f"rewind_dedup: {len(events)} raw "
-         f"({len(user_events)} user, {trace_count} traces) -> "
+         f"({len(user_events)} user, {trace_count} traces, "
+         f"{invalidated_count} invalidated) -> "
          f"{len(active)} active "
-         f"({len(neutralised_user_eids)} neutralised by traces)")
+         f"({len(neutralised_user_eids)} by eid, "
+         f"{len(neutralised_entity_keys)} entity keys, "
+         f"{len(dropped)} total neutralised)")
     for e in dropped:
         flog(f"rewind_dedup: neutralised eid={e.event_id} "
              f"op={e.operation_type} "
              f"identity={(e.feature_identity_json or '')[:80]}")
 
-    return _collapse_user_chain(active)
+    chained, redundant = _collapse_user_chain_with_stats(active)
+    stats = {
+        "raw": len(events),
+        "user": len(user_events),
+        "traces": trace_count,
+        "traces_invalidated": invalidated_count,
+        "traces_active": trace_count - invalidated_count,
+        "dedup_dropped": len(dropped),
+        "dedup_redundant": redundant,
+        "dedup_active": len(chained),
+    }
+    return chained, stats
 
 
 _MAX_CHAIN = 10
+
+
+def _collapse_user_chain_with_stats(
+    events: List[AuditEvent],
+) -> Tuple[List[AuditEvent], int]:
+    """Same as _collapse_user_chain but also returns the count of events
+    eliminated by the chain collapse (raw_in - len(result))."""
+    result = _collapse_user_chain(events)
+    return result, max(len(events) - len(result), 0)
 
 
 def _collapse_user_chain(events: List[AuditEvent]) -> List[AuditEvent]:
@@ -141,9 +292,22 @@ def _collapse_user_chain(events: List[AuditEvent]) -> List[AuditEvent]:
     result: List[AuditEvent] = []
     skipped_entities = 0
     fused_entities = 0
+    cancelled_pairs = 0
 
     for key in order:
         chain = buckets[key]
+        if len(chain) == 1:
+            result.append(chain[0])
+            continue
+
+        # RW-20: cancel internal INSERT→DELETE pairs (sub-lifetimes that
+        # were both born and died within the rewind window).
+        chain_before = len(chain)
+        chain = _cancel_internal_lifetimes(chain)
+        cancelled_pairs += (chain_before - len(chain))
+        if not chain:
+            skipped_entities += 1
+            continue
         if len(chain) == 1:
             result.append(chain[0])
             continue
@@ -168,12 +332,52 @@ def _collapse_user_chain(events: List[AuditEvent]) -> List[AuditEvent]:
 
     raw = len(events)
     deduped = len(result)
-    if raw != deduped or fused_entities:
+    if raw != deduped or fused_entities or cancelled_pairs:
         flog(f"rewind_dedup: user_chain {raw} -> {deduped} events"
              f" ({raw - deduped} redundant, {skipped_entities} no-op,"
-             f" {fused_entities} fused)")
+             f" {fused_entities} fused, {cancelled_pairs} pair-cancelled RW-20)")
 
     return result
+
+
+def _cancel_internal_lifetimes(chain_desc: List[AuditEvent]) -> List[AuditEvent]:
+    """Cancel paired INSERT→DELETE sub-lifetimes within a single-entity chain.
+
+    Walk chronologically (ASC). Each INSERT opens a lifetime; each DELETE
+    closes the most recent open lifetime. Events of closed lifetimes are
+    dropped (feature was created and destroyed inside the rewind window;
+    no compensation needed). Events not enclosed in a closed lifetime
+    (orphan DELETE/UPDATE before first INSERT, or events of the still-open
+    final lifetime) are preserved.
+
+    Returns events in the original DESC order. Empty list = entire chain
+    cancels (caller treats as no-op).
+    """
+    chain_asc = list(reversed(chain_desc))
+    open_lifetimes: List[List[AuditEvent]] = []
+    orphans: List[AuditEvent] = []  # events with no enclosing INSERT
+    closed_count = 0
+    for event in chain_asc:
+        op = event.operation_type
+        if op == "INSERT":
+            open_lifetimes.append([event])
+        elif op == "DELETE":
+            if open_lifetimes:
+                open_lifetimes.pop()  # paired lifetime cancelled
+                closed_count += 1
+            else:
+                orphans.append(event)
+        else:  # UPDATE or other
+            if open_lifetimes:
+                open_lifetimes[-1].append(event)
+            else:
+                orphans.append(event)
+    if closed_count == 0:
+        return chain_desc  # nothing cancelled, preserve original
+    survivors_asc: List[AuditEvent] = list(orphans)
+    for lt in open_lifetimes:
+        survivors_asc.extend(lt)
+    return list(reversed(survivors_asc))
 
 
 def _intermediates_all_updates(chain: List[AuditEvent]) -> bool:
