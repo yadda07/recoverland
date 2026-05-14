@@ -376,11 +376,38 @@ def _buffer_delete(layer, event: AuditEvent,
                  f"target=none→snap={snapshot_fid}")
             target_fid = snapshot_fid
         else:
-            flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
-                 f"target=none snap=none→ABSENT", "WARNING")
+            # BL-RW-P0-02: idempotence proof requires the source event to
+            # be an INSERT (whose compensation is DELETE). In that case
+            # the feature is gone => undo already applied. For any other
+            # source op, target absence is a hard failure: we cannot
+            # prove the user state matches the desired one.
+            if event.operation_type == 'INSERT':
+                flog(
+                    f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
+                    f"target=none snap=none status=SKIPPED_IDEMPOTENT "
+                    f"reason_code=absent_vs_insert_comp "
+                    f"(undo of user INSERT already applied)",
+                    "INFO",
+                )
+                return {
+                    "success": True, "skipped": True,
+                    "status": "SKIPPED_IDEMPOTENT",
+                    "reason_code": "absent_vs_insert_comp",
+                    "message": "Skipped (idempotent): feature already absent",
+                }
+            flog(
+                f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
+                f"target=none snap=none status=FAILED "
+                f"reason_code=target_absent op={event.operation_type}",
+                "WARNING",
+            )
             _diagnose_snapshot_miss(layer, event)
-            return {"success": True, "skipped": True,
-                    "message": "Skipped: feature already absent"}
+            return {
+                "success": False,
+                "status": "FAILED",
+                "reason_code": "target_absent",
+                "message": "Failed: target feature absent",
+            }
     else:
         flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} target={target_fid}", "DEBUG")
 
@@ -404,11 +431,22 @@ def _buffer_delete(layer, event: AuditEvent,
                     "WARNING"
                 )
             else:
-                flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid}"
-                     f"→SKIP snap_mismatch trusted={trusted}", "WARNING")
-                return {"success": True,
-                        "skipped": True,
-                        "message": "Skipped: identity mismatch (FID-only)"}
+                # BL-RW-P0-02: identity mismatch is unprovable -> FAILED.
+                # We cannot demonstrate idempotence; aborting prevents
+                # destroying an unrelated feature that happens to share
+                # the FID.
+                flog(
+                    f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
+                    f"status=FAILED reason_code=identity_mismatch_fid_only "
+                    f"trusted={trusted}",
+                    "WARNING",
+                )
+                return {
+                    "success": False,
+                    "status": "FAILED",
+                    "reason_code": "identity_mismatch_fid_only",
+                    "message": "Failed: identity mismatch (FID-only)",
+                }
         else:
             flog(f"BUF_DEL eid={event.event_id} fp={fp} "
                  f"fid={target_fid}→snap={fallback_fid} recovered")
@@ -423,10 +461,19 @@ def _buffer_delete(layer, event: AuditEvent,
                 "message": "Already pending delete (OGR FID recycle)"}
 
     if not layer.deleteFeature(target_fid):
-        flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
-             f"DELETE_FAILED→SKIP (buffer refused)", "WARNING")
-        return {"success": True, "skipped": True,
-                "message": "Skipped: buffer deleteFeature refused"}
+        # BL-RW-P0-02: buffer refusal is a hard failure -> FAILED.
+        # We did not apply, did not prove idempotence; downgrade to FAIL.
+        flog(
+            f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
+            f"status=FAILED reason_code=buffer_refused",
+            "WARNING",
+        )
+        return {
+            "success": False,
+            "status": "FAILED",
+            "reason_code": "buffer_refused",
+            "message": "Failed: buffer deleteFeature refused",
+        }
     flog_kv(
         "INFO", "BUF_DEL", module="restore_executor",
         eid=event.event_id, fp=fp, fid=target_fid, status="deleted",
@@ -510,12 +557,21 @@ def _buffer_update(layer, event: AuditEvent,
                  f"eid={event.event_id} fid={fallback_fid}")
             target_fid = fallback_fid
         else:
-            flog(f"_buffer_update: target absent, skipping "
-                 f"eid={event.event_id} "
-                 f"identity_keys={list(identity.keys())}", "WARNING")
-            return {"success": True,
-                    "skipped": True,
-                    "message": "Skipped: target feature absent"}
+            # BL-RW-P0-02: UPDATE on an absent feature CANNOT be proven
+            # idempotent (the desired final state involves a feature
+            # that no longer exists). Hard failure.
+            flog(
+                f"_buffer_update: status=FAILED reason_code=target_absent "
+                f"eid={event.event_id} "
+                f"identity_keys={list(identity.keys())}",
+                "WARNING",
+            )
+            return {
+                "success": False,
+                "status": "FAILED",
+                "reason_code": "target_absent",
+                "message": "Failed: target feature absent",
+            }
     if remapped is not None:
         flog(f"_buffer_update: using fid_remap "
              f"eid={event.event_id} fid={target_fid}")
@@ -571,6 +627,7 @@ def _buffer_update(layer, event: AuditEvent,
                         "success": True,
                         "skipped": True,
                         "status": "SKIPPED_GEOMETRY_DRIFT",
+                        "reason_code": "geometry_drift",
                         "message": (
                             f"Skipped: makeValid drift {drift_units:.9f} "
                             f"exceeds tolerance {MAKEVALID_DRIFT_TOLERANCE}"

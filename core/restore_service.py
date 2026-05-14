@@ -638,17 +638,36 @@ def _unsupported_result(operation_type: str) -> Dict[str, Any]:
 def _classify_restore_result(result: Dict[str, Any]) -> str:
     """Map a restore step result dict to a stable reason code.
 
-    See `core.restore_executor` for the reason code constants. The mapping
-    is intentionally based on STABLE substrings of the message field plus
-    the explicit `status` field for geometry drift, so legacy code paths
-    that did not yet tag results still classify correctly.
+    See `core.restore_executor` for the reason code constants. The
+    classification prefers the explicit `reason_code` field when present
+    (BL-RW-P0-02 sites); otherwise it falls back to STABLE substrings of
+    the `message` field plus the `status` field, so legacy callers that
+    did not yet tag results still classify correctly.
+
+    Returned values are mutually exclusive and stable:
+        "applied", "skipped_idempotent", "target_absent",
+        "geometry_drift", "failed".
     """
+    reason_code = (result.get("reason_code") or "").strip()
+    if reason_code:
+        if reason_code == "absent_vs_insert_comp":
+            return "skipped_idempotent"
+        if reason_code in ("target_absent", "identity_mismatch_fid_only"):
+            return "target_absent"
+        if reason_code == "buffer_refused":
+            return "failed"
+        if reason_code in ("geometry_drift",):
+            return "geometry_drift"
+        # Unknown reason_code: fall through to legacy parsing.
+
     msg = (result.get("message") or "").lower()
     status = (result.get("status") or "")
     skipped = bool(result.get("skipped"))
     success = bool(result.get("success"))
 
-    if status == "SKIPPED_GEOMETRY_DRIFT" or "drift" in msg and "tolerance" in msg:
+    if status == "SKIPPED_GEOMETRY_DRIFT" or (
+        "drift" in msg and "tolerance" in msg
+    ):
         return "geometry_drift"
     if (
         "target feature absent" in msg
