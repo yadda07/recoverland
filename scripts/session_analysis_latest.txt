@@ -1,0 +1,465 @@
+RecoverLand — Analyse sessions  [2026-05-14 08:40:27]
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 06:55:04  (6 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  06:56:00  Score=71.1%
+       manq=-353  surp=+312  mod=~1932
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  06:56:32  Score=58.6%  ▼12.5pp
+       manq=-1 (-352✓)  surp=+94 (-218✓)  mod=~3271 (+1339✗)
+       couches OK=14  KO=21
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  06:56:46  Score=58.6%  ─0.0pp
+       manq=-1 (±0)  surp=+92 (-2✓)  mod=~3271 (±0)
+       couches OK=14  KO=21
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R4  06:56:54  Score=58.6%  ─0.0pp
+       manq=-1 (±0)  surp=+94 (+2✗)  mod=~3271 (±0)
+       couches OK=14  KO=21
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R5  06:56:55  Score=58.6%  ─0.0pp
+       manq=-1 (±0)  surp=+94 (±0)  mod=~3271 (±0)
+       couches OK=14  KO=21
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R6  06:57:08  Score=58.6%  ─0.0pp
+       manq=-1 (±0)  surp=+83 (-11✓)  mod=~3271 (±0)
+       couches OK=14  KO=21
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (71.1%)  |  Pire: R2 (58.6%)
+  Problèmes: 1 manquants | 83 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 07:08:43  (3 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  07:09:41  Score=54.9%
+       manq=-362  surp=+301  mod=~3245
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  07:10:18  Score=43.0%  ▼11.9pp
+       manq=-0 (-362✓)  surp=+78 (-223✓)  mod=~4553 (+1308✗)
+       couches OK=14  KO=21
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  07:10:58  Score=41.0%  ▼2.0pp
+       manq=-308 (+308✗)  surp=+307 (+229✗)  mod=~4408 (-145✓)
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (54.9%)  |  Pire: R3 (41.0%)
+  Problèmes: 308 manquants | 307 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 07:29:27  (1 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  07:30:45  Score=78.7%
+       manq=-1  surp=+529  mod=~1705
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (78.7%)  |  Pire: R1 (78.7%)
+  Problèmes: 1 manquants | 529 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 07:39:42  (1 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  07:44:03  Score=49.1%
+       manq=-0  surp=+574  mod=~4394
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (49.1%)  |  Pire: R1 (49.1%)
+  Problèmes: 574 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 07:55:05  (5 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  07:56:11  Score=81.5%
+       manq=-0  surp=+683  mod=~1700
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  07:57:30  Score=50.4%  ▼31.1pp
+       manq=-0 (±0)  surp=+723 (+40✗)  mod=~4561 (+2861✗)
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  07:58:07  Score=48.7%  ▼1.7pp
+       manq=-0 (±0)  surp=+121 (-602✓)  mod=~4720 (+159✗)
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R4  07:58:11  Score=48.7%  ─0.0pp
+       manq=-0 (±0)  surp=+127 (+6✗)  mod=~4724 (+4✗)
+       couches OK=11  KO=24
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R5  07:59:20  Score=50.3%  ▲1.6pp
+       manq=-0 (±0)  surp=+768 (+641✗)  mod=~4575 (-149✓)
+       couches OK=10  KO=25
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (81.5%)  |  Pire: R3 (48.7%)
+  Problèmes: 768 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 08:23:09  (1 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  08:28:11  Score=72.4%
+       manq=-60  surp=+42  mod=~2711
+       couches OK=19  KO=16
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (72.4%)  |  Pire: R1 (72.4%)
+  Problèmes: 60 manquants | 42 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 10:17:02  (1 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  10:17:56  Score=82.3%
+       manq=-0  surp=+10  mod=~1775
+       couches OK=26  KO=9
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (82.3%)  |  Pire: R1 (82.3%)
+  Problèmes: 10 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 10:18:06  (3 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  10:18:53  Score=79.1%
+       manq=-2  surp=+29  mod=~2102
+       couches OK=18  KO=17
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  10:19:15  Score=79.0%  ▼0.1pp
+       manq=-0 (-2✓)  surp=+36 (+7✗)  mod=~2106 (+4✗)
+       couches OK=18  KO=17
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  10:19:34  Score=79.1%  ▲0.1pp
+       manq=-0 (±0)  surp=+41 (+5✗)  mod=~2104 (-2✓)
+       couches OK=18  KO=17
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (79.1%)  |  Pire: R2 (79.0%)
+  Problèmes: 41 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 10:59:05  (1 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  11:00:10  Score=81.0%
+       manq=-11  surp=+85  mod=~1900
+       couches OK=13  KO=22
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (81.0%)  |  Pire: R1 (81.0%)
+  Problèmes: 11 manquants | 85 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 19:39:27  (3 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  19:39:55  Score=93.4%
+       manq=-0  surp=+8  mod=~227
+       couches OK=14  KO=7
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  19:40:12  Score=91.0%  ▼2.4pp
+       manq=-46 (+46✗)  surp=+6 (-2✓)  mod=~265 (+38✗)
+       couches OK=10  KO=11
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  19:40:27  Score=90.3%  ▼0.7pp
+       manq=-0 (-46✓)  surp=+101 (+95✗)  mod=~333 (+68✗)
+       couches OK=11  KO=10
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (93.4%)  |  Pire: R3 (90.3%)
+  Problèmes: 101 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 19:46:34  (3 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  19:48:31  Score=84.3%
+       manq=-2  surp=+26  mod=~555
+       couches OK=15  KO=6
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  19:48:39  Score=84.7%  ▲0.4pp
+       manq=-0 (-2✓)  surp=+3 (-23✓)  mod=~542 (-13✓)
+       couches OK=16  KO=5
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  19:48:48  Score=84.7%  ─0.0pp
+       manq=-0 (±0)  surp=+3 (±0)  mod=~542 (±0)
+       couches OK=16  KO=5
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R2 (84.7%)  |  Pire: R1 (84.3%)
+  Problèmes: 3 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-13 20:20:29  (3 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  20:21:13  Score=68.3%
+       manq=-2  surp=+30  mod=~1120
+       couches OK=8  KO=13
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  20:21:23  Score=68.3%  ─0.0pp
+       manq=-1 (-1✓)  surp=+42 (+12✗)  mod=~1121 (+1✗)
+       couches OK=8  KO=13
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  20:21:34  Score=68.3%  ─0.0pp
+       manq=-1 (±0)  surp=+51 (+9✗)  mod=~1121 (±0)
+       couches OK=8  KO=13
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (68.3%)  |  Pire: R1 (68.3%)
+  Problèmes: 1 manquants | 51 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 00:52:07  (3 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  00:52:57  Score=69.2%
+       manq=-0  surp=+2  mod=~1107
+       couches OK=12  KO=9
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  00:53:32  Score=68.8%  ▼0.4pp
+       manq=-1 (+1✗)  surp=+56 (+54✗)  mod=~1118 (+11✗)
+       couches OK=11  KO=10
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  00:53:39  Score=68.8%  ─0.0pp
+       manq=-1 (±0)  surp=+56 (±0)  mod=~1118 (±0)
+       couches OK=11  KO=10
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (69.2%)  |  Pire: R2 (68.8%)
+  Problèmes: 1 manquants | 56 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 01:05:15  (4 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  01:06:40  Score=72.4%
+       manq=-31  surp=+12  mod=~977
+       couches OK=8  KO=13
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  01:06:55  Score=73.4%  ▲1.0pp
+       manq=-0 (-31✓)  surp=+29 (+17✗)  mod=~969 (-8✓)
+       couches OK=8  KO=13
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  01:07:01  Score=73.4%  ─0.0pp
+       manq=-0 (±0)  surp=+29 (±0)  mod=~969 (±0)
+       couches OK=8  KO=13
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R4  01:07:15  Score=72.4%  ▼1.0pp
+       manq=-31 (+31✗)  surp=+17 (-12✓)  mod=~975 (+6✗)
+       couches OK=8  KO=13
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R2 (73.4%)  |  Pire: R1 (72.4%)
+  Problèmes: 31 manquants | 17 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 01:26:37  (3 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  01:27:35  Score=81.6%
+       manq=-1  surp=+169  mod=~668
+       couches OK=6  KO=15
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  01:27:47  Score=81.6%  ─0.0pp
+       manq=-1 (±0)  surp=+169 (±0)  mod=~668 (±0)
+       couches OK=6  KO=15
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  01:28:12  Score=81.6%  ─0.0pp
+       manq=-1 (±0)  surp=+169 (±0)  mod=~668 (±0)
+       couches OK=6  KO=15
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (81.6%)  |  Pire: R1 (81.6%)
+  Problèmes: 1 manquants | 169 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 01:36:20  (3 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  01:37:04  Score=82.5%
+       manq=-68  surp=+2  mod=~611
+       couches OK=11  KO=10
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  01:37:07  Score=82.5%  ─0.0pp
+       manq=-68 (±0)  surp=+2 (±0)  mod=~611 (±0)
+       couches OK=11  KO=10
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R3  07:04:32  Score=82.5%  ─0.0pp
+       manq=-68 (±0)  surp=+2 (±0)  mod=~611 (±0)
+       couches OK=11  KO=10
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (82.5%)  |  Pire: R1 (82.5%)
+  Problèmes: 68 manquants | 2 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 07:05:10  (2 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  07:05:44  Score=87.9%
+       manq=-46  surp=+10  mod=~420
+       couches OK=10  KO=11
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  R2  07:05:45  Score=87.9%  ─0.0pp
+       manq=-46 (±0)  surp=+10 (±0)  mod=~420 (±0)
+       couches OK=10  KO=11
+       [cycle] non lié (log tronqué ou Rewind hors session)
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (87.9%)  |  Pire: R1 (87.9%)
+  Problèmes: 46 manquants | 10 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 07:49:39  (2 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  07:50:19  Score=82.8%
+       manq=-0  surp=+25  mod=~658
+       couches OK=8  KO=13
+       [cycle] traces_active=0  plan=648  ok=572  skip=76  fail=0
+       [cycle] cutoff=?  raw=654  written=572
+
+  R2  07:50:22  Score=82.8%  ─0.0pp
+       manq=-0 (±0)  surp=+25 (±0)  mod=~658 (±0)
+       couches OK=8  KO=13
+       [cycle] traces_active=0  plan=648  ok=572  skip=76  fail=0
+       [cycle] cutoff=?  raw=654  written=572
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (82.8%)  |  Pire: R1 (82.8%)
+  Problèmes: 76 SNAP_SCAN failures | 25 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 07:52:05  (2 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  07:52:28  Score=91.1%
+       manq=-0  surp=+12  mod=~342
+       couches OK=14  KO=7
+       [cycle] traces_active=0  plan=288  ok=285  skip=3  fail=0
+       [cycle] cutoff=2026-05-14T05:52:05  raw=290  written=285
+
+  R2  07:52:31  Score=91.1%  ─0.0pp
+       manq=-0 (±0)  surp=+12 (±0)  mod=~342 (±0)
+       couches OK=14  KO=7
+       [cycle] traces_active=0  plan=288  ok=285  skip=3  fail=0
+       [cycle] cutoff=2026-05-14T05:52:05  raw=290  written=285
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (91.1%)  |  Pire: R1 (91.1%)
+  Problèmes: 3 SNAP_SCAN failures | 12 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 08:05:49  (2 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  08:07:14  Score=50.3%
+       manq=-0  surp=+1  mod=~1920
+       couches OK=8  KO=13
+       [cycle] traces_active=0  plan=554  ok=554  skip=0  fail=0
+       [cycle] cutoff=2026-05-14T05:52:48  raw=566  written=554
+
+  R2  08:07:18  Score=50.3%  ─0.0pp
+       manq=-0 (±0)  surp=+1 (±0)  mod=~1920 (±0)
+       couches OK=8  KO=13
+       [cycle] traces_active=0  plan=554  ok=554  skip=0  fail=0
+       [cycle] cutoff=2026-05-14T05:52:48  raw=566  written=554
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (50.3%)  |  Pire: R1 (50.3%)
+  Problèmes: 1 surplus
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 08:16:28  (2 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  08:17:15  Score=75.9%
+       manq=-0  surp=+0  mod=~930
+       couches OK=17  KO=4
+       [cycle] traces_active=0  plan=88  ok=88  skip=0  fail=0
+       [cycle] cutoff=2026-05-14T06:16:28  raw=92  written=88
+
+  R2  08:17:23  Score=75.9%  ─0.0pp
+       manq=-0 (±0)  surp=+0 (±0)  mod=~930 (±0)
+       couches OK=17  KO=4
+       [cycle] traces_active=0  plan=88  ok=88  skip=0  fail=0
+       [cycle] cutoff=2026-05-14T06:16:28  raw=92  written=88
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (75.9%)  |  Pire: R1 (75.9%)
+  ✓ Aucun problème critique sur dernier Rewind
+════════════════════════════════════════════════════════════════════════
+
+SESSION  2026-05-14 08:27:57  (1 Rewind(s))
+────────────────────────────────────────────────────────────────────────
+  R1  08:40:27  Score=79.3%
+       manq=-0  surp=+12  mod=~799
+       couches OK=11  KO=10
+       [cycle] traces_active=0  plan=387  ok=385  skip=2  fail=0
+       [cycle] cutoff=2026-05-14T06:16:28  raw=413  written=385
+
+  ── VERDICT SESSION ────────────────────────────────────────────────────
+  Meilleur: R1 (79.3%)  |  Pire: R1 (79.3%)
+  Problèmes: 2 SNAP_SCAN failures | 12 surplus
+════════════════════════════════════════════════════════════════════════
+
+ÉVOLUTION INTER-SESSIONS
+────────────────────────────────────────────────────────────────────────
+  06:55:04  N=6  Meilleur=71.1%  skip=?
+  07:08:43  N=3  Meilleur=54.9%  ▼16.2pp vs session précédente  skip=?
+  07:29:27  N=1  Meilleur=78.7%  ▲23.8pp vs session précédente  skip=?
+  07:39:42  N=1  Meilleur=49.1%  ▼29.6pp vs session précédente  skip=?
+  07:55:05  N=5  Meilleur=81.5%  ▲32.4pp vs session précédente  skip=?
+  08:23:09  N=1  Meilleur=72.4%  ▼9.1pp vs session précédente  skip=?
+  10:17:02  N=1  Meilleur=82.3%  ▲9.9pp vs session précédente  skip=?
+  10:18:06  N=3  Meilleur=79.1%  ▼3.2pp vs session précédente  skip=?
+  10:59:05  N=1  Meilleur=81.0%  ▲1.9pp vs session précédente  skip=?
+  19:39:27  N=3  Meilleur=93.4%  ▲12.4pp vs session précédente  skip=?
+  19:46:34  N=3  Meilleur=84.7%  ▼8.7pp vs session précédente  skip=?
+  20:20:29  N=3  Meilleur=68.3%  ▼16.4pp vs session précédente  skip=?
+  00:52:07  N=3  Meilleur=69.2%  ▲0.9pp vs session précédente  skip=?
+  01:05:15  N=4  Meilleur=73.4%  ▲4.2pp vs session précédente  skip=?
+  01:26:37  N=3  Meilleur=81.6%  ▲8.2pp vs session précédente  skip=?
+  01:36:20  N=3  Meilleur=82.5%  ▲0.9pp vs session précédente  skip=?
+  07:05:10  N=2  Meilleur=87.9%  ▲5.4pp vs session précédente  skip=?
+  07:49:39  N=2  Meilleur=82.8%  ▼5.1pp vs session précédente  skip=76
+  07:52:05  N=2  Meilleur=91.1%  ▲8.3pp vs session précédente  skip=3
+  08:05:49  N=2  Meilleur=50.3%  ▼40.8pp vs session précédente  skip=0
+  08:16:28  N=2  Meilleur=75.9%  ▲25.6pp vs session précédente  skip=0
+  08:27:57  N=1  Meilleur=79.3%  ▲3.4pp vs session précédente  skip=2

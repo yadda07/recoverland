@@ -1,0 +1,48 @@
+
+======================================================================
+  VALIDATION REWIND  vs  snapshot 2026-05-14T08:27:57
+  Fichier : stress_snapshot_latest.json
+======================================================================
+[OK ] CSV_PMZ-00007                  : 246/246 features OK
+[OK ] EXE_D1D2_63LLW_FI-63057-0002_ListeIMB_001_1A — DBL : 249/249 features OK
+[OK ] IPON_LE BRUGERON_63057         : 485/485 features OK
+[OK ] ZoneContourPB_PM_00007         : 246/246 features OK
+[PART] bpe                            : 155/156 OK  |  -0 manquants  +1 surplus  ~1 modifiés
+       SURPLUS   (ne devaient pas)  : fid=156
+       MODIFIÉS  (valeur diff)      : fid=155 [attr 'commentair': snap=None now='stress_ac8fbbef']
+[PART] cable_fttx_rip                 : 16/151 OK  |  -0 manquants  +1 surplus  ~135 modifiés
+       SURPLUS   (ne devaient pas)  : fid=151
+       MODIFIÉS  (valeur diff)      : fid=126 [attr 'type_cable': snap=None now='Distribution2'], fid=136 [attr 'commentair': snap='DISTRIBUTION 2 - de PA 00051/ PT 000566 vers PB 00607/ PT 000692' now=None], fid=107 [attr 'commentair': snap='DISTRIBUTION 2 - de PB 00582/PT 000664 vers PB 00581/PT 000504' now=None], fid=103 [attr 'commentair': snap='DISTRIBUTION 2 - de BPE 4900606 / PT 000531 vers PB 00587 / PT 000675' now='DISTRIBUTION 2 - de PB 00582/PT 000664 vers PB 00581/PT 000504'], fid=83 [attr 'id_ftth': snap=8043 now=2850645], fid=19 [attr 'commentair': snap='DISTRIBUTION 2 - de PB 00632/ PT 000706 vers PB 00626 / PT 00707' now='DISTRIBUTION 2 - de PB 00629/PT 000705 vers PB 00632/PT 000706'], fid=93 [attr 'commentair': snap=None now='DISTRIBUTION 2 - de PB 00624/PT 000704 vers PB 00629/PT 000705'], fid=115 [attr 'commentair': snap='DISTRIBUTION 2 - de PB 00583 / PT 000666 vers PB 00588 / PT 000668' now=None], fid=112 [attr 'commentair': snap='DISTRIBUTION 2 - de BPE 4900606 / PT 000531 vers PB 00587 / PT 000675' now='DISTRIBUTION 2 - de BPE 4900606 / PT 000531 vers PB 00592 / PT 000667'], fid=31 [attr 'commentair': snap='DISTRIBUTION 2 - de PB 00639 / PT 000748 vers PB 00638 / PT 000743' now='DISTRIBUTION 2 - de BPE 4900699 / PT 000738 vers PB 00634 / PT 000744'] (+125 autres)
+[OK ] communegeom                    : 0/0 features OK
+[PART] immeuble_rip                   : 319/325 OK  |  -0 manquants  +2 surplus  ~6 modifiés
+       SURPLUS   (ne devaient pas)  : fid=325, 326
+       MODIFIÉS  (valeur diff)      : fid=139 [attr 'statut_lib': snap='D�ploy�(e)' now='stress_43a6e055'], fid=323 [attr 'id_ftth': snap=17258239 now=17258241], fid=324 [attr 'statut_lib': snap='D�ploy�(e)' now='stress_69ced968'], fid=235 [geom diff], fid=237 [attr 'id_ftth': snap=17258122 now=17258124], fid=236 [geom diff]
+[PART] parcours_fttx_rip              : 663/677 OK  |  -0 manquants  +3 surplus  ~14 modifiés
+       SURPLUS   (ne devaient pas)  : fid=677, 678, 679
+       MODIFIÉS  (valeur diff)      : fid=180 [geom diff], fid=673 [attr 'id_ftth': snap=9939161 now=9939148], fid=674 [attr 'id_ftth': snap=9939148 now=9939140], fid=196 [geom diff], fid=197 [attr 'type_site_': snap='Appui t�l�com' now='Appui �nergie'], fid=189 [geom diff], fid=194 [geom diff], fid=187 [geom diff], fid=195 [geom diff], fid=174 [geom diff] (+4 autres)
+[PART] pf_rip                         : 21/144 OK  |  -0 manquants  +1 surplus  ~123 modifiés
+       SURPLUS   (ne devaient pas)  : fid=144
+       MODIFIÉS  (valeur diff)      : fid=126 [attr 'commentair': snap=None now='PBR'], fid=136 [attr 'auteur': snap=None now='IPON'], fid=107 [attr 'source_oid': snap=2074 now=None], fid=103 [attr 'commentair': snap=None now='PBR'], fid=83 [attr 'statut_lib': snap=None now='En cours'], fid=93 [attr 'statut_lib': snap=None now='En cours'], fid=115 [attr 'auteur': snap='IPON' now=None], fid=112 [attr 'id_ftth': snap=3694878 now=9958], fid=31 [attr 'commentair': snap='PBR' now=None], fid=87 [attr 'auteur': snap='IPON' now=None] (+113 autres)
+[PART] point_technique_rip            : 159/160 OK  |  -0 manquants  +0 surplus  ~1 modifiés
+       MODIFIÉS  (valeur diff)      : fid=59 [geom diff]
+[PART] projet_fttx_rip                : 5/62 OK  |  -0 manquants  +0 surplus  ~57 modifiés
+       MODIFIÉS  (valeur diff)      : fid=27 [attr 'statut_lib': snap=None now='En cours'], fid=20 [attr 'auteur': snap='rwfx4422' now=None], fid=36 [attr 'statut_lib': snap='En cours' now=None], fid=14 [attr 'auteur': snap='rwfx4422' now=None], fid=40 [attr 'statut_lib': snap='En cours' now=None], fid=61 [attr 'statut_lib': snap='En cours' now=None], fid=57 [attr 'statut_lib': snap=None now='En cours'], fid=19 [attr 'id_ftth': snap=9259 now=3726], fid=49 [attr 'id_ftth': snap=6646 now=880], fid=39 [attr 'id_ftth': snap=880 now=1645] (+47 autres)
+[OK ] projet_gc_additionnel_fttx_rip : 3/3 features OK
+[OK ] st_appui_energie_fttx_rip      : 139/139 features OK
+[PART] st_appui_telecom_fttx_rip      : 112/491 OK  |  -0 manquants  +0 surplus  ~379 modifiés
+       MODIFIÉS  (valeur diff)      : fid=425 [attr 'auteur': snap='rwfx4422' now='IPON'], fid=380 [attr 'id_ftth': snap=26436167 now=26436165], fid=448 [attr 'source_oid': snap=2473 now=1043], fid=336 [attr 'auteur': snap='rwfx4422' now='IPON'], fid=171 [attr 'id_ftth': snap=26441264 now=26441262], fid=229 [attr 'id_ftth': snap=26440599 now=26440597], fid=265 [attr 'id_ftth': snap=26440349 now=26440347], fid=453 [attr 'statut_lib': snap='D�ploy�(e)' now=None], fid=290 [attr 'commentair': snap='RAUV' now=None], fid=357 [attr 'id_ftth': snap=26436190 now=26436188] (+369 autres)
+[OK ] st_armoire_fttx_rip            : 1/1 features OK
+[OK ] st_chambre_fttx_rip            : 65/65 features OK
+[OK ] st_facade_fttx_rip             : 13/13 features OK
+[OK ] st_imb_fttx_rip                : 27/27 features OK
+[PART] zone_eligibilite_rip           : 137/140 OK  |  -0 manquants  +2 surplus  ~3 modifiés
+       SURPLUS   (ne devaient pas)  : fid=140, 141
+       MODIFIÉS  (valeur diff)      : fid=26 [geom diff], fid=68 [attr 'code': snap='63258/LLW/PA/00054' now='63258/LLW/PA/00056'], fid=139 [attr 'id_ftth': snap=3217000 now=7145]
+[PART] zone_mkt_rip                   : 2/82 OK  |  -0 manquants  +2 surplus  ~80 modifiés
+       SURPLUS   (ne devaient pas)  : fid=82, 83
+       MODIFIÉS  (valeur diff)      : fid=14 [attr 'auteur': snap=None now='1170611927171162'], fid=19 [attr 'auteur': snap='1170611927171162' now=None], fid=31 [attr 'auteur': snap='1170611927171162' now=None], fid=50 [attr 'id_ftth': snap=3597 now=7246], fid=75 [attr 'id_ftth': snap=3597 now=9074], fid=10 [attr 'auteur': snap='1170611927171162' now=None], fid=21 [attr 'id_ftth': snap=1516 now=2983], fid=51 [attr 'id_ftth': snap=7329 now=4025], fid=26 [attr 'id_ftth': snap=2983 now=3597], fid=45 [attr 'id_ftth': snap=4025 now=6453] (+70 autres)
+----------------------------------------------------------------------
+  COUCHES : 11 OK  10 KO  0 absentes
+  FEATURES: 3063/3862 correctes (79.3%)  |  -0 manquants  +12 surplus  ~799 modifiés
+  VERDICT : REWIND INCOMPLET — 811 écart(s) significatifs
+======================================================================
