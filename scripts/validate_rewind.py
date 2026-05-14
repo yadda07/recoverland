@@ -128,6 +128,11 @@ def _fmt_list(items, max_n):
 # AUTO-REWIND (déclenche le rewind avec cutoff = snapshot_time)
 # ---------------------------------------------------------------------------
 
+# BL-RW-P1-09: latest auto-rewind breakdown, populated by
+# trigger_rewind_to_snapshot() and consumed by validate_rewind() so the
+# text report exposes per-category counters separately.
+_LAST_REWIND_BREAKDOWN: dict = {}
+
 def _get_recoverland_plugin():
     """Retourne l'instance du plugin RecoverLand, ou lève RuntimeError."""
     import qgis.utils
@@ -236,24 +241,52 @@ def trigger_rewind_to_snapshot(snapshot_path=None):
         print("[auto-rewind] runner terminé sans résultat (?)")
         return {"total_ok": 0, "total_fail": 0}
 
-    print(f"[auto-rewind] terminé: ok={result.total_ok} fail={result.total_fail} "
-          f"errors={len(result.errors or [])}")
+    # BL-RW-P1-09: propagate the 5-bucket breakdown so the validation
+    # report distinguishes target_absent / geometry_drift from generic
+    # failures. Defaults keep the result valid for legacy callers that
+    # do not populate the breakdown.
+    applied = int(getattr(result, "applied", 0) or 0)
+    skipped_idempotent = int(getattr(result, "skipped_idempotent", 0) or 0)
+    failed_other = int(getattr(result, "failed", 0) or 0)
+    failed_target_absent = int(getattr(result, "failed_target_absent", 0) or 0)
+    failed_geometry_drift = int(
+        getattr(result, "failed_geometry_drift", 0) or 0
+    )
+
+    print(
+        f"[auto-rewind] termine: ok={result.total_ok} "
+        f"fail={result.total_fail} "
+        f"applied={applied} skipped_idempotent={skipped_idempotent} "
+        f"failed={failed_other} "
+        f"failed_target_absent={failed_target_absent} "
+        f"failed_geometry_drift={failed_geometry_drift} "
+        f"errors={len(result.errors or [])}"
+    )
     if result.errors:
         for err in result.errors[:5]:
             print(f"  err: {err}")
 
-    # Force la mise à jour du canvas pour que la validation voie l'état post-rewind
+    # Force la mise a jour du canvas pour que la validation voie l'etat post-rewind
     try:
         from qgis.utils import iface
         iface.mapCanvas().refresh()
     except Exception:
         pass
 
-    return {
+    breakdown = {
         "total_ok": result.total_ok,
         "total_fail": result.total_fail,
         "errors": list(result.errors or []),
+        "applied": applied,
+        "skipped_idempotent": skipped_idempotent,
+        "failed": failed_other,
+        "failed_target_absent": failed_target_absent,
+        "failed_geometry_drift": failed_geometry_drift,
     }
+    # BL-RW-P1-09: expose the breakdown to validate_rewind() via module scope.
+    global _LAST_REWIND_BREAKDOWN
+    _LAST_REWIND_BREAKDOWN = dict(breakdown)
+    return breakdown
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +405,16 @@ def validate_rewind(snapshot_path=None):
         f"  FEATURES: {total_ok}/{total_expected} correctes ({score_pct:.1f}%)"
         f"  |  -{total_missing} manquants  +{total_extra} surplus  ~{total_changed} modifiés"
     )
+    # BL-RW-P1-09: append the per-category breakdown of the latest rewind.
+    if _LAST_REWIND_BREAKDOWN:
+        bd = _LAST_REWIND_BREAKDOWN
+        lines.append(
+            f"  REWIND  : applied={bd.get('applied', 0)} "
+            f"skipped_idempotent={bd.get('skipped_idempotent', 0)} "
+            f"failed={bd.get('failed', 0)} "
+            f"failed_target_absent={bd.get('failed_target_absent', 0)} "
+            f"failed_geometry_drift={bd.get('failed_geometry_drift', 0)}"
+        )
     if total_missing == 0 and total_extra == 0 and total_changed == 0 and layers_absent == 0:
         lines.append("  VERDICT : REWIND PARFAIT — état identique au snapshot")
     elif score_pct >= 95.0:
