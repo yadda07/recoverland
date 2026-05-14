@@ -28,6 +28,7 @@ class AuditEvent(NamedTuple):
     entity_fingerprint: Optional[str] = None
     event_schema_version: Optional[int] = None
     new_geometry_wkb: Optional[bytes] = None
+    invalidated_at: Optional[str] = None
 
 
 class SearchCriteria(NamedTuple):
@@ -58,6 +59,18 @@ class RestoreReport(NamedTuple):
     failed: Dict[int, str]
     total_requested: int
     trace_events: tuple = ()
+    # BL-RW-P3-18: per-category breakdown for the runner.finished signal.
+    # All defaults are empty so legacy call sites stay valid.
+    # `succeeded` already includes idempotent skips; the breakdown
+    # below decomposes the populations into mutually-exclusive sets:
+    #   applied = succeeded \ (skipped_idempotent
+    #                          \u222a failed_target_absent
+    #                          \u222a failed_geometry_drift)
+    #   failed_other = failed \ (failed_target_absent
+    #                            \u222a failed_geometry_drift)
+    skipped_idempotent: List[int] = []
+    failed_target_absent: List[int] = []
+    failed_geometry_drift: List[int] = []
 
 
 class AuditBackend(ABC):

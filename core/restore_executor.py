@@ -27,6 +27,17 @@ from .serialization import iter_mapped_attributes
 from .logger import flog, flog_kv
 
 
+# BL-RW-P3-18: stable reason codes used to tag each restore step result.
+# The runner aggregates these into the runner.finished signal so the UI
+# can show "applied / skipped_idempotent / failed / failed_target_absent
+# / failed_geometry_drift" breakdown.
+RESTORE_REASON_APPLIED = "applied"
+RESTORE_REASON_SKIPPED_IDEMPOTENT = "skipped_idempotent"
+RESTORE_REASON_TARGET_ABSENT = "target_absent"
+RESTORE_REASON_GEOMETRY_DRIFT = "geometry_drift"
+RESTORE_REASON_FAILED = "failed"
+
+
 def preflight_layer_check(plan: RestorePlan, layer) -> List[str]:
     """Check layer-level prerequisites that require QGIS objects.
 

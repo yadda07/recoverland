@@ -11,12 +11,53 @@ from .restore_service import restore_batch, undo_restore_batch
 from .logger import flog
 
 
+_temp_layer_ids: List[str] = []
+
+
+def cleanup_temp_layers() -> int:
+    """Remove temporary layers added during restore (RW-15).
+
+    Returns number of layers removed.
+    """
+    if not _temp_layer_ids:
+        return 0
+    try:
+        from qgis.core import QgsProject
+        project = QgsProject.instance()
+        removed = 0
+        for lid in list(_temp_layer_ids):
+            if project.mapLayer(lid) is not None:
+                project.removeMapLayer(lid)
+                removed += 1
+        flog(f"cleanup_temp_layers: removed={removed}/{len(_temp_layer_ids)}")
+        _temp_layer_ids.clear()
+        return removed
+    except Exception as exc:
+        flog(f"cleanup_temp_layers: failed: {exc}", "WARNING")
+        _temp_layer_ids.clear()
+        return 0
+
+
 class GroupedRestoreResult(NamedTuple):
     total_ok: int
     total_fail: int
     errors: List[str]
     by_ds: Dict[str, list]
     trace_events: list
+    failed_eids: List[int] = []
+    # BL-RW-P3-18: per-category breakdown propagated by the runners.
+    # `applied` is a strict subset of `total_ok`: it excludes events that
+    # the executor short-circuited as `skipped_idempotent`, `target_absent`
+    # or `geometry_drift`. Conservation invariant:
+    #   total_ok + total_fail == applied + skipped_idempotent
+    #                          + failed + failed_target_absent
+    #                          + failed_geometry_drift
+    # (plus a `cancelled` delta when the runner was interrupted).
+    applied: int = 0
+    skipped_idempotent: int = 0
+    failed: int = 0
+    failed_target_absent: int = 0
+    failed_geometry_drift: int = 0
 
 
 def execute_grouped_restore(
@@ -180,8 +221,9 @@ def _try_restore_from_registry(event: AuditEvent, read_conn) -> object:
         layer = create_layer_from_registry(info)
         if layer is not None and layer.isValid():
             QgsProject.instance().addMapLayer(layer, False)
+            _temp_layer_ids.append(layer.id())
             flog(f"find_target_layer: temp layer added for restore "
-                 f"provider={info.provider_type}")
+                 f"provider={info.provider_type} id={layer.id()}")
             return layer
 
         if info.provider_type in _DB_PROVIDERS:
