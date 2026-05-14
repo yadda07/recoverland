@@ -80,6 +80,68 @@ def flog(message: str, level: str = "INFO") -> None:
         _file_logger.info(message)
 
 
+_KV_QUOTE_TRIGGERS = (" ", "=", '"', "'", "\n", "\t")
+
+
+def _format_kv_value(value) -> str:
+    """Render a single value for the key=value log format.
+
+    Bare token for simple values. Values containing space, '=', quote,
+    newline or tab are wrapped in matching quotes so the parser
+    (`scripts.validation.parse_log._KV_RE`) can recover the original
+    string by stripping the outermost quotes.
+
+    Quote selection:
+        - no special character        -> bare token
+        - contains double quote only  -> wrapped in single quotes
+        - contains single quote only  -> wrapped in double quotes
+        - contains both quote types   -> wrapped in double quotes with
+          backslash escape (unambiguous but requires a tolerant parser)
+        - other special character     -> wrapped in double quotes
+    """
+    s = str(value)
+    if s == "":
+        return '""'
+    if not any(c in s for c in _KV_QUOTE_TRIGGERS):
+        return s
+    has_double = '"' in s
+    has_single = "'" in s
+    if has_double and not has_single:
+        return f"'{s}'"
+    if has_double and has_single:
+        s = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{s}"'
+    return f'"{s}"'
+
+
+def flog_kv(level: str, event: str, *, module: str, **fields) -> None:
+    """Emit a structured `level=... module=... event=... k=v ...` log line.
+
+    The output format is grep-able and parseable by
+    `scripts.validation.parse_log.parse_line`. Field order follows the
+    insertion order of `fields` (Python 3.7+ dict ordering).
+
+    Args:
+        level: log severity (INFO, WARNING, ERROR, DEBUG, CRITICAL).
+        event: short uppercase event identifier (e.g. BUF_INS).
+        module: source module name (e.g. restore_executor).
+        **fields: additional key=value pairs.
+
+    Example:
+        flog_kv("INFO", "BUF_INS", module="restore_executor",
+                eid=12, fp="fid:42", buf_fid=43)
+        # -> level=INFO module=restore_executor event=BUF_INS eid=12 fp=fid:42 buf_fid=43
+    """
+    parts = [
+        f"level={level}",
+        f"module={module}",
+        f"event={event}",
+    ]
+    for k, v in fields.items():
+        parts.append(f"{k}={_format_kv_value(v)}")
+    flog(" ".join(parts), level)
+
+
 _QLOG_LEVELS = {
     "INFO": QgisCompat.MSG_INFO,
     "WARNING": QgisCompat.MSG_WARNING,

@@ -22,7 +22,7 @@ from .geometry_utils import (
     wkb_short_repr, feature_geom_short_repr,
 )
 from .serialization import iter_mapped_attributes
-from .logger import flog
+from .logger import flog, flog_kv
 
 
 def preflight_layer_check(plan: RestorePlan, layer) -> List[str]:
@@ -263,9 +263,16 @@ def _buffer_insert(layer, event: AuditEvent,
     fp = event.entity_fingerprint or '?'
     prev = fid_remap.get(fp) if fid_remap and fp != '?' else None
     _record_remap(fid_remap, event, new_fid)
-    collision = f' COLLISION:prev={prev}' if prev is not None else ''
     geom_repr = feature_geom_short_repr(layer, new_fid) if new_fid else '?'
-    flog(f"BUF_INS eid={event.event_id} fp={fp} buf_fid={new_fid} geom={geom_repr}{collision}")
+    ins_fields = {
+        "eid": event.event_id,
+        "fp": fp,
+        "buf_fid": new_fid,
+        "geom": geom_repr,
+    }
+    if prev is not None:
+        ins_fields["collision_prev"] = prev
+    flog_kv("INFO", "BUF_INS", module="restore_executor", **ins_fields)
     return {"success": True, "message": "Inserted via buffer", "fid": new_fid}
 
 
@@ -361,7 +368,10 @@ def _buffer_delete(layer, event: AuditEvent,
              f"DELETE_FAILED→SKIP (buffer refused)", "WARNING")
         return {"success": True, "skipped": True,
                 "message": "Skipped: buffer deleteFeature refused"}
-    flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid}→deleted")
+    flog_kv(
+        "INFO", "BUF_DEL", module="restore_executor",
+        eid=event.event_id, fp=fp, fid=target_fid, status="deleted",
+    )
     return {"success": True, "message": "Deleted via buffer"}
 
 
@@ -519,8 +529,12 @@ def _buffer_update(layer, event: AuditEvent,
         return {"success": False,
                 "message": "All attribute changes rejected"}
 
-    flog(f"_buffer_update: applied eid={event.event_id} fid={target_fid} "
-         f"attr_ok={attr_ok} attr_fail={attr_fail} geom={geom_status}")
+    flog_kv(
+        "INFO", "BUF_UPD", module="restore_executor",
+        eid=event.event_id, fid=target_fid,
+        attr_ok=attr_ok, attr_fail=attr_fail,
+        geom_status=geom_status, status="applied",
+    )
     return {"success": True, "message": "Reverted via buffer"}
 
 
