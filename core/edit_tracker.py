@@ -385,6 +385,13 @@ class EditSessionTracker:
         real FIDs. We serialize everything here so _generate_events can
         build INSERT events without any provider lookup.
         """
+        if not self._active or self.is_suppressed:
+            flog(
+                f"EditSessionTracker: signal=committedFeaturesAdded "
+                f"ignored=suppressed layer_id={layer_id}",
+                "DEBUG",
+            )
+            return
         buf = self._buffers.get(layer_id)
         if buf is None:
             flog(f"EditSessionTracker: committedFeaturesAdded but no buffer "
@@ -417,6 +424,13 @@ class EditSessionTracker:
         every feature the user marked as deleted in the buffer, even if
         the provider rejected the delete (constraint, referential check).
         """
+        if not self._active or self.is_suppressed:
+            flog(
+                f"EditSessionTracker: signal=committedFeaturesRemoved "
+                f"ignored=suppressed layer_id={layer_id}",
+                "DEBUG",
+            )
+            return
         buf = self._buffers.get(layer_id)
         if buf is None:
             return
@@ -433,6 +447,13 @@ class EditSessionTracker:
         QGIS emits ``{fid_post_commit: {idx: value}}`` after the provider
         confirms the attribute writes for that fid.
         """
+        if not self._active or self.is_suppressed:
+            flog(
+                f"EditSessionTracker: signal=committedAttributeValuesChanges "
+                f"ignored=suppressed layer_id={layer_id}",
+                "DEBUG",
+            )
+            return
         buf = self._buffers.get(layer_id)
         if buf is None:
             return
@@ -455,6 +476,13 @@ class EditSessionTracker:
         QGIS emits ``{fid_post_commit: QgsGeometry}`` after the provider
         confirms each geometry write.
         """
+        if not self._active or self.is_suppressed:
+            flog(
+                f"EditSessionTracker: signal=committedGeometriesChanges "
+                f"ignored=suppressed layer_id={layer_id}",
+                "DEBUG",
+            )
+            return
         buf = self._buffers.get(layer_id)
         if buf is None:
             return
@@ -472,6 +500,17 @@ class EditSessionTracker:
              f"(total={len(changed_geoms)})")
 
     def _on_rollback(self, layer_id: str) -> None:
+        # When suppressed we deliberately keep the buffer in place: a
+        # restore-driven rollback should not lose user data captured
+        # before suppress() was called. The buffer is reaped on the
+        # next session reset (force_unsuppress / disconnect_all).
+        if not self._active or self.is_suppressed:
+            flog(
+                f"EditSessionTracker: signal=rollback "
+                f"ignored=suppressed layer_id={layer_id}",
+                "DEBUG",
+            )
+            return
         buf = self._buffers.pop(layer_id, None)
         if buf is not None:
             buf.clear()
