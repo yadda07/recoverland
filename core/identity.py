@@ -11,6 +11,31 @@ from typing import Optional, Dict, Any
 
 from .support_policy import IdentityStrength, refine_ogr_identity
 
+# BL-RW-P2-13 (CR-1): portable fingerprints across machines.
+#
+# `RECOVERLAND_FINGERPRINT_MODE` env var controls how file-based sources
+# (provider in {ogr, spatialite, delimitedtext}) are normalised inside
+# `compute_datasource_fingerprint`:
+#   - 'absolute' (default, legacy behaviour) -> os.path.abspath the path.
+#   - 'relative'                              -> make the path relative
+#     to `QgsProject.instance().homePath()`. When the project has no
+#     home (unsaved project, no QGIS runtime, exception), the function
+#     falls back to absolute mode and emits a WARNING log so the
+#     degraded state is visible to operators.
+# In both modes the path keeps `os.path.normcase` + forward slashes so
+# the canonical form is identical to the historical layout, byte for
+# byte, when mode is 'absolute'.
+_FINGERPRINT_MODE_ENV = "RECOVERLAND_FINGERPRINT_MODE"
+_FILE_PROVIDERS = ("ogr", "spatialite", "delimitedtext")
+
+
+def _get_fingerprint_mode() -> str:
+    raw = os.environ.get(_FINGERPRINT_MODE_ENV) or ""
+    mode = raw.strip().lower()
+    if mode in ("absolute", "relative"):
+        return mode
+    return "absolute"
+
 
 def compute_datasource_fingerprint(layer) -> str:
     """Compute a deterministic fingerprint for a layer's data source.
@@ -22,6 +47,67 @@ def compute_datasource_fingerprint(layer) -> str:
     raw_source = layer.source()
     normalized = _normalize_source_uri(provider_name, raw_source)
     return f"{provider_name}::{normalized}"
+
+
+def datasource_fingerprints_match(stored: str, current: str) -> bool:
+    """Return True when `stored` and `current` denote the same datasource.
+
+    Strict equality first; cross-mode resolution (absolute vs relative
+    against the current QGIS project home) as fallback so that audit
+    records produced before BL-RW-P2-13 keep matching layers loaded in
+    the new relative mode. Cross-mode only applies to file-based
+    providers (`ogr` / `spatialite` / `delimitedtext`); DB fingerprints
+    are compared strictly.
+    """
+    if not stored or not current:
+        return stored == current
+    if stored == current:
+        return True
+    return _cross_mode_match(stored, current)
+
+
+def _cross_mode_match(stored: str, current: str) -> bool:
+    """Resolve both fingerprints against the project home and compare."""
+    if "::" not in stored or "::" not in current:
+        return False
+    stored_provider, _, stored_src = stored.partition("::")
+    current_provider, _, current_src = current.partition("::")
+    if stored_provider != current_provider:
+        return False
+    if stored_provider not in _FILE_PROVIDERS:
+        return False
+    home = _qgs_project_home_path()
+    if not home:
+        return False
+    try:
+        abs_home = os.path.abspath(home)
+    except (OSError, ValueError):
+        return False
+    return _absolutize(stored_src, abs_home) == _absolutize(current_src, abs_home)
+
+
+def _absolutize(source: str, abs_home: str) -> str:
+    """Best-effort canonical absolute representation of a file source."""
+    path = source.split("|")[0].strip().replace("\\", "/")
+    if not os.path.isabs(path):
+        path = os.path.join(abs_home, path)
+    try:
+        path = os.path.abspath(path)
+        path = os.path.normcase(path)
+    except (OSError, ValueError):
+        pass
+    path = path.replace("\\", "/")
+    suffix = "|" + source.split("|", 1)[1] if "|" in source else ""
+    return path + suffix
+
+
+def _qgs_project_home_path():
+    """Return QgsProject.instance().homePath() or '' if unavailable."""
+    try:
+        from qgis.core import QgsProject
+        return QgsProject.instance().homePath() or ""
+    except Exception:
+        return ""
 
 
 # DB source normalization profiles.
@@ -90,19 +176,67 @@ def _normalize_db_source(raw: str, profile) -> str:
 
 
 def _normalize_file_source(raw: str) -> str:
-    """Normalize a file-based source URI to absolute path."""
+    """Normalize a file-based source URI.
+
+    Honours `RECOVERLAND_FINGERPRINT_MODE`:
+      - 'absolute' (default) -> historical behaviour: abspath + normcase.
+      - 'relative'           -> path made relative to the current QGIS
+        project home, with `os.path.normcase` still applied for case
+        consistency. Falls back to absolute mode with a WARNING log
+        when no project home is available.
+    """
     path = raw.split("|")[0].strip()
     path = path.replace("\\", "/")
+    mode = _get_fingerprint_mode()
+    if mode == "relative":
+        rel_path = _try_relative_to_project_home(path)
+        if rel_path is not None:
+            path = rel_path
+        else:
+            from .logger import flog
+            flog(
+                f"identity: RECOVERLAND_FINGERPRINT_MODE=relative but "
+                f"QgsProject homePath() is empty/absent; falling back "
+                f"to absolute path for source={raw!r}",
+                "WARNING",
+            )
+            try:
+                path = os.path.abspath(path)
+            except (OSError, ValueError):
+                pass
+    else:
+        try:
+            path = os.path.abspath(path)
+        except (OSError, ValueError):
+            pass
     try:
-        path = os.path.abspath(path)
         path = os.path.normcase(path)
-        path = path.replace("\\", "/")
     except (OSError, ValueError):
         pass
+    path = path.replace("\\", "/")
     suffix = ""
     if "|" in raw:
         suffix = "|" + raw.split("|", 1)[1]
     return path + suffix
+
+
+def _try_relative_to_project_home(path: str) -> Optional[str]:
+    """Return `path` rewritten relative to QgsProject.homePath() or None.
+
+    Returns None when the project has no home, when the QGIS runtime is
+    not available, or when the path lives on a different drive / mount
+    point so that no relative form exists.
+    """
+    home = _qgs_project_home_path()
+    if not home:
+        return None
+    try:
+        abs_path = os.path.abspath(path)
+        abs_home = os.path.abspath(home)
+        rel = os.path.relpath(abs_path, abs_home)
+    except (OSError, ValueError):
+        return None
+    return rel.replace("\\", "/")
 
 
 def compute_feature_identity(layer, feature) -> str:
