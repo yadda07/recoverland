@@ -683,8 +683,14 @@ def _classify_restore_result(result: Dict[str, Any]) -> str:
 
 
 def restore_batch(layer, events: List[AuditEvent],
-                  fid_cache: Optional[Dict] = None) -> RestoreReport:
-    """Restore a batch of events with per-entity error isolation."""
+                  fid_cache: Optional[Dict] = None,
+                  trace_id: str = "") -> RestoreReport:
+    """Restore a batch of events with per-entity error isolation.
+
+    BL-RW-P3-17: trace_id is propagated from the runner so the breakdown
+    summary log carries the same `[trace_id]` prefix as the rest of the
+    rewind chain.
+    """
     layer_error = validate_restore_layer_state(layer)
     if layer_error:
         failed = {(e.event_id or 0): layer_error for e in events}
@@ -725,10 +731,12 @@ def restore_batch(layer, events: List[AuditEvent],
                 failed[eid] = result["message"]
         except Exception as e:
             failed[eid] = str(e)
-            flog(f"restore_batch: error on event {eid}: {e}", "ERROR")
+            prefix = f"[{trace_id}] " if trace_id else ""
+            flog(f"{prefix}restore_batch: error on event {eid}: {e}", "ERROR")
 
+    prefix = f"[{trace_id}] " if trace_id else ""
     flog(
-        f"restore_batch: breakdown succeeded={len(succeeded)} "
+        f"{prefix}restore_batch: breakdown succeeded={len(succeeded)} "
         f"failed={len(failed)} skipped_idempotent={len(skipped_idempotent)} "
         f"failed_target_absent={len(failed_target_absent)} "
         f"failed_geometry_drift={len(failed_geometry_drift)}",

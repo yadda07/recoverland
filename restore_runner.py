@@ -320,7 +320,11 @@ class RestoreRunner(QObject):
         end = min(start + _CHUNK_SIZE, len(group))
         chunk = group[start:end]
 
-        report = restore_batch(layer, chunk, fid_cache=self._group_fid_cache)
+        report = restore_batch(
+            layer, chunk,
+            fid_cache=self._group_fid_cache,
+            trace_id=self._trace_id,
+        )
         self._total_ok += len(report.succeeded)
         self._group_ok += len(report.succeeded)
         self._total_fail += len(report.failed)
@@ -617,6 +621,7 @@ class StrictRestoreRunner(QObject):
             result = _apply_via_buffer(
                 layer, action.compensatory_op, event,
                 self._strict_fid_remap,
+                trace_id=self._trace_id,
             )
             # BL-RW-P3-18: classify the action result for the breakdown.
             from .core.restore_service import _classify_restore_result
