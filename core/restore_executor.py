@@ -240,7 +240,12 @@ def _apply_via_buffer(layer, compensatory_op: str, event: AuditEvent,
         return _buffer_delete(layer, event, fid_remap)
     if compensatory_op == "UPDATE":
         return _buffer_update(layer, event, fid_remap)
-    return {"success": False, "message": f"Unknown operation: {compensatory_op}"}
+    return {
+        "success": False,
+        "status": "FAILED",
+        "reason_code": "unknown_operation",
+        "message": f"Unknown operation: {compensatory_op}",
+    }
 
 
 def _buffer_insert(layer, event: AuditEvent,
@@ -271,7 +276,12 @@ def _buffer_insert(layer, event: AuditEvent,
 
     if not layer.addFeature(feature):
         flog(f"_buffer_insert: addFeature failed eid={event.event_id}", "ERROR")
-        return {"success": False, "message": "Buffer addFeature failed"}
+        return {
+            "success": False,
+            "status": "FAILED",
+            "reason_code": "buffer_refused",
+            "message": "Buffer addFeature failed",
+        }
     new_fid = feature.id()
     fp = event.entity_fingerprint or '?'
     prev = fid_remap.get(fp) if fid_remap and fp != '?' else None
@@ -286,7 +296,15 @@ def _buffer_insert(layer, event: AuditEvent,
     if prev is not None:
         ins_fields["collision_prev"] = prev
     flog_kv("INFO", "BUF_INS", module="restore_executor", **ins_fields)
-    return {"success": True, "message": "Inserted via buffer", "fid": new_fid}
+    # BL-RW-P2-14: tag the success path explicitly so _classify_restore_result
+    # doesn't have to fall back to message parsing.
+    return {
+        "success": True,
+        "status": "APPLIED",
+        "reason_code": "applied",
+        "message": "Inserted via buffer",
+        "fid": new_fid,
+    }
 
 
 def _record_remap(fid_remap: Optional[Dict], event: AuditEvent,
@@ -454,11 +472,19 @@ def _buffer_delete(layer, event: AuditEvent,
 
     buf = layer.editBuffer()
     if buf is not None and target_fid in (buf.deletedFeatureIds() or set()):
+        # BL-RW-P2-14: an already-pending delete is a proven idempotent
+        # result. The buffer holds the deletion; the net effect equals
+        # the desired final state, so tag it as SKIPPED_IDEMPOTENT.
         flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
-             f"already_pending_delete→OK (RW-19b: net result correct, "
-             f"FID recycled by OGR)", "WARNING")
-        return {"success": True,
-                "message": "Already pending delete (OGR FID recycle)"}
+             f"already_pending_delete=>SKIPPED_IDEMPOTENT (RW-19b: net "
+             f"result correct, FID recycled by OGR)", "WARNING")
+        return {
+            "success": True,
+            "skipped": True,
+            "status": "SKIPPED_IDEMPOTENT",
+            "reason_code": "already_pending_delete",
+            "message": "Already pending delete (OGR FID recycle)",
+        }
 
     if not layer.deleteFeature(target_fid):
         # BL-RW-P0-02: buffer refusal is a hard failure -> FAILED.
@@ -478,7 +504,13 @@ def _buffer_delete(layer, event: AuditEvent,
         "INFO", "BUF_DEL", module="restore_executor",
         eid=event.event_id, fp=fp, fid=target_fid, status="deleted",
     )
-    return {"success": True, "message": "Deleted via buffer"}
+    # BL-RW-P2-14: tag the success path explicitly.
+    return {
+        "success": True,
+        "status": "APPLIED",
+        "reason_code": "applied",
+        "message": "Deleted via buffer",
+    }
 
 
 def _target_matches_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:
@@ -597,14 +629,22 @@ def _buffer_update(layer, event: AuditEvent,
             flog(f"_buffer_update: rebuild_geometry returned None "
                  f"eid={event.event_id} fid={target_fid} wkb_len={wkb_len}",
                  "ERROR")
-            return {"success": False,
-                    "message": "Geometry rebuild failed (corrupt WKB)"}
+            return {
+                "success": False,
+                "status": "FAILED",
+                "reason_code": "corrupt_wkb",
+                "message": "Geometry rebuild failed (corrupt WKB)",
+            }
         if geom.isEmpty() or geom.isNull():
             geom_status = "rebuilt_empty"
             flog(f"_buffer_update: rebuilt geometry empty/null "
                  f"eid={event.event_id} fid={target_fid}", "ERROR")
-            return {"success": False,
-                    "message": "Geometry rebuilt empty"}
+            return {
+                "success": False,
+                "status": "FAILED",
+                "reason_code": "rebuilt_empty",
+                "message": "Geometry rebuilt empty",
+            }
         if not geom.isGeosValid():
             geom_before_makevalid = geom
             repaired = geom.makeValid()
@@ -672,8 +712,12 @@ def _buffer_update(layer, event: AuditEvent,
             flog(f"_buffer_update: changeGeometry REJECTED "
                  f"eid={event.event_id} fid={target_fid} wkb_len={wkb_len}",
                  "ERROR")
-            return {"success": False,
-                    "message": "changeGeometry rejected by buffer"}
+            return {
+                "success": False,
+                "status": "FAILED",
+                "reason_code": "buffer_refused",
+                "message": "changeGeometry rejected by buffer",
+            }
 
         if identical:
             flog(f"_buffer_update: NO-OP geom identical "
@@ -688,8 +732,12 @@ def _buffer_update(layer, event: AuditEvent,
         flog(f"_buffer_update: all attr changes REJECTED "
              f"eid={event.event_id} fid={target_fid} attempted={attr_fail}",
              "ERROR")
-        return {"success": False,
-                "message": "All attribute changes rejected"}
+        return {
+            "success": False,
+            "status": "FAILED",
+            "reason_code": "buffer_refused",
+            "message": "All attribute changes rejected",
+        }
 
     flog_kv(
         "INFO", "BUF_UPD", module="restore_executor",
@@ -697,7 +745,13 @@ def _buffer_update(layer, event: AuditEvent,
         attr_ok=attr_ok, attr_fail=attr_fail,
         geom_status=geom_status, status="applied",
     )
-    return {"success": True, "message": "Reverted via buffer"}
+    # BL-RW-P2-14: tag the success path explicitly.
+    return {
+        "success": True,
+        "status": "APPLIED",
+        "reason_code": "applied",
+        "message": "Reverted via buffer",
+    }
 
 
 def _safe_field_mapping(layer, event: AuditEvent) -> dict:
@@ -822,10 +876,27 @@ def _apply_snapshot_to_existing(layer, fid, attrs, geom, mapping) -> dict:
         if not layer.changeAttributeValue(fid, idx, value):
             attr_fail += 1
     if not layer.changeGeometry(fid, geom):
-        return {"success": False, "message": "Existing feature geometry update failed"}
+        return {
+            "success": False,
+            "status": "FAILED",
+            "reason_code": "buffer_refused",
+            "message": "Existing feature geometry update failed",
+        }
     if attr_fail > 0:
-        return {"success": False, "message": "Existing feature attribute update failed"}
-    return {"success": True, "message": "Already present", "fid": fid}
+        return {
+            "success": False,
+            "status": "FAILED",
+            "reason_code": "buffer_refused",
+            "message": "Existing feature attribute update failed",
+        }
+    # BL-RW-P2-14: applying snapshot to an existing feature equals APPLIED.
+    return {
+        "success": True,
+        "status": "APPLIED",
+        "reason_code": "applied",
+        "message": "Already present",
+        "fid": fid,
+    }
 
 
 def _current_geom_matches(layer, fid: int, expected_geom) -> bool:
