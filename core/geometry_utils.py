@@ -4,7 +4,61 @@ Handles WKB serialization/deserialization of QgsGeometry objects.
 Stores geometry as binary WKB in SQLite, with CRS tracked separately.
 Tables without geometry get geometry_wkb=NULL, geometry_type='NoGeometry'.
 """
+import hashlib
 from typing import Optional, Tuple
+
+
+def _compute_makevalid_drift(geom_before, geom_after) -> Tuple[str, str, float]:
+    """Quantify the change between two QgsGeometry objects.
+
+    Returns a tuple `(wkb_hash_before, wkb_hash_after, drift_units)` where:
+      - `wkb_hash_*` are 8-hex-char SHA-256 prefixes of `bytes(geom.asWkb())`.
+        They equal each other if and only if the WKB byte sequences are
+        identical.
+      - `drift_units` is the L_infinity (Chebyshev) distance between the
+        two bounding boxes expressed in the geometry CRS units:
+            max(|xmin_a - xmin_b|, |ymin_a - ymin_b|,
+                |xmax_a - xmax_b|, |ymax_a - ymax_b|)
+        A drift of 0 means the bboxes coincide exactly. Identical inputs
+        always produce drift=0, but drift=0 does not imply identical WKB
+        (two distinct shapes can share a bbox). Treat as a fast,
+        conservative coarse-grained drift metric, not a full geometric
+        equality test.
+
+    Used by `core/restore_executor.py:_buffer_update` (BL-RW-P1-08,
+    CR-8) to decide whether the result of `QgsGeometry.makeValid()` is
+    close enough to the original to be safely applied, or whether the
+    drift exceeds `MAKEVALID_DRIFT_TOLERANCE` and the apply must be
+    skipped with status `SKIPPED_GEOMETRY_DRIFT`.
+
+    Defensive: if either input is None / empty / lacks asWkb(), the
+    function falls back to placeholder hashes and an infinite drift so
+    that callers treat the comparison as "definitely drifted".
+    """
+    def _wkb_hash(g):
+        try:
+            if g is None or g.isNull() or g.isEmpty():
+                return "00000000"
+            return hashlib.sha256(bytes(g.asWkb())).hexdigest()[:8]
+        except Exception:
+            return "00000000"
+
+    hash_before = _wkb_hash(geom_before)
+    hash_after = _wkb_hash(geom_after)
+
+    try:
+        bb_b = geom_before.boundingBox()
+        bb_a = geom_after.boundingBox()
+        drift = max(
+            abs(bb_a.xMinimum() - bb_b.xMinimum()),
+            abs(bb_a.yMinimum() - bb_b.yMinimum()),
+            abs(bb_a.xMaximum() - bb_b.xMaximum()),
+            abs(bb_a.yMaximum() - bb_b.yMaximum()),
+        )
+    except Exception:
+        drift = float("inf")
+
+    return hash_before, hash_after, drift
 
 
 def geometry_to_wkb(geom) -> Optional[bytes]:

@@ -16,10 +16,12 @@ from .restore_planner import preflight_check
 from .restore_service import restore_batch, build_restore_trace_event
 from .search_service import reconstruct_attributes
 from .schema_drift import safe_field_mapping
+from .constants import MAKEVALID_DRIFT_TOLERANCE
 from .geometry_utils import (
     rebuild_geometry, is_geometry_present,
     feature_matches_geometry, get_feature_source,
     wkb_short_repr, feature_geom_short_repr,
+    _compute_makevalid_drift,
 )
 from .serialization import iter_mapped_attributes
 from .logger import flog, flog_kv
@@ -334,10 +336,30 @@ def _buffer_delete(layer, event: AuditEvent,
     identity = _parse_identity(event.feature_identity_json)
     fp = event.entity_fingerprint or '?'
     remapped = _resolve_target_fid(layer, event, fid_remap)
+    # FID-reuse defense: when remap points to a freshly-added buffer feature
+    # (negative FID), a comp INSERT (undo of user DELETE) just wrote into the
+    # remap. A comp DELETE for a user INSERT sharing entity_fingerprint=fid:X
+    # (GPKG/OGR FID reuse) would otherwise target the just-re-inserted feature
+    # instead of the user-inserted one. Bypass the remap and fall back to
+    # direct FID + snapshot verification.
+    if remapped is not None and remapped < 0:
+        flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
+             f"negative→ignore (FID-reuse defense)", "WARNING")
+        remapped = None
+    # Exclude FIDs of features we re-inserted in this same session: their
+    # geometry equals the OLD snapshot of the user DELETE event, and could
+    # collide with the INSERT snapshot we're trying to undo via snap.
+    exclude_remap_fids = (
+        set(v for v in fid_remap.values() if v is not None)
+        if fid_remap else None
+    )
     target_fid = remapped if remapped is not None \
         else _find_target_feature(layer, identity)
     if target_fid is None:
-        snapshot_fid = _find_by_snapshot(layer, event, resolve_ambiguity=True)
+        snapshot_fid = _find_by_snapshot(
+            layer, event, resolve_ambiguity=True,
+            exclude_fids=exclude_remap_fids,
+        )
         if snapshot_fid is not None:
             flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
                  f"target=none→snap={snapshot_fid}")
@@ -346,22 +368,48 @@ def _buffer_delete(layer, event: AuditEvent,
             flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
                  f"target=none snap=none→ABSENT", "WARNING")
             _diagnose_snapshot_miss(layer, event)
-            return {"success": True, "message": "Already absent"}
+            return {"success": True, "skipped": True,
+                    "message": "Skipped: feature already absent"}
     else:
         flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} target={target_fid}", "DEBUG")
 
     has_pk = bool(identity.get("pk_field")) and identity.get("pk_value") is not None
     trusted = remapped is not None or has_pk
     if not trusted and not _target_matches_insert_snapshot(layer, target_fid, event):
-        fallback_fid = _find_by_snapshot(layer, event, resolve_ambiguity=True)
+        fallback_fid = _find_by_snapshot(
+            layer, event, resolve_ambiguity=True,
+            exclude_fids=exclude_remap_fids,
+        )
         if fallback_fid is None:
-            flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid}"
-                 f"→SKIP snap_mismatch trusted={trusted}", "WARNING")
-            return {"success": True,
-                    "skipped": True,
-                    "message": "Skipped: identity mismatch (FID-only)"}
-        flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid}→snap={fallback_fid} recovered")
-        target_fid = fallback_fid
+            provider_key = (
+                layer.dataProvider().name()
+                if layer.dataProvider() else ''
+            )
+            if event.operation_type == 'INSERT':
+                flog(
+                    f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
+                    f"snap_mismatch→direct_fid prov={provider_key} "
+                    f"(INSERT FID trustworthy: subsequent rounds modified attrs RW-11)",
+                    "WARNING"
+                )
+            else:
+                flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid}"
+                     f"→SKIP snap_mismatch trusted={trusted}", "WARNING")
+                return {"success": True,
+                        "skipped": True,
+                        "message": "Skipped: identity mismatch (FID-only)"}
+        else:
+            flog(f"BUF_DEL eid={event.event_id} fp={fp} "
+                 f"fid={target_fid}→snap={fallback_fid} recovered")
+            target_fid = fallback_fid
+
+    buf = layer.editBuffer()
+    if buf is not None and target_fid in (buf.deletedFeatureIds() or set()):
+        flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
+             f"already_pending_delete→OK (RW-19b: net result correct, "
+             f"FID recycled by OGR)", "WARNING")
+        return {"success": True,
+                "message": "Already pending delete (OGR FID recycle)"}
 
     if not layer.deleteFeature(target_fid):
         flog(f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
@@ -438,7 +486,8 @@ def _buffer_update(layer, event: AuditEvent,
             fallback_fid = _find_update_target_by_post_state(layer, event)
             if fallback_fid is None:
                 flog(f"BUF_UPD eid={event.event_id} fid={target_fid} "
-                     f"post_chk=fail no_fallback → force_apply (stale geom)", "WARNING")
+                     f"post_chk=fail no_fallback → FORCE_APPLY "
+                     f"(FID exists, apply comp RW-12)", "WARNING")
             else:
                 flog(f"BUF_UPD eid={event.event_id} fid={target_fid}→fallback={fallback_fid} post_chk=recovered")
                 target_fid = fallback_fid
@@ -489,6 +538,51 @@ def _buffer_update(layer, event: AuditEvent,
                  f"eid={event.event_id} fid={target_fid}", "ERROR")
             return {"success": False,
                     "message": "Geometry rebuilt empty"}
+        if not geom.isGeosValid():
+            geom_before_makevalid = geom
+            repaired = geom.makeValid()
+            if repaired and not repaired.isEmpty():
+                wkb_hash_before, wkb_hash_after, drift_units = (
+                    _compute_makevalid_drift(geom_before_makevalid, repaired)
+                )
+                if drift_units > MAKEVALID_DRIFT_TOLERANCE:
+                    flog(
+                        f"makevalid_drift: eid={event.event_id} "
+                        f"fid={target_fid} "
+                        f"wkb_hash_before={wkb_hash_before} "
+                        f"wkb_hash_after={wkb_hash_after} "
+                        f"drift_units={drift_units:.9f} "
+                        f"tolerance={MAKEVALID_DRIFT_TOLERANCE:.9f} "
+                        f"status=SKIPPED_GEOMETRY_DRIFT",
+                        "WARNING",
+                    )
+                    return {
+                        "success": True,
+                        "skipped": True,
+                        "status": "SKIPPED_GEOMETRY_DRIFT",
+                        "message": (
+                            f"Skipped: makeValid drift {drift_units:.9f} "
+                            f"exceeds tolerance {MAKEVALID_DRIFT_TOLERANCE}"
+                        ),
+                    }
+                flog(
+                    f"makevalid_drift: eid={event.event_id} "
+                    f"fid={target_fid} "
+                    f"wkb_hash_before={wkb_hash_before} "
+                    f"wkb_hash_after={wkb_hash_after} "
+                    f"drift_units={drift_units:.9f} "
+                    f"tolerance={MAKEVALID_DRIFT_TOLERANCE:.9f} "
+                    f"status=APPLIED",
+                    "INFO",
+                )
+                flog(f"_buffer_update: GEOS-invalid→makeValid "
+                     f"eid={event.event_id} fid={target_fid} "
+                     f"(RW-19a: original shapefile geometry)", "WARNING")
+                geom = repaired
+            else:
+                flog(f"_buffer_update: GEOS-invalid, makeValid failed, "
+                     f"applying as-is eid={event.event_id} fid={target_fid} "
+                     f"(RW-19a: trust original WKB)", "WARNING")
 
         before_apply = feature_geom_short_repr(layer, target_fid)
         old_target = wkb_short_repr(event.geometry_wkb)
