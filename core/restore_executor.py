@@ -96,7 +96,7 @@ def execute_restore_plan(
 
     if plan.atomicity == AtomicityPolicy.STRICT:
         return _execute_strict(plan, events_by_id, layer, trace_id=trace_id)
-    return _execute_best_effort(plan, events_by_id, layer)
+    return _execute_best_effort(plan, events_by_id, layer, trace_id=trace_id)
 
 
 def build_restore_session(
@@ -135,10 +135,11 @@ def _execute_best_effort(
     plan: RestorePlan,
     events_by_id: Dict[int, AuditEvent],
     layer,
+    trace_id: str = "",
 ) -> RestoreReport:
     """Per-entity isolation via existing restore_batch."""
     ordered = [events_by_id[a.event_id] for a in plan.actions if a.event_id in events_by_id]
-    return restore_batch(layer, ordered)
+    return restore_batch(layer, ordered, trace_id=trace_id)
 
 
 def _execute_strict(
@@ -169,7 +170,10 @@ def _execute_strict(
             failed[action.event_id] = "Event data not found"
             break
 
-        result = _apply_via_buffer(layer, action.compensatory_op, event)
+        result = _apply_via_buffer(
+            layer, action.compensatory_op, event,
+            trace_id=trace_id,
+        )
         if result["success"]:
             succeeded.append(action.event_id)
         else:
@@ -220,7 +224,8 @@ def _build_traces_for_succeeded(
 
 
 def _apply_via_buffer(layer, compensatory_op: str, event: AuditEvent,
-                      fid_remap: Optional[Dict] = None) -> dict:
+                      fid_remap: Optional[Dict] = None,
+                      trace_id: str = "") -> dict:
     """Apply a single compensatory action via the layer editing buffer.
 
     fid_remap: shared dict {entity_fingerprint -> new_fid} maintained across
@@ -228,18 +233,22 @@ def _apply_via_buffer(layer, compensatory_op: str, event: AuditEvent,
     UPDATE/DELETE consult it first. This is required for FID-only identity
     layers where re-inserted features get fresh negative FIDs in the buffer
     that no longer match the historical FID stored in the event.
+
+    BL-RW-P3-17: trace_id flows from the runner so executor logs share
+    the same `[trace_id]` prefix as the rest of the rewind chain.
     """
+    prefix = f"[{trace_id}] " if trace_id else ""
     layer_name = layer.name() if layer and hasattr(layer, 'name') else '?'
-    flog(f"_apply_via_buffer: comp_op={compensatory_op} "
+    flog(f"{prefix}_apply_via_buffer: comp_op={compensatory_op} "
          f"eid={event.event_id} orig_op={event.operation_type} "
          f"layer={layer_name!r} "
          f"identity={(event.feature_identity_json or '')[:80]}")
     if compensatory_op == "INSERT":
-        return _buffer_insert(layer, event, fid_remap)
+        return _buffer_insert(layer, event, fid_remap, trace_id=trace_id)
     if compensatory_op == "DELETE":
-        return _buffer_delete(layer, event, fid_remap)
+        return _buffer_delete(layer, event, fid_remap, trace_id=trace_id)
     if compensatory_op == "UPDATE":
-        return _buffer_update(layer, event, fid_remap)
+        return _buffer_update(layer, event, fid_remap, trace_id=trace_id)
     return {
         "success": False,
         "status": "FAILED",
@@ -249,7 +258,8 @@ def _apply_via_buffer(layer, compensatory_op: str, event: AuditEvent,
 
 
 def _buffer_insert(layer, event: AuditEvent,
-                   fid_remap: Optional[Dict] = None) -> dict:
+                   fid_remap: Optional[Dict] = None,
+                   trace_id: str = "") -> dict:
     """Re-insert a deleted feature via editing buffer.
 
     Plain addFeature. No geometry-based idempotence: scanning the layer
@@ -349,7 +359,8 @@ def _resolve_target_fid(layer, event: AuditEvent,
 
 
 def _buffer_delete(layer, event: AuditEvent,
-                   fid_remap: Optional[Dict] = None) -> dict:
+                   fid_remap: Optional[Dict] = None,
+                   trace_id: str = "") -> dict:
     """Delete an inserted feature via editing buffer.
 
     Safety: when identity is FID-only (no PK captured), FIDs can be reused
@@ -539,7 +550,8 @@ def _target_matches_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:
 
 
 def _buffer_update(layer, event: AuditEvent,
-                   fid_remap: Optional[Dict] = None) -> dict:
+                   fid_remap: Optional[Dict] = None,
+                   trace_id: str = "") -> dict:
     """Revert attributes and geometry via editing buffer.
 
     Safety: when identity is FID-only (no PK captured) and the captured NEW

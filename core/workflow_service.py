@@ -64,6 +64,7 @@ def execute_grouped_restore(
     events: List[AuditEvent],
     find_layer_fn: Callable[[AuditEvent], object],
     on_group_done: Optional[Callable[[int, int], None]] = None,
+    trace_id: str = "",
 ) -> GroupedRestoreResult:
     """Execute restore grouped by datasource fingerprint.
 
@@ -72,6 +73,8 @@ def execute_grouped_restore(
         find_layer_fn: callable(event) -> QgsVectorLayer or None.
         on_group_done: optional callback(processed_count, total_count)
             for progress updates.
+        trace_id: BL-RW-P3-17 — propagated to restore_batch so executor
+            logs share the rewind chain prefix.
 
     Returns:
         GroupedRestoreResult with totals, errors, by_ds map, and trace events.
@@ -96,7 +99,7 @@ def execute_grouped_restore(
                 on_group_done(processed, len(events))
             continue
 
-        report = restore_batch(layer, group)
+        report = restore_batch(layer, group, trace_id=trace_id)
         total_ok += len(report.succeeded)
         total_fail += len(report.failed)
         for eid, msg in report.failed.items():
