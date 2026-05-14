@@ -91,3 +91,40 @@ journal contient 100 evenements UPDATE.
 
 Fermer QGIS, rouvrir. Le plugin recharge sans erreur. Le journal du
 projet precedent est accessible.
+
+## 13. Scenarios non-regression hypotheses (BL-RW-P3-19)
+
+Les trois scenarios runtime ci-dessous reproduisent les hypotheses
+H-V1, H-V2, H-T1 documentees dans `SESSION_REWIND.md` chap. 17. Ils
+sont localises dans `scripts/validation/scenarios/hypotheses/`
+(toolkit interne, gitignored). Chacun emet exactement une ligne de
+verdict :
+
+```
+hypothesis_h_v1: status=VALIDATED|FALSIFIED|UNREPRODUCED reason=...
+hypothesis_h_v2: status=VALIDATED|FALSIFIED|UNREPRODUCED reason=...
+hypothesis_h_t1: status=VALIDATED|FALSIFIED|UNREPRODUCED reason=...
+```
+
+Lancement console Python QGIS :
+
+```python
+from scripts.validation.runner import run_scenario
+run_scenario('scripts/validation/scenarios/hypotheses/h_v1_trace_invalidated.py')
+run_scenario('scripts/validation/scenarios/hypotheses/h_v2_fuse_long_chain.py')
+run_scenario('scripts/validation/scenarios/hypotheses/h_t1_phase_order.py')
+```
+
+Verdicts attendus en l etat actuel du code :
+
+- `h_v1` : sortie `FALSIFIED` ou `UNREPRODUCED` (le pipeline filtre les
+  trace events avec ou sans `invalidated_at` ; la branche orpheline n est
+  plus silencieusement laissee passer).
+- `h_v2` : sortie `FALSIFIED` (le synthetic preserve `feature_identity_json`,
+  `entity_fingerprint` et `new_geometry_wkb` du newest, `geometry_wkb`
+  du oldest).
+- `h_t1` : sortie `VALIDATED` (le risque structurel decrit par H-T1
+  reste theorique ; la mitigation est runtime via `fid_remap`).
+
+Tout autre triplet de verdicts doit etre traite comme une regression et
+escalade en backlog.
