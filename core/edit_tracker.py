@@ -26,7 +26,9 @@ from .serialization import (
     serialize_attributes, serialize_field_schema,
     compute_update_delta, build_full_snapshot,
 )
-from .support_policy import evaluate_layer_support, SupportLevel
+from .support_policy import (
+    evaluate_layer_support, SupportLevel, IdentityStrength,
+)
 from .user_identity import resolve_user_name
 from .logger import flog
 
@@ -143,23 +145,88 @@ class EditSessionTracker:
         flog(f"EditSessionTracker: filter set, {len(self._allowed_layer_fingerprints)} layer(s)")
 
     def connect_layer(self, layer) -> None:
-        """Start monitoring a layer for edit events."""
+        """Start monitoring a layer for edit events.
+
+        Gate by `identity_strength` so the user has a structured log of
+        capture decisions per layer. Behaviour by strength:
+
+        * STRONG  -> capture, INFO
+        * MEDIUM  -> capture, INFO action=accepted_untested
+        * WEAK    -> capture, WARNING action=warned (recommend a PK)
+        * NONE    -> refuse,  WARNING action=refused
+
+        Providers refused at the support level (REFUSED) are blocked
+        upstream. Providers whose policy disables capture (capture=False)
+        are refused with reason=capture_disabled.
+        """
         layer_id = layer.id()
         layer_fp = compute_datasource_fingerprint(layer)
         if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
             return
         if layer_id in self._connected_layers:
             return
-        policy = evaluate_layer_support(layer)
-        if policy.support_level == SupportLevel.REFUSED:
-            flog(f"EditSessionTracker: refused {layer.name()}: {policy.reason}")
+
+        try:
+            policy = evaluate_layer_support(layer)
+            provider = layer.dataProvider()
+            provider_name = provider.name() if provider is not None else "unknown"
+            if provider_name == "ogr" and provider is not None:
+                driver_name = provider.storageType() or "unknown"
+            else:
+                driver_name = provider_name
+        except (RuntimeError, AttributeError) as exc:
+            flog(
+                f"EditSessionTracker.connect_layer: layer={layer.name()!r} "
+                f"layer_id={layer_id} action=refused reason=policy_eval_failed "
+                f"error={type(exc).__name__} msg={exc}",
+                "WARNING",
+            )
             return
+
+        strength = policy.identity_strength
+        support = policy.support_level
+        base = (
+            f"EditSessionTracker.connect_layer: layer={layer.name()!r} "
+            f"provider={provider_name} driver={driver_name} "
+            f"identity_strength={strength.value} support_level={support.value}"
+        )
+
+        if support == SupportLevel.REFUSED:
+            flog(
+                f"{base} action=refused reason=provider_refused "
+                f"policy_reason={policy.reason!r}",
+                "WARNING",
+            )
+            return
+
+        if strength == IdentityStrength.NONE:
+            flog(
+                f"{base} action=refused reason=no_stable_identity",
+                "WARNING",
+            )
+            return
+
         if not policy.capture:
+            flog(
+                f"{base} action=refused reason=capture_disabled",
+                "INFO",
+            )
             return
+
+        if strength == IdentityStrength.WEAK:
+            level = "WARNING"
+            tail = ' action=warned recommendation="add a PK column"'
+        elif strength == IdentityStrength.MEDIUM:
+            level = "INFO"
+            tail = " action=accepted_untested"
+        else:
+            level = "INFO"
+            tail = " action=accepted"
+
         self._bind_signals(layer)
         self._connected_layers[layer_id] = layer
         self._layer_fingerprints[layer_id] = layer_fp
-        flog(f"EditSessionTracker: connected {layer.name()} [{layer_id}]")
+        flog(f"{base}{tail} layer_id={layer_id}", level)
 
     def disconnect_layer(self, layer) -> None:
         """Stop monitoring a layer."""
