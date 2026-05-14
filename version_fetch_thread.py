@@ -13,7 +13,7 @@ from .qgs_task_support import TaskEnabledThread, trace_prefix
 
 
 def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
-               is_cancelled, include_traces=False):
+               is_cancelled, include_traces=True):
     conn = None
     prefix = trace_prefix(trace_id)
     cutoff_str = cutoff.isoformat() if hasattr(cutoff, 'isoformat') else str(cutoff)
@@ -56,7 +56,7 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
 
 
 def _run_fetch_task(task, journal, fingerprints, cutoff, trace_id, count_callback,
-                    include_traces=False):
+                    include_traces=True):
     return _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
                       task.isCanceled, include_traces=include_traces)
 
@@ -69,7 +69,7 @@ class VersionFetchThread(TaskEnabledThread):
     error_occurred = pyqtSignal(str)
 
     def __init__(self, journal, fingerprints, cutoff, trace_id: str = "",
-                 include_traces: bool = False):
+                 include_traces: bool = True):
         super().__init__(trace_id=trace_id)
         self._journal = journal
         self._fingerprints = list(fingerprints)

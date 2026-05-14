@@ -43,7 +43,7 @@ def fetch_events_after_cutoff(
     cutoff: RestoreCutoff,
     limit: int = MAX_EVENTS_PER_RESTORE,
     trace_id: str = "",
-    include_traces: bool = False,
+    include_traces: bool = True,
 ) -> List[AuditEvent]:
     """Fetch events after a cutoff, ordered for reverse replay (DESC).
 
@@ -98,7 +98,7 @@ def count_events_after_cutoff(
     datasource_fp: str,
     cutoff: RestoreCutoff,
     trace_id: str = "",
-    include_traces: bool = False,
+    include_traces: bool = True,
 ) -> int:
     """Count events after a cutoff without loading them.
 
@@ -179,7 +179,7 @@ def get_oldest_event_date(
 
 def _cutoff_where(
     datasource_fp: Optional[str], cutoff: RestoreCutoff,
-    include_traces: bool = False,
+    include_traces: bool = True,
 ) -> tuple:
     """Build WHERE clause and params for a cutoff filter.
 
