@@ -305,6 +305,10 @@ def _buffer_insert(layer, event: AuditEvent,
     }
     if prev is not None:
         ins_fields["collision_prev"] = prev
+    # BL-RW-P3-17: include trace_id so the structured BUF_INS log
+    # correlates with the rest of the rewind chain.
+    if trace_id:
+        ins_fields["trace_id"] = trace_id
     flog_kv("INFO", "BUF_INS", module="restore_executor", **ins_fields)
     # BL-RW-P2-14: tag the success path explicitly so _classify_restore_result
     # doesn't have to fall back to message parsing.
@@ -511,10 +515,13 @@ def _buffer_delete(layer, event: AuditEvent,
             "reason_code": "buffer_refused",
             "message": "Failed: buffer deleteFeature refused",
         }
-    flog_kv(
-        "INFO", "BUF_DEL", module="restore_executor",
+    # BL-RW-P3-17: include trace_id on the structured BUF_DEL log.
+    _del_fields = dict(
         eid=event.event_id, fp=fp, fid=target_fid, status="deleted",
     )
+    if trace_id:
+        _del_fields["trace_id"] = trace_id
+    flog_kv("INFO", "BUF_DEL", module="restore_executor", **_del_fields)
     # BL-RW-P2-14: tag the success path explicitly.
     return {
         "success": True,
@@ -751,12 +758,15 @@ def _buffer_update(layer, event: AuditEvent,
             "message": "All attribute changes rejected",
         }
 
-    flog_kv(
-        "INFO", "BUF_UPD", module="restore_executor",
+    # BL-RW-P3-17: include trace_id on the structured BUF_UPD log.
+    _upd_fields = dict(
         eid=event.event_id, fid=target_fid,
         attr_ok=attr_ok, attr_fail=attr_fail,
         geom_status=geom_status, status="applied",
     )
+    if trace_id:
+        _upd_fields["trace_id"] = trace_id
+    flog_kv("INFO", "BUF_UPD", module="restore_executor", **_upd_fields)
     # BL-RW-P2-14: tag the success path explicitly.
     return {
         "success": True,
