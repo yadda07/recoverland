@@ -683,11 +683,20 @@ class StrictRestoreRunner(QObject):
                 else:
                     self._strict_group_applied += 1
             else:
+                # BL-RW-P4-22: distinguish soft failures (target_absent,
+                # geometry_drift) from hard failures. Soft failures are
+                # bounded to a single action that left the buffer state
+                # untouched, so the batch can keep processing the
+                # remaining actions instead of triggering a layer-wide
+                # rollback that would discard already-applied valid
+                # compensations.
+                soft_fail = reason in ("target_absent", "geometry_drift")
+                log_level = "WARNING" if soft_fail else "ERROR"
                 flog(f"{prefix}StrictRestoreRunner: action_failed "
                      f"eid={action.event_id} comp_op={action.compensatory_op} "
                      f"orig_op={action.operation_type} reason={reason} "
-                     f"msg={result['message']}",
-                     "ERROR")
+                     f"soft={soft_fail} msg={result['message']}",
+                     log_level)
                 self._errors.append(
                     f"Evt {action.event_id}: {result['message']}")
                 if reason == "target_absent":
@@ -696,6 +705,14 @@ class StrictRestoreRunner(QObject):
                     self._strict_group_failed_geometry_drift += 1
                 else:
                     self._strict_group_failed_other += 1
+                if soft_fail:
+                    # Skip the offending action; the buffer is untouched
+                    # because _buffer_update/_buffer_delete return early
+                    # before any layer mutation when target is absent or
+                    # geometry drift is detected. The breakdown counter
+                    # already recorded the failure reason; the commit
+                    # path will fold it into _total_fail.
+                    continue
                 self._rollback_strict(prefix, "apply_failed")
                 return
 
@@ -861,6 +878,23 @@ class StrictRestoreRunner(QObject):
         # and must contribute to total_ok so the breakdown invariant
         # bucket_sum == total_ok + total_fail holds.
         self._total_ok += ok_count + skipped_count
+        # BL-RW-P4-22: soft failures (target_absent, geometry_drift,
+        # failed_other) accumulated during this layer batch must be
+        # credited to _total_fail so the invariant
+        # bucket_sum == total_ok + total_fail holds even when the layer
+        # commits with partial soft-fail isolation enabled. We compute
+        # the delta from total_actions - (ok + skipped) to avoid the
+        # double-count that would happen if we naively summed the
+        # bucket accumulators: _buffer_update can return success=True,
+        # skipped=True, reason_code=geometry_drift (drift skipped case),
+        # which legitimately increments BOTH the skipped accumulator
+        # (via _strict_skipped) and the failed_geometry_drift bucket
+        # (for the breakdown). Counting that event as both ok and fail
+        # would break the invariant; treating it as ok (already in
+        # skipped_count) is the right call here.
+        total_actions = len(self._strict_plan.actions)
+        soft_fail_count = max(0, total_actions - ok_count - skipped_count)
+        self._total_fail += soft_fail_count
         # BL-RW-P4-21: commit succeeded -> the per-group bucket
         # accumulators reflect the final state and can be merged into
         # the global breakdown counters.
@@ -869,6 +903,12 @@ class StrictRestoreRunner(QObject):
         self._failed_other += self._strict_group_failed_other
         self._failed_target_absent += self._strict_group_failed_target_absent
         self._failed_geometry_drift += self._strict_group_failed_geometry_drift
+        flog(f"{prefix}StrictRestoreRunner: commit_breakdown "
+             f"layer={layer_name} ok={ok_count} skipped={skipped_count} "
+             f"soft_fail={soft_fail_count} "
+             f"failed_target_absent={self._strict_group_failed_target_absent} "
+             f"failed_geometry_drift={self._strict_group_failed_geometry_drift} "
+             f"failed_other={self._strict_group_failed_other}")
         self._strict_group_applied = 0
         self._strict_group_skipped_idempotent = 0
         self._strict_group_failed_other = 0
