@@ -453,10 +453,15 @@ def validate_rewind(snapshot_path=None):
 # ---------------------------------------------------------------------------
 # AUTO-RUN
 # ---------------------------------------------------------------------------
-if AUTO_REWIND:
-    try:
-        trigger_rewind_to_snapshot()
-    except Exception as exc:
-        print(f"[auto-rewind] ABORT: {type(exc).__name__}: {exc}")
-        print("[auto-rewind] validation faite sur l'état courant (sans rewind auto)")
-validate_rewind()
+def _auto_run():
+    if AUTO_REWIND:
+        try:
+            trigger_rewind_to_snapshot()
+        except Exception as exc:
+            print(f"[auto-rewind] ABORT: {type(exc).__name__}: {exc}")
+            print("[auto-rewind] validation faite sur l'état courant (sans rewind auto)")
+    validate_rewind()
+
+
+if __name__ == "__main__":
+    _auto_run()
