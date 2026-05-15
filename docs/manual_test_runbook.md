@@ -117,12 +117,14 @@ run_scenario('scripts/validation/scenarios/hypotheses/h_t1_phase_order.py')
 
 Verdicts attendus en l etat actuel du code :
 
-- `h_v1` : sortie `FALSIFIED` ou `UNREPRODUCED` (le pipeline filtre les
-  trace events avec ou sans `invalidated_at` ; la branche orpheline n est
-  plus silencieusement laissee passer).
-- `h_v2` : sortie `FALSIFIED` (le synthetic preserve `feature_identity_json`,
-  `entity_fingerprint` et `new_geometry_wkb` du newest, `geometry_wkb`
-  du oldest).
+- `h_v1` : sortie `VALIDATED` (le risque structurel existe : un trace
+  event avec `invalidated_at IS NULL` neutralise silencieusement le
+  user event qu il reference. Mitigation : `undo_restore_batch` doit
+  setter `invalidated_at` lors d un rollback, pas la dedup elle-meme).
+- `h_v2` : sortie `UNREPRODUCED` (le pre-pass de dedup collapse les
+  UPDATE consecutifs avant que `_fuse_long_chain` ne soit atteint) ou
+  `FALSIFIED` (si la fusion fire, elle preserve correctement
+  `feature_identity_json`, `entity_fingerprint`, `new_geometry_wkb`).
 - `h_t1` : sortie `VALIDATED` (le risque structurel decrit par H-T1
   reste theorique ; la mitigation est runtime via `fid_remap`).
 
