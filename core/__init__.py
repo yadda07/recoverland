@@ -111,9 +111,12 @@ from .geometry_preview import GeometryPreviewManager
 from .layer_stats_cache import LayerStatsCache, LayerStats
 from .workflow_service import (
     execute_grouped_restore, execute_grouped_undo,
-    find_target_layer, GroupedRestoreResult,
+    find_target_layer, cleanup_temp_layers, GroupedRestoreResult,
 )
-from .rewind_dedup import collapse_rewind_events
+from .rewind_dedup import (
+    collapse_rewind_events,
+    collapse_rewind_events_with_stats,
+)
 
 __all__ = (
     "PLUGIN_NAME",
@@ -183,6 +186,6 @@ __all__ = (
     "GeometryPreviewManager",
     "LayerStatsCache", "LayerStats",
     "execute_grouped_restore", "execute_grouped_undo",
-    "find_target_layer", "GroupedRestoreResult",
-    "collapse_rewind_events",
+    "find_target_layer", "cleanup_temp_layers", "GroupedRestoreResult",
+    "collapse_rewind_events", "collapse_rewind_events_with_stats",
 )

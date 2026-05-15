@@ -194,6 +194,9 @@ class RecoverPlugin:
             flog(f"[{integrity_trace_id}] RecoverPlugin: integrity check start path={journal_path}")
             integrity = check_journal_integrity(journal_path, trace_id=integrity_trace_id)
             self._integrity_result = integrity
+            if integrity.pending_rejected > 0:
+                qlog(f"RecoverLand: {integrity.pending_rejected} pending event(s) "
+                     f"could not be recovered (see log for details)", "WARNING")
             if not integrity.is_healthy:
                 for issue in integrity.issues:
                     flog(f"Journal issue: {issue}", "WARNING")

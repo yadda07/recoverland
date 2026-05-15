@@ -50,6 +50,7 @@ class IntegrityResult(NamedTuple):
     is_healthy: bool
     issues: List[str]
     recovered_events: int
+    pending_rejected: int = 0
 
 
 def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult:
@@ -59,6 +60,7 @@ def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult
     """
     issues: List[str] = []
     recovered = 0
+    rejected = 0
 
     with timed_op("check_journal_integrity", trace_id):
         if not os.path.isfile(db_path):
@@ -72,7 +74,7 @@ def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult
             _check_sqlite_integrity(conn, issues)
             _check_wal_state(conn, issues)
             _check_schema_version(conn, issues)
-            recovered = _recover_pending_events(db_path, conn)
+            recovered, rejected = _recover_pending_events(db_path, conn)
 
         except sqlite3.Error as e:
             issues.append(f"Cannot open journal: {e}")
@@ -81,7 +83,7 @@ def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult
                 conn.close()
 
     is_healthy = len(issues) == 0
-    return IntegrityResult(is_healthy, issues, recovered)
+    return IntegrityResult(is_healthy, issues, recovered, rejected)
 
 
 def _check_sqlite_integrity(conn: sqlite3.Connection, issues: List[str]) -> None:
@@ -113,11 +115,14 @@ def _check_schema_version(conn: sqlite3.Connection, issues: List[str]) -> None:
         issues.append(f"Schema version check error: {e}")
 
 
-def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> int:
-    """Re-integrate events from the pending recovery file."""
+def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> tuple:
+    """Re-integrate events from the pending recovery file.
+
+    Returns (recovered_count, rejected_count).
+    """
     pending_path = _get_pending_path(db_path)
     if not os.path.isfile(pending_path):
-        return 0
+        return 0, 0
 
     try:
         with open(pending_path, "r", encoding="utf-8") as f:
@@ -125,24 +130,26 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> int:
 
         if not isinstance(events, list) or len(events) == 0:
             os.remove(pending_path)
-            return 0
+            return 0, 0
 
         count, remaining = _insert_pending_events(conn, events)
+        rejected = len(remaining)
         if remaining:
             _rewrite_pending_events(pending_path, remaining)
             flog(
-                f"integrity: recovered {count} pending events, kept {len(remaining)} unrecovered",
+                f"integrity: recovered {count} pending events, "
+                f"rejected {rejected} (kept in pending file)",
                 "WARNING",
             )
-            return count
+            return count, rejected
 
         os.remove(pending_path)
         flog(f"integrity: recovered {count} pending events")
-        return count
+        return count, 0
 
     except (json.JSONDecodeError, OSError) as e:
         flog(f"integrity: pending recovery failed: {e}", "ERROR")
-        return 0
+        return 0, 0
 
 
 def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:

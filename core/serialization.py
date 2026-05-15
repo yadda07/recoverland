@@ -10,6 +10,7 @@ from datetime import date, time, datetime
 from typing import Any, Dict, Iterable, List, Optional
 
 from .audit_field_policy import is_layer_audit_field  # noqa: F401 re-export
+from .logger import flog
 
 
 _QVARIANT_NULL_TYPES = frozenset(["QVariant", "Invalid"])
@@ -221,6 +222,7 @@ def iter_mapped_attributes(mapping: Dict[str, str], attrs: Dict, fields):
     set on a buffered feature, accumulate a ``changeAttributeValues``
     dict, or call ``layer.changeAttributeValue`` directly.
     """
+    _skipped = []
     for hist_name, curr_name in mapping.items():
         if hist_name not in attrs:
             continue
@@ -228,8 +230,12 @@ def iter_mapped_attributes(mapping: Dict[str, str], attrs: Dict, fields):
             continue
         idx = fields.indexOf(curr_name)
         if idx < 0:
+            _skipped.append(curr_name)
             continue
         yield idx, attrs[hist_name]
+    if _skipped:
+        flog(f"iter_mapped_attributes: {len(_skipped)} field(s) skipped "
+             f"(schema drift): {_skipped[:5]}", "WARNING")
 
 
 def _values_equal(val_a: Any, val_b: Any) -> bool:

@@ -9,6 +9,7 @@ No QGIS dependency. All data comes via AuditEvent.
 from typing import List, Optional
 
 from .audit_backend import AuditEvent
+from .logger import flog
 from .restore_contracts import (
     RestoreMode, RestoreScope, CutoffType, RestoreCutoff, ConflictPolicy,
     AtomicityPolicy, PlannedAction, Conflict, RestorePlan,
@@ -164,6 +165,17 @@ def _build_action(
     Returns (action_or_None, conflict_or_None).
     """
     eid = event.event_id or 0
+
+    if getattr(event, 'restored_from_event_id', None) is not None:
+        flog(f"restore_planner: trace event leaked into planner "
+             f"eid={eid} restored_from={event.restored_from_event_id}", "ERROR")
+        return None, Conflict(
+            event_id=eid,
+            reason="trace_event_leaked",
+            severity="blocking",
+            details=None,
+        )
+
     comp_op = COMPENSATORY_OPS.get(event.operation_type)
     if comp_op is None:
         return None, Conflict(

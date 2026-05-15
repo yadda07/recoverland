@@ -8,7 +8,7 @@ from typing import List, Tuple
 
 from .logger import flog
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 # Authoritative column order for the audit_event table. Every SELECT/INSERT
 # site (search_service, event_stream_repository, write_queue, integrity)
@@ -21,6 +21,7 @@ AUDIT_EVENT_COLUMNS = (
     "geometry_wkb", "geometry_type", "crs_authid", "field_schema_json",
     "user_name", "session_id", "created_at", "restored_from_event_id",
     "entity_fingerprint", "event_schema_version", "new_geometry_wkb",
+    "invalidated_at",
 )
 AUDIT_EVENT_INSERT_COLUMNS = AUDIT_EVENT_COLUMNS[1:]  # event_id is autoincrement
 AUDIT_EVENT_SELECT_SQL = ", ".join(AUDIT_EVENT_COLUMNS)
@@ -109,7 +110,8 @@ _TABLE_DDL = [
         restored_from_event_id INTEGER,
         entity_fingerprint TEXT,
         event_schema_version INTEGER,
-        new_geometry_wkb BLOB
+        new_geometry_wkb BLOB,
+        invalidated_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS datasource_alias (
         alias_fingerprint TEXT PRIMARY KEY,
@@ -208,6 +210,8 @@ def get_migration_plan(current_version: int) -> List[Tuple[int, str, str]]:
         migrations.append((3, "Add partial indexes and performance PRAGMAs", ""))
     if current_version < 4:
         migrations.append((4, "Add datasource_alias table", _V4_MIGRATION_SQL))
+    if current_version < 5:
+        migrations.append((5, "Add invalidated_at for soft-delete traces", _V5_MIGRATION_SQL))
     return migrations
 
 
@@ -225,6 +229,8 @@ _V4_MIGRATION_SQL = (
     "note TEXT, "
     "CHECK(alias_fingerprint != target_fingerprint))"
 )
+
+_V5_MIGRATION_SQL = "ALTER TABLE audit_event ADD COLUMN invalidated_at TEXT"
 
 
 def _run_migrations(conn: sqlite3.Connection, current_version: int) -> None:

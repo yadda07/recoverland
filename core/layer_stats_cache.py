@@ -18,6 +18,7 @@ _STATS_QUERY = """
         GROUP_CONCAT(DISTINCT operation_type) AS op_types,
         COUNT(*) AS event_count
     FROM audit_event
+    WHERE restored_from_event_id IS NULL
     GROUP BY datasource_fingerprint
 """
 
@@ -28,6 +29,7 @@ _GLOBAL_STATS_QUERY = """
         GROUP_CONCAT(DISTINCT operation_type) AS op_types,
         COUNT(*) AS event_count
     FROM audit_event
+    WHERE restored_from_event_id IS NULL
 """
 
 
@@ -100,3 +102,11 @@ class LayerStatsCache:
 
     def is_empty(self) -> bool:
         return len(self._by_fp) == 0
+
+    def invalidate(self) -> None:
+        """Clear all cached data so next build() refreshes from DB (RW-20)."""
+        self._by_fp.clear()
+        self._global_min = None
+        self._global_max = None
+        self._global_ops = set()
+        self._global_count = 0
