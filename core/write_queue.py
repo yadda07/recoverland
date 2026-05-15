@@ -267,4 +267,5 @@ def _event_to_row(event: AuditEvent) -> tuple:
         event.entity_fingerprint,
         event.event_schema_version,
         event.new_geometry_wkb,
+        event.invalidated_at,
     )

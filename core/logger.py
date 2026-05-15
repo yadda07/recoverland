@@ -76,6 +76,8 @@ def flog(message: str, level: str = "INFO") -> None:
         _file_logger.warning(message)
     elif level == "ERROR":
         _file_logger.error(message)
+    elif level == "CRITICAL":
+        _file_logger.critical(message)
     else:
         _file_logger.info(message)
 

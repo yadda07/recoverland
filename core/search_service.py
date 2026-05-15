@@ -251,6 +251,7 @@ def _row_to_event(row: tuple) -> AuditEvent:
         entity_fingerprint=row[17] if len(row) > 17 else None,
         event_schema_version=row[18] if len(row) > 18 else None,
         new_geometry_wkb=new_geom,
+        invalidated_at=row[20] if len(row) > 20 else None,
     )
 
 

@@ -17,6 +17,7 @@ _LAYER_AUDIT_FIELD_NAMES = frozenset([
     "audituser",
     "datemodif",
     "datemodification",
+    "gid",
     "lasteditedat",
     "lasteditedby",
     "modifpar",

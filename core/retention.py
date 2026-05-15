@@ -99,7 +99,8 @@ def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
             with conn:
                 cursor = conn.execute(
                     "DELETE FROM audit_event WHERE event_id IN "
-                    "(SELECT event_id FROM audit_event ORDER BY created_at ASC LIMIT ?)",
+                    "(SELECT event_id FROM audit_event "
+                    "ORDER BY created_at ASC, event_id ASC LIMIT ?)",
                     (chunk,),
                 )
                 batch = cursor.rowcount
@@ -189,8 +190,30 @@ def vacuum_async(db_path: str,
     t.start()
 
 
+def _purge_orphan_traces(conn: sqlite3.Connection) -> int:
+    """Delete trace events whose referenced user event no longer exists (RW-18).
+
+    Returns number of orphan traces deleted.
+    """
+    try:
+        with conn:
+            cursor = conn.execute(
+                "DELETE FROM audit_event WHERE restored_from_event_id IS NOT NULL "
+                "AND restored_from_event_id NOT IN "
+                "(SELECT event_id FROM audit_event WHERE restored_from_event_id IS NULL)"
+            )
+            deleted = cursor.rowcount
+        if deleted:
+            flog(f"retention: purged {deleted} orphan trace event(s)")
+        return deleted
+    except sqlite3.Error as e:
+        flog(f"retention: orphan trace purge error: {e}", "WARNING")
+        return 0
+
+
 def _post_purge_maintenance(conn: sqlite3.Connection) -> None:
     """Refresh query planner stats and checkpoint WAL after a purge."""
+    _purge_orphan_traces(conn)
     try:
         conn.execute("ANALYZE audit_event")
         flog("retention: post-purge ANALYZE completed")

@@ -14,7 +14,7 @@
   --ac:#F5D060;--ac2:#E8C84A;--ac-lt:#2A2200;
 }
 html{scroll-behavior:smooth;scroll-padding-top:60px}
-body{font-family:var(--f);background:var(--bg);color:var(--tx);font-size:15px;line-height:1.75;-webkit-font-smoothing:antialiased}
+body{font-family:var(--f);background:var(--bg);color:var(--tx);font-size:clamp(15px,1.05vw,17px);line-height:1.75;-webkit-font-smoothing:antialiased}
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;opacity:.018;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");background-repeat:repeat;background-size:180px}
 [data-t="d"] body::before{opacity:.025;mix-blend-mode:soft-light}
 a{color:var(--ac2);text-decoration:none}
@@ -70,7 +70,7 @@ a:hover{text-decoration:underline}
 .side-pill.active{opacity:1}
 .cat{font-family:var(--fm);font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--tx3);margin:18px 0 3px 6px;opacity:.6}
 .cat:first-child{margin-top:0}
-.main{flex:1;min-width:0;max-width:700px;padding:32px 40px 80px}
+.main{flex:1;min-width:0;max-width:1180px;padding:32px 56px 80px}
 .rp{width:var(--right);flex-shrink:0;position:sticky;top:var(--bar);height:calc(100vh - var(--bar));overflow-y:auto;padding:28px 16px 20px 20px}
 .rp::-webkit-scrollbar{width:0}
 .rp h4{font-family:var(--fm);font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px}
@@ -80,11 +80,11 @@ a:hover{text-decoration:underline}
 [data-t="d"] .rp a.on{color:var(--ac)}
 .rp .sub{padding-left:14px;font-size:11px;opacity:.7;border-left:1px solid var(--bg3);margin-left:4px}
 .rp .sub:hover{opacity:1}
-@media(max-width:1160px){.rp{display:none}.main{max-width:780px}}
+@media(max-width:1380px){.rp{display:none}.main{max-width:1080px}}
 @media(max-width:820px){.side{display:none}.main{padding:20px 16px 60px;max-width:100%}}
 
-h1{font-size:32px;font-weight:700;color:var(--ink);letter-spacing:-.04em;line-height:1.15;margin-bottom:8px}
-h2{font-size:21px;font-weight:700;color:var(--ink);letter-spacing:-.03em;margin:48px 0 10px;padding-top:8px;border-top:1px solid var(--bg3)}
+h1{font-size:clamp(28px,2.2vw,36px);font-weight:700;color:var(--ink);letter-spacing:-.04em;line-height:1.15;margin-bottom:8px}
+h2{font-size:clamp(20px,1.4vw,24px);font-weight:700;color:var(--ink);letter-spacing:-.03em;margin:48px 0 10px;padding-top:8px;border-top:1px solid var(--bg3)}
 h2:first-of-type{border-top:none;margin-top:0}
 h3{font-size:15.5px;font-weight:600;color:var(--ink);margin:26px 0 8px}
 h4{font-size:13.5px;font-weight:600;color:var(--ink);margin:18px 0 6px}
@@ -235,7 +235,7 @@ pre{background:var(--ink);border-radius:var(--r);padding:15px 18px;overflow-x:au
 
 /* HERO */
 .hero{text-align:center;padding:48px 24px 40px;position:relative;overflow:hidden}
-.hero-logo{display:inline-block;max-width:420px;width:100%;position:relative}
+.hero-logo{display:inline-block;max-width:min(640px,55vw);width:100%;position:relative}
 .hero-logo svg{display:block;width:100%;height:auto;overflow:visible}
 .hero-logo svg #logo-text{fill:var(--ink);transition:fill .3s}
 
@@ -479,3 +479,157 @@ section.vis>h2::before,section.reveal.vis>h2::before{width:32px}
 @keyframes vt-fade-in{from{opacity:0;filter:blur(2px)}}
 
 @media print{.bar,.side,.rp,.tbtn,#pgbar{display:none!important}.main{max-width:100%;padding:8px}.reveal,.reveal-left,.reveal-scale{opacity:1!important;transform:none!important}.hero-orb,.hero-orb-2{display:none!important};body::before{display:none!important}}
+
+/* =================================================================== */
+/*  INTERACTIVE ARCHITECTURE GRAPH                                     */
+/*  Yellow + grayscale only. Hover = highlight, others fade.           */
+/* =================================================================== */
+.arch-wrap{margin:24px -40px 28px;padding:0;background:linear-gradient(180deg,var(--bg2),var(--bg));border-top:1px solid var(--bg3);border-bottom:1px solid var(--bg3);position:relative}
+@media(max-width:1160px){.arch-wrap{margin:24px -16px 28px}}
+.arch-canvas{position:relative;width:100%;height:0;padding-bottom:65%;overflow:hidden}
+.arch-svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+.arch-svg text{font-family:var(--fm);user-select:none}
+
+/* edges (default = barely visible, but readable in both themes) */
+.arch-edge{stroke:var(--brd);stroke-width:1;fill:none;opacity:.28;transition:stroke .35s ease,stroke-width .35s ease,opacity .35s ease}
+[data-t="d"] .arch-edge{stroke:#475569;opacity:.42}
+
+/* node group */
+.arch-node{cursor:pointer}
+.arch-node circle{fill:var(--srf);stroke:var(--brd);stroke-width:1.4;transition:fill .35s ease,stroke .35s ease,stroke-width .35s ease,r .45s cubic-bezier(.16,1,.3,1),opacity .35s ease,filter .35s ease}
+[data-t="d"] .arch-node circle{fill:#1E293B;stroke:#475569;stroke-width:1.5}
+.arch-node text{fill:var(--tx2);font-size:10.5px;font-weight:500;pointer-events:none;transition:fill .35s ease,opacity .35s ease,font-weight .35s ease;text-anchor:middle}
+[data-t="d"] .arch-node text{fill:#CBD5E1;font-weight:600}
+
+/* hub category : entry & contracts always slightly more visible */
+.arch-node[data-cluster="entry"] circle{fill:var(--ac-lt);stroke:var(--ac);stroke-width:1.6}
+.arch-node[data-cluster="entry"] text{fill:var(--ink);font-weight:600}
+.arch-node[data-cluster="contracts"] circle{stroke:var(--ac);stroke-width:1.6}
+.arch-node[data-cluster="contracts"] text{fill:var(--ink)}
+
+/* default hover (no node active yet) */
+.arch-node:hover circle{stroke:var(--ac);stroke-width:2.2}
+.arch-node:hover text{fill:var(--ink);font-weight:700}
+
+/* when graph has an active node — fade non-related, but stay readable */
+.arch-svg.has-active .arch-node circle{opacity:.28}
+.arch-svg.has-active .arch-node text{opacity:.32}
+.arch-svg.has-active .arch-edge{opacity:.08}
+[data-t="d"] .arch-svg.has-active .arch-node circle{opacity:.4}
+[data-t="d"] .arch-svg.has-active .arch-node text{opacity:.55}
+[data-t="d"] .arch-svg.has-active .arch-edge{opacity:.18}
+
+/* the ACTIVE node : translucent gold fill + crisp stroke. The fill stays
+   light enough to let the canvas grid breathe through, the stroke alone
+   carries the focus state. */
+.arch-svg.has-active .arch-node.active circle{opacity:1;fill:color-mix(in srgb,var(--ac) 55%,transparent);stroke:var(--ac2);stroke-width:2.5}
+[data-t="d"] .arch-svg.has-active .arch-node.active circle{fill:color-mix(in srgb,var(--ac) 45%,transparent);stroke:var(--ac)}
+.arch-svg.has-active .arch-node.active text{opacity:1;fill:var(--ink);font-weight:700;font-size:11.5px}
+
+/* connected (neighbour) nodes */
+.arch-svg.has-active .arch-node.connected circle{opacity:.95;stroke:var(--ac);stroke-width:1.8;fill:var(--ac-lt)}
+.arch-svg.has-active .arch-node.connected text{opacity:.95;fill:var(--ink);font-weight:600}
+
+/* connected edges */
+.arch-svg.has-active .arch-edge.connected{stroke:var(--ac);stroke-width:1.6;opacity:.85;color:var(--ac)}
+[data-t="d"] .arch-svg.has-active .arch-edge.connected{stroke:var(--ac);opacity:.9;color:var(--ac)}
+
+/* edge labels : horizontal gold badge on the connected arrow, hidden by default */
+.arch-edge-labels{pointer-events:none}
+.arch-edge-label{opacity:0;transition:opacity .25s ease}
+.arch-svg.has-active .arch-edge-label.connected{opacity:1}
+.arch-edge-label-bg{fill:var(--bg);stroke:var(--ac);stroke-width:1.2}
+[data-t="d"] .arch-edge-label-bg{fill:#0F172A;stroke:var(--ac);stroke-width:1.2}
+.arch-edge-label-text{font-family:var(--fm);font-size:12px;font-weight:600;fill:var(--ac2);text-anchor:middle;letter-spacing:.02em}
+[data-t="d"] .arch-edge-label-text{fill:var(--ac)}
+
+/* directional arrowheads : polygons rendered ABOVE nodes so they never hide.
+   transform transition stays in place : if the active node ever gets a halo
+   again, placeArrow(poly, larger_offset) will slide the tip smoothly.
+   No transform-box / transform-origin override here : the SVG transform
+   attribute must keep its native pivot (0,0 local), otherwise the rotated
+   tip ends up off the line by half the polygon width. */
+.arch-edge-arrow{fill:var(--ac);opacity:0;pointer-events:none;transition:opacity .25s ease,transform .35s cubic-bezier(.16,1,.3,1)}
+.arch-svg.has-active .arch-edge-arrow.connected{opacity:1;animation:arch-arrow-pulse 1.8s ease-in-out infinite}
+@keyframes arch-arrow-pulse{0%,100%{filter:drop-shadow(0 0 1px var(--ac))}50%{filter:drop-shadow(0 0 6px var(--ac))}}
+[data-t="d"] .arch-svg.has-active .arch-edge-arrow.connected{animation:arch-arrow-pulse-d 1.8s ease-in-out infinite}
+@keyframes arch-arrow-pulse-d{0%,100%{filter:drop-shadow(0 0 2px var(--ac))}50%{filter:drop-shadow(0 0 9px var(--ac))}}
+
+/* invisible hit areas : wide transparent strokes that capture mouse events
+   on the thin visible edges. Cursor changes so the user knows lines are
+   interactive. Placed under nodes so node hover wins on overlap. */
+.arch-edge-hits{pointer-events:none}
+.arch-edge-hit{stroke:transparent;stroke-width:14;fill:none;pointer-events:stroke;cursor:pointer}
+
+/* single-edge focus : isolate one line among many. The visible edge gets
+   bolder + brighter, its arrow and label step up, the OTHER connected
+   pieces are dimmed so the eye locks on the chosen line. */
+.arch-svg.has-edge-focus .arch-edge.connected:not(.edge-focus){opacity:.18}
+.arch-svg.has-edge-focus .arch-edge-arrow.connected:not(.edge-focus){opacity:.25;animation:none}
+.arch-svg.has-edge-focus .arch-edge-label.connected:not(.edge-focus){opacity:.2}
+.arch-edge.edge-focus{stroke:var(--ac2)!important;stroke-width:2.6!important;opacity:1!important;filter:drop-shadow(0 0 6px color-mix(in srgb,var(--ac) 55%,transparent))}
+[data-t="d"] .arch-edge.edge-focus{stroke:var(--ac)!important;filter:drop-shadow(0 0 8px color-mix(in srgb,var(--ac) 75%,transparent))}
+.arch-edge-arrow.edge-focus{opacity:1!important;animation:arch-arrow-pulse 1.2s ease-in-out infinite!important}
+[data-t="d"] .arch-edge-arrow.edge-focus{animation:arch-arrow-pulse-d 1.2s ease-in-out infinite!important}
+.arch-edge-label.edge-focus{opacity:1!important}
+.arch-edge-label.edge-focus .arch-edge-label-bg{stroke-width:2;filter:drop-shadow(0 0 4px color-mix(in srgb,var(--ac) 50%,transparent))}
+.arch-edge-label.edge-focus .arch-edge-label-text{fill:var(--ac2);font-weight:700}
+[data-t="d"] .arch-edge-label.edge-focus .arch-edge-label-text{fill:var(--ac)}
+
+/* cluster halo bands (subtle background regions) */
+.arch-cluster-halo{fill:var(--bg2);opacity:.55;stroke:var(--bg3);stroke-width:1;stroke-dasharray:3 5;rx:18;ry:18;transition:opacity .35s ease,stroke .35s ease}
+[data-t="d"] .arch-cluster-halo{fill:#1E293B;opacity:.5;stroke:#475569}
+.arch-cluster-label{fill:var(--tx3);font-size:9.5px;font-family:var(--fm);font-weight:600;letter-spacing:.14em;text-transform:uppercase;pointer-events:none;transition:fill .3s ease,opacity .3s ease}
+[data-t="d"] .arch-cluster-label{fill:#94A3B8}
+.arch-svg.has-active .arch-cluster-halo{opacity:.3}
+.arch-svg.has-active .arch-cluster-label{opacity:.4}
+[data-t="d"] .arch-svg.has-active .arch-cluster-halo{opacity:.35}
+[data-t="d"] .arch-svg.has-active .arch-cluster-label{opacity:.5}
+
+/* legend bar above the graph */
+.arch-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 24px;border-bottom:1px solid var(--bg3);background:var(--srf);flex-wrap:wrap}
+.arch-head-title{font-family:var(--fm);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--tx3)}
+.arch-head-hint{font-family:var(--f);font-size:11.5px;color:var(--tx3);display:flex;align-items:center;gap:8px}
+.arch-head-hint kbd{font-family:var(--fm);font-size:10px;background:var(--bg2);border:1px solid var(--bg3);border-radius:4px;padding:2px 6px;color:var(--tx2)}
+.arch-cluster-legend{display:flex;flex-wrap:wrap;gap:6px}
+.arch-leg{display:inline-flex;align-items:center;gap:5px;font-family:var(--fm);font-size:10px;color:var(--tx2);padding:3px 9px;border-radius:999px;background:var(--bg2);border:1px solid var(--bg3);cursor:pointer;transition:background .2s,border-color .2s,color .2s}
+.arch-leg-dot{width:7px;height:7px;border-radius:50%;background:var(--tx3)}
+.arch-leg[data-cluster="entry"] .arch-leg-dot,.arch-leg[data-cluster="contracts"] .arch-leg-dot{background:var(--ac)}
+.arch-leg:hover{background:var(--bg3);color:var(--ink);border-color:var(--brd)}
+.arch-leg.active{background:var(--ac-lt);color:var(--ac2);border-color:var(--ac)}
+[data-t="d"] .arch-leg.active{color:var(--ac)}
+
+/* detail panel below the graph */
+.arch-detail{display:grid;grid-template-columns:1fr 2fr;gap:0;padding:0;border-top:1px solid var(--bg3);background:var(--srf);min-height:120px}
+@media(max-width:720px){.arch-detail{grid-template-columns:1fr}}
+.arch-detail-head{padding:18px 22px;border-right:1px solid var(--bg3);display:flex;flex-direction:column;justify-content:center}
+@media(max-width:720px){.arch-detail-head{border-right:none;border-bottom:1px solid var(--bg3)}}
+.arch-detail-eyebrow{font-family:var(--fm);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--tx3);margin-bottom:6px}
+.arch-detail-title{font-family:var(--fm);font-size:18px;color:var(--ink);font-weight:700;line-height:1.2;letter-spacing:-.01em}
+.arch-detail-cluster{font-family:var(--fm);font-size:10px;color:var(--tx3);margin-top:4px;letter-spacing:.04em}
+.arch-detail-body{padding:18px 24px;display:flex;flex-direction:column;justify-content:center;min-height:100px}
+.arch-detail-desc{font-size:13.5px;color:var(--tx2);line-height:1.65;margin:0;min-height:1.6em}
+.arch-detail-desc::after{content:'\258A';display:inline-block;color:var(--ac);margin-left:2px;animation:arch-caret 1s steps(2) infinite;font-weight:400}
+.arch-detail-desc.done::after{display:none}
+@keyframes arch-caret{0%,49%{opacity:1}50%,100%{opacity:0}}
+.arch-detail-meta{display:flex;gap:14px;margin-top:10px;font-family:var(--fm);font-size:10.5px;color:var(--tx3);flex-wrap:wrap}
+.arch-detail-meta strong{color:var(--ac2);font-weight:600}
+[data-t="d"] .arch-detail-meta strong{color:var(--ac)}
+.arch-detail-deps{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.arch-detail-dep{font-family:var(--fm);font-size:10.5px;padding:2px 8px;border-radius:4px;background:var(--bg2);border:1px solid var(--bg3);color:var(--tx2);cursor:pointer;transition:background .15s,border-color .15s,color .15s;white-space:nowrap}
+.arch-detail-dep:hover{background:var(--ac-lt);border-color:var(--ac);color:var(--ac2)}
+[data-t="d"] .arch-detail-dep:hover{color:var(--ac)}
+.arch-chip-arrow{color:var(--ac);font-weight:700;margin-right:1px}
+.arch-chip-verb{color:var(--tx3);font-style:italic;font-size:.92em;margin:0 2px}
+.arch-detail-dep:hover .arch-chip-verb{color:var(--ac2)}
+[data-t="d"] .arch-detail-dep:hover .arch-chip-verb{color:var(--ac)}
+
+/* idle (no hover) state */
+.arch-idle-tip{display:flex;align-items:center;gap:8px;color:var(--tx3);font-size:13px;font-style:italic}
+.arch-idle-pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ac);animation:arch-pulse 1.6s ease-in-out infinite;flex-shrink:0}
+@keyframes arch-pulse{0%,100%{transform:scale(.6);opacity:.5}50%{transform:scale(1.2);opacity:1;box-shadow:0 0 12px var(--ac)}}
+
+@media(prefers-reduced-motion:reduce){
+  .arch-edge,.arch-node circle,.arch-node text,.arch-cluster-halo,.arch-detail-desc::after,.arch-idle-pulse,.arch-edge-arrow,.arch-edge-label{transition:none!important;animation:none!important}
+}
+
