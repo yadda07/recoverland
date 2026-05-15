@@ -298,6 +298,9 @@ class RestoreRunner(QObject):
         )
         if layer is None:
             self._errors.extend(errors)
+            # BL-RW-P4-21: layer cannot be resolved -> entire group is
+            # accounted as failed_other so the breakdown invariant holds.
+            self._failed_other += len(group)
             self._total_fail += len(group)
             self._processed += len(group)
             self.progress.emit(self._processed, len(self._events))
@@ -455,12 +458,22 @@ class StrictRestoreRunner(QObject):
         self._all_succeeded_ids: set = set()
 
         # BL-RW-P3-18: per-category breakdown accumulator (mirror of
-        # RestoreRunner). Decremented when a layer rolls back.
+        # RestoreRunner). Per-layer counters are kept separate so a
+        # rollback or a commit failure can credit the whole layer as
+        # _failed_other instead of leaving accumulated buckets that
+        # never made it to the user-visible state (BL-RW-P4-21).
         self._applied = 0
         self._skipped_idempotent = 0
         self._failed_other = 0
         self._failed_target_absent = 0
         self._failed_geometry_drift = 0
+        # Per-group accumulators reset at every _begin_strict_for_layer
+        # and merged into the globals only on commit success.
+        self._strict_group_applied = 0
+        self._strict_group_skipped_idempotent = 0
+        self._strict_group_failed_other = 0
+        self._strict_group_failed_target_absent = 0
+        self._strict_group_failed_geometry_drift = 0
 
     def start(self) -> None:
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
@@ -495,6 +508,9 @@ class StrictRestoreRunner(QObject):
         )
         if layer is None:
             self._errors.extend(errors)
+            # BL-RW-P4-21: layer cannot be resolved -> entire group is
+            # accounted as failed_other so the breakdown invariant holds.
+            self._failed_other += len(group)
             self._total_fail += len(group)
             self._processed += len(group)
             self.progress.emit(self._processed, len(self._events))
@@ -521,6 +537,9 @@ class StrictRestoreRunner(QObject):
         if report.verdict == PreflightVerdict.BLOCKED:
             msg = "; ".join(report.blocking_reasons[:3])
             self._errors.append(f"Preflight blocked: {msg}")
+            # BL-RW-P4-21: preflight blocked the whole group -> count
+            # every action as failed_other.
+            self._failed_other += len(group)
             self._total_fail += len(group)
             self._processed += len(group)
             self.progress.emit(self._processed, len(self._events))
@@ -531,6 +550,9 @@ class StrictRestoreRunner(QObject):
         if layer_issues:
             msg = "; ".join(layer_issues[:3])
             self._errors.append(f"Layer check failed: {msg}")
+            # BL-RW-P4-21: layer-level preflight refused the layer ->
+            # whole group is failed_other.
+            self._failed_other += len(group)
             self._total_fail += len(group)
             self._processed += len(group)
             self.progress.emit(self._processed, len(self._events))
@@ -549,11 +571,20 @@ class StrictRestoreRunner(QObject):
         self._strict_was_editing = layer.isEditable()
         self._strict_apply_start = time.monotonic()
         self._strict_fid_remap = {}
+        # BL-RW-P4-21: reset per-group bucket accumulators.
+        self._strict_group_applied = 0
+        self._strict_group_skipped_idempotent = 0
+        self._strict_group_failed_other = 0
+        self._strict_group_failed_target_absent = 0
+        self._strict_group_failed_geometry_drift = 0
 
         if not self._strict_was_editing:
             if not layer.startEditing():
                 flog(f"{prefix}StrictRestoreRunner: startEditing failed", "ERROR")
                 self._errors.append("Cannot start editing on layer")
+                # BL-RW-P4-21: cannot open the layer for editing ->
+                # whole group is failed_other.
+                self._failed_other += len(group)
                 self._total_fail += len(group)
                 self._processed += len(group)
                 self.progress.emit(self._processed, len(self._events))
@@ -640,14 +671,17 @@ class StrictRestoreRunner(QObject):
                 else:
                     self._strict_succeeded.append(action.event_id)
                     self._all_succeeded_ids.add(action.event_id)
+                # BL-RW-P4-21: route bucket increments through the
+                # per-group accumulators so a later rollback can
+                # discard them cleanly.
                 if reason == "target_absent":
-                    self._failed_target_absent += 1
+                    self._strict_group_failed_target_absent += 1
                 elif reason == "geometry_drift":
-                    self._failed_geometry_drift += 1
+                    self._strict_group_failed_geometry_drift += 1
                 elif reason == "skipped_idempotent":
-                    self._skipped_idempotent += 1
+                    self._strict_group_skipped_idempotent += 1
                 else:
-                    self._applied += 1
+                    self._strict_group_applied += 1
             else:
                 flog(f"{prefix}StrictRestoreRunner: action_failed "
                      f"eid={action.event_id} comp_op={action.compensatory_op} "
@@ -657,11 +691,11 @@ class StrictRestoreRunner(QObject):
                 self._errors.append(
                     f"Evt {action.event_id}: {result['message']}")
                 if reason == "target_absent":
-                    self._failed_target_absent += 1
+                    self._strict_group_failed_target_absent += 1
                 elif reason == "geometry_drift":
-                    self._failed_geometry_drift += 1
+                    self._strict_group_failed_geometry_drift += 1
                 else:
-                    self._failed_other += 1
+                    self._strict_group_failed_other += 1
                 self._rollback_strict(prefix, "apply_failed")
                 return
 
@@ -690,6 +724,26 @@ class StrictRestoreRunner(QObject):
 
         for eid in self._strict_succeeded:
             self._all_succeeded_ids.discard(eid)
+
+        # BL-RW-P4-21: the layer rolled back, so discard the per-group
+        # bucket accumulators (applied/skipped were rolled back at the
+        # provider level) and credit the whole layer as failed_other,
+        # except for the action that actually triggered the rollback
+        # whose specific reason (target_absent / geometry_drift) is
+        # preserved so the breakdown still tells the operator why.
+        preserved_target_absent = self._strict_group_failed_target_absent
+        preserved_geometry_drift = self._strict_group_failed_geometry_drift
+        self._failed_target_absent += preserved_target_absent
+        self._failed_geometry_drift += preserved_geometry_drift
+        remainder_other = (
+            total_actions - preserved_target_absent - preserved_geometry_drift
+        )
+        self._failed_other += max(remainder_other, 0)
+        self._strict_group_applied = 0
+        self._strict_group_skipped_idempotent = 0
+        self._strict_group_failed_other = 0
+        self._strict_group_failed_target_absent = 0
+        self._strict_group_failed_geometry_drift = 0
 
         self._total_fail += total_actions
         remaining = total_actions - self._strict_action_idx
@@ -781,7 +835,18 @@ class StrictRestoreRunner(QObject):
                 for eid in self._strict_succeeded:
                     self._all_succeeded_ids.discard(eid)
                 self._errors.append(f"Commit failed: {msg}")
-                self._total_fail += len(self._strict_plan.actions)
+                # BL-RW-P4-21: commit failure rolls back every action
+                # in the layer; per-group bucket accumulators no longer
+                # represent reality. Credit the whole layer as
+                # failed_other and discard the per-group counters.
+                total_actions = len(self._strict_plan.actions)
+                self._failed_other += total_actions
+                self._strict_group_applied = 0
+                self._strict_group_skipped_idempotent = 0
+                self._strict_group_failed_other = 0
+                self._strict_group_failed_target_absent = 0
+                self._strict_group_failed_geometry_drift = 0
+                self._total_fail += total_actions
                 layer.triggerRepaint()
                 QTimer.singleShot(0, self._advance_group)
                 return
@@ -791,7 +856,24 @@ class StrictRestoreRunner(QObject):
 
         ok_count = len(self._strict_succeeded)
         skipped_count = len(self._strict_skipped)
-        self._total_ok += ok_count
+        # BL-RW-P4-21: skipped-idempotent events are successes per the
+        # audit_backend contract (`succeeded includes idempotent skips`)
+        # and must contribute to total_ok so the breakdown invariant
+        # bucket_sum == total_ok + total_fail holds.
+        self._total_ok += ok_count + skipped_count
+        # BL-RW-P4-21: commit succeeded -> the per-group bucket
+        # accumulators reflect the final state and can be merged into
+        # the global breakdown counters.
+        self._applied += self._strict_group_applied
+        self._skipped_idempotent += self._strict_group_skipped_idempotent
+        self._failed_other += self._strict_group_failed_other
+        self._failed_target_absent += self._strict_group_failed_target_absent
+        self._failed_geometry_drift += self._strict_group_failed_geometry_drift
+        self._strict_group_applied = 0
+        self._strict_group_skipped_idempotent = 0
+        self._strict_group_failed_other = 0
+        self._strict_group_failed_target_absent = 0
+        self._strict_group_failed_geometry_drift = 0
 
         for eid in self._strict_succeeded:
             event = self._strict_events_by_id.get(eid)
