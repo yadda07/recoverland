@@ -24,12 +24,18 @@ scripts/validate_rewind.py
 # Internal working documents (kept local, repo is public)
 docs/rewind_charter.md
 docs/backlog_rewind_v2.md
+docs/backlog_*.md
 docs/validation_strategy.md
 docs/orchestrator.md
 docs/orchestrator_state.json
 docs/audit_profond_recoverland.md
+docs/compat_audit_*.md
 docs/architecture.html
 docs/manual_test_runbook.md
+docs/support_policy.md
+
+# Cascade workflows (local-only, never in public repo)
+.windsurf/
 
 # Internal tooling (orchestrator + validation toolkit)
 scripts/orchestrator/
