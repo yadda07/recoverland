@@ -177,6 +177,45 @@ class JournalManager:
             self._unsaved_session_token = None
             self._lock_acquired = False
 
+    def open_readonly_connection(self) -> sqlite3.Connection:
+        """Open a read-only connection dedicated to Time Lens (IL-I1).
+
+        Returns a fresh sqlite3.Connection with TWO independent layers of
+        write protection:
+
+            1. URI mode=ro  - filesystem-level (SQLITE_OPEN_READONLY).
+            2. PRAGMA query_only=ON  - session-level (rejects any DML).
+
+        Defence-in-depth: any caller that bypasses one layer still hits
+        the other. Lens never shares `JournalManager._conn` (the
+        read-write connection used by the WriteQueue).
+
+        Logs `flog: journal_manager event=ro_connection_opened mode=ro
+        query_only=1` to make IL-I1 traceable in `recoverland_debug.log`.
+        """
+        if self._path is None:
+            raise RuntimeError("Journal is not open")
+        conn = sqlite3.connect(
+            f"file:{self._path}?mode=ro",
+            uri=True,
+            check_same_thread=False,
+        )
+        try:
+            # Belt-and-suspenders: even if a caller drops the URI mode=ro
+            # parameter, query_only blocks any DML at the session layer.
+            conn.execute("PRAGMA query_only=ON")
+            apply_pragmas(conn)
+            # apply_pragmas may reset query_only; re-apply to be safe.
+            conn.execute("PRAGMA query_only=ON")
+        except sqlite3.Error:
+            conn.close()
+            raise
+        flog(
+            f"journal_manager event=ro_connection_opened "
+            f"path={self._path} mode=ro query_only=1"
+        )
+        return conn
+
     def create_read_connection(self) -> sqlite3.Connection:
         """Create a separate read-only connection for search threads."""
         if self._path is None:
