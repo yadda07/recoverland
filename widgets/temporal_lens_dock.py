@@ -19,13 +19,14 @@ Phase 10b will add the polygon map tool, the date range picker, the
 operation filter combobox, the colour legend, the truncation banner and
 the entity list. Phase 10c will add the attribute diff panel.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QDateTime
 from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDockWidget,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -38,8 +39,32 @@ from qgis.core import (
     QgsGeometry,
     QgsProject,
 )
+from qgis.gui import QgsDateTimeEdit
 
+from ..compat import QtCompat
+from ..core.lens_contracts import LensOpFilter
+from ..core.time_format import format_relative_time
 from .temporal_lens_map_tool import LensRectangleMapTool
+from .temporal_lens_polygon_map_tool import LensPolygonMapTool
+
+# Static legend palette (RGB hex). Kept in sync with lens_renderer
+# operation classes; the renderer itself does not yet expose its
+# palette as a public constant, so we redeclare it here (5 entries).
+_LEGEND_PALETTE = (
+    ("INSERT", "#4CAF50", "creations"),
+    ("UPDATE", "#FF9800", "modifications"),
+    ("DELETE", "#F44336", "suppressions"),
+    ("ATTR",   "#2196F3", "attributs seuls"),
+    ("GEOM",   "#9C27B0", "geometrie seule"),
+)
+
+_PRESETS = (
+    ("Aujourd'hui", 0),
+    ("7 derniers jours", 7),
+    ("30 derniers jours", 30),
+    ("Personnalise", None),
+)
+_DEFAULT_PRESET_INDEX = 2  # 30 derniers jours
 
 
 # Logging is wired lazily so the module imports cleanly off-QGIS for the
@@ -68,7 +93,7 @@ class TemporalLensDock(QDockWidget):
     def __init__(self, iface, journal, parent=None):
         super().__init__("Time Lens", parent)
         self.setObjectName(self.OBJECT_NAME)
-        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.setAllowedAreas(QtCompat.DOCK_AREA_LEFT | QtCompat.DOCK_AREA_RIGHT)
 
         self._iface = iface
         self._journal = journal
@@ -95,21 +120,70 @@ class TemporalLensDock(QDockWidget):
         self.layer_combo = QComboBox(self)
         layout.addWidget(self.layer_combo)
 
-        btn_row = QHBoxLayout()
-        self.select_button = QPushButton("Selectionner rectangle", self)
+        sel_row = QHBoxLayout()
+        self.select_button = QPushButton("Rectangle", self)
         self.select_button.setCheckable(True)
         self.select_button.clicked.connect(self._on_select_button)
-        btn_row.addWidget(self.select_button)
+        sel_row.addWidget(self.select_button)
+
+        self.select_polygon_button = QPushButton("Polygone", self)
+        self.select_polygon_button.setCheckable(True)
+        self.select_polygon_button.clicked.connect(
+            self._on_select_polygon_button
+        )
+        sel_row.addWidget(self.select_polygon_button)
+        layout.addLayout(sel_row)
+
+        layout.addWidget(QLabel("Plage temporelle :"))
+        self.preset_combo = QComboBox(self)
+        for label, _ in _PRESETS:
+            self.preset_combo.addItem(label)
+        self.preset_combo.setCurrentIndex(_DEFAULT_PRESET_INDEX)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        layout.addWidget(self.preset_combo)
+
+        now_qdt = QDateTime.currentDateTime()
+        date_row = QHBoxLayout()
+        date_row.addWidget(QLabel("De :"))
+        self.t_min_input = QgsDateTimeEdit()
+        self.t_min_input.setDisplayFormat("dd/MM/yyyy HH:mm")
+        self.t_min_input.dateTimeChanged.connect(self._update_legend_age)
+        date_row.addWidget(self.t_min_input)
+        layout.addLayout(date_row)
+
+        date_row2 = QHBoxLayout()
+        date_row2.addWidget(QLabel("A :"))
+        self.t_max_input = QgsDateTimeEdit()
+        self.t_max_input.setDisplayFormat("dd/MM/yyyy HH:mm")
+        self.t_max_input.setDateTime(now_qdt)
+        date_row2.addWidget(self.t_max_input)
+        layout.addLayout(date_row2)
+
+        layout.addWidget(QLabel("Filtre operation :"))
+        self.op_combo = QComboBox(self)
+        self.op_combo.addItem("Tout", LensOpFilter.ALL.value)
+        self.op_combo.addItem("Insertions uniquement", LensOpFilter.INSERT_ONLY.value)
+        self.op_combo.addItem("Mises a jour uniquement", LensOpFilter.UPDATE_ONLY.value)
+        self.op_combo.addItem("Suppressions uniquement", LensOpFilter.DELETE_ONLY.value)
+        self.op_combo.addItem("Attributs seuls", LensOpFilter.ATTR_ONLY.value)
+        self.op_combo.addItem("Geometrie seule", LensOpFilter.GEOM_ONLY.value)
+        layout.addWidget(self.op_combo)
 
         self.refresh_button = QPushButton("Rafraichir", self)
         self.refresh_button.setEnabled(False)
         self.refresh_button.clicked.connect(self._on_refresh_button)
-        btn_row.addWidget(self.refresh_button)
-        layout.addLayout(btn_row)
+        layout.addWidget(self.refresh_button)
 
         self.status_label = QLabel("Aucune selection.", self)
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+        layout.addWidget(QLabel("Legende :"))
+        self.legend_widget = self._build_legend_widget()
+        layout.addWidget(self.legend_widget)
+        self.legend_age_label = QLabel("Plage non definie.", self)
+        self.legend_age_label.setWordWrap(True)
+        layout.addWidget(self.legend_age_label)
 
         layout.addStretch(1)
 
@@ -118,6 +192,36 @@ class TemporalLensDock(QDockWidget):
         layout.addWidget(self.disable_button)
 
         self.setWidget(root)
+        # Apply the default preset NOW so the t_min/t_max widgets are
+        # populated coherently before the user clicks Rafraichir.
+        self._on_preset_changed(_DEFAULT_PRESET_INDEX)
+
+    def _build_legend_widget(self) -> QFrame:
+        """Static 5-row legend (color swatch + label).
+
+        Acceptance section 1.6 of BL-IL-P0-10. The dynamic *"il y a Xj"*
+        label sits BELOW the swatches and is refreshed by
+        :meth:`_update_legend_age` every time t_min changes.
+        """
+        frame = QFrame(self)
+        frame.setFrameShape(QtCompat.HLINE)  # subtle separator look
+        v = QVBoxLayout(frame)
+        v.setContentsMargins(0, 4, 0, 4)
+        v.setSpacing(2)
+        self._legend_swatches = []
+        for code, color_hex, descr in _LEGEND_PALETTE:
+            row = QHBoxLayout()
+            swatch = QLabel(self)
+            swatch.setFixedSize(16, 16)
+            swatch.setStyleSheet(
+                f"background-color: {color_hex}; border: 1px solid #555;"
+            )
+            row.addWidget(swatch)
+            row.addWidget(QLabel(f"{code} ({descr})", self))
+            row.addStretch(1)
+            v.addLayout(row)
+            self._legend_swatches.append(swatch)
+        return frame
 
     # ----- combobox population ------------------------------------------
 
@@ -194,36 +298,30 @@ class TemporalLensDock(QDockWidget):
     # ----- selection workflow -------------------------------------------
 
     def _on_select_button(self, checked: bool) -> None:
-        if not checked:
-            # User unchecked: cancel selection in flight.
-            self._restore_previous_map_tool()
-            self.status_label.setText("Selection annulee.")
-            return
-
-        if self.layer_combo.currentData() is None:
-            self.status_label.setText("Choisissez d'abord une couche auditee.")
-            self.select_button.setChecked(False)
-            return
-
-        if self._canvas is None:
-            self.status_label.setText("Canvas QGIS indisponible.")
-            self.select_button.setChecked(False)
-            return
-
-        self._prev_map_tool = self._canvas.mapTool()
-        self._lens_map_tool = LensRectangleMapTool(self._canvas)
-        self._lens_map_tool.selection_completed.connect(
-            self._on_map_selection_completed,
-        )
-        self._canvas.setMapTool(self._lens_map_tool)
-        self.status_label.setText(
+        self._activate_map_tool(
+            checked,
+            LensRectangleMapTool,
+            self.select_button,
+            self.select_polygon_button,
             "Tracez un rectangle sur la carte (clic-glisser-relacher).",
+        )
+
+    def _on_select_polygon_button(self, checked: bool) -> None:
+        self._activate_map_tool(
+            checked,
+            LensPolygonMapTool,
+            self.select_polygon_button,
+            self.select_button,
+            "Tracez un polygone (clic = sommet, double-clic = valider, Esc = annuler).",
         )
 
     def _on_map_selection_completed(self, geom) -> None:
         self._selected_geom = geom
         self.refresh_button.setEnabled(True)
-        self.select_button.setChecked(False)
+        for btn in (self.select_button, self.select_polygon_button):
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
         self._restore_previous_map_tool()
         bbox = geom.boundingBox()
         self.status_label.setText(
@@ -250,7 +348,7 @@ class TemporalLensDock(QDockWidget):
     def _on_refresh_button(self) -> None:
         import uuid as _uuid
         from ..core.event_stream_repository import fetch_events_in_zone
-        from ..core.lens_contracts import LensOpFilter, LensSelection
+        from ..core.lens_contracts import LensFetchStats, LensSelection
         from ..core.workflow_service import execute_grouped_lens_view
 
         data = self.layer_combo.currentData()
@@ -299,9 +397,15 @@ class TemporalLensDock(QDockWidget):
             bbox.xMaximum(), bbox.yMaximum(),
         )
 
-        now = datetime.now(timezone.utc)
-        t_min = (now - timedelta(days=30)).isoformat()
-        t_max = (now + timedelta(days=1)).isoformat()
+        t_min = self._get_iso_from_qdt(self.t_min_input)
+        t_max = self._get_iso_from_qdt(self.t_max_input)
+        op_filter_value = self.op_combo.currentData() or LensOpFilter.ALL.value
+        op_filter = LensOpFilter(op_filter_value)
+        _flog(
+            f"lens_dock event=refresh_clicked layer={layer.name()} "
+            f"t_min={t_min} t_max={t_max} op_filter={op_filter.value}",
+            "INFO",
+        )
 
         selection = LensSelection(
             layer_id_snapshot=data["layer_id"],
@@ -310,7 +414,7 @@ class TemporalLensDock(QDockWidget):
             bbox_crs=bbox_crs_storage,
             t_min=t_min,
             t_max=t_max,
-            op_filter=LensOpFilter.ALL,
+            op_filter=op_filter,
         )
 
         trace_id = _uuid.uuid4().hex[:8]
@@ -347,6 +451,24 @@ class TemporalLensDock(QDockWidget):
                 pass
             return
 
+        # Apply op_filter post-fetch (the repository does NOT filter by
+        # op_filter; this keeps the planner pure and lets the dock
+        # change the filter without re-querying SQL).
+        n_pre = len(events)
+        if op_filter != LensOpFilter.ALL:
+            events = self._filter_events_by_op_filter(events, op_filter)
+            fetch_stats = LensFetchStats(
+                n_events_total=fetch_stats.n_events_total,
+                n_events_returned=len(events),
+                n_events_truncated=fetch_stats.n_events_truncated,
+                elapsed_ms=fetch_stats.elapsed_ms,
+            )
+        _flog(
+            f"lens_dock event=op_filter_applied trace_id={trace_id} "
+            f"op_filter={op_filter.value} n_pre={n_pre} n_post={len(events)}",
+            "DEBUG" if op_filter == LensOpFilter.ALL else "INFO",
+        )
+
         try:
             result = execute_grouped_lens_view(
                 events,
@@ -362,23 +484,147 @@ class TemporalLensDock(QDockWidget):
             except Exception:  # noqa: BLE001
                 pass
 
-        truncated_note = (
-            f" ({result.n_events_truncated} tronques)"
-            if result.n_events_truncated > 0
-            else ""
-        )
-        self.status_label.setText(
-            f"{result.n_entities} entites - "
-            f"{result.n_events_displayed} events affiches{truncated_note} "
-            f"({result.elapsed_ms} ms, trace={trace_id})"
-        )
+        if result.n_entities == 0:
+            self.status_label.setText(
+                "Aucune modification trouvee dans cette zone et cette fenetre."
+            )
+        else:
+            truncated_note = (
+                f" ({result.n_events_truncated} tronques)"
+                if result.n_events_truncated > 0
+                else ""
+            )
+            self.status_label.setText(
+                f"{result.n_entities} entites - "
+                f"{result.n_events_displayed} events affiches{truncated_note} "
+                f"({result.elapsed_ms} ms, trace={trace_id})"
+            )
         _flog(
             f"lens_dock event=refresh_done trace_id={trace_id} "
             f"n_entities={result.n_entities} "
             f"n_events_displayed={result.n_events_displayed} "
-            f"n_truncated={result.n_events_truncated}",
+            f"n_truncated={result.n_events_truncated} "
+            f"op_filter={op_filter.value}",
             "INFO",
         )
+
+    # ----- helpers (phase 10b) ------------------------------------------
+
+    def _activate_map_tool(self, checked, tool_cls, self_button,
+                           other_button, hint_message):
+        """Mutually exclusive activation of rectangle / polygon map tool.
+
+        Acceptance section 1.2 (BL-IL-P0-10): the user can only have ONE
+        Lens selection tool active at a time. Switching from rectangle
+        to polygon (or vice versa) must restore the previous canvas
+        map tool cleanly before installing the new one.
+        """
+        other_button.blockSignals(True)
+        other_button.setChecked(False)
+        other_button.blockSignals(False)
+        if not checked:
+            self._restore_previous_map_tool()
+            self.status_label.setText("Selection annulee.")
+            return
+        if self.layer_combo.currentData() is None:
+            self.status_label.setText("Choisissez d'abord une couche auditee.")
+            self_button.setChecked(False)
+            return
+        if self._canvas is None:
+            self.status_label.setText("Canvas QGIS indisponible.")
+            self_button.setChecked(False)
+            return
+        if self._lens_map_tool is not None:
+            self._restore_previous_map_tool()
+        self._prev_map_tool = self._canvas.mapTool()
+        self._lens_map_tool = tool_cls(self._canvas)
+        self._lens_map_tool.selection_completed.connect(
+            self._on_map_selection_completed,
+        )
+        self._canvas.setMapTool(self._lens_map_tool)
+        self.status_label.setText(hint_message)
+        data = self.layer_combo.currentData() or {}
+        _flog(
+            f"lens_dock event=lens_activated tool={tool_cls.__name__} "
+            f"layer_id={data.get('layer_id', '')}",
+            "INFO",
+        )
+
+    def _filter_events_by_op_filter(self, events, op_filter):
+        """Apply :class:`LensOpFilter` to a list of ``AuditEvent`` (pure).
+
+        ATTR_ONLY = UPDATE event whose geometry did NOT change.
+        GEOM_ONLY = UPDATE event whose geometry DID change.
+        Both predicates fall back to comparing ``geometry_wkb`` and
+        ``new_geometry_wkb`` raw bytes.
+        """
+        if op_filter == LensOpFilter.ALL:
+            return events
+        out = []
+        for ev in events:
+            op = ev.operation_type
+            if op_filter == LensOpFilter.INSERT_ONLY and op == "INSERT":
+                out.append(ev)
+            elif op_filter == LensOpFilter.UPDATE_ONLY and op == "UPDATE":
+                out.append(ev)
+            elif op_filter == LensOpFilter.DELETE_ONLY and op == "DELETE":
+                out.append(ev)
+            elif op_filter == LensOpFilter.ATTR_ONLY and op == "UPDATE":
+                new_wkb = getattr(ev, "new_geometry_wkb", None)
+                if new_wkb is None or new_wkb == ev.geometry_wkb:
+                    out.append(ev)
+            elif op_filter == LensOpFilter.GEOM_ONLY and op == "UPDATE":
+                new_wkb = getattr(ev, "new_geometry_wkb", None)
+                if new_wkb is not None and new_wkb != ev.geometry_wkb:
+                    out.append(ev)
+        return out
+
+    def _get_iso_from_qdt(self, qdt_widget) -> str:
+        """Convert a ``QgsDateTimeEdit`` value to an ISO UTC string."""
+        qdt = qdt_widget.dateTime()
+        ms = qdt.toMSecsSinceEpoch()
+        py_dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+        return py_dt.isoformat()
+
+    def _on_preset_changed(self, index: int) -> None:
+        """Apply a DateRange preset to the t_min / t_max widgets.
+
+        Acceptance 1.3 (BL-IL-P0-10). "Personnalise" leaves the date
+        widgets untouched so the user can craft any window.
+        """
+        if not (0 <= index < len(_PRESETS)):
+            return
+        _label, days = _PRESETS[index]
+        if days is None:
+            return
+        now = QDateTime.currentDateTime()
+        if days == 0:
+            time_of_day = now.time()
+            seconds_since_midnight = (
+                time_of_day.hour() * 3600
+                + time_of_day.minute() * 60
+                + time_of_day.second()
+            )
+            t_min_qdt = now.addSecs(-seconds_since_midnight)
+        else:
+            t_min_qdt = now.addDays(-days)
+        self.t_min_input.blockSignals(True)
+        self.t_max_input.blockSignals(True)
+        self.t_min_input.setDateTime(t_min_qdt)
+        self.t_max_input.setDateTime(now)
+        self.t_min_input.blockSignals(False)
+        self.t_max_input.blockSignals(False)
+        self._update_legend_age()
+
+    def _update_legend_age(self) -> None:
+        """Refresh the *Depuis :* label below the legend swatches."""
+        try:
+            t_min_iso = self._get_iso_from_qdt(self.t_min_input)
+            rel = format_relative_time(t_min_iso)
+            absolute = self.t_min_input.dateTime().toString("dd/MM/yyyy HH:mm")
+            self.legend_age_label.setText(f"Depuis : {rel} ({absolute})")
+        except Exception:  # noqa: BLE001
+            self.legend_age_label.setText("Plage non definie.")
 
     # ----- disable / close ----------------------------------------------
 

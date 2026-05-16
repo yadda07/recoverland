@@ -102,6 +102,14 @@ class QtCompat:
 
     # --- Qt.CursorShape ---
     POINTING_HAND_CURSOR = _resolve_enum(Qt, 'CursorShape', 'PointingHandCursor')
+    CROSS_CURSOR = _resolve_enum(Qt, 'CursorShape', 'CrossCursor')
+
+    # --- Qt.Key ---
+    KEY_ESCAPE = _resolve_enum(Qt, 'Key', 'Key_Escape')
+
+    # --- Qt.DockWidgetArea ---
+    DOCK_AREA_LEFT = _resolve_enum(Qt, 'DockWidgetArea', 'LeftDockWidgetArea')
+    DOCK_AREA_RIGHT = _resolve_enum(Qt, 'DockWidgetArea', 'RightDockWidgetArea')
 
     # --- Qt.ContextMenuPolicy ---
     CUSTOM_CONTEXT_MENU = _resolve_enum(Qt, 'ContextMenuPolicy', 'CustomContextMenu')
