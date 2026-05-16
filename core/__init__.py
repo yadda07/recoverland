@@ -121,6 +121,7 @@ from .layer_stats_cache import LayerStatsCache, LayerStats
 from .workflow_service import (
     execute_grouped_restore, execute_grouped_undo,
     find_target_layer, cleanup_temp_layers, GroupedRestoreResult,
+    purge_lens_overlays, execute_grouped_lens_view,
 )
 from .rewind_dedup import (
     collapse_rewind_events,
@@ -202,5 +203,6 @@ __all__ = (
     "LayerStatsCache", "LayerStats",
     "execute_grouped_restore", "execute_grouped_undo",
     "find_target_layer", "cleanup_temp_layers", "GroupedRestoreResult",
+    "purge_lens_overlays", "execute_grouped_lens_view",
     "collapse_rewind_events", "collapse_rewind_events_with_stats",
 )

@@ -10,7 +10,7 @@ from .themed_action_icon import ThemedActionIconController
 from .core import (
     flog, qlog, JournalManager, WriteQueue, EditSessionTracker,
     SQLiteAuditBackend,
-    check_journal_integrity,
+    check_journal_integrity, purge_lens_overlays,
     get_journal_size_bytes, format_journal_size,
     get_journal_stats, evaluate_journal_health,
     format_integrity_message,
@@ -119,6 +119,7 @@ class RecoverPlugin:
 
         self._init_local_backend()
         self._setup_status_bar()
+        purge_lens_overlays("startup")
         flog("RecoverPlugin: initGui complete")
 
     def _show_duplicate_warning(self):
@@ -149,6 +150,7 @@ class RecoverPlugin:
             return
 
         self._shutdown_local_backend()
+        purge_lens_overlays("shutdown")
 
         try:
             QgsProject.instance().layersAdded.disconnect(self._on_layers_added)
