@@ -78,6 +78,11 @@ from .restore_contracts import (
     default_atomicity, scope_requires_confirmation,
     RestoreSession,
 )
+from .lens_contracts import (
+    LensOpFilter, LensVisualizationMode, EntityClassification,
+    LensSelection, LensFetchStats, EntityState, EntityTimeline,
+    LensRenderPlan, LensRenderResult,
+)
 from .identity import compute_entity_fingerprint
 from .event_stream_repository import (
     fetch_entity_stream, fetch_events_after_cutoff,
@@ -169,6 +174,9 @@ __all__ = (
     "is_restore_allowed", "validate_cutoff", "check_volume_limits",
     "default_atomicity", "scope_requires_confirmation",
     "RestoreSession",
+    "LensOpFilter", "LensVisualizationMode", "EntityClassification",
+    "LensSelection", "LensFetchStats", "EntityState", "EntityTimeline",
+    "LensRenderPlan", "LensRenderResult",
     "fetch_entity_stream", "fetch_events_after_cutoff",
     "count_events_after_cutoff", "fetch_events_by_ids",
     "get_oldest_event_date",
