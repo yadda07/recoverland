@@ -87,6 +87,8 @@ from .identity import compute_entity_fingerprint
 from .event_stream_repository import (
     fetch_entity_stream, fetch_events_after_cutoff,
     count_events_after_cutoff, fetch_events_by_ids,
+    fetch_events_by_session, count_events_by_session,
+    fetch_events_in_zone,
     get_oldest_event_date,
 )
 from .restore_planner import (
@@ -179,6 +181,8 @@ __all__ = (
     "LensRenderPlan", "LensRenderResult",
     "fetch_entity_stream", "fetch_events_after_cutoff",
     "count_events_after_cutoff", "fetch_events_by_ids",
+    "fetch_events_by_session", "count_events_by_session",
+    "fetch_events_in_zone",
     "get_oldest_event_date",
     "plan_event_restore", "plan_temporal_restore", "preflight_check",
     "check_retention_coverage",
