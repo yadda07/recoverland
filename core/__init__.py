@@ -96,6 +96,7 @@ from .restore_planner import (
     check_retention_coverage,
 )
 from .lens_planner import plan_lens_view
+from .lens_renderer import execute_lens_render
 from .restore_executor import execute_restore_plan, preflight_layer_check, build_restore_session
 from .restore_service import undo_restore_batch
 from .search_service import reconstruct_new_attributes
@@ -187,7 +188,7 @@ __all__ = (
     "get_oldest_event_date",
     "plan_event_restore", "plan_temporal_restore", "preflight_check",
     "check_retention_coverage",
-    "plan_lens_view",
+    "plan_lens_view", "execute_lens_render",
     "execute_restore_plan", "preflight_layer_check", "build_restore_session",
     "format_plan_summary", "format_preflight_report", "format_dry_run_message",
     "evaluate_journal_health", "check_disk_space", "format_integrity_message",
