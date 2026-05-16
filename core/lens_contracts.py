@@ -52,9 +52,9 @@ class EntityClassification(Enum):
     CREATED_IN_ZONE = "created_in_zone"
     DELETED_FROM_ZONE = "deleted_from_zone"
     UPDATED_IN_ZONE = "updated_in_zone"
-    MOVED_WITHIN_ZONE = "moved_within"
-    MOVED_INTO_ZONE = "moved_into"
-    MOVED_OUT_OF_ZONE = "moved_out"
+    MOVED_WITHIN_ZONE = "moved_within_zone"
+    MOVED_INTO_ZONE = "moved_into_zone"
+    MOVED_OUT_OF_ZONE = "moved_out_of_zone"
     ATTR_ONLY_IN_ZONE = "attr_only"
 
 
