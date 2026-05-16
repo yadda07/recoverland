@@ -1,25 +1,37 @@
-"""Time Lens renderer (BL-IL-P0-08, phase 08a).
+"""Time Lens renderer (BL-IL-P0-08, phases 08a + 08b).
 
 Consumes a `LensRenderPlan` produced by `core/lens_planner.plan_lens_view`
-and materialises two QGIS memory overlay layers:
+and materialises three QGIS memory overlay layers:
 
     1. `__rl_lens_<uuid8>_geom_past`
        The OLD geometry of every audit event in the plan. The geometry
        type is detected from the first non-empty WKB; mixed types in a
-       single plan are not supported in phase 08a (warning emitted,
-       additional types are silently skipped).
+       single plan are not supported yet (warning emitted, additional
+       types are silently skipped).
 
     2. `__rl_lens_<uuid8>_arrows`
        A LineString from centroid(OLD) -> centroid(NEW) for every UPDATE
-       event that has both geometries.
+       event whose OLD and NEW geometries are byte-distinct. Zero-length
+       arrows (geometry unchanged) are filtered: the attr_markers layer
+       carries the attr-only signal instead.
+
+    3. `__rl_lens_<uuid8>_attr_markers`
+       A Point at centroid(NEW or OLD) for every UPDATE event that
+       carries a non-empty `attrs_delta` AND whose geometry did not
+       change between OLD and NEW (or where only one of the two is
+       present). Phase 08b: this is what the dock surfaces as the
+       "i" marker (info: only attributes changed).
+
+Truncation banner: when `plan.fetch_stats.n_events_truncated > 0`,
+`LensRenderResult.warnings` carries `truncated:<n>` so the dock can
+render the red header banner described by acceptance §4.
 
 Each feature carries the attribute set required by acceptance §3 of
 BL-IL-P0-08: `entity_fp`, `event_id`, `created_at`, `op`, `user`,
 `age_label`, `is_repaired`, `classification`.
 
-Phase 08a deliberately ships with **single-symbol symbology** (no
-categorised gradient yet) and **no attribute-only markers**. Both are
-deferred to phase 08b together with the truncation banner.
+Single-symbol symbology is shipped at this stage. Categorised gradient
+over `age_label` is deferred to a follow-up symbology pass.
 
 Anti-silo IL-I4 OK: this module is **not** in the forbidden list of
 levels 0-4 (see lens_charter.md §5). It sits at level 5 alongside
@@ -205,6 +217,7 @@ def execute_lens_render(plan, dst_crs_authid: str, trace_id: str = ""):
         QgsProject,
     )
     from .geometry_utils import (  # noqa: PLC0415
+        geometries_equal,
         is_geometry_present,
         repair_geometry_for_render,
         reproject_geometry_for_render,
@@ -236,12 +249,15 @@ def execute_lens_render(plan, dst_crs_authid: str, trace_id: str = ""):
     uuid8 = uuid.uuid4().hex[:8]
     past_name = f"__rl_lens_{uuid8}_geom_past"
     arrows_name = f"__rl_lens_{uuid8}_arrows"
+    attr_name = f"__rl_lens_{uuid8}_attr_markers"
     past_layer = _make_overlay_layer(past_name, geom_family, dst_crs_authid)
     arrows_layer = _make_overlay_layer(arrows_name, "LineString", dst_crs_authid)
+    attr_layer = _make_overlay_layer(attr_name, "Point", dst_crs_authid)
 
     now = datetime.now(timezone.utc)
     past_feats: List[QgsFeature] = []
     arrow_feats: List[QgsFeature] = []
+    attr_feats: List[QgsFeature] = []
     n_skipped_geom = 0
 
     for entity_fp, timeline in plan.entities.items():
@@ -278,43 +294,77 @@ def execute_lens_render(plan, dst_crs_authid: str, trace_id: str = ""):
                     else:
                         n_skipped_geom += 1
 
-            # --- arrow feature: UPDATE with both old & new ---
-            if (
-                state.operation_type == "UPDATE"
-                and state.old_geom_wkb
-                and state.new_geom_wkb
-            ):
-                old_g = repair_geometry_for_render(
-                    state.old_geom_wkb, trace_id=trace_id,
+            # --- UPDATE: pick arrow (geom changed) OR attr marker ---
+            if state.operation_type == "UPDATE":
+                geom_unchanged = geometries_equal(
+                    state.old_geom_wkb, state.new_geom_wkb,
                 )
-                new_g = repair_geometry_for_render(
-                    state.new_geom_wkb, trace_id=trace_id,
+                has_attrs_delta = bool(state.attrs_delta)
+                has_both_geoms = bool(
+                    state.old_geom_wkb and state.new_geom_wkb,
                 )
-                if is_geometry_present(old_g) and is_geometry_present(new_g):
-                    old_repro = reproject_geometry_for_render(
-                        old_g, state.crs_authid, dst_crs_authid,
-                        transform_cache, trace_id=trace_id,
+
+                if has_both_geoms and not geom_unchanged:
+                    old_g = repair_geometry_for_render(
+                        state.old_geom_wkb, trace_id=trace_id,
                     )
-                    new_repro = reproject_geometry_for_render(
-                        new_g, state.crs_authid, dst_crs_authid,
-                        transform_cache, trace_id=trace_id,
+                    new_g = repair_geometry_for_render(
+                        state.new_geom_wkb, trace_id=trace_id,
                     )
                     if (
-                        is_geometry_present(old_repro)
-                        and is_geometry_present(new_repro)
+                        is_geometry_present(old_g)
+                        and is_geometry_present(new_g)
                     ):
-                        try:
-                            old_c = old_repro.centroid().asPoint()
-                            new_c = new_repro.centroid().asPoint()
-                            arrow = QgsGeometry.fromPolylineXY([old_c, new_c])
-                            f = QgsFeature(arrows_layer.fields())
-                            f.setGeometry(arrow)
-                            f.setAttributes(_feature_attrs(
-                                entity_fp, state, classification, now,
-                            ))
-                            arrow_feats.append(f)
-                        except Exception:  # noqa: BLE001
-                            pass
+                        old_repro = reproject_geometry_for_render(
+                            old_g, state.crs_authid, dst_crs_authid,
+                            transform_cache, trace_id=trace_id,
+                        )
+                        new_repro = reproject_geometry_for_render(
+                            new_g, state.crs_authid, dst_crs_authid,
+                            transform_cache, trace_id=trace_id,
+                        )
+                        if (
+                            is_geometry_present(old_repro)
+                            and is_geometry_present(new_repro)
+                        ):
+                            try:
+                                old_c = old_repro.centroid().asPoint()
+                                new_c = new_repro.centroid().asPoint()
+                                arrow = QgsGeometry.fromPolylineXY(
+                                    [old_c, new_c],
+                                )
+                                f = QgsFeature(arrows_layer.fields())
+                                f.setGeometry(arrow)
+                                f.setAttributes(_feature_attrs(
+                                    entity_fp, state, classification, now,
+                                ))
+                                arrow_feats.append(f)
+                            except Exception:  # noqa: BLE001
+                                pass
+
+                elif has_attrs_delta:
+                    # attr-only: geometry unchanged or one side missing.
+                    src_wkb = state.new_geom_wkb or state.old_geom_wkb
+                    if src_wkb:
+                        marker_g = repair_geometry_for_render(
+                            src_wkb, trace_id=trace_id,
+                        )
+                        if is_geometry_present(marker_g):
+                            marker_repro = reproject_geometry_for_render(
+                                marker_g, state.crs_authid, dst_crs_authid,
+                                transform_cache, trace_id=trace_id,
+                            )
+                            if is_geometry_present(marker_repro):
+                                try:
+                                    pt = marker_repro.centroid()
+                                    f = QgsFeature(attr_layer.fields())
+                                    f.setGeometry(pt)
+                                    f.setAttributes(_feature_attrs(
+                                        entity_fp, state, classification, now,
+                                    ))
+                                    attr_feats.append(f)
+                                except Exception:  # noqa: BLE001
+                                    pass
 
     if past_feats:
         past_layer.dataProvider().addFeatures(past_feats)
@@ -322,16 +372,21 @@ def execute_lens_render(plan, dst_crs_authid: str, trace_id: str = ""):
     if arrow_feats:
         arrows_layer.dataProvider().addFeatures(arrow_feats)
         arrows_layer.updateExtents()
+    if attr_feats:
+        attr_layer.dataProvider().addFeatures(attr_feats)
+        attr_layer.updateExtents()
 
     project = QgsProject.instance()
     project.addMapLayer(past_layer, True)
     project.addMapLayer(arrows_layer, True)
+    project.addMapLayer(attr_layer, True)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     flog(
         f"lens_renderer event=overlay_built trace_id={trace_id} "
-        f"layers=2 n_features_past={len(past_feats)} "
+        f"layers=3 n_features_past={len(past_feats)} "
         f"n_features_arrows={len(arrow_feats)} "
+        f"n_features_attr={len(attr_feats)} "
         f"n_skipped_geom={n_skipped_geom} "
         f"truncated={plan.fetch_stats.n_events_truncated > 0} "
         f"elapsed_ms={elapsed_ms}",
@@ -340,11 +395,17 @@ def execute_lens_render(plan, dst_crs_authid: str, trace_id: str = ""):
 
     if n_skipped_geom > 0:
         warnings.append(f"geom_family_mismatch:{n_skipped_geom}")
+    if plan.fetch_stats.n_events_truncated > 0:
+        warnings.append(f"truncated:{plan.fetch_stats.n_events_truncated}")
 
     return LensRenderResult(
-        overlay_layer_ids=(past_layer.id(), arrows_layer.id()),
+        overlay_layer_ids=(
+            past_layer.id(), arrows_layer.id(), attr_layer.id(),
+        ),
         n_entities=len(plan.entities),
-        n_events_displayed=len(past_feats) + len(arrow_feats),
+        n_events_displayed=(
+            len(past_feats) + len(arrow_feats) + len(attr_feats)
+        ),
         n_events_truncated=plan.fetch_stats.n_events_truncated,
         warnings=warnings,
         elapsed_ms=elapsed_ms,
