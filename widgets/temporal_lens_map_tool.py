@@ -7,10 +7,12 @@ signal. Esc cancels the in-flight rubber band; right-click also cancels.
 The polygon variant (free-form polygon, double-click validates) is
 deferred to phase 10b.
 """
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.core import QgsGeometry, QgsPointXY, QgsRectangle, QgsWkbTypes
 from qgis.gui import QgsMapTool, QgsRubberBand
+
+from ..compat import QtCompat
 
 
 class LensRectangleMapTool(QgsMapTool):
@@ -38,12 +40,12 @@ class LensRectangleMapTool(QgsMapTool):
         self._rubber.setColor(QColor(255, 165, 0, 80))    # translucent orange
         self._rubber.setStrokeColor(QColor(255, 100, 0))  # solid border
         self._rubber.setWidth(2)
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(QtCompat.CROSS_CURSOR)
 
     # ----- map tool overrides -------------------------------------------
 
     def canvasPressEvent(self, event):
-        if event.button() == Qt.RightButton:
+        if event.button() == QtCompat.RIGHT_BUTTON:
             self.reset()
             return
         self._start_point = self.toMapCoordinates(event.pos())
@@ -57,7 +59,7 @@ class LensRectangleMapTool(QgsMapTool):
         self._update_rubber(self._start_point, end)
 
     def canvasReleaseEvent(self, event):
-        if event.button() != Qt.LeftButton or self._start_point is None:
+        if event.button() != QtCompat.LEFT_BUTTON or self._start_point is None:
             return
         end = self.toMapCoordinates(event.pos())
         rect = QgsRectangle(
@@ -75,7 +77,7 @@ class LensRectangleMapTool(QgsMapTool):
         self.selection_completed.emit(geom)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+        if event.key() == QtCompat.KEY_ESCAPE:
             self.reset()
 
     # ----- helpers ------------------------------------------------------
