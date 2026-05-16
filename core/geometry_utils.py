@@ -144,6 +144,75 @@ def rebuild_geometry(wkb_data: Optional[bytes]):
     return geom
 
 
+def repair_geometry_for_render(wkb_data: Optional[bytes], trace_id: str = ""):
+    """Reconstruct a QgsGeometry from WKB and repair if GEOS-invalid.
+
+    Used by Time Lens (BL-IL-P0-07, cause racine CR-IL-4) before adding
+    audit geometries to a memory overlay layer. Audit events may store
+    geometries that were valid at capture time but are GEOS-invalid
+    today (mixed providers, makeValid() not yet applied, manual file
+    edits). Rendering such geometries either fails silently or paints
+    self-intersecting noise on the canvas.
+
+    Pattern: rebuild_geometry then makeValid if needed. Same antecedent
+    as `restore_executor._buffer_update` (RW-19a / BL-RW-P1-08) which
+    repairs on the write side; this helper repairs on the render side.
+
+    Returns:
+        QgsGeometry: a non-empty geometry safe to render. Either the
+            original (when isGeosValid()) or its makeValid() result.
+        None: when *wkb_data* is None/empty/corrupted, when makeValid()
+            yields an empty result, or when makeValid() raises.
+
+    Emits log signatures (structured key=value) for traceability:
+        flog: lens_geom_repair event=repaired trace_id=<id> drift_units=<f>
+        flog: lens_geom_repair event=repair_yielded_empty trace_id=<id>
+        flog: lens_geom_repair event=repair_exception trace_id=<id> type=<X>
+    """
+    geom = rebuild_geometry(wkb_data)
+    if not is_geometry_present(geom):
+        return None
+
+    try:
+        if geom.isGeosValid():
+            return geom
+    except (AttributeError, RuntimeError):
+        # geom does not implement the predicate (mock/stub). Fall through.
+        pass
+
+    # Lazy import to keep the module importable without QGIS for static
+    # checks (cf. il7 structural assertion).
+    from .logger import flog  # noqa: PLC0415
+
+    try:
+        repaired = geom.makeValid()
+    except Exception as exc:  # noqa: BLE001 - QGIS raises various types
+        flog(
+            f"lens_geom_repair event=repair_exception trace_id={trace_id} "
+            f"type={type(exc).__name__}",
+            "WARNING",
+        )
+        return None
+
+    if not is_geometry_present(repaired):
+        flog(
+            f"lens_geom_repair event=repair_yielded_empty trace_id={trace_id}",
+            "WARNING",
+        )
+        return None
+
+    try:
+        _hash_b, _hash_a, drift = _compute_makevalid_drift(geom, repaired)
+    except Exception:  # noqa: BLE001 - drift is diagnostic only
+        drift = float("nan")
+    flog(
+        f"lens_geom_repair event=repaired trace_id={trace_id} "
+        f"drift_units={drift:.6f}",
+        "INFO",
+    )
+    return repaired
+
+
 def geometries_equal(wkb_a: Optional[bytes], wkb_b: Optional[bytes]) -> bool:
     """Compare two WKB geometries for equality."""
     if wkb_a is None and wkb_b is None:
