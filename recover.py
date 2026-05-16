@@ -49,7 +49,9 @@ class RecoverPlugin:
     def __init__(self, iface):
         self.iface = iface
         self.action = None
+        self.lens_action = None
         self.dlg = None
+        self._lens_dock = None
         self._themed_action_icon = None
         self._journal = JournalManager()
         self._write_queue = WriteQueue()
@@ -104,6 +106,13 @@ class RecoverPlugin:
         self.action.triggered.connect(self.run)
         self.iface.addPluginToMenu("RecoverLand", self.action)
         self.iface.addToolBarIcon(self.action)
+
+        self.lens_action = QAction("Time Lens", self.iface.mainWindow())
+        self.lens_action.setToolTip(QCoreApplication.translate(
+            "RecoverPlugin", "RecoverLand - Time Lens (visualisation temporelle)",
+        ))
+        self.lens_action.triggered.connect(self.open_lens_dock)
+        self.iface.addPluginToMenu("RecoverLand", self.lens_action)
 
         if theme_icon_path:
             self._themed_action_icon = ThemedActionIconController(
@@ -169,6 +178,35 @@ class RecoverPlugin:
             self._themed_action_icon = None
         self.iface.removePluginMenu("RecoverLand", self.action)
         self.iface.removeToolBarIcon(self.action)
+        if self.lens_action is not None:
+            self.iface.removePluginMenu("RecoverLand", self.lens_action)
+            self.lens_action = None
+        if self._lens_dock is not None:
+            try:
+                self._lens_dock.close()
+                self._lens_dock.deleteLater()
+            except (RuntimeError, AttributeError):
+                pass
+            self._lens_dock = None
+
+    def open_lens_dock(self):
+        if self._duplicate_of is not None:
+            self._show_duplicate_warning()
+            return
+        from qgis.PyQt.QtCore import Qt
+        from .widgets.temporal_lens_dock import TemporalLensDock
+        if self._lens_dock is None:
+            self._lens_dock = TemporalLensDock(
+                self.iface, journal=self._journal,
+            )
+            self.iface.addDockWidget(
+                Qt.RightDockWidgetArea, self._lens_dock,
+            )
+        else:
+            self._lens_dock._populate_layers_combo()
+        self._lens_dock.show()
+        self._lens_dock.raise_()
+        flog("RecoverPlugin: Time Lens dock opened")
 
     def run(self):
         if self._duplicate_of is not None:
