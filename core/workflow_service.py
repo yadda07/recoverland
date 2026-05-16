@@ -314,15 +314,22 @@ def execute_grouped_lens_view(
         trace_id: opaque correlation id propagated end-to-end.
 
     Returns:
-        The `LensRenderResult` produced by `execute_lens_render`. The
-        caller (dock) uses `overlay_layer_ids` for the legend toggle
-        and `warnings` for the truncation banner.
+        ``LensRefreshOutcome(plan, result)`` (BL-IL-P0-10c). The dock
+        uses ``outcome.result.overlay_layer_ids`` for legend toggle /
+        ``outcome.result.warnings`` for truncation banner, and
+        ``outcome.plan.entities`` for the clickable entity list and
+        the attribute diff panel.
+
+        Phase 10b returned the bare ``LensRenderResult``; phase 10c
+        aggregates plan + result so the dock does not have to recall
+        ``plan_lens_view`` just to obtain the per-entity timelines.
 
     Emits:
         flog: lens_lifecycle event=refresh trace_id=<id>
-              n_removed=<n> n_added=<n> elapsed_ms=<n>
+              n_removed=<n> n_added=<n> n_entities=<n> elapsed_ms=<n>
     """
     import time as _time  # noqa: PLC0415
+    from .lens_contracts import LensRefreshOutcome  # noqa: PLC0415
     from .lens_planner import plan_lens_view  # noqa: PLC0415
     from .lens_renderer import execute_lens_render  # noqa: PLC0415
 
@@ -339,7 +346,7 @@ def execute_grouped_lens_view(
     flog(
         f"lens_lifecycle event=refresh trace_id={trace_id} "
         f"n_removed={n_removed} n_added={len(result.overlay_layer_ids)} "
-        f"elapsed_ms={elapsed_ms}",
+        f"n_entities={result.n_entities} elapsed_ms={elapsed_ms}",
         "INFO",
     )
-    return result
+    return LensRefreshOutcome(plan=plan, result=result)

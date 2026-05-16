@@ -86,6 +86,11 @@ class QtCompat:
     # --- QAbstractItemView.SelectionBehavior ---
     SELECT_ROWS = _resolve_enum(QAbstractItemView, 'SelectionBehavior', 'SelectRows')
 
+    # --- QAbstractItemView.EditTrigger ---
+    NO_EDIT_TRIGGERS = _resolve_enum(
+        QAbstractItemView, 'EditTrigger', 'NoEditTriggers'
+    )
+
     # --- QEvent.Type ---
     EVENT_ENTER = _resolve_enum(QEvent, 'Type', 'Enter')
     EVENT_LEAVE = _resolve_enum(QEvent, 'Type', 'Leave')

@@ -29,7 +29,11 @@ from qgis.PyQt.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +42,7 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsGeometry,
     QgsProject,
+    QgsRectangle,
 )
 from qgis.gui import QgsDateTimeEdit
 
@@ -104,6 +109,9 @@ class TemporalLensDock(QDockWidget):
         self._lens_map_tool: Optional[LensRectangleMapTool] = None
         self._prev_map_tool = None
         self._read_conn = None
+        # Phase 10c: keep the last LensRenderPlan so we can resolve
+        # entity_fp -> EntityTimeline on click without re-fetching.
+        self._last_plan = None
 
         self._build_ui()
         self._populate_layers_combo()
@@ -184,6 +192,34 @@ class TemporalLensDock(QDockWidget):
         self.legend_age_label = QLabel("Plage non definie.", self)
         self.legend_age_label.setWordWrap(True)
         layout.addWidget(self.legend_age_label)
+
+        layout.addWidget(QLabel("Entites :"))
+        self.entity_list = QListWidget(self)
+        self.entity_list.setMaximumHeight(150)
+        self.entity_list.itemClicked.connect(self._on_entity_clicked)
+        layout.addWidget(self.entity_list)
+
+        self.diff_panel = QFrame(self)
+        self.diff_panel.setFrameShape(QtCompat.HLINE)
+        diff_v = QVBoxLayout(self.diff_panel)
+        diff_v.setContentsMargins(0, 4, 0, 4)
+        diff_v.setSpacing(2)
+        self.diff_label = QLabel(
+            "Selectionnez une entite pour voir le diff.", self
+        )
+        self.diff_label.setWordWrap(True)
+        diff_v.addWidget(self.diff_label)
+        self.diff_table = QTableWidget(0, 5, self)
+        self.diff_table.setHorizontalHeaderLabels(
+            ["Date", "Op", "Champ", "Ancien", "Nouveau"]
+        )
+        self.diff_table.horizontalHeader().setStretchLastSection(True)
+        self.diff_table.setEditTriggers(QtCompat.NO_EDIT_TRIGGERS)
+        self.diff_table.setAlternatingRowColors(True)
+        self.diff_table.setMaximumHeight(200)
+        diff_v.addWidget(self.diff_table)
+        self.diff_panel.hide()
+        layout.addWidget(self.diff_panel)
 
         layout.addStretch(1)
 
@@ -351,6 +387,11 @@ class TemporalLensDock(QDockWidget):
         from ..core.lens_contracts import LensFetchStats, LensSelection
         from ..core.workflow_service import execute_grouped_lens_view
 
+        # 10c: every refresh wipes the entity list and the diff panel so
+        # the user never sees stale clickable entries from the previous
+        # selection while the new fetch is still in flight.
+        self._clear_entity_panels()
+
         data = self.layer_combo.currentData()
         if data is None or self._selected_geom is None:
             self.status_label.setText("Selection incomplete.")
@@ -470,7 +511,7 @@ class TemporalLensDock(QDockWidget):
         )
 
         try:
-            result = execute_grouped_lens_view(
+            outcome = execute_grouped_lens_view(
                 events,
                 selection,
                 layer.name(),
@@ -483,6 +524,12 @@ class TemporalLensDock(QDockWidget):
                 conn.close()
             except Exception:  # noqa: BLE001
                 pass
+
+        # 10c: keep the plan so _on_entity_clicked can resolve fingerprint
+        # -> EntityTimeline; expose render counters via outcome.result.
+        self._last_plan = outcome.plan
+        result = outcome.result
+        self._populate_entity_list(outcome.plan)
 
         if result.n_entities == 0:
             self.status_label.setText(
@@ -626,11 +673,187 @@ class TemporalLensDock(QDockWidget):
         except Exception:  # noqa: BLE001
             self.legend_age_label.setText("Plage non definie.")
 
+    # ----- entity list + diff panel (phase 10c) -------------------------
+
+    def _clear_entity_panels(self) -> None:
+        """Reset the clickable entity list and hide the diff panel.
+
+        Called at the start of every refresh and on Desactiver Lens so
+        stale entries from a previous selection never linger.
+        """
+        self.entity_list.clear()
+        self.diff_table.setRowCount(0)
+        self.diff_label.setText(
+            "Selectionnez une entite pour voir le diff."
+        )
+        self.diff_panel.hide()
+        self._last_plan = None
+
+    def _populate_entity_list(self, plan) -> None:
+        """Fill the entity list from ``plan.entities`` (BL-IL-P0-10c).
+
+        Each item label is *fp8 - classification - N states*; the full
+        fingerprint is stashed in ``Qt.UserRole`` so the click handler
+        can resolve it back to the matching ``EntityTimeline`` without
+        reparsing the label.
+        """
+        self.entity_list.clear()
+        if plan is None or not plan.entities:
+            return
+        for entity_fp, timeline in plan.entities.items():
+            cls_value = (
+                timeline.classification.value
+                if hasattr(timeline.classification, "value")
+                else str(timeline.classification)
+            )
+            label = (
+                f"{entity_fp[:8]} - {cls_value} - "
+                f"{len(timeline.states)} states"
+            )
+            item = QListWidgetItem(label)
+            item.setData(QtCompat.USER_ROLE, entity_fp)
+            self.entity_list.addItem(item)
+        _flog(
+            f"lens_dock event=entity_list_populated "
+            f"n_entities={len(plan.entities)}",
+            "DEBUG",
+        )
+
+    def _on_entity_clicked(self, item) -> None:
+        """Handler for QListWidget.itemClicked (acceptance 1.8).
+
+        Centres the canvas on the entity's latest geometry and populates
+        the diff panel. Bails out silently when ``self._last_plan`` is
+        ``None`` (no refresh yet) or when the fingerprint is unknown.
+        """
+        if self._last_plan is None or item is None:
+            return
+        entity_fp = item.data(QtCompat.USER_ROLE)
+        if not entity_fp:
+            return
+        timeline = self._last_plan.entities.get(entity_fp)
+        if timeline is None:
+            _flog(
+                f"lens_dock event=entity_click_unknown_fp fp={entity_fp[:8]}",
+                "WARNING",
+            )
+            return
+        self._center_canvas_on_entity(entity_fp, timeline)
+        self._populate_diff_panel(entity_fp, timeline)
+        _flog(
+            f"lens_dock event=entity_clicked fp={entity_fp[:8]} "
+            f"n_states={len(timeline.states)}",
+            "INFO",
+        )
+
+    def _center_canvas_on_entity(self, entity_fp, timeline) -> None:
+        """Centre the canvas on the most recent state with a geometry.
+
+        Falls back to the previous state if the latest one has no
+        geometry (e.g. an attribute-only update). Reprojects from the
+        storage CRS to the canvas CRS when needed.
+        """
+        from ..core.wkb_envelope import parse_envelope  # noqa: PLC0415
+
+        if self._canvas is None or not timeline.states:
+            return
+        last_geom_wkb = None
+        last_state = None
+        for st in reversed(timeline.states):
+            wkb = st.new_geom_wkb or st.old_geom_wkb
+            if wkb is not None:
+                last_geom_wkb = wkb
+                last_state = st
+                break
+        if last_geom_wkb is None:
+            _flog(
+                f"lens_dock event=entity_center_no_geom fp={entity_fp[:8]}",
+                "WARNING",
+            )
+            return
+        env = parse_envelope(last_geom_wkb)
+        if env is None:
+            return
+        bbox = QgsRectangle(env[0], env[1], env[2], env[3])
+        storage_crs = (
+            (last_state.crs_authid if last_state else None)
+            or self._last_plan.selection.bbox_crs
+        )
+        canvas_crs = self._canvas.mapSettings().destinationCrs().authid()
+        if storage_crs and canvas_crs and storage_crs != canvas_crs:
+            try:
+                tr = QgsCoordinateTransform(
+                    QgsCoordinateReferenceSystem(storage_crs),
+                    QgsCoordinateReferenceSystem(canvas_crs),
+                    QgsProject.instance(),
+                )
+                bbox = tr.transformBoundingBox(bbox)
+            except Exception as exc:  # noqa: BLE001
+                _flog(
+                    f"lens_dock event=entity_center_reproject_failed "
+                    f"fp={entity_fp[:8]} type={type(exc).__name__}",
+                    "WARNING",
+                )
+                return
+        bbox.scale(1.3)  # 30 % buffer for context around the entity
+        self._canvas.setExtent(bbox)
+        self._canvas.refresh()
+        _flog(
+            f"lens_dock event=entity_centered fp={entity_fp[:8]} "
+            f"crs_src={storage_crs} crs_dst={canvas_crs}",
+            "INFO",
+        )
+
+    def _populate_diff_panel(self, entity_fp, timeline) -> None:
+        """Fill the diff table with one row per (state, attribute) pair.
+
+        Phase 10c MVP: raw display of ``attrs_delta`` as returned by the
+        planner. Schema drift handling (IL-P1-12) is out of scope here:
+        if a field name disappeared from the layer, it is still shown
+        verbatim.
+        """
+        rows = []
+        for st in timeline.states:
+            if not st.attrs_delta:
+                continue
+            ts = (st.created_at or "")[:19]
+            for field, pair in st.attrs_delta.items():
+                try:
+                    old, new = pair
+                except (TypeError, ValueError):
+                    old, new = None, pair
+                rows.append((ts, st.operation_type, field, old, new))
+
+        self.diff_label.setText(
+            f"Diff entite {entity_fp[:8]} - {len(timeline.states)} states - "
+            f"{len(rows)} changements"
+        )
+        self.diff_table.setRowCount(len(rows))
+        for i, (ts, op, field, old, new) in enumerate(rows):
+            self.diff_table.setItem(i, 0, QTableWidgetItem(ts))
+            self.diff_table.setItem(i, 1, QTableWidgetItem(op))
+            self.diff_table.setItem(i, 2, QTableWidgetItem(str(field)))
+            self.diff_table.setItem(
+                i, 3,
+                QTableWidgetItem("(vide)" if old is None else str(old)),
+            )
+            self.diff_table.setItem(
+                i, 4,
+                QTableWidgetItem("(vide)" if new is None else str(new)),
+            )
+        self.diff_panel.show()
+        _flog(
+            f"lens_dock event=diff_panel_populated fp={entity_fp[:8]} "
+            f"n_rows={len(rows)}",
+            "DEBUG",
+        )
+
     # ----- disable / close ----------------------------------------------
 
     def _on_disable_button(self) -> None:
         from ..core.workflow_service import purge_lens_overlays
         purge_lens_overlays("disable_lens")
+        self._clear_entity_panels()
         self._restore_previous_map_tool()
         self.close()
 
