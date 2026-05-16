@@ -213,6 +213,134 @@ def repair_geometry_for_render(wkb_data: Optional[bytes], trace_id: str = ""):
     return repaired
 
 
+def reproject_geometry_for_render(
+    geom,
+    src_crs_authid: Optional[str],
+    dst_crs_authid: str,
+    transform_cache: dict,
+    trace_id: str = "",
+):
+    """Reproject a QgsGeometry from src CRS to dst CRS for rendering.
+
+    Used by Time Lens (BL-IL-P0-06, cause racine CR-IL-3) before adding
+    audit geometries to the canvas overlay. Audit events are captured
+    in the layer source CRS, but the canvas may render in a different
+    CRS. Without on-the-fly reprojection, an event captured in EPSG:2154
+    and shown on an EPSG:3857 canvas appears thousands of kilometres
+    off-target.
+
+    Args:
+        geom: QgsGeometry to reproject (assumed non-None, non-empty;
+            callers should pre-filter via is_geometry_present).
+        src_crs_authid: CRS authority id of *geom* (e.g. "EPSG:2154").
+            None or invalid triggers a skip with warning.
+        dst_crs_authid: CRS authority id of the target canvas (e.g.
+            "EPSG:3857"). Must be valid; fail-fast on None/invalid.
+        transform_cache: dict keyed by ``(src_authid, dst_authid)``,
+            holding QgsCoordinateTransform instances. Mutated in place:
+            entries are added on cache miss. The caller owns the cache
+            lifecycle (invalidate on QgsProject.crsChanged).
+        trace_id: opaque correlation id propagated in log signatures.
+
+    Returns:
+        QgsGeometry: a reprojected copy of *geom* if the transform
+            succeeds.
+        None: when *src_crs_authid* is None/invalid, when the
+            destination CRS cannot be resolved, when the transform
+            instantiation fails (CRS not installed locally), or when
+            the actual reprojection raises a QGIS exception.
+
+    Emits log signatures (structured key=value) for traceability:
+        flog: lens_geom_reproject event=reprojected trace_id=<id>
+              src_crs=<a> dst_crs=<b> cache_hit=<bool>
+        flog: lens_geom_reproject event=skipped trace_id=<id>
+              reason=src_crs_none|src_crs_invalid|dst_crs_invalid|transform_failed
+              src_crs=<a> dst_crs=<b>
+    """
+    from .logger import flog  # noqa: PLC0415
+
+    if src_crs_authid is None or not src_crs_authid:
+        flog(
+            f"lens_geom_reproject event=skipped trace_id={trace_id} "
+            f"reason=src_crs_none src_crs=None dst_crs={dst_crs_authid}",
+            "WARNING",
+        )
+        return None
+
+    from qgis.core import (  # noqa: PLC0415
+        QgsCoordinateReferenceSystem,
+        QgsCoordinateTransform,
+        QgsProject,
+    )
+
+    cache_key = (src_crs_authid, dst_crs_authid)
+    transform = transform_cache.get(cache_key)
+    cache_hit = transform is not None
+
+    if transform is None:
+        src_crs = QgsCoordinateReferenceSystem(src_crs_authid)
+        if not src_crs.isValid():
+            flog(
+                f"lens_geom_reproject event=skipped trace_id={trace_id} "
+                f"reason=src_crs_invalid src_crs={src_crs_authid} "
+                f"dst_crs={dst_crs_authid}",
+                "WARNING",
+            )
+            return None
+        dst_crs = QgsCoordinateReferenceSystem(dst_crs_authid)
+        if not dst_crs.isValid():
+            flog(
+                f"lens_geom_reproject event=skipped trace_id={trace_id} "
+                f"reason=dst_crs_invalid src_crs={src_crs_authid} "
+                f"dst_crs={dst_crs_authid}",
+                "WARNING",
+            )
+            return None
+        try:
+            transform = QgsCoordinateTransform(
+                src_crs, dst_crs, QgsProject.instance(),
+            )
+        except Exception as exc:  # noqa: BLE001 - QGIS raises various types
+            flog(
+                f"lens_geom_reproject event=skipped trace_id={trace_id} "
+                f"reason=transform_failed src_crs={src_crs_authid} "
+                f"dst_crs={dst_crs_authid} type={type(exc).__name__}",
+                "WARNING",
+            )
+            return None
+        transform_cache[cache_key] = transform
+
+    try:
+        # transform() returns int status code (0=ok); we need a copy.
+        repro = type(geom)(geom)
+        status = repro.transform(transform)
+    except Exception as exc:  # noqa: BLE001 - QGIS raises various types
+        flog(
+            f"lens_geom_reproject event=skipped trace_id={trace_id} "
+            f"reason=transform_failed src_crs={src_crs_authid} "
+            f"dst_crs={dst_crs_authid} type={type(exc).__name__}",
+            "WARNING",
+        )
+        return None
+
+    if status != 0:
+        flog(
+            f"lens_geom_reproject event=skipped trace_id={trace_id} "
+            f"reason=transform_failed src_crs={src_crs_authid} "
+            f"dst_crs={dst_crs_authid} status={status}",
+            "WARNING",
+        )
+        return None
+
+    flog(
+        f"lens_geom_reproject event=reprojected trace_id={trace_id} "
+        f"src_crs={src_crs_authid} dst_crs={dst_crs_authid} "
+        f"cache_hit={str(cache_hit).lower()}",
+        "INFO",
+    )
+    return repro
+
+
 def geometries_equal(wkb_a: Optional[bytes], wkb_b: Optional[bytes]) -> bool:
     """Compare two WKB geometries for equality."""
     if wkb_a is None and wkb_b is None:
