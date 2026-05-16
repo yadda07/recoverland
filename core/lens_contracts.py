@@ -153,6 +153,25 @@ class LensRenderResult(NamedTuple):
     elapsed_ms: int                      # total render wall clock
 
 
+class LensRefreshOutcome(NamedTuple):
+    """Aggregated outcome of a single Lens refresh cycle (BL-IL-P0-10c).
+
+    Returned by `workflow_service.execute_grouped_lens_view` so the dock
+    can BOTH display the render counters (via ``result``) AND iterate
+    over the per-entity timelines (via ``plan.entities``) for the
+    clickable entity list and the attribute diff panel.
+
+    Splitting plan and result in two distinct NamedTuples keeps each
+    contract honest: ``plan`` is the pure pre-render data, ``result``
+    is the QGIS-side rendering report. Aggregating them here avoids
+    a second `plan_lens_view` call from the dock just to get the
+    entities map.
+    """
+
+    plan: LensRenderPlan
+    result: LensRenderResult
+
+
 __all__ = [
     "LensOpFilter",
     "LensVisualizationMode",
@@ -163,4 +182,5 @@ __all__ = [
     "EntityTimeline",
     "LensRenderPlan",
     "LensRenderResult",
+    "LensRefreshOutcome",
 ]
