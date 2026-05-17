@@ -124,17 +124,17 @@ class TemporalLensDock(QDockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        layout.addWidget(QLabel("Couche audited :"))
+        layout.addWidget(QLabel(self.tr("Couche audited :")))
         self.layer_combo = QComboBox(self)
         layout.addWidget(self.layer_combo)
 
         sel_row = QHBoxLayout()
-        self.select_button = QPushButton("Rectangle", self)
+        self.select_button = QPushButton(self.tr("Rectangle"), self)
         self.select_button.setCheckable(True)
         self.select_button.clicked.connect(self._on_select_button)
         sel_row.addWidget(self.select_button)
 
-        self.select_polygon_button = QPushButton("Polygone", self)
+        self.select_polygon_button = QPushButton(self.tr("Polygone"), self)
         self.select_polygon_button.setCheckable(True)
         self.select_polygon_button.clicked.connect(
             self._on_select_polygon_button
@@ -142,17 +142,17 @@ class TemporalLensDock(QDockWidget):
         sel_row.addWidget(self.select_polygon_button)
         layout.addLayout(sel_row)
 
-        layout.addWidget(QLabel("Plage temporelle :"))
+        layout.addWidget(QLabel(self.tr("Plage temporelle :")))
         self.preset_combo = QComboBox(self)
         for label, _ in _PRESETS:
-            self.preset_combo.addItem(label)
+            self.preset_combo.addItem(self.tr(label))
         self.preset_combo.setCurrentIndex(_DEFAULT_PRESET_INDEX)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         layout.addWidget(self.preset_combo)
 
         now_qdt = QDateTime.currentDateTime()
         date_row = QHBoxLayout()
-        date_row.addWidget(QLabel("De :"))
+        date_row.addWidget(QLabel(self.tr("De :")))
         self.t_min_input = QgsDateTimeEdit()
         self.t_min_input.setDisplayFormat("dd/MM/yyyy HH:mm")
         self.t_min_input.dateTimeChanged.connect(self._update_legend_age)
@@ -160,40 +160,40 @@ class TemporalLensDock(QDockWidget):
         layout.addLayout(date_row)
 
         date_row2 = QHBoxLayout()
-        date_row2.addWidget(QLabel("A :"))
+        date_row2.addWidget(QLabel(self.tr("A :")))
         self.t_max_input = QgsDateTimeEdit()
         self.t_max_input.setDisplayFormat("dd/MM/yyyy HH:mm")
         self.t_max_input.setDateTime(now_qdt)
         date_row2.addWidget(self.t_max_input)
         layout.addLayout(date_row2)
 
-        layout.addWidget(QLabel("Filtre operation :"))
+        layout.addWidget(QLabel(self.tr("Filtre operation :")))
         self.op_combo = QComboBox(self)
-        self.op_combo.addItem("Tout", LensOpFilter.ALL.value)
-        self.op_combo.addItem("Insertions uniquement", LensOpFilter.INSERT_ONLY.value)
-        self.op_combo.addItem("Mises a jour uniquement", LensOpFilter.UPDATE_ONLY.value)
-        self.op_combo.addItem("Suppressions uniquement", LensOpFilter.DELETE_ONLY.value)
-        self.op_combo.addItem("Attributs seuls", LensOpFilter.ATTR_ONLY.value)
-        self.op_combo.addItem("Geometrie seule", LensOpFilter.GEOM_ONLY.value)
+        self.op_combo.addItem(self.tr("Tout"), LensOpFilter.ALL.value)
+        self.op_combo.addItem(self.tr("Insertions uniquement"), LensOpFilter.INSERT_ONLY.value)
+        self.op_combo.addItem(self.tr("Mises a jour uniquement"), LensOpFilter.UPDATE_ONLY.value)
+        self.op_combo.addItem(self.tr("Suppressions uniquement"), LensOpFilter.DELETE_ONLY.value)
+        self.op_combo.addItem(self.tr("Attributs seuls"), LensOpFilter.ATTR_ONLY.value)
+        self.op_combo.addItem(self.tr("Geometrie seule"), LensOpFilter.GEOM_ONLY.value)
         layout.addWidget(self.op_combo)
 
-        self.refresh_button = QPushButton("Rafraichir", self)
+        self.refresh_button = QPushButton(self.tr("Rafraichir"), self)
         self.refresh_button.setEnabled(False)
         self.refresh_button.clicked.connect(self._on_refresh_button)
         layout.addWidget(self.refresh_button)
 
-        self.status_label = QLabel("Aucune selection.", self)
+        self.status_label = QLabel(self.tr("Aucune selection."), self)
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        layout.addWidget(QLabel("Legende :"))
+        layout.addWidget(QLabel(self.tr("Legende :")))
         self.legend_widget = self._build_legend_widget()
         layout.addWidget(self.legend_widget)
-        self.legend_age_label = QLabel("Plage non definie.", self)
+        self.legend_age_label = QLabel(self.tr("Plage non definie."), self)
         self.legend_age_label.setWordWrap(True)
         layout.addWidget(self.legend_age_label)
 
-        layout.addWidget(QLabel("Entites :"))
+        layout.addWidget(QLabel(self.tr("Entites :")))
         self.entity_list = QListWidget(self)
         self.entity_list.setMaximumHeight(150)
         self.entity_list.itemClicked.connect(self._on_entity_clicked)
@@ -205,13 +205,14 @@ class TemporalLensDock(QDockWidget):
         diff_v.setContentsMargins(0, 4, 0, 4)
         diff_v.setSpacing(2)
         self.diff_label = QLabel(
-            "Selectionnez une entite pour voir le diff.", self
+            self.tr("Selectionnez une entite pour voir le diff."), self
         )
         self.diff_label.setWordWrap(True)
         diff_v.addWidget(self.diff_label)
         self.diff_table = QTableWidget(0, 5, self)
         self.diff_table.setHorizontalHeaderLabels(
-            ["Date", "Op", "Champ", "Ancien", "Nouveau"]
+            [self.tr("Date"), self.tr("Op"), self.tr("Champ"),
+             self.tr("Ancien"), self.tr("Nouveau")]
         )
         self.diff_table.horizontalHeader().setStretchLastSection(True)
         self.diff_table.setEditTriggers(QtCompat.NO_EDIT_TRIGGERS)
@@ -223,7 +224,7 @@ class TemporalLensDock(QDockWidget):
 
         layout.addStretch(1)
 
-        self.disable_button = QPushButton("Desactiver Lens", self)
+        self.disable_button = QPushButton(self.tr("Desactiver Lens"), self)
         self.disable_button.clicked.connect(self._on_disable_button)
         layout.addWidget(self.disable_button)
 
@@ -253,7 +254,7 @@ class TemporalLensDock(QDockWidget):
                 f"background-color: {color_hex}; border: 1px solid #555;"
             )
             row.addWidget(swatch)
-            row.addWidget(QLabel(f"{code} ({descr})", self))
+            row.addWidget(QLabel(f"{code} ({self.tr(descr)})", self))
             row.addStretch(1)
             v.addLayout(row)
             self._legend_swatches.append(swatch)
@@ -273,7 +274,7 @@ class TemporalLensDock(QDockWidget):
 
         self.layer_combo.clear()
         if self._journal is None or not self._journal.is_open:
-            self.layer_combo.addItem("(Journal non ouvert)", None)
+            self.layer_combo.addItem(self.tr("(Journal non ouvert)"), None)
             self.layer_combo.setEnabled(False)
             return
 
@@ -284,7 +285,7 @@ class TemporalLensDock(QDockWidget):
                 f"lens_dock event=populate_failed type={type(exc).__name__}",
                 "WARNING",
             )
-            self.layer_combo.addItem("(Erreur d'ouverture du journal)", None)
+            self.layer_combo.addItem(self.tr("(Erreur d'ouverture du journal)"), None)
             self.layer_combo.setEnabled(False)
             return
 
@@ -322,7 +323,7 @@ class TemporalLensDock(QDockWidget):
                 pass
 
         if n_audited == 0:
-            self.layer_combo.addItem("(Aucune couche audited dans le projet)", None)
+            self.layer_combo.addItem(self.tr("(Aucune couche audited dans le projet)"), None)
             self.layer_combo.setEnabled(False)
         else:
             self.layer_combo.setEnabled(True)
@@ -339,7 +340,7 @@ class TemporalLensDock(QDockWidget):
             LensRectangleMapTool,
             self.select_button,
             self.select_polygon_button,
-            "Tracez un rectangle sur la carte (clic-glisser-relacher).",
+            self.tr("Tracez un rectangle sur la carte (clic-glisser-relacher)."),
         )
 
     def _on_select_polygon_button(self, checked: bool) -> None:
@@ -348,7 +349,7 @@ class TemporalLensDock(QDockWidget):
             LensPolygonMapTool,
             self.select_polygon_button,
             self.select_button,
-            "Tracez un polygone (clic = sommet, double-clic = valider, Esc = annuler).",
+            self.tr("Tracez un polygone (clic = sommet, double-clic = valider, Esc = annuler)."),
         )
 
     def _on_map_selection_completed(self, geom) -> None:
@@ -361,9 +362,16 @@ class TemporalLensDock(QDockWidget):
         self._restore_previous_map_tool()
         bbox = geom.boundingBox()
         self.status_label.setText(
-            f"Zone selectionnee: x=[{bbox.xMinimum():.1f}, {bbox.xMaximum():.1f}], "
-            f"y=[{bbox.yMinimum():.1f}, {bbox.yMaximum():.1f}]. "
-            "Cliquez Rafraichir."
+            self.tr(
+                "Zone selectionnee: x=[{xmin}, {xmax}], "
+                "y=[{ymin}, {ymax}]. "
+                "Cliquez Rafraichir."
+            ).format(
+                xmin=f"{bbox.xMinimum():.1f}",
+                xmax=f"{bbox.xMaximum():.1f}",
+                ymin=f"{bbox.yMinimum():.1f}",
+                ymax=f"{bbox.yMaximum():.1f}",
+            )
         )
 
     def _restore_previous_map_tool(self) -> None:
@@ -394,15 +402,15 @@ class TemporalLensDock(QDockWidget):
 
         data = self.layer_combo.currentData()
         if data is None or self._selected_geom is None:
-            self.status_label.setText("Selection incomplete.")
+            self.status_label.setText(self.tr("Selection incomplete."))
             return
         if self._journal is None or not self._journal.is_open:
-            self.status_label.setText("Journal non ouvert.")
+            self.status_label.setText(self.tr("Journal non ouvert."))
             return
 
         layer = QgsProject.instance().mapLayer(data["layer_id"])
         if layer is None:
-            self.status_label.setText("Couche disparue du projet.")
+            self.status_label.setText(self.tr("Couche disparue du projet."))
             return
 
         src_crs_authid = (
@@ -429,7 +437,9 @@ class TemporalLensDock(QDockWidget):
                 geom_in_storage.transform(transform)
             except Exception as exc:  # noqa: BLE001
                 self.status_label.setText(
-                    f"Reprojection bbox echec: {type(exc).__name__}",
+                    self.tr("Reprojection bbox echec: {error_type}").format(
+                        error_type=type(exc).__name__
+                    ),
                 )
                 return
         bbox = geom_in_storage.boundingBox()
@@ -463,7 +473,9 @@ class TemporalLensDock(QDockWidget):
             conn = self._journal.create_read_connection()
         except Exception as exc:  # noqa: BLE001
             self.status_label.setText(
-                f"Connexion lecture echec: {type(exc).__name__}",
+                self.tr("Connexion lecture echec: {error_type}").format(
+                    error_type=type(exc).__name__
+                ),
             )
             return
 
@@ -484,7 +496,9 @@ class TemporalLensDock(QDockWidget):
                 "WARNING",
             )
             self.status_label.setText(
-                f"Lecture journal echec: {type(exc).__name__}",
+                self.tr("Lecture journal echec: {error_type}").format(
+                    error_type=type(exc).__name__
+                ),
             )
             try:
                 conn.close()
@@ -533,18 +547,26 @@ class TemporalLensDock(QDockWidget):
 
         if result.n_entities == 0:
             self.status_label.setText(
-                "Aucune modification trouvee dans cette zone et cette fenetre."
+                self.tr("Aucune modification trouvee dans cette zone et cette fenetre.")
             )
         else:
             truncated_note = (
-                f" ({result.n_events_truncated} tronques)"
+                self.tr(" ({n} tronques)").format(n=result.n_events_truncated)
                 if result.n_events_truncated > 0
                 else ""
             )
             self.status_label.setText(
-                f"{result.n_entities} entites - "
-                f"{result.n_events_displayed} events affiches{truncated_note} "
-                f"({result.elapsed_ms} ms, trace={trace_id})"
+                self.tr(
+                    "{n_entities} entites - "
+                    "{n_events} events affiches{truncated} "
+                    "({elapsed} ms, trace={trace})"
+                ).format(
+                    n_entities=result.n_entities,
+                    n_events=result.n_events_displayed,
+                    truncated=truncated_note,
+                    elapsed=result.elapsed_ms,
+                    trace=trace_id,
+                )
             )
         _flog(
             f"lens_dock event=refresh_done trace_id={trace_id} "
@@ -571,14 +593,14 @@ class TemporalLensDock(QDockWidget):
         other_button.blockSignals(False)
         if not checked:
             self._restore_previous_map_tool()
-            self.status_label.setText("Selection annulee.")
+            self.status_label.setText(self.tr("Selection annulee."))
             return
         if self.layer_combo.currentData() is None:
-            self.status_label.setText("Choisissez d'abord une couche auditee.")
+            self.status_label.setText(self.tr("Choisissez d'abord une couche auditee."))
             self_button.setChecked(False)
             return
         if self._canvas is None:
-            self.status_label.setText("Canvas QGIS indisponible.")
+            self.status_label.setText(self.tr("Canvas QGIS indisponible."))
             self_button.setChecked(False)
             return
         if self._lens_map_tool is not None:
@@ -669,9 +691,13 @@ class TemporalLensDock(QDockWidget):
             t_min_iso = self._get_iso_from_qdt(self.t_min_input)
             rel = format_relative_time(t_min_iso)
             absolute = self.t_min_input.dateTime().toString("dd/MM/yyyy HH:mm")
-            self.legend_age_label.setText(f"Depuis : {rel} ({absolute})")
+            self.legend_age_label.setText(
+                self.tr("Depuis : {rel} ({absolute})").format(
+                    rel=rel, absolute=absolute
+                )
+            )
         except Exception:  # noqa: BLE001
-            self.legend_age_label.setText("Plage non definie.")
+            self.legend_age_label.setText(self.tr("Plage non definie."))
 
     # ----- entity list + diff panel (phase 10c) -------------------------
 
@@ -684,7 +710,7 @@ class TemporalLensDock(QDockWidget):
         self.entity_list.clear()
         self.diff_table.setRowCount(0)
         self.diff_label.setText(
-            "Selectionnez une entite pour voir le diff."
+            self.tr("Selectionnez une entite pour voir le diff.")
         )
         self.diff_panel.hide()
         self._last_plan = None
@@ -706,9 +732,12 @@ class TemporalLensDock(QDockWidget):
                 if hasattr(timeline.classification, "value")
                 else str(timeline.classification)
             )
-            label = (
-                f"{entity_fp[:8]} - {cls_value} - "
-                f"{len(timeline.states)} states"
+            label = self.tr(
+                "{fp} - {cls} - {n} states"
+            ).format(
+                fp=entity_fp[:8],
+                cls=cls_value,
+                n=len(timeline.states),
             )
             item = QListWidgetItem(label)
             item.setData(QtCompat.USER_ROLE, entity_fp)
@@ -825,8 +854,14 @@ class TemporalLensDock(QDockWidget):
                 rows.append((ts, st.operation_type, field, old, new))
 
         self.diff_label.setText(
-            f"Diff entite {entity_fp[:8]} - {len(timeline.states)} states - "
-            f"{len(rows)} changements"
+            self.tr(
+                "Diff entite {fp} - {n_states} states - "
+                "{n_changes} changements"
+            ).format(
+                fp=entity_fp[:8],
+                n_states=len(timeline.states),
+                n_changes=len(rows),
+            )
         )
         self.diff_table.setRowCount(len(rows))
         for i, (ts, op, field, old, new) in enumerate(rows):
@@ -835,11 +870,11 @@ class TemporalLensDock(QDockWidget):
             self.diff_table.setItem(i, 2, QTableWidgetItem(str(field)))
             self.diff_table.setItem(
                 i, 3,
-                QTableWidgetItem("(vide)" if old is None else str(old)),
+                QTableWidgetItem(self.tr("(vide)") if old is None else str(old)),
             )
             self.diff_table.setItem(
                 i, 4,
-                QTableWidgetItem("(vide)" if new is None else str(new)),
+                QTableWidgetItem(self.tr("(vide)") if new is None else str(new)),
             )
         self.diff_panel.show()
         _flog(
