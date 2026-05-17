@@ -532,6 +532,7 @@ class TemporalLensDock(QDockWidget):
                 fetch_stats,
                 dst_crs_authid_render,
                 trace_id=trace_id,
+                source_layer=layer,
             )
         finally:
             try:

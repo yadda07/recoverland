@@ -189,10 +189,61 @@ def _feature_attrs(
     ]
 
 
+# ----- Style inheritance (BL-IL-P1-13) ----------------------------------
+
+_GHOST_OPACITY = 0.4
+
+
+def _apply_source_style(overlay_layer, source_layer, trace_id: str = ""):
+    """Clone the source layer QML style onto the overlay and set opacity.
+
+    Uses ``QgsMapLayerStyle`` (cross-version safe) to snapshot the
+    current rendering of *source_layer* and replay it onto *overlay_layer*.
+    If the source layer is unavailable or the style transfer fails, the
+    overlay keeps its default QGIS style — never crashes.
+    """
+    from .logger import flog  # noqa: PLC0415
+
+    if source_layer is None:
+        return
+    try:
+        from qgis.core import QgsMapLayerStyle  # noqa: PLC0415
+
+        style = QgsMapLayerStyle()
+        style.readFromLayer(source_layer)
+        if not style.isValid():
+            flog(
+                f"lens_renderer event=style_clone_empty "
+                f"trace_id={trace_id} source={source_layer.name()}",
+                "DEBUG",
+            )
+            return
+        style.writeToLayer(overlay_layer)
+        overlay_layer.setOpacity(_GHOST_OPACITY)
+        overlay_layer.triggerRepaint()
+        flog(
+            f"lens_renderer event=style_cloned "
+            f"trace_id={trace_id} source={source_layer.name()} "
+            f"opacity={_GHOST_OPACITY}",
+            "INFO",
+        )
+    except Exception as exc:  # noqa: BLE001
+        flog(
+            f"lens_renderer event=style_clone_error "
+            f"trace_id={trace_id} type={type(exc).__name__}",
+            "WARNING",
+        )
+
+
 # ----- Public API -------------------------------------------------------
 
 
-def execute_lens_render(plan, dst_crs_authid: str, trace_id: str = ""):
+def execute_lens_render(
+    plan,
+    dst_crs_authid: str,
+    trace_id: str = "",
+    source_layer=None,
+):
     """Materialise the two phase-08a overlay memory layers.
 
     Args:
@@ -375,6 +426,8 @@ def execute_lens_render(plan, dst_crs_authid: str, trace_id: str = ""):
     if attr_feats:
         attr_layer.dataProvider().addFeatures(attr_feats)
         attr_layer.updateExtents()
+
+    _apply_source_style(past_layer, source_layer, trace_id)
 
     project = QgsProject.instance()
     project.addMapLayer(past_layer, True)
