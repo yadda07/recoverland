@@ -26,6 +26,7 @@ from .core import (
     is_layer_audit_field,
     generate_trace_id,
     get_event_by_id, fetch_events_by_ids,
+    fetch_events_by_session, count_events_by_session,
     _BLOB_MARKER,
 )
 from .core.observability import log_state_transition
@@ -957,7 +958,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         self.table_widget = QTableWidget()
         self.table_widget.setSelectionBehavior(QtCompat.SELECT_ROWS)
-        self.table_widget.setAlternatingRowColors(True)
+        self.table_widget.setAlternatingRowColors(False)
         self.table_widget.horizontalHeader().setStretchLastSection(True)
         self.table_widget.setMinimumHeight(100)
         self.table_widget.setSortingEnabled(True)
@@ -1002,6 +1003,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
+        # Smoothing animation: interpolates progress_bar value between
+        # successive emits from the restore runner. The runner only emits
+        # once per chunk (~20 events), so the bar would otherwise jump in
+        # ~5% increments. This QVariantAnimation runs on Qt's global
+        # animation scheduler (same as the logo widget), so progress
+        # smoothing and the logo animation share a single clock and do not
+        # compete for QTimer slots in the UI thread.
+        self._progress_smoother = QVariantAnimation(self)
+        self._progress_smoother.setDuration(300)
+        self._progress_smoother.setEasingCurve(QtCompat.EASE_IN_OUT_QUAD)
+        self._progress_smoother.valueChanged.connect(
+            self._on_progress_smoother_value)
         self.progress_phase_label = QLabel("")
         self.progress_phase_label.setVisible(False)
         flog(
@@ -1138,6 +1151,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                         self.tr("Filtrer sur '{name}'").format(name=layer_name))
                     filter_act.triggered.connect(
                         lambda: self._filter_on_layer(event.datasource_fingerprint))
+                self._append_undo_session_menu(menu, event)
         menu.addSeparator()
         sel_all = menu.addAction(self.tr("Tout selectionner"))
         sel_all.triggered.connect(self.select_all_rows)
@@ -1377,6 +1391,60 @@ class RecoverDialog(QDialog, LoggerMixin):
                         break
             self.table_widget.setRowHidden(row, not match)
 
+    def _build_event_diff_tooltip(self, event, parsed_data, attrs: dict,
+                                  changed_keys: set, geom_changed: bool) -> str:
+        """US-4.10.03: Build a rich HTML tooltip describing this event's diff.
+
+        For UPDATE : two-column before/after of modified fields (max 10).
+        For INSERT : list of created attribute values (max 10).
+        For DELETE : list of pre-deletion attribute values (max 10).
+        Includes a geometry note if relevant. Never includes user_name or
+        other identity fields (A3 of US-03 — PII discipline).
+        """
+        op = event.operation_type or ""
+        header_parts = [f"<b>{op}</b>"]
+        if event.layer_name_snapshot:
+            header_parts.append(f"<i>{event.layer_name_snapshot}</i>")
+        if geom_changed:
+            header_parts.append(self.tr("Geometrie modifiee"))
+
+        rows_html = []
+        if op == "UPDATE" and parsed_data and "changed_only" in parsed_data:
+            changes = parsed_data["changed_only"]
+            items = [(k, v) for k, v in changes.items()
+                     if not is_layer_audit_field(k)]
+            for k, change in items[:10]:
+                if isinstance(change, dict):
+                    old = change.get("old", "")
+                    new = change.get("new", "")
+                    rows_html.append(
+                        f"<tr><td><b>{k}</b></td>"
+                        f"<td style='color:#888'>{old}</td>"
+                        f"<td>&rarr;</td>"
+                        f"<td>{new}</td></tr>")
+            if len(items) > 10:
+                rows_html.append(
+                    f"<tr><td colspan='4'><i>"
+                    f"...et {len(items) - 10} autre(s)</i></td></tr>")
+        elif op in ("INSERT", "DELETE"):
+            items = [(k, v) for k, v in attrs.items()
+                     if not is_layer_audit_field(k)]
+            label = (self.tr("Valeurs creees")
+                     if op == "INSERT" else self.tr("Valeurs supprimees"))
+            header_parts.append(label)
+            for k, v in items[:10]:
+                rows_html.append(
+                    f"<tr><td><b>{k}</b></td><td>{v}</td></tr>")
+            if len(items) > 10:
+                rows_html.append(
+                    f"<tr><td colspan='2'><i>"
+                    f"...et {len(items) - 10} autre(s)</i></td></tr>")
+
+        html = "<br>".join(header_parts)
+        if rows_html:
+            html += "<table>" + "".join(rows_html) + "</table>"
+        return html
+
     def _build_change_legend(self):
         """Build color legend widget with icons for accessibility (UX-E03)."""
         container = QWidget()
@@ -1421,9 +1489,10 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.table_widget.setColumnHidden(col, not keep)
 
     def _on_period_mode_changed(self, mode: str) -> None:
-        """Switch period stack and layer widget between event and version modes."""
+        """Switch period stack and layer widget between event, version and geogit modes."""
         flog(f"period_mode: switched to {mode}")
         is_version = (mode == "temporal")
+        is_geogit = (mode == "geogit")
         if is_version:
             self._period_stack.setCurrentIndex(1)
             self.layer_input.setVisible(False)
@@ -1436,6 +1505,19 @@ class RecoverDialog(QDialog, LoggerMixin):
             if not self._is_recovering:
                 self.recover_button.setEnabled(True)
             self._refresh_slider_bounds()
+        elif is_geogit:
+            self._period_stack.setCurrentIndex(0)
+            self.layer_input.setVisible(True)
+            self._version_layer_list.setVisible(False)
+            self._version_layer_btns.setVisible(False)
+            self.results_group.setVisible(False)
+            self.restore_button.setVisible(False)
+            self.recover_button.setText(self.tr("Visualiser"))
+            self.recover_button.setIcon(
+                QgsApplication.getThemeIcon('/mActionMapTips.svg'),
+            )
+            if not self._is_recovering:
+                self.recover_button.setEnabled(True)
         else:
             self._period_stack.setCurrentIndex(0)
             self._version_layer_list.setVisible(False)
@@ -1592,11 +1674,55 @@ class RecoverDialog(QDialog, LoggerMixin):
         """Update progress bar value.
 
         Called from thread signals dispatched via Qt event loop.
-        No processEvents needed.
+        Routes through ``_smooth_set_progress`` so the bar glides instead
+        of jumping in coarse steps (the runners emit per chunk, not per
+        event, so raw setValue would look like a staircase).
+        """
+        self._smooth_set_progress(value)
+
+    def _on_progress_smoother_value(self, val) -> None:
+        """Slot for ``_progress_smoother.valueChanged``.
+
+        QVariantAnimation feeds intermediate floats; the progress bar
+        accepts ints only, so we round here.
+        """
+        # The smoother is only used when the bar is in determinate mode;
+        # if it was switched to indeterminate (maximum==0) mid-animation,
+        # silently drop the update to avoid resetting the range.
+        if self.progress_bar.maximum() == 0:
+            return
+        self.progress_bar.setValue(int(round(float(val))))
+
+    def _smooth_set_progress(self, target_value: int) -> None:
+        """Animate progress_bar from its current value to ``target_value``.
+
+        Behaviour matrix:
+        - indeterminate mode (max==0) ........ switch to determinate first
+        - target == current displayed value .. no-op
+        - target <= 0 or target >= 100 ....... immediate (reset / done),
+          stop any in-flight animation to avoid an over-shoot afterwards
+        - any other target ................... 300 ms eased interpolation;
+          if a previous animation is still running, restart from the
+          currently displayed value so the visual stays continuous.
         """
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(value)
+        current = self.progress_bar.value()
+        if target_value == current:
+            return
+        running = (self._progress_smoother.state()
+                   == QtCompat.ANIM_STATE_RUNNING)
+        if target_value <= 0 or target_value >= 100:
+            if running:
+                self._progress_smoother.stop()
+            self.progress_bar.setValue(target_value)
+            return
+        if running:
+            self._progress_smoother.stop()
+            current = self.progress_bar.value()
+        self._progress_smoother.setStartValue(float(current))
+        self._progress_smoother.setEndValue(float(target_value))
+        self._progress_smoother.start()
 
     def on_events_committed(self, edited_fingerprint="") -> None:
         """Auto-refresh smart bar and event table after new events are flushed.
@@ -1634,10 +1760,125 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.enable_controls(False)
         self.progress_bar.setValue(0)
 
-        if self.restore_mode_selector.mode() == "temporal":
+        current_mode = self.restore_mode_selector.mode()
+        if current_mode == "temporal":
             self._recover_version_mode()
+        elif current_mode == "geogit":
+            self._recover_geogit_mode()
         else:
             self._recover_event_mode()
+
+    def _recover_geogit_mode(self) -> None:
+        """GeoGit mode: fetch events in canvas extent + render Lens overlays."""
+        import uuid as _uuid
+        from .core.event_stream_repository import fetch_events_in_zone
+        from .core.lens_contracts import LensFetchStats, LensSelection
+        from .core.workflow_service import execute_grouped_lens_view
+
+        trace_id = _uuid.uuid4().hex[:8]
+        canvas = self.iface.mapCanvas()
+
+        layer_data = self.layer_input.currentData()
+        if layer_data is None:
+            self._is_recovering = False
+            self.enable_controls(True)
+            self.recover_button.setEnabled(True)
+            flog(f"[{trace_id}] geogit: no layer selected", "WARNING")
+            return
+
+        layer = QgsProject.instance().mapLayer(layer_data.get("layer_id", ""))
+        if layer is None:
+            self._is_recovering = False
+            self.enable_controls(True)
+            self.recover_button.setEnabled(True)
+            flog(f"[{trace_id}] geogit: layer disappeared", "WARNING")
+            return
+
+        extent_geom = QgsGeometry.fromRect(canvas.extent())
+        src_crs = canvas.mapSettings().destinationCrs().authid()
+        storage_crs = layer_data.get("crs_authid") or src_crs
+
+        geom_storage = QgsGeometry(extent_geom)
+        if storage_crs and storage_crs != src_crs:
+            xform = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem(src_crs),
+                QgsCoordinateReferenceSystem(storage_crs),
+                QgsProject.instance(),
+            )
+            try:
+                geom_storage.transform(xform)
+            except Exception:  # noqa: BLE001
+                pass
+
+        start_dt = self.start_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
+        end_dt = self.end_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
+
+        op_filter_value = self.operation_input.currentData()
+        flog(
+            f"[{trace_id}] geogit: start layer={layer.name()} "
+            f"dates={start_dt}..{end_dt} op={op_filter_value} crs={src_crs}",
+            "INFO",
+        )
+
+        conn = None
+        try:
+            conn = self._journal.open_readonly_connection()
+            fetch_stats = LensFetchStats(0, 0, False)
+            events, fetch_stats = fetch_events_in_zone(
+                conn,
+                layer_data.get("datasource_fingerprint", ""),
+                geom_storage,
+                t_min=start_dt,
+                t_max=end_dt,
+            )
+            flog(
+                f"[{trace_id}] geogit: fetched n_events={len(events)} "
+                f"truncated={fetch_stats.truncated}",
+                "INFO",
+            )
+            if not events:
+                self.update_phase(self.tr("Aucun evenement dans cette zone et periode."))
+                self._is_recovering = False
+                self.enable_controls(True)
+                self.recover_button.setEnabled(True)
+                return
+
+            selection = LensSelection(
+                layer_id=layer_data.get("layer_id", ""),
+                layer_name=layer.name(),
+                bbox_wkt=geom_storage.asWkt(),
+                crs_authid=storage_crs,
+            )
+            outcome = execute_grouped_lens_view(
+                events,
+                selection,
+                layer.name(),
+                fetch_stats,
+                src_crs,
+                trace_id=trace_id,
+                source_layer=layer,
+            )
+            n_ent = outcome.result.n_entities
+            self.update_phase(
+                self.tr("{n} entite(s) visualisee(s) sur la carte.").format(n=n_ent),
+            )
+            flog(
+                f"[{trace_id}] geogit: rendered n_entities={n_ent} "
+                f"n_overlays={len(outcome.result.overlay_layer_ids)}",
+                "INFO",
+            )
+        except Exception as exc:  # noqa: BLE001
+            flog(f"[{trace_id}] geogit: error={exc!r}", "ERROR")
+            self.update_phase(str(exc))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._is_recovering = False
+            self.enable_controls(True)
+            self.recover_button.setEnabled(True)
 
     def _recover_event_mode(self) -> None:
         """Event mode: threaded search with start/end date range."""
@@ -2076,14 +2317,14 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _on_restore_runner_progress(self, done: int, total: int) -> None:
         if total > 0:
-            self.progress_bar.setValue(int(done / total * 100))
+            self._smooth_set_progress(int(done / total * 100))
 
     def _on_version_restore_done(self, result) -> None:
         trace_id = self._active_restore_trace_id
         self._restore_in_progress = False
         self._restore_runner = None
         cleanup_temp_layers()
-        self.progress_bar.setValue(100)
+        self._smooth_set_progress(100)
         self._stop_logo_activity()
         if trace_id:
             started = self._restore_started_at
@@ -2127,6 +2368,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         if result.total_ok > 0:
             flog(f"recover_version: refreshing canvas for {result.total_ok} ok")
             self.iface.mapCanvas().refresh()
+            self._open_attribute_tables_if_requested(restore_by_ds, "version")
 
         self.progress_bar.setVisible(False)
         self.enable_controls(True)
@@ -2348,18 +2590,24 @@ class RecoverDialog(QDialog, LoggerMixin):
                                 and all(is_layer_audit_field(k) for k in parsed_data["changed_only"]))
                 geom_changed = is_geom_only or (is_update and event.geometry_wkb is not None)
                 row_values.append(self.tr("Modifiée") if geom_changed else "")
+            diff_tooltip = self._build_event_diff_tooltip(
+                event, parsed_data, attrs, changed_keys, geom_changed)
             for col_idx, val in enumerate(row_values):
                 item = QTableWidgetItem(val)
                 if col_idx == 0:
                     item.setData(QtCompat.USER_ROLE, row_idx)
                 if has_geom_change and col_idx == len(row_values) - 1 and geom_changed:
                     item.setBackground(CHANGE_TYPE_COLORS["geometry"])
+                if col_idx == 3 and diff_tooltip:
+                    item.setToolTip(diff_tooltip)
                 self.table_widget.setItem(row_idx, col_idx, item)
 
+            op = event.operation_type or ""
             for col_offset, key in enumerate(attr_keys):
                 val = attrs.get(key)
                 item = QTableWidgetItem(str(val) if val is not None else "")
                 col_idx = n_fixed + col_offset
+                has_value = val is not None and val != ""
                 if is_update and key in changed_keys:
                     item.setBackground(CHANGE_TYPE_COLORS["modified"])
                     self._modified_col_indices.add(col_idx)
@@ -2368,6 +2616,13 @@ class RecoverDialog(QDialog, LoggerMixin):
                         if isinstance(change, dict):
                             item.setToolTip(self.tr("Ancien: {old}\nActuel: {new}").format(
                                 old=val, new=change.get('new')))
+                elif op in ("INSERT", "DELETE") and has_value:
+                    # Per user feedback (2026-05-16): no per-cell coloring for
+                    # INSERT/DELETE -- the whole row is new/gone, color coding
+                    # adds noise rather than information. Tracking is kept so
+                    # the "modifications only" column filter still surfaces
+                    # the active columns.
+                    self._modified_col_indices.add(col_idx)
                 self.table_widget.setItem(row_idx, col_idx, item)
 
         self.table_widget.setSortingEnabled(True)
@@ -2524,32 +2779,89 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._update_geometry_preview()
 
     def _update_geometry_preview(self) -> None:
-        """P1.1: Show old geometry on canvas when exactly one geometry event is selected."""
-        if not self.selected_rows:
+        """P1.1: Show old geometry on canvas when exactly one geometry event is selected.
+
+        Every exit path logs its reason so a missing zoom/flash can be
+        diagnosed from the trace (user rule: log every critical branch).
+        """
+        n_rows = len(self.selected_rows)
+        if n_rows == 0:
             self._geom_preview.clear()
+            flog("_update_geometry_preview: cleared reason=no_selection",
+                 "DEBUG")
             return
-        if len(self.selected_rows) != 1:
+        if n_rows != 1:
             self._geom_preview.clear()
+            flog(
+                f"_update_geometry_preview: cleared reason=multi_selection "
+                f"n_rows={n_rows}",
+                "DEBUG",
+            )
             return
         idx = self.selected_rows[0]
         if idx >= len(self._search_events):
             self._geom_preview.clear()
+            flog(
+                f"_update_geometry_preview: cleared reason=idx_oob "
+                f"idx={idx} n_events={len(self._search_events)}",
+                "WARNING",
+            )
             return
         event = self._search_events[idx]
         if not event.geometry_wkb:
             self._geom_preview.clear()
+            flog(
+                f"_update_geometry_preview: cleared reason=no_geometry_wkb "
+                f"event_id={event.event_id} op={event.operation_type}",
+                "INFO",
+            )
             return
         wkb = event.geometry_wkb
+        wkb_source = "lightweight"
         if wkb == _BLOB_MARKER and event.event_id is not None:
             conn = self._get_dialog_read_conn()
             if conn is not None:
                 full = get_event_by_id(conn, event.event_id)
                 if full is not None:
                     wkb = full.geometry_wkb
+                    wkb_source = "full_fetch"
         if not wkb or wkb == _BLOB_MARKER:
             self._geom_preview.clear()
+            flog(
+                f"_update_geometry_preview: cleared reason=blob_marker_unresolved "
+                f"event_id={event.event_id}",
+                "WARNING",
+            )
             return
-        self._geom_preview.show(wkb, event.crs_authid)
+        target_layer = None
+        try:
+            target_layer = find_target_layer(event, self._get_dialog_read_conn())
+        except Exception as exc:
+            flog(
+                f"_update_geometry_preview: target_layer_resolve_failed "
+                f"event_id={event.event_id} err={exc}",
+                "WARNING",
+            )
+        rendered = self._geom_preview.show(wkb, event.crs_authid, target_layer)
+        if not rendered:
+            flog(
+                f"_update_geometry_preview: show_returned_false "
+                f"event_id={event.event_id} crs={event.crs_authid} "
+                f"wkb_source={wkb_source}",
+                "WARNING",
+            )
+            return
+        zoom_enabled = self.auto_zoom_check.isChecked()
+        flog(
+            f"_update_geometry_preview: rendered "
+            f"event_id={event.event_id} op={event.operation_type} "
+            f"crs={event.crs_authid or '-'} wkb_source={wkb_source} "
+            f"zoom_enabled={zoom_enabled}",
+            "INFO",
+        )
+        if zoom_enabled:
+            self._geom_preview.zoom_to_preview()
+        self._geom_preview.flash()
 
     def select_all_rows(self):
         """Select all"""
@@ -2653,7 +2965,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._restore_in_progress = False
         self._restore_runner = None
         cleanup_temp_layers()
-        self.progress_bar.setValue(100)
+        self._smooth_set_progress(100)
         if trace_id:
             started = self._restore_started_at
             elapsed_ms = int((time.monotonic() - started) * 1000) if started else 0
@@ -2671,6 +2983,9 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.undo_last_btn.setEnabled(True)
         self._event_restore_events = None
 
+        if result.total_ok > 0:
+            self._open_attribute_tables_if_requested(result.by_ds, "event")
+
         feedback = (result.total_ok, result.total_fail, tuple(result.errors))
         elapsed = time.monotonic() - self._restore_started_at
         remaining = _MIN_RESTORE_ANIMATION_SEC - elapsed
@@ -2679,6 +2994,57 @@ class RecoverDialog(QDialog, LoggerMixin):
             QTimer.singleShot(int(remaining * 1000), self._display_deferred_restore_feedback)
             return
         self._display_restore_feedback(feedback)
+
+    def _open_attribute_tables_if_requested(self, by_ds: dict, source: str) -> None:
+        """US-FIX-02 (DC-2): Open attribute table per restored layer if checked.
+
+        Reads `open_attribute_check` state. For each unique datasource in by_ds,
+        resolves the actual QgsVectorLayer via `find_target_layer` and asks QGIS
+        to display its attribute table. Failures are logged but never raised.
+        """
+        if not by_ds:
+            return
+        if not self.open_attribute_check.isChecked():
+            return
+        read_conn = self._get_dialog_read_conn()
+        opened = 0
+        for fp, evts in by_ds.items():
+            if not evts:
+                continue
+            try:
+                layer = find_target_layer(evts[0], read_conn)
+            except Exception as exc:
+                flog(
+                    f"open_attribute_table: resolver_error source={source} "
+                    f"fp={fp[:16]}... err={exc}",
+                    "WARNING",
+                )
+                continue
+            if layer is None:
+                flog(
+                    f"open_attribute_table: layer_not_found source={source} "
+                    f"fp={fp[:16]}...",
+                    "DEBUG",
+                )
+                continue
+            try:
+                self.iface.showAttributeTable(layer)
+                opened += 1
+                flog(
+                    f"open_attribute_table: opened source={source} "
+                    f"layer_id={layer.id()} name={layer.name()!r}",
+                    "DEBUG",
+                )
+            except Exception as exc:
+                flog(
+                    f"open_attribute_table: failed source={source} "
+                    f"layer={layer.name()!r} err={exc}",
+                    "WARNING",
+                )
+        if opened > 0:
+            flog(
+                f"open_attribute_table: total_opened={opened} source={source}"
+            )
 
     def _invalidate_undo_for(self, edited_fingerprint: str) -> None:
         """Remove a single layer from the undo state after user edits it."""
@@ -2700,6 +3066,189 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._last_restore_events = None
             self.undo_last_btn.setEnabled(False)
             flog("undo_last_btn: DISABLED (all layers edited)")
+
+    def _append_undo_session_menu(self, menu, event) -> None:
+        """US-4.10.01: Append an 'undo entire session' entry to the menu.
+
+        If the event has a session_id, show the count and wire _undo_session.
+        If session_id is NULL (legacy pre-v5 event), show a disabled entry
+        with an explanatory tooltip (A6 of US-01).
+        """
+        session_id = event.session_id
+        menu.addSeparator()
+        if not session_id:
+            legacy_act = menu.addAction(
+                self.tr("Annuler toute la session (indisponible)"))
+            legacy_act.setEnabled(False)
+            legacy_act.setToolTip(self.tr(
+                "Evenement legacy, groupement de session indisponible."))
+            flog(
+                f"undo_session_menu: skipped reason=legacy_null_session "
+                f"event_id={event.event_id}",
+                "DEBUG",
+            )
+            return
+        n_events = self._count_session_events(session_id)
+        if n_events == 0:
+            return
+        session_date = (event.created_at or "")[:16] or "?"
+        undo_act = menu.addAction(
+            QgsApplication.getThemeIcon('/mActionUndo.svg'),
+            self.tr("Annuler toute la session d'edition ({n} evenements)").format(
+                n=n_events))
+        undo_act.setToolTip(self.tr("Session du {date}").format(date=session_date))
+        undo_act.triggered.connect(lambda: self._undo_session(session_id))
+
+    def _count_session_events(self, session_id: str) -> int:
+        """US-4.10.01: Count events of a session for the context-menu label."""
+        if not session_id:
+            return 0
+        read_conn = self._get_dialog_read_conn()
+        if read_conn is None:
+            return 0
+        try:
+            return count_events_by_session(read_conn, session_id)
+        except Exception as exc:
+            flog(
+                f"_count_session_events: error session_id={session_id} "
+                f"err={exc}",
+                "WARNING",
+            )
+            return 0
+
+    def _undo_session(self, session_id: str) -> None:
+        """US-4.10.01: Reverse all events of a given edit session.
+
+        Fetches the user events of the session, builds the by_ds payload,
+        confirms with the user, then dispatches to UndoRunner. Reuses the
+        existing rewind_dedup logic for idempotence.
+        """
+        if not session_id:
+            return
+        if getattr(self, '_restore_in_progress', False):
+            qlog(self.tr("Un restore est deja en cours."), "WARNING")
+            return
+        read_conn = self._get_dialog_read_conn()
+        if read_conn is None:
+            return
+
+        t0 = time.monotonic()
+        try:
+            events = fetch_events_by_session(read_conn, session_id)
+        except Exception as exc:
+            flog(
+                f"_undo_session: fetch_error session_id={session_id} err={exc}",
+                "ERROR",
+            )
+            qlog(self.tr("Erreur lors de la lecture de la session."), "ERROR")
+            return
+        fetch_ms = int((time.monotonic() - t0) * 1000)
+        if not events:
+            qlog(self.tr("Aucun evenement a annuler pour cette session."),
+                 "WARNING")
+            flog(
+                f"_undo_session: no_events session_id={session_id} "
+                f"fetch_elapsed_ms={fetch_ms}",
+                "INFO",
+            )
+            return
+
+        by_ds = {}
+        for e in events:
+            by_ds.setdefault(e.datasource_fingerprint, []).append(e)
+
+        layer_names = sorted({e.layer_name_snapshot or '?' for e in events})
+        op_counts = {}
+        for e in events:
+            op_counts[e.operation_type] = op_counts.get(e.operation_type, 0) + 1
+        ops_str = ', '.join(f"{n} {op}" for op, n in sorted(op_counts.items()))
+        layers_str = '\n'.join(f"  - {n}" for n in layer_names)
+
+        msg = self.tr(
+            "Annuler la session d'edition entiere ?\n\n"
+            "Session : {sid}\n"
+            "{total} evenement(s) sur {nlayers} couche(s).\n"
+            "Operations : {ops}\n\n"
+            "Couches touchees :\n{layers}"
+        ).format(
+            sid=session_id[:8] + "...", total=len(events),
+            nlayers=len(by_ds), ops=ops_str, layers=layers_str,
+        )
+
+        reply = QMessageBox.question(
+            self, self.tr("Annuler la session"),
+            msg, QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_NO,
+        )
+        if reply != QtCompat.MSG_YES:
+            flog(
+                f"_undo_session: cancelled_by_user session_id={session_id}",
+                "INFO",
+            )
+            return
+
+        trace_id = generate_trace_id()
+        flog(
+            f"[{trace_id}] undo_session: start "
+            f"session_id={session_id} n_events={len(events)} "
+            f"n_layers={len(by_ds)} fetch_elapsed_ms={fetch_ms}",
+            "INFO",
+        )
+
+        self._active_restore_trace_id = trace_id
+        self._current_undo_session_id = session_id
+        self.restore_button.setEnabled(False)
+        self.recover_button.setEnabled(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self._restore_started_at = time.monotonic()
+        self._start_logo_activity(self._glow_color, "restore")
+        self._restore_in_progress = True
+
+        def resolver(evt):
+            return find_target_layer(evt, read_conn)
+
+        runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
+        runner.progress.connect(self._on_restore_runner_progress)
+        runner.finished.connect(self._on_undo_session_done)
+        self._restore_runner = runner
+        runner.start()
+
+    def _on_undo_session_done(self, result) -> None:
+        """US-4.10.01: Callback after undo_session completes."""
+        trace_id = self._active_restore_trace_id
+        session_id = getattr(self, '_current_undo_session_id', '')
+        self._restore_in_progress = False
+        self._restore_runner = None
+        cleanup_temp_layers()
+        self._smooth_set_progress(100)
+        self._stop_logo_activity()
+
+        if trace_id:
+            started = self._restore_started_at
+            elapsed_ms = int((time.monotonic() - started) * 1000) if started else 0
+            flog(
+                f"[{trace_id}] undo_session: done "
+                f"session_id={session_id} "
+                f"ok={result.total_ok} fail={result.total_fail} "
+                f"elapsed_ms={elapsed_ms}",
+                "INFO",
+            )
+            self._active_restore_trace_id = ""
+
+        if result.total_fail == 0:
+            qlog(self.tr("Session annulee : {ok} evenement(s) neutralise(s).").format(
+                ok=result.total_ok))
+        else:
+            qlog(self.tr("Annulation partielle : {ok} OK, {fail} echec(s).").format(
+                ok=result.total_ok, fail=result.total_fail), "WARNING")
+
+        self.progress_bar.setVisible(False)
+        self.enable_controls(True)
+        self.recover_button.setEnabled(True)
+        self.restore_button.setEnabled(True)
+        self._current_undo_session_id = ""
+        self.iface.mapCanvas().refresh()
 
     def _undo_last_restore(self):
         """Undo the last restore: revert data to its pre-restore state."""
@@ -2754,7 +3303,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._last_restore_events = None
         self._last_restore_by_ds = None
 
-        self.progress_bar.setValue(100)
+        self._smooth_set_progress(100)
         self._stop_logo_activity()
         self.progress_bar.setVisible(False)
         self.enable_controls(True)
@@ -2941,10 +3490,10 @@ class RecoverDialog(QDialog, LoggerMixin):
                     "et perdra les modifications non encore appliquees.\n\n"
                     "Fermer quand meme ?"
                 ),
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                QgisCompat.MSG_YES | QgisCompat.MSG_NO,
+                QgisCompat.MSG_NO,
             )
-            if reply != QMessageBox.Yes:
+            if reply != QgisCompat.MSG_YES:
                 flog("closeEvent: restore in progress, user chose to keep open")
                 event.ignore()
                 return
