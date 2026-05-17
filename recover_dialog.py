@@ -1768,6 +1768,19 @@ class RecoverDialog(QDialog, LoggerMixin):
         else:
             self._recover_event_mode()
 
+    def _resolve_layer_by_fingerprint(self, fingerprint: str):
+        """Find the QgsVectorLayer in the project matching *fingerprint*."""
+        from .core.identity import compute_datasource_fingerprint
+        for lyr in QgsProject.instance().mapLayers().values():
+            if not hasattr(lyr, 'dataProvider'):
+                continue
+            try:
+                if compute_datasource_fingerprint(lyr) == fingerprint:
+                    return lyr
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
     def _recover_geogit_mode(self) -> None:
         """GeoGit mode: fetch events in canvas extent + render Lens overlays."""
         import uuid as _uuid
@@ -1778,25 +1791,25 @@ class RecoverDialog(QDialog, LoggerMixin):
         trace_id = _uuid.uuid4().hex[:8]
         canvas = self.iface.mapCanvas()
 
-        layer_data = self.layer_input.currentData()
-        if layer_data is None:
+        fingerprint = self.layer_input.currentData()
+        if not fingerprint:
             self._is_recovering = False
             self.enable_controls(True)
             self.recover_button.setEnabled(True)
             flog(f"[{trace_id}] geogit: no layer selected", "WARNING")
             return
 
-        layer = QgsProject.instance().mapLayer(layer_data.get("layer_id", ""))
+        layer = self._resolve_layer_by_fingerprint(fingerprint)
         if layer is None:
             self._is_recovering = False
             self.enable_controls(True)
             self.recover_button.setEnabled(True)
-            flog(f"[{trace_id}] geogit: layer disappeared", "WARNING")
+            flog(f"[{trace_id}] geogit: layer not found fp={fingerprint[:20]}", "WARNING")
             return
 
         extent_geom = QgsGeometry.fromRect(canvas.extent())
         src_crs = canvas.mapSettings().destinationCrs().authid()
-        storage_crs = layer_data.get("crs_authid") or src_crs
+        storage_crs = layer.crs().authid() if layer.crs().isValid() else src_crs
 
         geom_storage = QgsGeometry(extent_geom)
         if storage_crs and storage_crs != src_crs:
@@ -1826,7 +1839,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             fetch_stats = LensFetchStats(0, 0, False)
             events, fetch_stats = fetch_events_in_zone(
                 conn,
-                layer_data.get("datasource_fingerprint", ""),
+                fingerprint,
                 geom_storage,
                 t_min=start_dt,
                 t_max=end_dt,
@@ -1844,7 +1857,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                 return
 
             selection = LensSelection(
-                layer_id=layer_data.get("layer_id", ""),
+                layer_id=layer.id(),
                 layer_name=layer.name(),
                 bbox_wkt=geom_storage.asWkt(),
                 crs_authid=storage_crs,
