@@ -295,6 +295,7 @@ def execute_grouped_lens_view(
     fetch_stats,
     dst_crs_authid: str,
     trace_id: str = "",
+    source_layer=None,
 ):
     """Plan + render facade for the Time Lens dock (BL-IL-P0-09).
 
@@ -337,7 +338,9 @@ def execute_grouped_lens_view(
     n_removed = purge_lens_overlays("refresh")
 
     plan = plan_lens_view(events, selection, layer_name, fetch_stats)
-    result = execute_lens_render(plan, dst_crs_authid, trace_id=trace_id)
+    result = execute_lens_render(
+        plan, dst_crs_authid, trace_id=trace_id, source_layer=source_layer,
+    )
 
     _lens_layer_ids.clear()
     _lens_layer_ids.extend(result.overlay_layer_ids)
