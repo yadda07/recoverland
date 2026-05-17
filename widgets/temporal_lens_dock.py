@@ -22,8 +22,9 @@ the entity list. Phase 10c will add the attribute diff panel.
 from datetime import datetime, timezone
 from typing import Optional
 
-from qgis.PyQt.QtCore import QDateTime
+from qgis.PyQt.QtCore import QDateTime, QTimer
 from qgis.PyQt.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDockWidget,
     QFrame,
@@ -113,6 +114,13 @@ class TemporalLensDock(QDockWidget):
         # entity_fp -> EntityTimeline on click without re-fetching.
         self._last_plan = None
 
+        # P1-14: auto-refresh on canvas pan/zoom.
+        self._auto_refresh_active = False
+        self._debounce_timer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(500)
+        self._debounce_timer.timeout.connect(self._on_debounce_fire)
+
         self._build_ui()
         self._populate_layers_combo()
 
@@ -181,6 +189,15 @@ class TemporalLensDock(QDockWidget):
         self.refresh_button.setEnabled(False)
         self.refresh_button.clicked.connect(self._on_refresh_button)
         layout.addWidget(self.refresh_button)
+
+        self.auto_refresh_cb = QCheckBox(
+            self.tr("Auto-refresh au zoom"), self,
+        )
+        self.auto_refresh_cb.setToolTip(
+            self.tr("Rafraichit automatiquement quand la vue change"),
+        )
+        self.auto_refresh_cb.toggled.connect(self._on_auto_refresh_toggled)
+        layout.addWidget(self.auto_refresh_cb)
 
         self.status_label = QLabel(self.tr("Aucune selection."), self)
         self.status_label.setWordWrap(True)
@@ -884,16 +901,63 @@ class TemporalLensDock(QDockWidget):
             "DEBUG",
         )
 
+    # ----- auto-refresh on pan/zoom (BL-IL-P1-14) -------------------------
+
+    def _on_auto_refresh_toggled(self, checked: bool) -> None:
+        if checked:
+            if self._canvas is not None:
+                self._canvas.extentsChanged.connect(
+                    self._on_canvas_extent_changed,
+                )
+            self._auto_refresh_active = True
+            _flog("lens_dock event=auto_refresh_on", "INFO")
+        else:
+            self._disconnect_auto_refresh()
+            _flog("lens_dock event=auto_refresh_off", "INFO")
+
+    def _disconnect_auto_refresh(self) -> None:
+        self._auto_refresh_active = False
+        self._debounce_timer.stop()
+        if self._canvas is not None:
+            try:
+                self._canvas.extentsChanged.disconnect(
+                    self._on_canvas_extent_changed,
+                )
+            except TypeError:
+                pass
+
+    def _on_canvas_extent_changed(self) -> None:
+        if not self._auto_refresh_active:
+            return
+        self._debounce_timer.start()
+
+    def _on_debounce_fire(self) -> None:
+        if self._canvas is None:
+            return
+        extent = self._canvas.extent()
+        self._selected_geom = QgsGeometry.fromRect(extent)
+        self.refresh_button.setEnabled(True)
+        _flog(
+            "lens_dock event=auto_refresh_fire "
+            "extent_w={w:.0f} extent_h={h:.0f}".format(
+                w=extent.width(), h=extent.height(),
+            ),
+            "DEBUG",
+        )
+        self._on_refresh_button()
+
     # ----- disable / close ----------------------------------------------
 
     def _on_disable_button(self) -> None:
         from ..core.workflow_service import purge_lens_overlays
+        self._disconnect_auto_refresh()
         purge_lens_overlays("disable_lens")
         self._clear_entity_panels()
         self._restore_previous_map_tool()
         self.close()
 
     def closeEvent(self, event):
+        self._disconnect_auto_refresh()
         self._restore_previous_map_tool()
         try:
             from ..core.workflow_service import purge_lens_overlays
