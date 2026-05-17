@@ -8,7 +8,10 @@ from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPus
 from qgis.PyQt.QtCore import (QDateTime, QDate, QTime, QTimer,
                               QVariantAnimation)
 from qgis.PyQt.QtGui import QIcon, QColor, QKeySequence
-from qgis.core import (QgsVectorLayer, QgsProject, QgsApplication, QgsSettings)
+from qgis.core import (
+    QgsVectorLayer, QgsProject, QgsApplication, QgsSettings,
+    QgsGeometry, QgsCoordinateTransform, QgsCoordinateReferenceSystem,
+)
 from qgis.gui import QgsCollapsibleGroupBox, QgsDateTimeEdit
 from .compat import QtCompat, QgisCompat
 from .core import (
@@ -1782,10 +1785,17 @@ class RecoverDialog(QDialog, LoggerMixin):
         return None
 
     def _recover_geogit_mode(self) -> None:
-        """GeoGit mode: fetch events in canvas extent + render Lens overlays."""
+        """GeoGit mode: fetch events in canvas extent + render Lens overlays.
+
+        Mirrors temporal_lens_dock._on_refresh_button, reusing the dialog
+        widgets (layer_input, start_input, end_input, operation_input) and
+        the canvas extent as the spatial selection.
+        """
         import uuid as _uuid
         from .core.event_stream_repository import fetch_events_in_zone
-        from .core.lens_contracts import LensFetchStats, LensSelection
+        from .core.lens_contracts import (
+            LensFetchStats, LensOpFilter, LensSelection,
+        )
         from .core.workflow_service import execute_grouped_lens_view
 
         trace_id = _uuid.uuid4().hex[:8]
@@ -1793,24 +1803,18 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         fingerprint = self.layer_input.currentData()
         if not fingerprint:
-            self._is_recovering = False
-            self.enable_controls(True)
-            self.recover_button.setEnabled(True)
-            flog(f"[{trace_id}] geogit: no layer selected", "WARNING")
+            self._geogit_done(trace_id, "no layer selected")
             return
 
         layer = self._resolve_layer_by_fingerprint(fingerprint)
         if layer is None:
-            self._is_recovering = False
-            self.enable_controls(True)
-            self.recover_button.setEnabled(True)
-            flog(f"[{trace_id}] geogit: layer not found fp={fingerprint[:20]}", "WARNING")
+            self._geogit_done(trace_id, f"layer not found fp={fingerprint[:40]}")
             return
 
-        extent_geom = QgsGeometry.fromRect(canvas.extent())
         src_crs = canvas.mapSettings().destinationCrs().authid()
         storage_crs = layer.crs().authid() if layer.crs().isValid() else src_crs
 
+        extent_geom = QgsGeometry.fromRect(canvas.extent())
         geom_storage = QgsGeometry(extent_geom)
         if storage_crs and storage_crs != src_crs:
             xform = QgsCoordinateTransform(
@@ -1821,47 +1825,61 @@ class RecoverDialog(QDialog, LoggerMixin):
             try:
                 geom_storage.transform(xform)
             except Exception:  # noqa: BLE001
-                pass
+                self._geogit_done(trace_id, "bbox reprojection failed")
+                return
 
-        start_dt = self.start_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
-        end_dt = self.end_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
+        bbox = geom_storage.boundingBox()
+        bbox_xy = (
+            bbox.xMinimum(), bbox.yMinimum(),
+            bbox.xMaximum(), bbox.yMaximum(),
+        )
 
-        op_filter_value = self.operation_input.currentData()
+        t_min = self.start_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
+        t_max = self.end_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
+
+        op_key = self.operation_input.currentData() or "ALL"
+        try:
+            op_filter = LensOpFilter(op_key)
+        except ValueError:
+            op_filter = LensOpFilter.ALL
+
         flog(
             f"[{trace_id}] geogit: start layer={layer.name()} "
-            f"dates={start_dt}..{end_dt} op={op_filter_value} crs={src_crs}",
+            f"dates={t_min}..{t_max} op={op_filter.value} crs={src_crs}",
             "INFO",
+        )
+
+        selection = LensSelection(
+            layer_id_snapshot=layer.id(),
+            datasource_fp=fingerprint,
+            bbox_xy=bbox_xy,
+            bbox_crs=storage_crs,
+            t_min=t_min,
+            t_max=t_max,
+            op_filter=op_filter,
         )
 
         conn = None
         try:
-            conn = self._journal.open_readonly_connection()
-            fetch_stats = LensFetchStats(0, 0, False)
+            conn = self._journal.create_read_connection()
             events, fetch_stats = fetch_events_in_zone(
                 conn,
                 fingerprint,
-                geom_storage,
-                t_min=start_dt,
-                t_max=end_dt,
+                bbox_xy,
+                t_min,
+                t_max,
+                limit=selection.max_events,
+                trace_id=trace_id,
             )
             flog(
-                f"[{trace_id}] geogit: fetched n_events={len(events)} "
-                f"truncated={fetch_stats.truncated}",
+                f"[{trace_id}] geogit: fetched n_events={fetch_stats.n_events_returned} "
+                f"truncated={fetch_stats.n_events_truncated}",
                 "INFO",
             )
             if not events:
                 self.update_phase(self.tr("Aucun evenement dans cette zone et periode."))
-                self._is_recovering = False
-                self.enable_controls(True)
-                self.recover_button.setEnabled(True)
                 return
 
-            selection = LensSelection(
-                layer_id=layer.id(),
-                layer_name=layer.name(),
-                bbox_wkt=geom_storage.asWkt(),
-                crs_authid=storage_crs,
-            )
             outcome = execute_grouped_lens_view(
                 events,
                 selection,
@@ -1892,6 +1910,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._is_recovering = False
             self.enable_controls(True)
             self.recover_button.setEnabled(True)
+
+    def _geogit_done(self, trace_id: str, reason: str) -> None:
+        """Unlock UI and log after a GeoGit early exit."""
+        flog(f"[{trace_id}] geogit: {reason}", "WARNING")
+        self._is_recovering = False
+        self.enable_controls(True)
+        self.recover_button.setEnabled(True)
 
     def _recover_event_mode(self) -> None:
         """Event mode: threaded search with start/end date range."""
