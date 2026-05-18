@@ -437,6 +437,8 @@ class GeoGitSession:
             ("_rl_user", QVariant.String),
             ("_rl_age", QVariant.String),
             ("_rl_class", QVariant.String),
+            ("_rl_opacity", QVariant.Double),
+            ("_rl_stack_order", QVariant.Int),
         ]
 
         uri_parts = [f"{geom_family}?crs={dst_crs}"]
