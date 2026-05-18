@@ -125,6 +125,13 @@ class JournalMaintenanceDialog(QDialog):
         export_btn.clicked.connect(self._export_journal)
         actions_layout.addWidget(export_btn)
 
+        analyze_btn = QPushButton(self.tr("Analyser le journal"))
+        analyze_btn.setIcon(QgsApplication.getThemeIcon('/mActionIdentify.svg'))
+        analyze_btn.setToolTip(
+            self.tr("Mesurer la distribution, les doublons et le potentiel d'optimisation"))
+        analyze_btn.clicked.connect(self._analyze_journal)
+        actions_layout.addWidget(analyze_btn)
+
         actions_group.setLayout(actions_layout)
 
         self._progress = QProgressBar()
@@ -330,6 +337,51 @@ class JournalMaintenanceDialog(QDialog):
             if src_conn:
                 try:
                     src_conn.close()
+                except Exception:
+                    pass
+
+    def _analyze_journal(self) -> None:
+        """Run BL-OPT-08 diagnostic and display the report."""
+        if not self._journal or not self._journal.is_open:
+            return
+        from .core.journal_diagnostics import (
+            run_journal_diagnostics, format_diagnostic_report,
+        )
+        conn = None
+        try:
+            conn = self._journal.create_read_connection()
+            report = run_journal_diagnostics(conn)
+            text = format_diagnostic_report(report)
+            flog(
+                f"journal_diagnostics event=displayed "
+                f"total_events={report.total_events} "
+                f"elapsed_ms={report.elapsed_ms}",
+                "INFO",
+            )
+            from qgis.PyQt.QtWidgets import QTextEdit
+            dlg = QDialog(self)
+            dlg.setWindowTitle(self.tr("Diagnostic du journal"))
+            dlg.setMinimumSize(520, 400)
+            lay = QVBoxLayout(dlg)
+            te = QTextEdit(dlg)
+            te.setReadOnly(True)
+            te.setFontFamily("Consolas, monospace")
+            te.setPlainText(text)
+            lay.addWidget(te)
+            btn = QPushButton(self.tr("Fermer"), dlg)
+            btn.clicked.connect(dlg.accept)
+            lay.addWidget(btn, 0, QtCompat.ALIGN_RIGHT)
+            dlg.exec()
+        except Exception as e:
+            flog(f"journal_diagnostics error: {e}", "ERROR")
+            QMessageBox.warning(
+                self, self.tr("Erreur d'analyse"),
+                self.tr("Une erreur est survenue lors de l'analyse. "
+                        "Consultez le journal de logs."))
+        finally:
+            if conn:
+                try:
+                    conn.close()
                 except Exception:
                     pass
 

@@ -226,10 +226,10 @@ class TemporalLensDock(QDockWidget):
         )
         self.diff_label.setWordWrap(True)
         diff_v.addWidget(self.diff_label)
-        self.diff_table = QTableWidget(0, 5, self)
+        self.diff_table = QTableWidget(0, 4, self)
         self.diff_table.setHorizontalHeaderLabels(
-            [self.tr("Date"), self.tr("Op"), self.tr("Champ"),
-             self.tr("Ancien"), self.tr("Nouveau")]
+            [self.tr("Date"), self.tr("Op"),
+             self.tr("Utilisateur"), self.tr("Resume")]
         )
         self.diff_table.horizontalHeader().setStretchLastSection(True)
         self.diff_table.setEditTriggers(QtCompat.NO_EDIT_TRIGGERS)
@@ -852,54 +852,76 @@ class TemporalLensDock(QDockWidget):
         )
 
     def _populate_diff_panel(self, entity_fp, timeline) -> None:
-        """Fill the diff table with one row per (state, attribute) pair.
+        """Fill the diff table with one row per event (condensed timeline).
 
-        Phase 10c MVP: raw display of ``attrs_delta`` as returned by the
-        planner. Schema drift handling (IL-P1-12) is out of scope here:
-        if a field name disappeared from the layer, it is still shown
-        verbatim.
+        BL-IL-P2-17: shows 1 line per event with a human-readable summary
+        instead of 1 line per changed field. This avoids the '50 doublons'
+        effect and gives a readable chronological overview.
         """
         rows = []
         for st in timeline.states:
-            if not st.attrs_delta:
-                continue
             ts = (st.created_at or "")[:19]
-            for field, pair in st.attrs_delta.items():
-                try:
-                    old, new = pair
-                except (TypeError, ValueError):
-                    old, new = None, pair
-                rows.append((ts, st.operation_type, field, old, new))
+            user = st.user_name or ""
+            summary = self._build_event_summary(st)
+            rows.append((ts, st.operation_type, user, summary))
+
+        date_range = ""
+        if len(timeline.states) >= 2:
+            first_ts = (timeline.states[0].created_at or "")[:10]
+            last_ts = (timeline.states[-1].created_at or "")[:10]
+            if first_ts != last_ts:
+                date_range = f" ({first_ts} .. {last_ts})"
 
         self.diff_label.setText(
             self.tr(
-                "Diff entite {fp} - {n_states} states - "
-                "{n_changes} changements"
+                "Timeline {fp} - {n_events} evenement(s){date_range}"
             ).format(
                 fp=entity_fp[:8],
-                n_states=len(timeline.states),
-                n_changes=len(rows),
+                n_events=len(timeline.states),
+                date_range=date_range,
             )
         )
         self.diff_table.setRowCount(len(rows))
-        for i, (ts, op, field, old, new) in enumerate(rows):
+        for i, (ts, op, user, summary) in enumerate(rows):
             self.diff_table.setItem(i, 0, QTableWidgetItem(ts))
             self.diff_table.setItem(i, 1, QTableWidgetItem(op))
-            self.diff_table.setItem(i, 2, QTableWidgetItem(str(field)))
-            self.diff_table.setItem(
-                i, 3,
-                QTableWidgetItem(self.tr("(vide)") if old is None else str(old)),
-            )
-            self.diff_table.setItem(
-                i, 4,
-                QTableWidgetItem(self.tr("(vide)") if new is None else str(new)),
-            )
+            self.diff_table.setItem(i, 2, QTableWidgetItem(user))
+            self.diff_table.setItem(i, 3, QTableWidgetItem(summary))
         self.diff_panel.show()
         _flog(
             f"lens_dock event=diff_panel_populated fp={entity_fp[:8]} "
             f"n_rows={len(rows)}",
             "DEBUG",
         )
+
+    def _build_event_summary(self, state) -> str:
+        """Build a one-line summary for a single EntityState."""
+        from ..core.geometry_utils import geometries_equal
+
+        op = state.operation_type
+        if op == "INSERT":
+            return self.tr("Creation")
+        if op == "DELETE":
+            return self.tr("Suppression")
+        geom_moved = (
+            state.old_geom_wkb is not None
+            and state.new_geom_wkb is not None
+            and not geometries_equal(state.old_geom_wkb, state.new_geom_wkb)
+        )
+        n_fields = len(state.attrs_delta) if state.attrs_delta else 0
+        if geom_moved and n_fields:
+            return self.tr(
+                "Geometrie + {n} champ(s)"
+            ).format(n=n_fields)
+        if geom_moved:
+            return self.tr("Geometrie deplacee")
+        if n_fields:
+            names = list((state.attrs_delta or {}).keys())[:3]
+            suffix = "..." if n_fields > 3 else ""
+            return self.tr(
+                "{n} champ(s) : {fields}{suffix}"
+            ).format(n=n_fields, fields=", ".join(names), suffix=suffix)
+        return self.tr("Modification")
 
     # ----- auto-refresh on pan/zoom (BL-IL-P1-14) -------------------------
 
