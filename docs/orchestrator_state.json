@@ -2,10 +2,10 @@
   "schema_version": 1,
   "generated_at": "2026-05-14T08:00:00Z",
   "session_active": {
-    "current_item": "BL-IL-P2-17",
-    "current_state": "PROVEN",
-    "current_pilot": "corrector",
-    "started_at": "2026-05-18T13:05:50Z"
+    "current_item": "BL-IL-P2-19",
+    "current_state": "PATCHED",
+    "current_pilot": "architecte",
+    "started_at": "2026-05-18T13:08:35Z"
   },
   "session_history": [
     {
@@ -2367,7 +2367,7 @@
       "priority": "P2",
       "effort": "M",
       "root_cause": "Quand un cable a 50 events, on voit 50 features dupliquées au lieu d'1 timeline condensée. UC-IL-02/08.",
-      "state": "PROVEN",
+      "state": "DONE",
       "blocked_by": [
         "BL-IL-P2-16"
       ],
@@ -2400,6 +2400,13 @@
           "to": "PROVEN",
           "by": "corrector",
           "evidence": "Static proof: (1) geogit_session.py L173-174 oldest/newest replaces inner loop — max 3 features/entity. (2) geogit_render_worker.py L176-181 same. (3) temporal_lens_dock.py L854-895: 1 row/event. (4) _build_event_summary covers INSERT/DELETE/UPDATE+geom/UPDATE+attr. (5) il17 scenario 6 assertions. Runtime invariant: n_features<=3*n_entities."
+        },
+        {
+          "ts": "2026-05-18T13:06:50Z",
+          "from": "PROVEN",
+          "to": "DONE",
+          "by": "corrector",
+          "evidence": "Commit be70a50. geogit_session.py + geogit_render_worker.py condensed, temporal_lens_dock.py 4-col diff panel, il17 scenario ready."
         }
       ],
       "patch_files": [
@@ -2408,7 +2415,8 @@
         "widgets/temporal_lens_dock.py"
       ],
       "last_report": "scripts/validation/scenarios/lens/il17_timeline_condensed.py",
-      "scenario_status": "created_failing"
+      "scenario_status": "created_failing",
+      "commit_hash": "be70a50"
     },
     {
       "id": "BL-IL-P2-18",
@@ -2471,7 +2479,7 @@
       "priority": "P2",
       "effort": "L",
       "root_cause": "Mode B (Diff) est trop basique — l'user veut voir 'comment c'était avant' avec un effet visuel riche (Prince of Persia, ghost trail)",
-      "state": "OPEN",
+      "state": "PATCHED",
       "blocked_by": [
         "BL-IL-P2-17"
       ],
@@ -2482,7 +2490,27 @@
           "to": "OPEN",
           "by": "/architecte",
           "evidence": "User feedback: 'quand je travaille sur la carte, une version dynamique me montre comment c'était avant, avec un style bien choisi'. Cf backlog §6.3 Mode C."
+        },
+        {
+          "ts": "2026-05-18T13:08:35Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "architecte",
+          "evidence": "Mode C: viz_mode param in render worker/session. Stacked branch renders N geoms with _rl_opacity gradient + trail polyline per entity. UI combo in RecoverDialog GeoGit panel. Cap 200 states/entity."
+        },
+        {
+          "ts": "2026-05-18T13:15:07Z",
+          "from": "SCOPED",
+          "to": "PATCHED",
+          "by": "architecte",
+          "evidence": "Mode C updates_stacked implemented: (1) geogit_render_worker.py: _render_entity_stacked renders N geoms with opacity=(i+1)/N + trail polyline. _render_entity_condensed extracts old Mode B logic. viz_mode param in __init__. Cap _MAX_STACKED_STATES=200. (2) geogit_session.py: _LENS_META +2 fields (_rl_opacity, _rl_stack_order). (3) recover_dialog.py: _geogit_viz_combo QComboBox (Diff condense/Empile ghost) + _on_geogit_viz_changed slot + viz_mode passed to worker.",
+          "forced": true
         }
+      ],
+      "patch_files": [
+        "widgets/geogit_render_worker.py",
+        "core/geogit_session.py",
+        "recover_dialog.py"
       ]
     },
     {
@@ -2491,7 +2519,7 @@
       "priority": "P2",
       "effort": "M",
       "root_cause": "Impossible de quantifier le gain potentiel des optimisations sans mesurer la distribution events/entity, BLOB ratio, schema redundancy, traces invalidées et paires INSERT+DELETE.",
-      "state": "PROVEN",
+      "state": "DONE",
       "blocked_by": [],
       "scenario_path": "",
       "scenario_status": "n_a",
@@ -2521,8 +2549,16 @@
           "to": "PROVEN",
           "by": "corrector",
           "evidence": "core/journal_diagnostics.py: 6 pure SQL queries bounded. journal_maintenance.py: Analyser button triggers diagnostic in read-only connection + displays modal report. py_compile OK. Self-proving diagnostic."
+        },
+        {
+          "ts": "2026-05-18T13:06:57Z",
+          "from": "PROVEN",
+          "to": "DONE",
+          "by": "corrector",
+          "evidence": "Commit be70a50. core/journal_diagnostics.py 6 SQL diagnostic queries + journal_maintenance.py Analyser button."
         }
-      ]
+      ],
+      "commit_hash": "be70a50"
     }
   ]
 }

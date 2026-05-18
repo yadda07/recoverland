@@ -39,7 +39,8 @@ from .local_search_thread import LocalSearchThread
 from .journal_stats_thread import JournalStatsThread
 from .restore_runner import RestoreRunner, StrictRestoreRunner, UndoRunner
 from .version_fetch_thread import VersionFetchThread
-from .widgets import (AppleToggleSwitch, ThemedLogoWidget, RestoreModeSelector,
+from .widgets import (AppleToggleSwitch, GeoGitSegmentedSwitch,
+                      ThemedLogoWidget, RestoreModeSelector,
                       RestorePreflightDialog, TimeSliderWidget)
 import os
 import json
@@ -109,7 +110,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.resize(800, 700)
         self.setWindowFlags(self.windowFlags() | QtCompat.WINDOW_MAXIMIZE_BUTTON_HINT)
         self.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_PREFERRED)
-        self.setStyleSheet("")
+        self._apply_global_button_style()
 
         icon_path = os.path.join(os.path.dirname(__file__), "logo.svg")
         if os.path.exists(icon_path):
@@ -144,6 +145,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._stats_thread = None
         self._last_health = None
         self._last_size_str = ""
+        self._geogit_active = False
+        self._geogit_wants_persist = False
+        self._geogit_status_widget = None
+        self._geogit_worker = None
+        self._geogit_session = None
+        self._geogit_viz_mode = "diff_window"
 
         self.setup_ui()
 
@@ -157,6 +164,11 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._layer_refresh_timer.setInterval(10000)
         self._layer_refresh_timer.timeout.connect(self._refresh_journal_status)
         self._layer_refresh_timer.start()
+        self._geogit_debounce = QTimer(self)
+        self._geogit_debounce.setSingleShot(True)
+        self._geogit_debounce.setInterval(600)
+        self._geogit_debounce.timeout.connect(self._geogit_auto_refresh)
+        self._setup_geogit_status_bar()
         self._refresh_layers_panel()
         tracking_on = QgsSettings().value("RecoverLand/tracking_enabled", True, type=bool)
         self._programmatic_toggle = True
@@ -312,7 +324,11 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
         message = override or self._build_smart_bar_message(summary)
         pending = self._get_write_queue_pending()
-        meta_parts = [size_str, self.tr("{count} couche(s)").format(count=summary.layer_count)]
+        meta_parts = [size_str]
+        if self._last_health is not None and self._last_health.event_count > 0:
+            evt_fmt = f"{self._last_health.event_count:,}".replace(",", " ")
+            meta_parts.append(self.tr("{count} événement(s)").format(count=evt_fmt))
+        meta_parts.append(self.tr("{count} couche(s)").format(count=summary.layer_count))
         if pending > 0:
             meta_parts.append(self.tr("{count} en attente").format(count=pending))
         meta = " | ".join(meta_parts)
@@ -694,6 +710,51 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.layers_status_label.setText(
                 self.tr("{n} / {total} couche(s) surveillée(s)").format(n=len(allowed), total=total))
 
+    def _apply_global_button_style(self) -> None:
+        pal = self.palette()
+        hl = pal.highlight().color()
+        mid = pal.mid().color()
+        base = pal.base().color()
+        text = pal.text().color()
+        hl_text = pal.highlightedText().color()
+        border = f"rgba({mid.red()},{mid.green()},{mid.blue()},120)"
+        bg = f"rgba({base.red()},{base.green()},{base.blue()},220)"
+        hover_bg = f"rgba({base.red()},{base.green()},{base.blue()},255)"
+        pressed_bg = f"rgba({hl.red()},{hl.green()},{hl.blue()},210)"
+        checked_bg = f"rgba({hl.red()},{hl.green()},{hl.blue()},200)"
+        dis_text = f"rgba({text.red()},{text.green()},{text.blue()},90)"
+        dis_border = f"rgba({mid.red()},{mid.green()},{mid.blue()},60)"
+        dis_bg = f"rgba({base.red()},{base.green()},{base.blue()},120)"
+        self.setStyleSheet(
+            "QPushButton {"
+            f"  background-color: {bg};"
+            f"  color: palette(text);"
+            f"  border: 1px solid {border};"
+            f"  border-radius: 6px;"
+            f"  padding: 5px 14px;"
+            "}"
+            "QPushButton:hover {"
+            f"  background-color: {hover_bg};"
+            "}"
+            "QPushButton:pressed {"
+            f"  background-color: {pressed_bg};"
+            f"  color: {hl_text.name()};"
+            f"  border: none;"
+            f"  font-weight: bold;"
+            "}"
+            "QPushButton:checked {"
+            f"  background-color: {checked_bg};"
+            f"  color: {hl_text.name()};"
+            f"  border: none;"
+            f"  font-weight: bold;"
+            "}"
+            "QPushButton:disabled {"
+            f"  color: {dis_text};"
+            f"  border: 1px solid {dis_border};"
+            f"  background-color: {dis_bg};"
+            "}"
+        )
+
     def setup_ui(self):
 
         main_layout = QVBoxLayout()
@@ -782,8 +843,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._version_layer_list.setToolTip(self.tr("Cochez les couches a restaurer"))
         self._version_layer_list.setMaximumHeight(120)
         self._version_layer_list.setStyleSheet("QListWidget { border: 1px solid palette(mid); border-radius: 3px; }")
-        self._version_layer_list.setVisible(False)
-
         self._version_layer_btns = QWidget()
         vl_btn_layout = QHBoxLayout(self._version_layer_btns)
         vl_btn_layout.setContentsMargins(0, 0, 0, 0)
@@ -803,8 +862,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._vl_deselect_btn.clicked.connect(self._version_layers_uncheck_all)
         vl_btn_layout.addWidget(self._vl_select_all_btn)
         vl_btn_layout.addWidget(self._vl_deselect_btn)
-        self._version_layer_btns.setVisible(False)
-
         self.operation_input = QComboBox()
         self.operation_input.addItem(self.tr("Toutes"), "ALL")
         self.operation_input.setToolTip(self.tr("Type d'opération à rechercher"))
@@ -817,8 +874,22 @@ class RecoverDialog(QDialog, LoggerMixin):
         selection_row.addWidget(op_label)
         selection_row.addWidget(self.operation_input, 1)
         selection_outer.addLayout(selection_row)
-        selection_outer.addWidget(self._version_layer_list)
-        selection_outer.addWidget(self._version_layer_btns)
+
+        _vl_page = QWidget()
+        _vl_lay = QVBoxLayout(_vl_page)
+        _vl_lay.setContentsMargins(0, 0, 0, 0)
+        _vl_lay.setSpacing(6)
+        _vl_lay.addWidget(self._version_layer_list)
+        _vl_lay.addWidget(self._version_layer_btns)
+
+        self._layer_sel_stack = QStackedWidget()
+        self._layer_sel_stack.addWidget(QWidget())  # page 0: event
+        self._layer_sel_stack.addWidget(_vl_page)    # page 1: version/geogit
+        _list_h = self._version_layer_list.maximumHeight()
+        _btn_h = self._vl_select_all_btn.height() + 6
+        self._layer_sel_stack.setFixedHeight(_list_h + _btn_h)
+        self._layer_sel_stack.setCurrentIndex(0)
+        selection_outer.addWidget(self._layer_sel_stack)
         selection_group.setLayout(selection_outer)
         date_group = QgsCollapsibleGroupBox()
         date_group.setTitle(self.tr("Période"))
@@ -1066,12 +1137,28 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.help_button.setToolTip(self.tr("Ouvrir la documentation"))
         self.help_button.setCursor(QtCompat.POINTING_HAND_CURSOR)
         self.help_button.setStyleSheet(
-            "QPushButton { font-weight: bold; border-radius: 4px; }"
+            "QPushButton { font-weight: bold; }"
         )
         self.help_button.clicked.connect(self._open_help)
 
+        self._geogit_toggle = GeoGitSegmentedSwitch(self)
+        self._geogit_toggle.setToolTip(self.tr("Activer/desactiver la visualisation GeoGit"))
+        self._geogit_toggle.setVisible(False)
+        self._geogit_toggle.toggled.connect(self._on_geogit_toggle)
+
+        from qgis.PyQt.QtWidgets import QComboBox
+        self._geogit_viz_combo = QComboBox(self)
+        self._geogit_viz_combo.addItem(self.tr("Diff condense"), "diff_window")
+        self._geogit_viz_combo.addItem(self.tr("Empile (ghost)"), "updates_stacked")
+        self._geogit_viz_combo.setToolTip(
+            self.tr("Mode de visualisation : condense (1 feature/entite) ou empile (gradient opacite)"))
+        self._geogit_viz_combo.setVisible(False)
+        self._geogit_viz_combo.currentIndexChanged.connect(self._on_geogit_viz_changed)
+
         button_layout.addWidget(self.help_button)
         button_layout.addStretch()
+        button_layout.addWidget(self._geogit_viz_combo)
+        button_layout.addWidget(self._geogit_toggle)
         button_layout.addWidget(self.cancel_button)
         button_layout.addWidget(self.recover_button)
         button_layout.addWidget(self.restore_button)
@@ -1497,10 +1584,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         is_version = (mode == "temporal")
         is_geogit = (mode == "geogit")
         if is_version:
+            self._geogit_stop_session()
+            self._geogit_toggle.blockSignals(True)
+            self._geogit_toggle.setChecked(False)
+            self._geogit_toggle.blockSignals(False)
+            self._geogit_toggle.setVisible(False)
+            self._geogit_viz_combo.setVisible(False)
+            self.recover_button.setVisible(True)
+            self.cancel_button.setVisible(True)
+            self.undo_last_btn.setVisible(True)
             self._period_stack.setCurrentIndex(1)
             self.layer_input.setVisible(False)
-            self._version_layer_list.setVisible(True)
-            self._version_layer_btns.setVisible(True)
+            self._layer_sel_stack.setCurrentIndex(1)
             self.results_group.setVisible(False)
             self.restore_button.setVisible(False)
             self.recover_button.setText(self.tr("Rewind"))
@@ -1510,23 +1605,29 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._refresh_slider_bounds()
         elif is_geogit:
             self._period_stack.setCurrentIndex(0)
-            self.layer_input.setVisible(True)
-            self._version_layer_list.setVisible(False)
-            self._version_layer_btns.setVisible(False)
+            self.layer_input.setVisible(False)
+            self._layer_sel_stack.setCurrentIndex(1)
             self.results_group.setVisible(False)
             self.restore_button.setVisible(False)
-            self.recover_button.setText(self.tr("Visualiser"))
-            self.recover_button.setIcon(
-                QgsApplication.getThemeIcon('/mActionMapTips.svg'),
-            )
-            if not self._is_recovering:
-                self.recover_button.setEnabled(True)
+            self.recover_button.setVisible(False)
+            self.cancel_button.setVisible(False)
+            self.undo_last_btn.setVisible(False)
+            self._geogit_toggle.setVisible(True)
         else:
+            self._geogit_stop_session()
+            self._geogit_toggle.blockSignals(True)
+            self._geogit_toggle.setChecked(False)
+            self._geogit_toggle.blockSignals(False)
+            self._geogit_toggle.setVisible(False)
+            self._geogit_viz_combo.setVisible(False)
+            self.recover_button.setVisible(True)
+            self.cancel_button.setVisible(True)
+            self.undo_last_btn.setVisible(True)
             self._period_stack.setCurrentIndex(0)
-            self._version_layer_list.setVisible(False)
-            self._version_layer_btns.setVisible(False)
+            self._layer_sel_stack.setCurrentIndex(0)
             self.layer_input.setVisible(True)
-            self.results_group.setVisible(True)
+            has_rows = self.table_widget is not None and self.table_widget.rowCount() > 0
+            self.results_group.setVisible(has_rows)
             self.restore_button.setVisible(True)
             self.recover_button.setText(self.tr("Recover"))
             self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
@@ -1625,16 +1726,18 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def set_period(self, period):
         """Set period from shortcut buttons."""
+        flog(f"set_period: called period={period} start_enabled={self.start_input.isEnabled()} end_enabled={self.end_input.isEnabled()}", "DEBUG")
         today = QDateTime.currentDateTime()
         self.end_input.setMaximumDateTime(today)
+        ms_today = today.time().msecsSinceStartOfDay()
+        midnight = today.addMSecs(-ms_today)
 
         if period == "today":
-            self.start_input.setDateTime(QDateTime(QDate.currentDate(), QTime(0, 0, 0)))
+            self.start_input.setDateTime(midnight)
             self.end_input.setDateTime(today)
         elif period == "week":
-            current = QDate.currentDate()
-            monday = current.addDays(-(current.dayOfWeek() - 1))
-            self.start_input.setDateTime(QDateTime(monday, QTime(0, 0, 0)))
+            dow = int(QDate.currentDate().dayOfWeek()) - 1
+            self.start_input.setDateTime(midnight.addDays(-dow))
             self.end_input.setDateTime(today)
         elif period == "1day":
             self.start_input.setDateTime(today.addSecs(-86400))
@@ -1653,12 +1756,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.end_input.setDateTime(today)
         elif isinstance(period, int):
             if period == 0:
-                self.start_input.setDateTime(QDateTime(QDate.currentDate(), QTime(0, 0, 0)))
+                self.start_input.setDateTime(midnight)
                 self.end_input.setDateTime(today)
             elif period == 1:
-                yesterday = QDate.currentDate().addDays(-1)
-                self.start_input.setDateTime(QDateTime(yesterday, QTime(0, 0, 0)))
-                self.end_input.setDateTime(QDateTime(yesterday, QTime(23, 59, 59)))
+                yesterday_start = midnight.addDays(-1)
+                yesterday_end = midnight.addSecs(-1)
+                self.start_input.setDateTime(yesterday_start)
+                self.end_input.setDateTime(yesterday_end)
             else:
                 self.start_input.setDateTime(today.addDays(-period))
                 self.end_input.setDateTime(today)
@@ -1785,54 +1889,36 @@ class RecoverDialog(QDialog, LoggerMixin):
         return None
 
     def _recover_geogit_mode(self) -> None:
-        """GeoGit mode: fetch events in canvas extent + render Lens overlays.
+        """GeoGit toggle: start a session (cache + persistent overlays).
 
-        Mirrors temporal_lens_dock._on_refresh_button, reusing the dialog
-        widgets (layer_input, start_input, end_input, operation_input) and
-        the canvas extent as the spatial selection.
+        1. Load ALL events into RAM cache (background QThread).
+        2. Create persistent overlay layers ONCE.
+        3. Render visible features from cache.
+        4. On zoom/pan: re-filter cache (~20-80ms, no SQL).
         """
-        import uuid as _uuid
-        from .core.event_stream_repository import fetch_events_in_zone
-        from .core.lens_contracts import (
-            LensFetchStats, LensOpFilter, LensSelection,
-        )
-        from .core.workflow_service import execute_grouped_lens_view
+        from .core.lens_contracts import LensOpFilter
+        from .widgets.geogit_worker import GeoGitCacheWorker
 
-        trace_id = _uuid.uuid4().hex[:8]
+        if self._geogit_worker is not None:
+            self._geogit_worker.cancel()
+            if self._geogit_worker.isRunning():
+                self._geogit_worker.wait(500)
+            self._geogit_worker = None
+
+        if self._geogit_session is not None:
+            self._geogit_session.stop()
+            self._geogit_session = None
+
+        from .core.workflow_service import purge_lens_overlays
+        purge_lens_overlays("geogit_start")
+
         canvas = self.iface.mapCanvas()
-
-        fingerprint = self.layer_input.currentData()
-        if not fingerprint:
-            self._geogit_done(trace_id, "no layer selected")
-            return
-
-        layer = self._resolve_layer_by_fingerprint(fingerprint)
-        if layer is None:
-            self._geogit_done(trace_id, f"layer not found fp={fingerprint[:40]}")
-            return
-
         src_crs = canvas.mapSettings().destinationCrs().authid()
-        storage_crs = layer.crs().authid() if layer.crs().isValid() else src_crs
 
-        extent_geom = QgsGeometry.fromRect(canvas.extent())
-        geom_storage = QgsGeometry(extent_geom)
-        if storage_crs and storage_crs != src_crs:
-            xform = QgsCoordinateTransform(
-                QgsCoordinateReferenceSystem(src_crs),
-                QgsCoordinateReferenceSystem(storage_crs),
-                QgsProject.instance(),
-            )
-            try:
-                geom_storage.transform(xform)
-            except Exception:  # noqa: BLE001
-                self._geogit_done(trace_id, "bbox reprojection failed")
-                return
-
-        bbox = geom_storage.boundingBox()
-        bbox_xy = (
-            bbox.xMinimum(), bbox.yMinimum(),
-            bbox.xMaximum(), bbox.yMaximum(),
-        )
+        checked_fps = self._get_checked_layer_fingerprints()
+        if not checked_fps:
+            self._geogit_done("--------", "no layer checked")
+            return
 
         t_min = self.start_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
         t_max = self.end_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
@@ -1843,80 +1929,524 @@ class RecoverDialog(QDialog, LoggerMixin):
         except ValueError:
             op_filter = LensOpFilter.ALL
 
+        layer_infos = []
+        for fingerprint in checked_fps:
+            layer = self._resolve_layer_by_fingerprint(fingerprint)
+            if layer is None:
+                continue
+            storage_crs = layer.crs().authid() if layer.crs().isValid() else src_crs
+            layer_infos.append({
+                "fingerprint": fingerprint,
+                "layer_name": layer.name(),
+                "layer_id": layer.id(),
+                "storage_crs": storage_crs,
+            })
+
+        if not layer_infos:
+            self._geogit_done("--------", "no valid layers")
+            return
+
+        self._geogit_layer_infos = layer_infos
+        self._geogit_src_crs = src_crs
+        self._geogit_op_filter = op_filter
+        self._geogit_t_min = t_min
+        self._geogit_t_max = t_max
+
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.set_phase("fetch")
+        self.update_phase(self.tr("GeoGit : chargement du cache..."))
+
+        worker = GeoGitCacheWorker(
+            self._journal, layer_infos, t_min, t_max, parent=self,
+        )
+        worker.progress.connect(self._on_geogit_cache_progress)
+        worker.finished_ok.connect(self._on_geogit_cache_ready)
+        worker.finished_err.connect(self._on_geogit_cache_error)
+        self._geogit_worker = worker
+
         flog(
-            f"[{trace_id}] geogit: start layer={layer.name()} "
-            f"dates={t_min}..{t_max} op={op_filter.value} crs={src_crs}",
+            f"[{worker.trace_id}] geogit: cache_load_start "
+            f"n_layers={len(layer_infos)} dates={t_min}..{t_max}",
+            "INFO",
+        )
+        worker.start()
+
+    def _on_geogit_cache_progress(self, layer_name: str, n_events: int, idx: int) -> None:
+        """Slot: progress from cache worker."""
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.set_phase(
+                "fetch", f"{layer_name} ({n_events})",
+            )
+
+    def _on_geogit_cache_ready(self, trace_id: str, cache: dict) -> None:
+        """Slot: cache loaded — init session, then build layers one at a time.
+
+        Each layer is created via QTimer.singleShot(0) so the UI stays
+        responsive during the init phase (style cloning is expensive).
+        """
+        from .core.geogit_session import GeoGitSession
+
+        if self._geogit_worker is not None and self._geogit_worker.is_cancelled:
+            return
+        self._geogit_worker = None
+
+        session = GeoGitSession()
+        session.trace_id = trace_id
+        session._active = True
+        session._dst_crs = self._geogit_src_crs
+        session._t_min = self._geogit_t_min
+        session._t_max = self._geogit_t_max
+        session._op_filter = self._geogit_op_filter
+        session._event_cache = cache
+        session._total_cached = sum(len(v) for v in cache.values())
+        self._geogit_session = session
+
+        self._geogit_init_queue = list(self._geogit_layer_infos)
+        self._geogit_init_idx = 0
+
+        session._ensure_group()
+        QTimer.singleShot(0, self._geogit_init_next_layer)
+
+    def _geogit_init_next_layer(self) -> None:
+        """Create overlay layers for one source layer, then yield to Qt."""
+        import time as _time
+
+        session = self._geogit_session
+        if session is None or not session.is_active:
+            return
+        queue = getattr(self, '_geogit_init_queue', [])
+        idx = getattr(self, '_geogit_init_idx', 0)
+
+        if idx >= len(queue):
+            self._geogit_init_finish()
+            return
+
+        info = queue[idx]
+        self._geogit_init_idx = idx + 1
+
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.set_phase(
+                "render", f"{info['layer_name']} ({idx + 1}/{len(queue)})",
+            )
+
+        t0 = _time.monotonic()
+        session._create_one_overlay(info, self._geogit_src_crs)
+        elapsed = int((_time.monotonic() - t0) * 1000)
+
+        flog(
+            f"[{session.trace_id}] geogit: overlay_created "
+            f"layer={info['layer_name']} idx={idx} elapsed_ms={elapsed}",
             "INFO",
         )
 
-        selection = LensSelection(
-            layer_id_snapshot=layer.id(),
-            datasource_fp=fingerprint,
-            bbox_xy=bbox_xy,
-            bbox_crs=storage_crs,
-            t_min=t_min,
-            t_max=t_max,
-            op_filter=op_filter,
-        )
+        QTimer.singleShot(0, self._geogit_init_next_layer)
 
-        conn = None
-        try:
-            conn = self._journal.create_read_connection()
-            events, fetch_stats = fetch_events_in_zone(
-                conn,
-                fingerprint,
-                bbox_xy,
-                t_min,
-                t_max,
-                limit=selection.max_events,
-                trace_id=trace_id,
-            )
+    def _geogit_init_finish(self) -> None:
+        """All overlay layers created — start background render."""
+        session = self._geogit_session
+        if session is None or not session.is_active:
+            return
+        self._geogit_start_render(is_first=True)
+
+    def _geogit_start_render(self, is_first: bool = False) -> None:
+        """Launch background render worker for viewport refresh.
+
+        ALL heavy CPU (filter, plan, repair, reproject) runs in QThread.
+        Main thread only does addFeatures on layer_ready signal (~5ms).
+        """
+        from .widgets.geogit_render_worker import GeoGitRenderWorker
+
+        session = self._geogit_session
+        if session is None or not session.is_active:
+            return
+
+        if getattr(self, '_geogit_render_worker', None) is not None:
+            self._geogit_render_worker.cancel()
+            if self._geogit_render_worker.isRunning():
+                self._geogit_render_worker.wait(300)
+            self._geogit_render_worker = None
+
+        canvas = self.iface.mapCanvas()
+        bbox_xy = self._canvas_bbox_in_crs(
+            canvas, self._geogit_src_crs, self._geogit_src_crs,
+        )
+        if bbox_xy is None:
+            bbox_xy = (0, 0, 0, 0)
+
+        overlay_metas = []
+        for fp, ovl in session._overlays.items():
+            overlay_metas.append({
+                "fingerprint": fp,
+                "layer_name": ovl.layer_name,
+                "layer_id": ovl.source_layer_id,
+                "storage_crs": ovl.storage_crs,
+                "source_field_names": ovl.source_field_names,
+            })
+
+        self._geogit_render_is_first = is_first
+
+        worker = GeoGitRenderWorker(
+            event_cache=session._event_cache,
+            overlay_metas=overlay_metas,
+            bbox_xy=bbox_xy,
+            dst_crs=session._dst_crs,
+            t_min=session._t_min,
+            t_max=session._t_max,
+            op_filter=session._op_filter,
+            viz_mode=self._geogit_viz_mode,
+            trace_id=session.trace_id,
+            parent=self,
+        )
+        worker.layer_ready.connect(self._geogit_on_layer_ready)
+        worker.all_done.connect(self._geogit_on_render_done)
+        worker.error.connect(self._geogit_on_render_error)
+        self._geogit_render_worker = worker
+
+        for ovl in session._overlays.values():
+            session._truncate_overlay(ovl)
+
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.set_phase("render")
+
+        worker.start()
+
+    def _geogit_on_layer_ready(
+        self, fp: str, past_data, arrow_data, attr_data,
+    ) -> None:
+        """Slot: worker computed one layer — addFeatures on main thread (fast)."""
+        from qgis.core import QgsFeature, QgsGeometry, QgsProject
+
+        session = self._geogit_session
+        if session is None or not session.is_active:
+            return
+        ovl = session._overlays.get(fp)
+        if ovl is None:
+            return
+
+        project = QgsProject.instance()
+        past_layer = project.mapLayer(ovl.past_id)
+        arrows_layer = project.mapLayer(ovl.arrows_id)
+        attr_layer = project.mapLayer(ovl.attr_id)
+
+        if past_layer is None or arrows_layer is None or attr_layer is None:
+            return
+
+        if past_data:
+            feats = []
+            fields = past_layer.fields()
+            for fd in past_data:
+                f = QgsFeature(fields)
+                geom = QgsGeometry()
+                geom.fromWkb(fd.wkb)
+                f.setGeometry(geom)
+                f.setAttributes(fd.attributes)
+                feats.append(f)
+            past_layer.dataProvider().addFeatures(feats)
+            past_layer.updateExtents()
+            past_layer.triggerRepaint()
+
+        if arrow_data:
+            feats = []
+            fields = arrows_layer.fields()
+            for fd in arrow_data:
+                f = QgsFeature(fields)
+                geom = QgsGeometry()
+                geom.fromWkb(fd.wkb)
+                f.setGeometry(geom)
+                f.setAttributes(fd.attributes)
+                feats.append(f)
+            arrows_layer.dataProvider().addFeatures(feats)
+            arrows_layer.updateExtents()
+            arrows_layer.triggerRepaint()
+
+        if attr_data:
+            feats = []
+            fields = attr_layer.fields()
+            for fd in attr_data:
+                f = QgsFeature(fields)
+                geom = QgsGeometry()
+                geom.fromWkb(fd.wkb)
+                f.setGeometry(geom)
+                f.setAttributes(fd.attributes)
+                feats.append(f)
+            attr_layer.dataProvider().addFeatures(feats)
+            attr_layer.updateExtents()
+            attr_layer.triggerRepaint()
+
+    def _geogit_on_render_done(self, totals: dict) -> None:
+        """Slot: render worker finished all layers."""
+        session = self._geogit_session
+        if session is None:
+            return
+        self._geogit_render_worker = None
+
+        n_ent = totals.get("n_entities", 0)
+        is_first = getattr(self, '_geogit_render_is_first', False)
+
+        if is_first:
             flog(
-                f"[{trace_id}] geogit: fetched n_events={fetch_stats.n_events_returned} "
-                f"truncated={fetch_stats.n_events_truncated}",
+                f"[{session.trace_id}] geogit: first_render_done "
+                f"n_entities={n_ent} n_features={totals.get('n_features', 0)} "
+                f"elapsed_ms={totals.get('elapsed_ms', 0)}",
                 "INFO",
             )
-            if not events:
-                self.update_phase(self.tr("Aucun evenement dans cette zone et periode."))
-                return
 
-            outcome = execute_grouped_lens_view(
-                events,
-                selection,
-                layer.name(),
-                fetch_stats,
-                src_crs,
-                trace_id=trace_id,
-                source_layer=layer,
-            )
-            n_ent = outcome.result.n_entities
+        if n_ent == 0:
+            self.update_phase(self.tr("Aucun evenement dans cette zone et periode."))
+        else:
             self.update_phase(
                 self.tr("{n} entite(s) visualisee(s) sur la carte.").format(n=n_ent),
             )
-            flog(
-                f"[{trace_id}] geogit: rendered n_entities={n_ent} "
-                f"n_overlays={len(outcome.result.overlay_layer_ids)}",
-                "INFO",
+
+        flog(
+            f"geogit: render_done n_entities={n_ent} "
+            f"n_features={totals.get('n_features', 0)} "
+            f"elapsed_ms={totals.get('elapsed_ms', 0)} "
+            f"rss_mb={totals.get('process_rss_mb', 0)} "
+            f"cache_events={totals.get('cache_events', 0)}",
+            "INFO",
+        )
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.update_stats(
+                n_ent, session.n_layers, totals.get("n_features", 0),
             )
-        except Exception as exc:  # noqa: BLE001
-            flog(f"[{trace_id}] geogit: error={exc!r}", "ERROR")
-            self.update_phase(str(exc))
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            self._geogit_status_widget.set_phase("done")
+
+        if is_first:
             self._is_recovering = False
             self.enable_controls(True)
-            self.recover_button.setEnabled(True)
+            self._geogit_toggle.setEnabled(True)
+            if not self._geogit_active:
+                self._geogit_connect_auto_refresh()
+
+    def _geogit_on_render_error(self, message: str) -> None:
+        """Slot: render worker encountered an error."""
+        flog(f"geogit_render_worker: error={message}", "ERROR")
+        self._geogit_render_worker = None
+        is_first = getattr(self, '_geogit_render_is_first', False)
+        if is_first:
+            self._is_recovering = False
+            self.enable_controls(True)
+            self._geogit_toggle.setEnabled(True)
+
+    def _on_geogit_cache_error(self, trace_id: str, message: str) -> None:
+        """Slot: fatal error from cache worker."""
+        flog(f"[{trace_id}] geogit: cache_load error={message}", "ERROR")
+        self.update_phase(message)
+        self._geogit_worker = None
+        self._is_recovering = False
+        self.enable_controls(True)
+        self._geogit_toggle.blockSignals(True)
+        self._geogit_toggle.setChecked(False)
+        self._geogit_toggle.blockSignals(False)
+        self._geogit_toggle.setEnabled(True)
+
+    def _get_checked_layer_fingerprints(self) -> list:
+        """Return fingerprints of all checked items in _version_layer_list."""
+        fps = []
+        for i in range(self._version_layer_list.count()):
+            item = self._version_layer_list.item(i)
+            if item.checkState() == QtCompat.CHECKED:
+                fp = item.data(QtCompat.USER_ROLE)
+                if fp:
+                    fps.append(fp)
+        return fps
+
+    def _canvas_bbox_in_crs(self, canvas, src_crs: str, dst_crs: str):
+        """Return canvas extent as (xmin, ymin, xmax, ymax) in dst_crs, or None."""
+        extent_geom = QgsGeometry.fromRect(canvas.extent())
+        geom = QgsGeometry(extent_geom)
+        if dst_crs and dst_crs != src_crs:
+            xform = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem(src_crs),
+                QgsCoordinateReferenceSystem(dst_crs),
+                QgsProject.instance(),
+            )
+            try:
+                geom.transform(xform)
+            except Exception:  # noqa: BLE001
+                return None
+        bbox = geom.boundingBox()
+        return (
+            bbox.xMinimum(), bbox.yMinimum(),
+            bbox.xMaximum(), bbox.yMaximum(),
+        )
+
+    def _on_geogit_toggle(self, checked: bool) -> None:
+        """Handle Apple toggle ON/OFF for GeoGit mode."""
+        if checked:
+            flog("geogit: toggle ON", "INFO")
+            self._geogit_wants_persist = True
+            self._geogit_viz_combo.setVisible(True)
+            self._show_geogit_status_bar()
+            if self._geogit_status_widget is not None:
+                self._geogit_status_widget.activate()
+                self._geogit_status_widget.set_phase("fetch")
+            from qgis.PyQt.QtWidgets import QApplication
+            QApplication.processEvents()
+            self.recover_and_load()
+        else:
+            flog("geogit: toggle OFF", "INFO")
+            self._geogit_viz_combo.setVisible(False)
+            self._geogit_stop_session()
+
+    def _on_geogit_viz_changed(self, index: int) -> None:
+        """Switch between diff_window (condensed) and updates_stacked (Mode C)."""
+        mode = self._geogit_viz_combo.itemData(index) or "diff_window"
+        if mode == self._geogit_viz_mode:
+            return
+        self._geogit_viz_mode = mode
+        flog(f"geogit: viz_mode changed to {mode}", "INFO")
+        if self._geogit_active:
+            self._geogit_start_render(is_first=False)
+
+    def _geogit_stop_from_statusbar(self) -> None:
+        """Slot: user clicked OFF on the QGIS status bar widget."""
+        flog("geogit: stop_from_statusbar", "INFO")
+        self._geogit_stop_session()
+        self._geogit_toggle.blockSignals(True)
+        self._geogit_toggle.setChecked(False)
+        self._geogit_toggle.blockSignals(False)
+        self._geogit_toggle.setEnabled(True)
+
+    def _geogit_stop_session(self) -> None:
+        """Stop GeoGit session, remove overlays, reset state."""
+        self._geogit_wants_persist = False
+        if getattr(self, '_geogit_render_worker', None) is not None:
+            self._geogit_render_worker.cancel()
+            if self._geogit_render_worker.isRunning():
+                self._geogit_render_worker.wait(300)
+            self._geogit_render_worker = None
+        if self._geogit_worker is not None:
+            self._geogit_worker.cancel()
+            if self._geogit_worker.isRunning():
+                self._geogit_worker.wait(500)
+            self._geogit_worker = None
+        self._geogit_disconnect_auto_refresh()
+        if self._geogit_session is not None:
+            self._geogit_session.stop()
+            self._geogit_session = None
+        self._is_recovering = False
+        self.enable_controls(True)
+        self.update_phase("")
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.deactivate()
+        flog("geogit: session stopped", "INFO")
 
     def _geogit_done(self, trace_id: str, reason: str) -> None:
         """Unlock UI and log after a GeoGit early exit."""
         flog(f"[{trace_id}] geogit: {reason}", "WARNING")
         self._is_recovering = False
         self.enable_controls(True)
-        self.recover_button.setEnabled(True)
+        self._geogit_toggle.blockSignals(True)
+        self._geogit_toggle.setChecked(False)
+        self._geogit_toggle.blockSignals(False)
+        self._geogit_toggle.setEnabled(True)
+
+    def _setup_geogit_status_bar(self) -> None:
+        """Create the GeoGit status widget (not yet in status bar)."""
+        try:
+            from .widgets.geogit_status_widget import GeoGitStatusWidget
+            self._geogit_status_widget = GeoGitStatusWidget()
+            self._geogit_status_widget.stop_requested.connect(
+                self._geogit_stop_from_statusbar,
+            )
+            flog("geogit: status_bar widget created", "DEBUG")
+        except Exception as exc:  # noqa: BLE001
+            flog(f"geogit: status_bar setup failed: {exc!r}", "WARNING")
+            self._geogit_status_widget = None
+
+    def _show_geogit_status_bar(self) -> None:
+        """Insert the GeoGit pill into the QGIS status bar (visible)."""
+        if self._geogit_status_widget is None:
+            return
+        try:
+            status_bar = self.iface.mainWindow().statusBar()
+            status_bar.insertPermanentWidget(0, self._geogit_status_widget)
+            self._geogit_status_widget.show()
+            flog("geogit: status_bar widget shown", "DEBUG")
+        except Exception as exc:  # noqa: BLE001
+            flog(f"geogit: status_bar show failed: {exc!r}", "WARNING")
+
+    def _hide_geogit_status_bar(self) -> None:
+        """Remove the GeoGit pill from the QGIS status bar."""
+        if self._geogit_status_widget is None:
+            return
+        try:
+            status_bar = self.iface.mainWindow().statusBar()
+            status_bar.removeWidget(self._geogit_status_widget)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _teardown_geogit_status_bar(self) -> None:
+        """Destroy the GeoGit status widget entirely."""
+        self._hide_geogit_status_bar()
+        self._geogit_status_widget = None
+
+    def _geogit_connect_auto_refresh(self) -> None:
+        """Connect canvas extentsChanged + journal signal for live GeoGit refresh."""
+        if self._geogit_active:
+            return
+        self._geogit_active = True
+        canvas = self.iface.mapCanvas()
+        canvas.extentsChanged.connect(self._geogit_on_extent_changed)
+        if self._tracker is not None:
+            try:
+                self._tracker.committed_features.connect(self._geogit_on_extent_changed)
+            except (AttributeError, TypeError):
+                pass
+        self._show_geogit_status_bar()
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.activate()
+        flog("geogit: auto_refresh connected", "INFO")
+
+    def _geogit_disconnect_auto_refresh(self) -> None:
+        """Disconnect canvas and journal signals for GeoGit auto-refresh."""
+        if not self._geogit_active:
+            return
+        self._geogit_active = False
+        self._geogit_debounce.stop()
+        canvas = self.iface.mapCanvas()
+        try:
+            canvas.extentsChanged.disconnect(self._geogit_on_extent_changed)
+        except TypeError:
+            pass
+        if self._tracker is not None:
+            try:
+                self._tracker.committed_features.disconnect(self._geogit_on_extent_changed)
+            except (AttributeError, TypeError):
+                pass
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.deactivate()
+        self._hide_geogit_status_bar()
+        flog("geogit: auto_refresh disconnected", "INFO")
+
+    def _geogit_on_extent_changed(self, *_args) -> None:
+        """Slot for canvas extentsChanged or journal committed — debounce 600ms."""
+        if not self._geogit_active:
+            return
+        self._geogit_debounce.start()
+
+    def _geogit_auto_refresh(self) -> None:
+        """Debounce fire: refresh viewport from cached events.
+
+        No SQL. No layer creation. Render runs in background QThread.
+        """
+        if not self._geogit_active:
+            return
+        session = self._geogit_session
+        if session is None or not session.is_active:
+            return
+        canvas = self.iface.mapCanvas()
+        ext = canvas.extent()
+        flog(
+            f"geogit: auto_refresh trigger "
+            f"bbox=({ext.xMinimum():.1f},{ext.yMinimum():.1f},"
+            f"{ext.xMaximum():.1f},{ext.yMaximum():.1f}) "
+            f"scale={canvas.scale():.0f}",
+            "DEBUG",
+        )
+        self._geogit_start_render(is_first=False)
 
     def _recover_event_mode(self) -> None:
         """Event mode: threaded search with start/end date range."""
@@ -2669,6 +3199,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.tr("{count} événement(s) trouvé(s), sélectionnez les lignes à restaurer").format(count=total)
         )
         self.results_group.setTitle(self.tr("Résultats ({count} événements)").format(count=total))
+        self.results_group.setVisible(True)
         self.results_group.setCollapsed(False)
         self.select_all_button.setEnabled(True)
         self.select_none_button.setEnabled(True)
@@ -3507,6 +4038,11 @@ class RecoverDialog(QDialog, LoggerMixin):
         if hasattr(self, '_layer_refresh_timer'):
             self._layer_refresh_timer.start()
         self._refresh_journal_status()
+        if self._geogit_wants_persist:
+            self._geogit_toggle.blockSignals(True)
+            self._geogit_toggle.setChecked(True)
+            self._geogit_toggle.blockSignals(False)
+            self._geogit_toggle.setEnabled(True)
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -3586,6 +4122,29 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self.logo_label.stop_recovery_effect()
             if hasattr(self, '_geom_preview'):
                 self._geom_preview.clear()
+            if self._geogit_wants_persist and self._geogit_session is not None:
+                flog("cleanup_resources: GeoGit active, keeping session alive", "INFO")
+            else:
+                if getattr(self, '_geogit_render_worker', None) is not None:
+                    self._geogit_render_worker.cancel()
+                    if self._geogit_render_worker.isRunning():
+                        self._geogit_render_worker.wait(300)
+                    self._geogit_render_worker = None
+                if self._geogit_worker is not None:
+                    self._geogit_worker.cancel()
+                    if self._geogit_worker.isRunning():
+                        self._geogit_worker.wait(500)
+                    self._geogit_worker = None
+                if self._geogit_session is not None:
+                    self._geogit_session.stop()
+                    self._geogit_session = None
+                self._geogit_disconnect_auto_refresh()
+                self._teardown_geogit_status_bar()
+                try:
+                    from .core.workflow_service import purge_lens_overlays
+                    purge_lens_overlays("dialog_close")
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as e:
             flog(f"cleanup_resources error: {e}", "WARNING")
 

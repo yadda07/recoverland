@@ -50,6 +50,8 @@ class GeoGitRenderWorker(QThread):
     all_done = pyqtSignal(object)
     error = pyqtSignal(str)
 
+    _MAX_STACKED_STATES = 200
+
     def __init__(
         self,
         event_cache: Dict[str, list],
@@ -59,6 +61,7 @@ class GeoGitRenderWorker(QThread):
         t_min: str,
         t_max: str,
         op_filter=None,
+        viz_mode: str = "diff_window",
         trace_id: str = "",
         parent=None,
     ):
@@ -70,6 +73,7 @@ class GeoGitRenderWorker(QThread):
         self._t_min = t_min
         self._t_max = t_max
         self._op_filter = op_filter
+        self._viz_mode = viz_mode
         self._cancelled = False
         self.trace_id = trace_id or uuid.uuid4().hex[:8]
 
@@ -173,98 +177,23 @@ class GeoGitRenderWorker(QThread):
                     if hasattr(timeline.classification, "name")
                     else str(timeline.classification)
                 )
-                # BL-IL-P2-17: condense to 1 past + 1 arrow + 1 marker per entity
                 if not timeline.states:
                     continue
-                oldest_state = timeline.states[0]
-                newest_state = timeline.states[-1]
-                representative = newest_state
 
-                # Past geometry: oldest OLD
-                if oldest_state.old_geom_wkb and geom_family:
-                    code = _wkb_type_code(oldest_state.old_geom_wkb)
-                    fam = _wkb_family(code) if code is not None else None
-                    if fam == geom_family:
-                        geom = repair_geometry_for_render(
-                            oldest_state.old_geom_wkb, trace_id=tid,
-                        )
-                        if is_geometry_present(geom):
-                            repro = reproject_geometry_for_render(
-                                geom, oldest_state.crs_authid,
-                                self._dst_crs, transform_cache,
-                                trace_id=tid,
-                            )
-                            if is_geometry_present(repro):
-                                past_feats.append(_FeatureData(
-                                    bytes(repro.asWkb()),
-                                    self._build_past_attrs(
-                                        representative, classification,
-                                        now, source_fields,
-                                        ev_index,
-                                    ),
-                                ))
-
-                # Arrow: oldest OLD -> newest NEW (if geom moved)
-                first_wkb = oldest_state.old_geom_wkb
-                last_wkb = newest_state.new_geom_wkb
-                if first_wkb and last_wkb and not geometries_equal(first_wkb, last_wkb):
-                    old_g = repair_geometry_for_render(first_wkb, trace_id=tid)
-                    new_g = repair_geometry_for_render(last_wkb, trace_id=tid)
-                    if is_geometry_present(old_g) and is_geometry_present(new_g):
-                        old_r = reproject_geometry_for_render(
-                            old_g, oldest_state.crs_authid,
-                            self._dst_crs, transform_cache, trace_id=tid,
-                        )
-                        new_r = reproject_geometry_for_render(
-                            new_g, newest_state.crs_authid,
-                            self._dst_crs, transform_cache, trace_id=tid,
-                        )
-                        if is_geometry_present(old_r) and is_geometry_present(new_r):
-                            try:
-                                old_c = old_r.centroid().asPoint()
-                                new_c = new_r.centroid().asPoint()
-                                from qgis.core import QgsGeometry
-                                arrow = QgsGeometry.fromPolylineXY(
-                                    [old_c, new_c],
-                                )
-                                arrow_feats.append(_FeatureData(
-                                    bytes(arrow.asWkb()),
-                                    _feature_attrs(
-                                        entity_fp, representative,
-                                        classification, now,
-                                    ),
-                                ))
-                            except Exception:  # noqa: BLE001
-                                pass
-
-                # Attr marker: latest position if any attrs changed
-                has_any_attrs = any(st.attrs_delta for st in timeline.states)
-                if has_any_attrs:
-                    src_wkb = (
-                        newest_state.new_geom_wkb
-                        or newest_state.old_geom_wkb
-                        or oldest_state.old_geom_wkb
+                if self._viz_mode == "updates_stacked":
+                    self._render_entity_stacked(
+                        entity_fp, timeline, classification,
+                        geom_family, tid, now, transform_cache,
+                        source_fields, ev_index,
+                        past_feats, arrow_feats,
                     )
-                    if src_wkb:
-                        mg = repair_geometry_for_render(src_wkb, trace_id=tid)
-                        if is_geometry_present(mg):
-                            crs = newest_state.crs_authid or oldest_state.crs_authid
-                            mr = reproject_geometry_for_render(
-                                mg, crs, self._dst_crs,
-                                transform_cache, trace_id=tid,
-                            )
-                            if is_geometry_present(mr):
-                                try:
-                                    pt = mr.centroid()
-                                    attr_feats.append(_FeatureData(
-                                        bytes(pt.asWkb()),
-                                        _feature_attrs(
-                                            entity_fp, representative,
-                                            classification, now,
-                                        ),
-                                    ))
-                                except Exception:  # noqa: BLE001
-                                    pass
+                else:
+                    self._render_entity_condensed(
+                        entity_fp, timeline, classification,
+                        geom_family, tid, now, transform_cache,
+                        source_fields, ev_index,
+                        past_feats, arrow_feats, attr_feats,
+                    )
 
             total_entities += len(plan.entities)
             total_features += (
@@ -332,6 +261,167 @@ class GeoGitRenderWorker(QThread):
             "cache_events": cache_events,
         })
 
+    def _render_entity_condensed(
+        self, entity_fp, timeline, classification,
+        geom_family, tid, now, transform_cache,
+        source_fields, ev_index,
+        past_feats, arrow_feats, attr_feats,
+    ) -> None:
+        """Mode B (P2-17): 1 past + 1 arrow + 1 marker per entity."""
+        from ..core.geometry_utils import (
+            geometries_equal, is_geometry_present,
+            repair_geometry_for_render, reproject_geometry_for_render,
+        )
+        from ..core.lens_renderer import (
+            _wkb_type_code, _wkb_family, _feature_attrs,
+        )
+
+        oldest_state = timeline.states[0]
+        newest_state = timeline.states[-1]
+        representative = newest_state
+
+        if oldest_state.old_geom_wkb and geom_family:
+            code = _wkb_type_code(oldest_state.old_geom_wkb)
+            fam = _wkb_family(code) if code is not None else None
+            if fam == geom_family:
+                geom = repair_geometry_for_render(
+                    oldest_state.old_geom_wkb, trace_id=tid,
+                )
+                if is_geometry_present(geom):
+                    repro = reproject_geometry_for_render(
+                        geom, oldest_state.crs_authid,
+                        self._dst_crs, transform_cache, trace_id=tid,
+                    )
+                    if is_geometry_present(repro):
+                        past_feats.append(_FeatureData(
+                            bytes(repro.asWkb()),
+                            self._build_past_attrs(
+                                representative, classification,
+                                now, source_fields, ev_index,
+                            ),
+                        ))
+
+        first_wkb = oldest_state.old_geom_wkb
+        last_wkb = newest_state.new_geom_wkb
+        if first_wkb and last_wkb and not geometries_equal(first_wkb, last_wkb):
+            old_g = repair_geometry_for_render(first_wkb, trace_id=tid)
+            new_g = repair_geometry_for_render(last_wkb, trace_id=tid)
+            if is_geometry_present(old_g) and is_geometry_present(new_g):
+                old_r = reproject_geometry_for_render(
+                    old_g, oldest_state.crs_authid,
+                    self._dst_crs, transform_cache, trace_id=tid,
+                )
+                new_r = reproject_geometry_for_render(
+                    new_g, newest_state.crs_authid,
+                    self._dst_crs, transform_cache, trace_id=tid,
+                )
+                if is_geometry_present(old_r) and is_geometry_present(new_r):
+                    try:
+                        old_c = old_r.centroid().asPoint()
+                        new_c = new_r.centroid().asPoint()
+                        from qgis.core import QgsGeometry
+                        arrow = QgsGeometry.fromPolylineXY([old_c, new_c])
+                        arrow_feats.append(_FeatureData(
+                            bytes(arrow.asWkb()),
+                            _feature_attrs(
+                                entity_fp, representative,
+                                classification, now,
+                            ),
+                        ))
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        has_any_attrs = any(st.attrs_delta for st in timeline.states)
+        if has_any_attrs:
+            src_wkb = (
+                newest_state.new_geom_wkb
+                or newest_state.old_geom_wkb
+                or oldest_state.old_geom_wkb
+            )
+            if src_wkb:
+                mg = repair_geometry_for_render(src_wkb, trace_id=tid)
+                if is_geometry_present(mg):
+                    crs = newest_state.crs_authid or oldest_state.crs_authid
+                    mr = reproject_geometry_for_render(
+                        mg, crs, self._dst_crs,
+                        transform_cache, trace_id=tid,
+                    )
+                    if is_geometry_present(mr):
+                        try:
+                            pt = mr.centroid()
+                            attr_feats.append(_FeatureData(
+                                bytes(pt.asWkb()),
+                                _feature_attrs(
+                                    entity_fp, representative,
+                                    classification, now,
+                                ),
+                            ))
+                        except Exception:  # noqa: BLE001
+                            pass
+
+    def _render_entity_stacked(
+        self, entity_fp, timeline, classification,
+        geom_family, tid, now, transform_cache,
+        source_fields, ev_index,
+        past_feats, arrow_feats,
+    ) -> None:
+        """Mode C (P2-19): ALL geometries stacked with opacity gradient + trail."""
+        from ..core.geometry_utils import (
+            is_geometry_present,
+            repair_geometry_for_render,
+            reproject_geometry_for_render,
+        )
+        from ..core.lens_renderer import _wkb_type_code, _wkb_family
+
+        states = timeline.states[:self._MAX_STACKED_STATES]
+        n = len(states)
+        centroids = []
+
+        for i, state in enumerate(states):
+            wkb = state.old_geom_wkb or state.new_geom_wkb
+            if not wkb or not geom_family:
+                continue
+            code = _wkb_type_code(wkb)
+            fam = _wkb_family(code) if code is not None else None
+            if fam != geom_family:
+                continue
+            geom = repair_geometry_for_render(wkb, trace_id=tid)
+            if not is_geometry_present(geom):
+                continue
+            repro = reproject_geometry_for_render(
+                geom, state.crs_authid,
+                self._dst_crs, transform_cache, trace_id=tid,
+            )
+            if not is_geometry_present(repro):
+                continue
+
+            opacity = (i + 1) / n
+            attrs = self._build_past_attrs(
+                state, classification, now,
+                source_fields, ev_index,
+                opacity=opacity, stack_order=i,
+            )
+            past_feats.append(_FeatureData(bytes(repro.asWkb()), attrs))
+
+            try:
+                centroids.append(repro.centroid().asPoint())
+            except Exception:  # noqa: BLE001
+                pass
+
+        if len(centroids) >= 2:
+            try:
+                from qgis.core import QgsGeometry
+                trail = QgsGeometry.fromPolylineXY(centroids)
+                from ..core.lens_renderer import _feature_attrs
+                arrow_feats.append(_FeatureData(
+                    bytes(trail.asWkb()),
+                    _feature_attrs(
+                        entity_fp, states[-1], classification, now,
+                    ),
+                ))
+            except Exception:  # noqa: BLE001
+                pass
+
     def _reproject_bbox(
         self, bbox_xy: Tuple[float, ...], src_crs: str, dst_crs: str,
     ) -> Tuple[float, ...]:
@@ -362,6 +452,7 @@ class GeoGitRenderWorker(QThread):
 
     def _build_past_attrs(
         self, state, classification, now, source_fields, ev_index,
+        opacity: float = None, stack_order: int = None,
     ) -> list:
         """Build attribute list: source fields + lens metadata.
 
@@ -399,6 +490,8 @@ class GeoGitRenderWorker(QThread):
             state.user_name or "",
             _age_label(state.created_at, now),
             classification,
+            opacity,
+            stack_order,
         ]
         return src_vals + meta
 
