@@ -69,7 +69,9 @@ def evaluate_journal_health(
     count_level = _classify_count(event_count)
     level = _worst_level(size_level, count_level)
 
-    message = _build_health_message(level, size_bytes, event_count)
+    message = _build_health_message(
+        level, size_bytes, event_count, oldest_event, newest_event,
+    )
     suggestion = _build_health_suggestion(level, size_bytes, event_count)
 
     return JournalHealthStatus(
@@ -182,6 +184,7 @@ def _worst_level(a: str, b: str) -> str:
 
 def _build_health_message(
     level: str, size_bytes: int, event_count: int,
+    oldest_event: str = "", newest_event: str = "",
 ) -> str:
     size_str = _format_size(size_bytes)
     count_str = f"{event_count:,}".replace(",", " ")
@@ -197,7 +200,7 @@ def _build_health_message(
             "Pensez a purger les anciens evenements."
         ).format(size=size_str, count=count_str)
     if level == HealthLevel.INFO:
-        return _tr("Journal : {size}, {count} evenement(s).").format(size=size_str, count=count_str)
+        return _format_coverage(oldest_event, newest_event)
     return ""
 
 
@@ -237,6 +240,29 @@ def _humanize_integrity_issue(issue: str) -> str:
     if "cannot open" in lower:
         return _tr("Impossible d'ouvrir le journal.")
     return _tr("Anomalie detectee : {issue}").format(issue=issue)
+
+
+def _format_coverage(oldest_iso: str, newest_iso: str) -> str:
+    """Human-readable temporal coverage between two ISO date strings."""
+    if not oldest_iso or not newest_iso or len(oldest_iso) < 7 or len(newest_iso) < 7:
+        return ""
+    try:
+        oy, om = int(oldest_iso[:4]), int(oldest_iso[5:7])
+        ny, nm = int(newest_iso[:4]), int(newest_iso[5:7])
+        total_months = (ny - oy) * 12 + (nm - om)
+        if total_months < 1:
+            return _tr("Couverture : quelques jours")
+        if total_months < 24:
+            return _tr("Couverture : {n} mois").format(n=total_months)
+        years = total_months // 12
+        remaining = total_months % 12
+        if remaining == 0:
+            return _tr("Couverture : {n} ans").format(n=years)
+        return _tr("Couverture : {y} ans et {m} mois").format(
+            y=years, m=remaining,
+        )
+    except (ValueError, IndexError):
+        return ""
 
 
 def _format_size(size_bytes: int) -> str:

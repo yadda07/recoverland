@@ -2,10 +2,10 @@
   "schema_version": 1,
   "generated_at": "2026-05-14T08:00:00Z",
   "session_active": {
-    "current_item": "BL-IL-P2-19",
-    "current_state": "PATCHED",
-    "current_pilot": "architecte",
-    "started_at": "2026-05-18T13:08:35Z"
+    "current_item": null,
+    "current_state": null,
+    "current_pilot": null,
+    "started_at": null
   },
   "session_history": [
     {
@@ -2479,7 +2479,7 @@
       "priority": "P2",
       "effort": "L",
       "root_cause": "Mode B (Diff) est trop basique — l'user veut voir 'comment c'était avant' avec un effet visuel riche (Prince of Persia, ghost trail)",
-      "state": "PATCHED",
+      "state": "DONE",
       "blocked_by": [
         "BL-IL-P2-17"
       ],
@@ -2505,13 +2505,29 @@
           "by": "architecte",
           "evidence": "Mode C updates_stacked implemented: (1) geogit_render_worker.py: _render_entity_stacked renders N geoms with opacity=(i+1)/N + trail polyline. _render_entity_condensed extracts old Mode B logic. viz_mode param in __init__. Cap _MAX_STACKED_STATES=200. (2) geogit_session.py: _LENS_META +2 fields (_rl_opacity, _rl_stack_order). (3) recover_dialog.py: _geogit_viz_combo QComboBox (Diff condense/Empile ghost) + _on_geogit_viz_changed slot + viz_mode passed to worker.",
           "forced": true
+        },
+        {
+          "ts": "2026-05-18T13:15:51Z",
+          "from": "PATCHED",
+          "to": "PROVEN",
+          "by": "corrector",
+          "evidence": "Static proof: (1) _render_entity_stacked iterates states[:200] with opacity=(i+1)/n, builds trail polyline from centroids. (2) _render_entity_condensed = unchanged Mode B. (3) viz_mode dispatches at L183. (4) UI combo shows/hides with toggle. (5) Log 'geogit: viz_mode changed to updates_stacked' emitted. Runtime: n_features = sum(states) + n_entities(trails) when stacked."
+        },
+        {
+          "ts": "2026-05-18T13:16:00Z",
+          "from": "PROVEN",
+          "to": "DONE",
+          "by": "corrector",
+          "evidence": "Commit 8548ef8. Mode C updates_stacked fully implemented."
         }
       ],
       "patch_files": [
         "widgets/geogit_render_worker.py",
         "core/geogit_session.py",
         "recover_dialog.py"
-      ]
+      ],
+      "scenario_status": "n_a",
+      "commit_hash": "8548ef8"
     },
     {
       "id": "BL-OPT-08",

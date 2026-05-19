@@ -1,8 +1,6 @@
-(function(){
-  var saved = localStorage.getItem('rl-theme');
-  document.documentElement.setAttribute('data-t', saved === null ? 'd' : saved);
-})();
-
+/* Theme bootstrap is inlined in the <head> of every page to prevent
+   the white flash on dark mode (no-flash dark pattern). Only the
+   toggle helper lives here. */
 function toggleTheme(){
   var d = document.documentElement;
   var t = d.getAttribute('data-t')==='d' ? '' : 'd';
@@ -104,6 +102,15 @@ var RL_SEARCH = [
   {t:'Lecteur reseau',k:'reseau unc montage lecteur',h:'limits.html#network-drive',p:'limites'},
   {t:'FID instable',k:'fid shapefile compactage repack',h:'limits.html#fid-instable',p:'limites'},
   {t:'Couche memoire',k:'memory volatile temporaire',h:'limits.html#memory-layer',p:'limites'},
+  {t:'Journal maintenance',k:'maintenance purge vacuum compaction retention integrity',h:'maintenance.html#vision',p:'maintenance'},
+  {t:'Health monitoring',k:'health monitor size threshold disk space warning critical',h:'maintenance.html#health',p:'maintenance'},
+  {t:'Integrity check',k:'integrity check pragma wal pending recovery schema version',h:'maintenance.html#integrity',p:'maintenance'},
+  {t:'Retention policy',k:'retention policy days max events auto purge cutoff',h:'maintenance.html#retention',p:'maintenance'},
+  {t:'Purge engine',k:'purge delete batch orphan trace session retention',h:'maintenance.html#purge',p:'maintenance'},
+  {t:'VACUUM compaction',k:'vacuum compact sqlite thread async reclaim disk space',h:'maintenance.html#vacuum',p:'maintenance'},
+  {t:'Journal export',k:'export backup sqlite3 backup api consistent copy',h:'maintenance.html#export',p:'maintenance'},
+  {t:'Journal diagnostics',k:'diagnostic analysis blob entity distribution schema dedup optimization',h:'maintenance.html#diagnostics',p:'maintenance'},
+  {t:'Diagnostic metrics',k:'metrics geometry duplicate insert delete pairs invalidated traces',h:'maintenance.html#metrics',p:'maintenance'},
 ];
 
 function initReveal(){
@@ -270,20 +277,13 @@ function initHeroParallax(){
   }, {passive:true});
 }
 
-/* ===== VIEW TRANSITIONS NAVIGATION ===== */
-function initViewTransitions(){
-  if(!document.startViewTransition) return;
-  document.querySelectorAll('.bar-nav a[href], .side nav a[href]').forEach(function(a){
-    var href = a.getAttribute('href');
-    if(!href || href.charAt(0) === '#') return;
-    a.addEventListener('click', function(e){
-      e.preventDefault();
-      document.startViewTransition(function(){
-        window.location.href = href;
-      });
-    });
-  });
-}
+/* ===== VIEW TRANSITIONS NAVIGATION =====
+   Cross-document slide is handled natively by `@view-transition{navigation:auto}`
+   in rl.css. The previous JS hook used `document.startViewTransition()` which is a
+   same-document API: combined with `window.location.href = ...` it cancelled the
+   browser's cross-doc animation and fell back to a hard navigation.
+   Kept as a no-op so the call site in DOMContentLoaded stays valid. */
+function initViewTransitions(){ /* intentionally empty */ }
 
 /* ===== CALLOUT MOUSE GLOW ===== */
 function initCalloutGlow(){
@@ -1123,21 +1123,55 @@ function initArchGraph(){
   deactivate();
 }
 
-document.addEventListener('DOMContentLoaded', function(){
+/* Snappy boot orchestration matching the segmented switch cadence (~180ms):
+   - Slide (0 - 200ms)         : only structural inits run, [data-prep] keeps
+                                 content hidden so the slide is the only motion.
+   - Content fade-in (200ms +) : [data-prep] removed, content fades in via CSS
+                                 transitions (220ms with tight stagger).
+                                 Decorative JS anims initialise simultaneously. */
+var RL_ENTRY_DELAY_MS = 200;
+
+function rlRunStructuralInits(){
   initRightToc();
   initScroll();
   initProgressBar();
   initSearch(RL_SEARCH);
-  initHeroOrbs();
-  initReveal();
-  initHeadingReveal();
   initCalloutGlow();
   initCardTilt();
-  initSvgDraw();
   initSmoothNav();
   initTocProgress();
   initSidebarPill();
   initHeroParallax();
   initViewTransitions();
   initArchGraph();
+}
+
+function rlRunEntranceAnims(){
+  /* Removing [data-prep] reverts CSS overrides; content fades in via the
+     stagger transitions defined in rl.css. */
+  document.documentElement.removeAttribute('data-prep');
+  /* Decorative anims attach AFTER content is back: they see final layout
+     and won't fight the slide. */
+  initHeroOrbs();
+  initHeadingReveal();
+  initSvgDraw();
+  initReveal();
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+  rlRunStructuralInits();
+  /* Defer entrance anims until the slide has fully settled. */
+  setTimeout(rlRunEntranceAnims, RL_ENTRY_DELAY_MS);
+});
+
+/* bfcache restore: pages restored from back/forward cache do NOT fire
+   DOMContentLoaded again. Re-arm [data-prep] + the entrance sequence so the
+   user sees the same coherent slide-then-anim flow on Back/Forward. */
+window.addEventListener('pageshow', function(e){
+  if(e.persisted){
+    document.documentElement.setAttribute('data-prep','1');
+    setTimeout(function(){
+      document.documentElement.removeAttribute('data-prep');
+    }, RL_ENTRY_DELAY_MS);
+  }
 });

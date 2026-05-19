@@ -268,10 +268,11 @@ def purge_lens_overlays(context: str = "manual") -> int:
         project = QgsProject.instance()
         ids = [
             lyr.id() for lyr in project.mapLayers().values()
-            if lyr.name().startswith(_LENS_LAYER_PREFIX)
+            if (lyr.name().startswith(_LENS_LAYER_PREFIX)
+                or lyr.customProperty("_rl_lens_managed") == "1")
         ]
-        for lid in ids:
-            project.removeMapLayer(lid)
+        if ids:
+            project.removeMapLayers(ids)
         _lens_layer_ids.clear()
         flog(
             f"lens_lifecycle event={context}_cleanup "

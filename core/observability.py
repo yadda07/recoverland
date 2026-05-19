@@ -141,8 +141,8 @@ def _detect_anomalies(
     active_traces = max(traces - traces_invalidated, 0)
 
     # 1. Everything skipped: classic "rewind already applied" symptom.
-    if cycle == "rewind" and plan_actions > 0 and apply_ok == 0 \
-            and apply_skipped == plan_actions:
+    if (cycle == "rewind" and plan_actions > 0 and apply_ok == 0 and
+            apply_skipped == plan_actions):
         anomalies.append((
             "WARNING", "all_skipped",
             f"all {plan_actions} action(s) skipped at apply phase. "
@@ -175,8 +175,8 @@ def _detect_anomalies(
 
     # 3. Active traces exist but very few user events neutralized:
     # likely fingerprint drift between trace and event.
-    if cycle == "rewind" and active_traces >= 5 \
-            and dedup_dropped < active_traces // 2:
+    if (cycle == "rewind" and active_traces >= 5 and
+            dedup_dropped < active_traces // 2):
         anomalies.append((
             "WARNING", "low_neutralization",
             f"low neutralization ratio: {active_traces} active "

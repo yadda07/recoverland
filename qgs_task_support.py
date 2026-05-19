@@ -13,9 +13,9 @@ def trace_prefix(trace_id: str) -> str:
 
 def supports_qgs_task() -> bool:
     return (
-        QgsTask is not None
-        and QgsApplication is not None
-        and hasattr(QgsApplication, "taskManager")
+        QgsTask is not None and
+        QgsApplication is not None and
+        hasattr(QgsApplication, "taskManager")
     )
 
 

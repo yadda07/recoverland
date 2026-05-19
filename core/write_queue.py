@@ -27,9 +27,9 @@ _BATCH_RETRY_BASE_SEC = 0.2
 _WAL_CHECKPOINT_INTERVAL_SEC = 60
 
 _INSERT_SQL = (
-    "INSERT INTO audit_event ("  # nosec B608: column list is a module constant
-    + AUDIT_EVENT_INSERT_SQL
-    + ") VALUES (" + AUDIT_EVENT_INSERT_PLACEHOLDERS + ")"
+    "INSERT INTO audit_event (" +  # nosec B608: column list is a module constant
+    AUDIT_EVENT_INSERT_SQL +
+    ") VALUES (" + AUDIT_EVENT_INSERT_PLACEHOLDERS + ")"
 )
 
 
@@ -202,7 +202,7 @@ class WriteQueue:
             except sqlite3.OperationalError as e:
                 last_err = e
                 wait = _BATCH_RETRY_BASE_SEC * (2 ** attempt)
-                flog(f"WriteQueue: retry {attempt+1}/{_BATCH_RETRY_COUNT} "
+                flog(f"WriteQueue: retry {attempt + 1}/{_BATCH_RETRY_COUNT} "
                      f"after {wait:.1f}s: {e}", "WARNING")
                 time.sleep(wait)
             except sqlite3.Error as e:

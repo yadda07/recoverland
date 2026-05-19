@@ -399,11 +399,14 @@ def cleanup_orphan_journals(profile_path: str,
 
 
 def get_journal_size_bytes(path: str) -> int:
-    """Return the file size of the journal in bytes, or 0 if not found."""
-    try:
-        return os.path.getsize(path)
-    except OSError:
-        return 0
+    """Return the total disk footprint (main + WAL + SHM) in bytes."""
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += os.path.getsize(path + suffix)
+        except OSError:
+            pass
+    return total
 
 
 def format_journal_size(size_bytes: int) -> str:

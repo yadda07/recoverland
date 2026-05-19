@@ -5,7 +5,32 @@ Stores geometry as binary WKB in SQLite, with CRS tracked separately.
 Tables without geometry get geometry_wkb=NULL, geometry_type='NoGeometry'.
 """
 import hashlib
+import os
 from typing import Optional, Tuple
+
+
+# Heavy forensic diagnostic: per-event provider.getFeatures() calls that
+# snapshot geometry before/after each restore action. Useful to triage a
+# corrupted rewind, but costs one provider I/O round-trip per event, which
+# freezes the UI thread on rewinds of ~1000 events (Windows reports
+# "(Ne repond pas)"). Off by default; the user opts in by setting the
+# env var to a truthy value before starting QGIS.
+HEAVY_DIAG_ENV = "RECOVERLAND_HEAVY_DIAG"
+_HEAVY_DIAG_DISABLED_TOKENS = ("", "0", "false", "no", "off")
+_HEAVY_DIAG = (
+    os.environ.get(HEAVY_DIAG_ENV, "0").strip().lower()
+    not in _HEAVY_DIAG_DISABLED_TOKENS
+)
+
+
+def heavy_diag_enabled() -> bool:
+    """Return True when the RECOVERLAND_HEAVY_DIAG opt-in is active.
+
+    Call sites use this to short-circuit per-event diagnostic loops
+    (EDIT_START, TRACE_POST_COMMIT, RELOAD_CHECK) when the user has
+    not asked for forensic logging.
+    """
+    return _HEAVY_DIAG
 
 
 def _compute_makevalid_drift(geom_before, geom_after) -> Tuple[str, str, float]:
@@ -201,15 +226,6 @@ def repair_geometry_for_render(wkb_data: Optional[bytes], trace_id: str = ""):
         )
         return None
 
-    try:
-        _hash_b, _hash_a, drift = _compute_makevalid_drift(geom, repaired)
-    except Exception:  # noqa: BLE001 - drift is diagnostic only
-        drift = float("nan")
-    flog(
-        f"lens_geom_repair event=repaired trace_id={trace_id} "
-        f"drift_units={drift:.6f}",
-        "INFO",
-    )
     return repaired
 
 
@@ -260,11 +276,6 @@ def reproject_geometry_for_render(
     from .logger import flog  # noqa: PLC0415
 
     if src_crs_authid is None or not src_crs_authid:
-        flog(
-            f"lens_geom_reproject event=skipped trace_id={trace_id} "
-            f"reason=src_crs_none src_crs=None dst_crs={dst_crs_authid}",
-            "WARNING",
-        )
         return None
 
     from qgis.core import (  # noqa: PLC0415
@@ -332,12 +343,6 @@ def reproject_geometry_for_render(
         )
         return None
 
-    flog(
-        f"lens_geom_reproject event=reprojected trace_id={trace_id} "
-        f"src_crs={src_crs_authid} dst_crs={dst_crs_authid} "
-        f"cache_hit={str(cache_hit).lower()}",
-        "INFO",
-    )
     return repro
 
 
@@ -463,6 +468,24 @@ def feature_geom_short_repr(layer, fid: int) -> str:
         return wkb_short_repr(bytes(geom.asWkb()))
     except Exception as exc:
         return f"lookup_err({exc})"
+
+
+def feature_geom_short_repr_diag(layer, fid: int) -> str:
+    """Diag-gated variant of ``feature_geom_short_repr``.
+
+    When ``RECOVERLAND_HEAVY_DIAG`` is off (default), returns ``"diag_off"``
+    without touching the provider, so the per-event log placeholder is
+    preserved but the provider.getFeatures() round-trip is skipped.
+    Cuts the UI thread blocking time on large rewinds.
+
+    Use this wrapper for log-only call sites (BUF_INS, TRACE_RESTORE,
+    UNDO_UPD). Keep the original ``feature_geom_short_repr`` for the
+    rare functional sites where the persisted geometry must be read
+    regardless of the diag flag.
+    """
+    if not _HEAVY_DIAG:
+        return "diag_off"
+    return feature_geom_short_repr(layer, fid)
 
 
 def capture_geometry_info(layer, feature) -> Tuple[Optional[bytes], str, Optional[str]]:

@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="view-transition" content="same-origin">
+<title>GeoGit - RecoverLand</title>
+<script>(function(){try{var t=localStorage.getItem('rl-theme');var d=document.documentElement;d.setAttribute('data-t',t===null?'d':t);d.setAttribute('data-prep','1');}catch(e){document.documentElement.setAttribute('data-t','d');}})();</script><link rel="stylesheet" href="rl.css?v=23">
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0"><defs>
+  <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--brd)"/></marker>
+  <marker id="ah2" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--ac)"/></marker>
+</defs></svg>
+
+<header class="bar">
+  <a class="bar-logo" href="index.html">
+    <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">4.9.0</span>
+  </a>
+  <nav class="bar-nav">
+    <a href="index.html">Overview</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="geogit.html" class="on">GeoGit</a>
+    <a href="guide.html">Guide</a>
+    <a href="formats.html">Formats</a>
+    <a href="limits.html">Limits</a>
+    <a href="maintenance.html">Maintenance</a>
+  </nav>
+  <div class="bar-right">
+    <button class="tbtn" onclick="toggleTheme()">&#9789;</button>
+  </div>
+</header>
+
+<div class="layout">
+<aside class="side"><nav>
+  <div class="cat">Big picture</div>
+  <a href="#vision">Vision</a>
+  <a href="#contract">What GeoGit is (and is not)</a>
+  <a href="#layers">The four layers</a>
+  <div class="cat">Pipelines</div>
+  <a href="#start-pipe">Session start</a>
+  <a href="#refresh-pipe">Viewport refresh</a>
+  <a href="#live-pipe">Live edits</a>
+  <a href="#stop-pipe">Session stop</a>
+  <div class="cat">Rendering</div>
+  <a href="#overlays">The three overlays</a>
+  <a href="#modes">Visualization modes</a>
+  <a href="#classification">Entity classification</a>
+  <div class="cat">Module catalog</div>
+  <a href="#cat-contracts">Contracts</a>
+  <a href="#cat-domain">Domain (planner, renderer)</a>
+  <a href="#cat-session">Session &amp; workers</a>
+  <a href="#cat-ui">UI surface</a>
+  <div class="cat">Operations</div>
+  <a href="#threads">Threading model</a>
+  <a href="#statusbar">Status bar pill</a>
+  <a href="#perf">Performance budget</a>
+  <a href="#integration">Integration with Restore</a>
+  <div class="cat">Honest view</div>
+  <a href="#debt">Known debt</a>
+</nav></aside>
+
+<main class="main">
+
+<div class="hero" style="padding:36px 0 24px;text-align:left">
+  <div class="slbl">GeoGit</div>
+  <h1 style="font-size:36px">A live lens on the past</h1>
+  <p class="lead" style="max-width:680px">GeoGit reads the local SQLite journal and projects historical edits onto the QGIS canvas as three transient overlays &mdash; past geometries, movement arrows, and attribute markers &mdash; without ever writing back. It is the read-only twin of Restore: same data, opposite intent.</p>
+  <div class="hero-line" style="margin:18px 0 0"></div>
+</div>
+
+<!-- ============================== VISION ============================== -->
+<section id="vision">
+<h2>Vision</h2>
+<p>Restore answers the question &laquo;&nbsp;put the data back&nbsp;&raquo;. GeoGit answers a different one: &laquo;&nbsp;what changed here, and when&nbsp;&raquo;. The same audit events feed both, but GeoGit never mutates a source layer. It builds in-memory overlay layers, refreshes them as the user pans and zooms, and tears them down on exit.</p>
+<p>The mode is designed as a continuous companion to QGIS editing: turn it on, keep editing, and the overlays update live as new events arrive. Turn it off and every trace disappears. No styles edited on source layers. No features changed. No journal rows written.</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-core">Read-only</div>
+    <div class="card-t">Zero side effects on source data</div>
+    <p>GeoGit only reads from the journal and adds memory layers prefixed <code>__rl_lens_</code>. The mode never calls <code>changeGeometry</code>, <code>changeAttributeValue</code>, <code>addFeatures</code> or <code>deleteFeatures</code> on a tracked layer.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Spatial-first</div>
+    <div class="card-t">Filter by viewport, not by table</div>
+    <p>The cache holds events for a time range; the renderer keeps only those whose envelope intersects the current canvas extent. Pan or zoom and the visible subset recomputes in 20&ndash;80&nbsp;ms per layer.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Live</div>
+    <div class="card-t">Edits appear within 600&nbsp;ms</div>
+    <p>The session subscribes to the edit tracker. Each new commit is debounced (600&nbsp;ms) and incrementally added to the cache and the visible overlays.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Bounded</div>
+    <div class="card-t">RAM and CPU budgets explicit</div>
+    <p>~2&nbsp;KB per cached event, ~10&nbsp;MB at 5&nbsp;000 events, ~100&nbsp;MB at 50k. The render worker is cancelable; a new viewport supersedes the previous one without waiting.</p>
+  </div>
+</div>
+</section>
+
+<!-- ============================== CONTRACT ============================== -->
+<section id="contract">
+<h2>What GeoGit is (and is not)</h2>
+<p>GeoGit is a runtime mode, not a workflow. It does not produce artefacts, it does not modify history, and it does not persist anything beyond the session.</p>
+
+<div class="tw"><table>
+<thead><tr><th>GeoGit&nbsp;<em>is</em></th><th>GeoGit&nbsp;<em>is&nbsp;not</em></th></tr></thead>
+<tbody>
+  <tr><td>A read-only overlay over the canvas</td><td>An editing tool</td></tr>
+  <tr><td>A live, viewport-bound view of audit events</td><td>A diff report or attribute table</td></tr>
+  <tr><td>A companion to Restore (same data, opposite verb)</td><td>A replacement for Restore</td></tr>
+  <tr><td>Cancelable per viewport refresh</td><td>An async export job</td></tr>
+  <tr><td>Cleared on toggle off</td><td>A persistent layer style</td></tr>
+</tbody>
+</table></div>
+
+<div class="info"><strong>Naming convention.</strong> Every layer GeoGit puts in the project is prefixed <code>__rl_lens_</code> followed by an 8-character UUID and a role suffix (<code>geom_past</code>, <code>arrows</code>, <code>attr_markers</code>). The prefix is shared with the legacy Time Lens dock so a single teardown (<code>workflow_service._LENS_LAYER_PREFIX</code>) cleans both. Nothing else is touched.</div>
+</section>
+
+<!-- ============================== LAYERS ============================== -->
+<section id="layers">
+<h2>The four layers</h2>
+<p>GeoGit lives across UI, orchestration, domain, and worker threads. Each layer has a single role; dependencies flow downward only.</p>
+
+<div class="dia">
+<svg viewBox="0 0 640 360" xmlns="http://www.w3.org/2000/svg">
+  <!-- L1: UI -->
+  <rect x="20" y="14" width="600" height="64" class="nd-ac"/>
+  <text x="36" y="38" class="lbl" font-size="11">L1 &mdash; UI surface</text>
+  <text x="36" y="54" class="dim" font-size="10.5">recover_dialog (toggle, dock host) &middot; widgets/temporal_lens_dock</text>
+  <text x="36" y="70" class="dim" font-size="10.5">widgets/geogit_status_widget &middot; widgets/geogit_segmented_switch &middot; widgets/temporal_lens_*_map_tool</text>
+
+  <!-- L2: Orchestration -->
+  <rect x="20" y="92" width="600" height="50" class="nd"/>
+  <text x="36" y="114" class="lbl" font-size="11">L2 &mdash; Session orchestration (UI thread)</text>
+  <text x="36" y="130" class="dim" font-size="10.5">core/geogit_session &nbsp;&mdash;&nbsp; cache, overlay lifecycle, viewport debounce</text>
+
+  <!-- L3: Domain -->
+  <rect x="20" y="156" width="600" height="76" class="nd-ac"/>
+  <text x="36" y="178" class="lbl" font-size="11">L3 &mdash; Pure domain (zero QGIS, zero Qt)</text>
+  <text x="36" y="194" class="dim" font-size="10.5">core/lens_contracts &nbsp;&mdash;&nbsp; NamedTuples, Enums, fetch stats</text>
+  <text x="36" y="210" class="dim" font-size="10.5">core/lens_planner &nbsp;&mdash;&nbsp; group by entity, classify, build timelines</text>
+  <text x="36" y="226" class="dim" font-size="10.5">core/wkb_envelope &nbsp;&mdash;&nbsp; bbox parsing &amp; intersection (no GEOS)</text>
+
+  <!-- L4: Workers -->
+  <rect x="20" y="246" width="600" height="64" class="nd"/>
+  <text x="36" y="268" class="lbl" font-size="11">L4 &mdash; Background workers (QThread)</text>
+  <text x="36" y="284" class="dim" font-size="10.5">widgets/geogit_worker &nbsp;&mdash;&nbsp; initial cache load (one-shot)</text>
+  <text x="36" y="300" class="dim" font-size="10.5">widgets/geogit_render_worker &nbsp;&mdash;&nbsp; per-viewport feature build (cancelable)</text>
+
+  <!-- Dependencies on existing infrastructure -->
+  <rect x="20" y="324" width="600" height="30" class="nd"/>
+  <text x="36" y="343" class="dim" font-size="10.5">Reuses: core/event_stream_repository &middot; core/geometry_utils &middot; core/lens_renderer &middot; core/journal_manager</text>
+
+  <line x1="320" y1="78"  x2="320" y2="92"  class="edge-ac"/>
+  <line x1="320" y1="142" x2="320" y2="156" class="edge"/>
+  <line x1="320" y1="232" x2="320" y2="246" class="edge-ac"/>
+  <line x1="320" y1="310" x2="320" y2="324" class="edge"/>
+</svg>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Layer</th><th>Owns</th><th>Forbidden</th></tr></thead>
+<tbody>
+  <tr><td><strong>L1 UI</strong></td><td>Dock, toggle, status pill, map tools, dialog wiring</td><td>Direct cache mutation, SQL reads</td></tr>
+  <tr><td><strong>L2 Session</strong></td><td>Cache lifecycle, overlay creation/teardown, debounce</td><td>Feature classification, geometry math</td></tr>
+  <tr><td><strong>L3 Domain</strong></td><td>Contracts, planner, envelope intersection</td><td>QGIS imports, Qt signals</td></tr>
+  <tr><td><strong>L4 Workers</strong></td><td>Off-UI fetch and feature build</td><td>QGIS layer mutation, project access</td></tr>
+</tbody>
+</table></div>
+
+<div class="tip"><strong>Pattern jumeau.</strong> The trio <code>lens_contracts</code> &rarr; <code>lens_planner</code> &rarr; <code>lens_renderer</code> mirrors the Restore trio <code>restore_contracts</code> &rarr; <code>restore_planner</code> &rarr; <code>restore_executor</code>. Same separation, opposite verb.</div>
+</section>
+
+<!-- ============================== START PIPELINE ============================== -->
+<section id="start-pipe">
+<h2>Session start</h2>
+<p>From toggle ON to first visible overlay. The first refresh is the slowest because the entire time range is loaded into RAM in a single QThread shot; everything afterwards reuses that cache.</p>
+
+<div class="dia">
+<svg viewBox="0 0 640 420" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20" y="14" width="600" height="42" class="nd"/>
+  <text x="320" y="32" text-anchor="middle" class="lbl" font-size="11">1. User flips the GeoGit toggle in the dialog</text>
+  <text x="320" y="48" text-anchor="middle" class="dim" font-size="10">Status pill inserts into QGIS status bar &middot; phase = fetch</text>
+  <line x1="320" y1="56" x2="320" y2="74" class="edge-ac"/>
+
+  <rect x="80" y="76" width="480" height="46" class="nd-ac"/>
+  <text x="320" y="98" text-anchor="middle" class="lbl" font-size="11">2. recover_dialog &mdash; build LensSelection</text>
+  <text x="320" y="114" text-anchor="middle" class="dim" font-size="10">layer fingerprints &middot; t_min/t_max &middot; op filter &middot; visualization mode</text>
+  <line x1="320" y1="122" x2="320" y2="140" class="edge-ac"/>
+
+  <rect x="80" y="142" width="480" height="50" class="nd"/>
+  <text x="320" y="164" text-anchor="middle" class="lbl" font-size="11">3. GeoGitCacheWorker (QThread)</text>
+  <text x="320" y="180" text-anchor="middle" class="dim" font-size="10">event_stream_repository.fetch_events_in_zone (no bbox at start)</text>
+  <text x="320" y="194" text-anchor="middle" class="dim" font-size="10">grouped by fingerprint &rarr; {fp: [AuditEvent]}</text>
+  <line x1="320" y1="192" x2="320" y2="212" class="edge-ac"/>
+
+  <rect x="80" y="214" width="480" height="46" class="nd-ac"/>
+  <text x="320" y="236" text-anchor="middle" class="lbl" font-size="11">4. geogit_session.start() &mdash; UI thread</text>
+  <text x="320" y="252" text-anchor="middle" class="dim" font-size="10">create 3 memory overlays per source layer &middot; once</text>
+  <line x1="320" y1="260" x2="320" y2="278" class="edge-ac"/>
+
+  <rect x="80" y="280" width="480" height="46" class="nd"/>
+  <text x="320" y="302" text-anchor="middle" class="lbl" font-size="11">5. First viewport refresh</text>
+  <text x="320" y="318" text-anchor="middle" class="dim" font-size="10">canvas.extent() &rarr; GeoGitRenderWorker &rarr; layer_ready signals</text>
+  <line x1="320" y1="326" x2="320" y2="344" class="edge-ac"/>
+
+  <rect x="180" y="346" width="280" height="38" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
+  <text x="320" y="364" text-anchor="middle" class="lbl" font-size="11">6. Overlays populated &middot; status pill = active</text>
+  <text x="320" y="378" text-anchor="middle" class="dim" font-size="10">phase = idle &middot; entity count visible in pill tooltip</text>
+
+  <line x1="320" y1="384" x2="320" y2="404" class="edge"/>
+  <text x="320" y="416" text-anchor="middle" class="dim" font-size="10">Subsequent pans / zooms reuse the cache (steps 5&rarr;6 only)</text>
+</svg>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Step</th><th>Module</th><th>Cost</th><th>Failure mode</th></tr></thead>
+<tbody>
+  <tr><td>1 Toggle</td><td><code>recover_dialog</code></td><td>O(1)</td><td>Status pill insertion forced via <code>QApplication.processEvents()</code> for instant feedback.</td></tr>
+  <tr><td>2 Selection</td><td><code>core/lens_contracts</code></td><td>O(layers)</td><td>Empty selection &rarr; early exit with WARNING log.</td></tr>
+  <tr><td>3 Fetch</td><td><code>widgets/geogit_worker</code></td><td>O(events) on read connection</td><td>Cap <code>MAX_EVENTS_PER_RESTORE</code> applies; truncation flagged in <code>fetch_stats</code>.</td></tr>
+  <tr><td>4 Overlay create</td><td><code>core/geogit_session</code></td><td>O(layers) &times; 3</td><td>Geometry family detected from first event; mixed types skipped with warning.</td></tr>
+  <tr><td>5 First render</td><td><code>widgets/geogit_render_worker</code></td><td>O(events in viewport)</td><td>Worker cancelable on rapid extent change.</td></tr>
+  <tr><td>6 Display</td><td><code>recover_dialog</code></td><td>O(features)</td><td><code>addFeatures</code> on memory provider &asymp; 5&nbsp;ms per layer.</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ============================== REFRESH PIPELINE ============================== -->
+<section id="refresh-pipe">
+<h2>Viewport refresh</h2>
+<p>Pan or zoom in QGIS &rarr; <code>canvas.extentsChanged</code> &rarr; debounce 600&nbsp;ms &rarr; render worker. The cache is never re-read from SQLite; only the in-RAM dict is filtered by envelope intersection.</p>
+
+<div class="dia">
+<svg viewBox="0 0 640 320" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20" y="14" width="600" height="42" class="nd"/>
+  <text x="320" y="32" text-anchor="middle" class="lbl" font-size="11">canvas.extentsChanged &rarr; QTimer (600 ms debounce)</text>
+  <text x="320" y="48" text-anchor="middle" class="dim" font-size="10">Subsequent extents within 600 ms restart the timer</text>
+  <line x1="320" y1="56" x2="320" y2="74" class="edge-ac"/>
+
+  <rect x="80" y="76" width="480" height="46" class="nd-ac"/>
+  <text x="320" y="98" text-anchor="middle" class="lbl" font-size="11">geogit_session.refresh_viewport(bbox)</text>
+  <text x="320" y="114" text-anchor="middle" class="dim" font-size="10">Cancel any in-flight render worker &middot; spawn a new one</text>
+  <line x1="320" y1="122" x2="320" y2="140" class="edge-ac"/>
+
+  <rect x="20" y="142" width="290" height="64" class="nd"/>
+  <text x="165" y="164" text-anchor="middle" class="lbl" font-size="11">Per-layer (worker thread)</text>
+  <text x="165" y="180" text-anchor="middle" class="dim" font-size="10">wkb_envelope.envelope_intersects()</text>
+  <text x="165" y="196" text-anchor="middle" class="dim" font-size="10">lens_planner.plan_lens_view()</text>
+
+  <rect x="330" y="142" width="290" height="64" class="nd"/>
+  <text x="475" y="164" text-anchor="middle" class="lbl" font-size="11">Per-feature (worker thread)</text>
+  <text x="475" y="180" text-anchor="middle" class="dim" font-size="10">repair_geometry_for_render</text>
+  <text x="475" y="196" text-anchor="middle" class="dim" font-size="10">reproject_geometry_for_render</text>
+
+  <line x1="165" y1="206" x2="245" y2="226" class="edge"/>
+  <line x1="475" y1="206" x2="395" y2="226" class="edge"/>
+
+  <rect x="100" y="228" width="440" height="46" class="nd-ac"/>
+  <text x="320" y="250" text-anchor="middle" class="lbl" font-size="11">layer_ready(fp, past[], arrows[], attr_markers[])</text>
+  <text x="320" y="266" text-anchor="middle" class="dim" font-size="10">Each item = (wkb_bytes, attribute_list) &mdash; no QGIS objects</text>
+  <line x1="320" y1="274" x2="320" y2="290" class="edge-ac"/>
+
+  <rect x="180" y="292" width="280" height="22" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.4"/>
+  <text x="320" y="307" text-anchor="middle" class="lbl" font-size="10.5">UI thread: truncate + addFeatures (&asymp; 5 ms / layer)</text>
+</svg>
+</div>
+
+<div class="info"><strong>Why the worker emits raw bytes.</strong> <code>QgsGeometry</code> is a Qt object and cannot safely cross threads. The worker emits <code>(wkb_bytes, attributes_list)</code>; the UI thread builds <code>QgsGeometry.fromWkb()</code> and calls <code>addFeatures()</code> in one batch.</div>
+</section>
+
+<!-- ============================== LIVE EDITS ============================== -->
+<section id="live-pipe">
+<h2>Live edits</h2>
+<p>While GeoGit is on, the user can keep editing tracked layers. Every commit triggers the same capture pipeline as Restore (<code>edit_tracker</code> &rarr; <code>write_queue</code>); GeoGit listens to the tracker&apos;s <code>committed_features</code> signal and updates the canvas without polling SQLite.</p>
+
+<div class="dia">
+<svg viewBox="0 0 640 220" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20" y="14" width="600" height="42" class="nd"/>
+  <text x="320" y="32" text-anchor="middle" class="lbl" font-size="11">edit_tracker.committed_features (n events)</text>
+  <text x="320" y="48" text-anchor="middle" class="dim" font-size="10">Same signal that feeds Restore &middot; same AuditEvent shape</text>
+  <line x1="320" y1="56" x2="320" y2="74" class="edge-ac"/>
+
+  <rect x="80" y="76" width="480" height="42" class="nd-ac"/>
+  <text x="320" y="98" text-anchor="middle" class="lbl" font-size="11">geogit_session.on_new_events(events)</text>
+  <text x="320" y="114" text-anchor="middle" class="dim" font-size="10">Filter by tracked fingerprint &rarr; append to in-RAM cache</text>
+  <line x1="320" y1="118" x2="320" y2="138" class="edge-ac"/>
+
+  <rect x="80" y="140" width="480" height="42" class="nd"/>
+  <text x="320" y="162" text-anchor="middle" class="lbl" font-size="11">Schedule debounced refresh (600 ms)</text>
+  <text x="320" y="178" text-anchor="middle" class="dim" font-size="10">Same path as a manual pan: render worker &rarr; layer_ready</text>
+  <line x1="320" y1="182" x2="320" y2="198" class="edge"/>
+
+  <rect x="180" y="200" width="280" height="14" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.4"/>
+</svg>
+</div>
+
+<div class="tip"><strong>End-to-end latency.</strong> Commit &rarr; visible overlay &asymp; <code>commit_capture (~50 ms) + debounce (600 ms) + render (~80 ms)</code>. The 600&nbsp;ms debounce is the dominant term; it absorbs back-to-back commits during multi-feature edit sessions.</div>
+</section>
+
+<!-- ============================== STOP PIPELINE ============================== -->
+<section id="stop-pipe">
+<h2>Session stop</h2>
+<p>Toggle off, status pill close button, dialog close, project switch &mdash; four entry points, one teardown path.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Trigger</th><th>Effect</th></tr></thead>
+<tbody>
+  <tr><td>Toggle off</td><td>Cancel render worker &middot; cancel cache worker &middot; <code>session.stop()</code> &middot; remove all <code>__rl_lens_*</code> overlays &middot; clear cache &middot; hide status pill</td></tr>
+  <tr><td>Status pill <kbd>&times;</kbd></td><td>Same as toggle off &middot; toggle widget reverts</td></tr>
+  <tr><td>Dialog close</td><td>Same as toggle off &middot; <code>purge_lens_overlays(&quot;dialog_close&quot;)</code> as belt-and-braces guard</td></tr>
+  <tr><td>Project switch</td><td>Same as dialog close &middot; reset of journal connection drops the cache implicitly</td></tr>
+</tbody>
+</table></div>
+
+<div class="warn"><strong>No persistence.</strong> Memory layers are not stored in the project file even if the user saves. They live in <code>QgsProject.instance()</code> only for the duration of the session.</div>
+</section>
+
+<!-- ============================== OVERLAYS ============================== -->
+<section id="overlays">
+<h2>The three overlays</h2>
+<p>For every tracked source layer, GeoGit creates exactly three memory layers. They share the source CRS but live in their own provider so styles and selections do not leak.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Suffix</th><th>Geometry</th><th>Carries</th><th>What it tells the user</th></tr></thead>
+<tbody>
+  <tr><td><code>geom_past</code></td><td>Same family as source (Point / Line / Polygon)</td><td>OLD geometry of every event in scope</td><td>Where the entity was before the change.</td></tr>
+  <tr><td><code>arrows</code></td><td>LineString</td><td>centroid(OLD) &rarr; centroid(NEW) for UPDATEs with geometry change</td><td>Movement vector. Length and direction tell the eye.</td></tr>
+  <tr><td><code>attr_markers</code></td><td>Point</td><td>centroid for UPDATEs that changed attributes only</td><td>&laquo; something changed but not the shape &raquo; &mdash; opens the diff panel on click.</td></tr>
+</tbody>
+</table></div>
+
+<div class="info"><strong>Attributes carried by every overlay feature.</strong> <code>entity_fp</code>, <code>event_id</code>, <code>created_at</code>, <code>op</code>, <code>user</code>, <code>_rl_age</code>, <code>_rl_class</code> (entity classification). For mode <em>Updates stacked</em> (P1), two more: <code>_rl_opacity</code> and <code>_rl_stack_order</code>. The dock&apos;s diff panel reads <code>event_id</code> to fetch the full attribute delta from SQLite on demand.</div>
+</section>
+
+<!-- ============================== MODES ============================== -->
+<section id="modes">
+<h2>Visualization modes</h2>
+<p><code>LensVisualizationMode</code> declares four modes; only two ship today.</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-strong">Active</div>
+    <div class="card-t">Diff window (Mode B)</div>
+    <p>Default. One past geometry + one arrow + one marker per entity, regardless of how many times it was edited within the time range. Lowest cognitive load.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-strong">Active</div>
+    <div class="card-t">Updates stacked (Mode C)</div>
+    <p>Every successive geometry of the same entity rendered with growing opacity (oldest faintest). A trail line connects centroids in order. Capped at 200 states per entity.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-weak">Planned (P1)</div>
+    <div class="card-t">Snapshot at T (Mode A)</div>
+    <p>The state of the layer reconstructed at one cutoff date. Unlike Mode B, no arrows; only one geometry per entity, the one valid at <em>T</em>.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-weak">Planned (P3)</div>
+    <div class="card-t">Animation</div>
+    <p>Time-driven playback through the timeline. Replays Mode A frames at user-controlled speed. Reuses the same overlays, only the active subset changes per tick.</p>
+  </div>
+</div>
+</section>
+
+<!-- ============================== CLASSIFICATION ============================== -->
+<section id="classification">
+<h2>Entity classification</h2>
+<p>For every entity, the planner inspects its OLD/NEW geometries against the selection bbox at first and last event. The result is one of seven classes carried in the <code>_rl_class</code> attribute and used by the dock symbology.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Class</th><th>Meaning</th></tr></thead>
+<tbody>
+  <tr><td><code>CREATED_IN_ZONE</code></td><td>First event is INSERT and falls inside the bbox.</td></tr>
+  <tr><td><code>DELETED_FROM_ZONE</code></td><td>Last event is DELETE; previous geometries were inside.</td></tr>
+  <tr><td><code>MOVED_INTO_ZONE</code></td><td>Old geometry outside, new geometry inside.</td></tr>
+  <tr><td><code>MOVED_OUT_OF_ZONE</code></td><td>Old geometry inside, new geometry outside.</td></tr>
+  <tr><td><code>MOVED_WITHIN_ZONE</code></td><td>Both inside, geometry differs.</td></tr>
+  <tr><td><code>ATTR_ONLY_IN_ZONE</code></td><td>Geometry stable, attributes changed.</td></tr>
+  <tr><td><code>UPDATED_IN_ZONE</code></td><td>Generic UPDATE inside the bbox; fallback bucket.</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ============================== MODULE CATALOG ============================== -->
+<section id="cat-contracts">
+<h2>Module catalog &mdash; Contracts</h2>
+<p>Pure data, zero QGIS, zero Qt. The vocabulary every other GeoGit module agrees on.</p>
+
+<div class="tw"><table>
+<thead><tr><th>File</th><th>Lines</th><th>Owns</th></tr></thead>
+<tbody>
+  <tr><td><code>core/lens_contracts.py</code></td><td>186</td><td>Enums (<code>LensOpFilter</code>, <code>LensVisualizationMode</code>, <code>EntityClassification</code>) and NamedTuples (<code>LensSelection</code>, <code>EntityState</code>, <code>EntityTimeline</code>, <code>LensFetchStats</code>, <code>LensRenderPlan</code>, <code>LensRenderResult</code>, <code>LensRefreshOutcome</code>).</td></tr>
+  <tr><td><code>core/wkb_envelope.py</code></td><td>250</td><td>WKB envelope parser using only the standard library. <code>parse_envelope(wkb)</code> returns a 4-tuple; <code>envelope_intersects(a, b)</code> answers in O(1) without GEOS.</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<section id="cat-domain">
+<h2>Module catalog &mdash; Domain (planner, renderer)</h2>
+<p>Pure logic. Same import discipline as the contracts. Tested without a running QGIS instance.</p>
+
+<div class="tw"><table>
+<thead><tr><th>File</th><th>Lines</th><th>Role</th></tr></thead>
+<tbody>
+  <tr><td><code>core/lens_planner.py</code></td><td>236</td><td>Groups events by entity (fingerprint preferred, identity_json fallback for shapefile FID recycling), orders timelines, builds <code>EntityState</code>s with old/new geom and attr delta, classifies the entity. Output: <code>LensRenderPlan</code>.</td></tr>
+  <tr><td><code>core/lens_renderer.py</code></td><td>549</td><td>Synchronous renderer that consumes a plan and creates the three QGIS memory layers in one call. Used by the standalone Time Lens dock; reused by <code>geogit_session</code> for overlay creation primitives (<code>_make_overlay_layer</code>) and by the render worker as the attribute schema reference.</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<section id="cat-session">
+<h2>Module catalog &mdash; Session &amp; workers</h2>
+<p>Where domain meets QGIS. The session lives on the UI thread; the workers run off it.</p>
+
+<div class="tw"><table>
+<thead><tr><th>File</th><th>Lines</th><th>Role</th></tr></thead>
+<tbody>
+  <tr><td><code>core/geogit_session.py</code></td><td>505</td><td>Owns the in-RAM event cache, the three overlay layer IDs per source, the active flag, and the destination CRS. Methods: <code>start()</code>, <code>refresh_viewport(bbox)</code>, <code>refresh_one_layer(fp, bbox)</code>, <code>on_new_events(events)</code>, <code>stop()</code>.</td></tr>
+  <tr><td><code>widgets/geogit_worker.py</code></td><td>117</td><td>One-shot QThread for the initial cache load. Emits <code>progress(layer_name, n_events, idx)</code>, <code>finished_ok(trace_id, cache)</code>, <code>finished_err(trace_id, msg)</code>.</td></tr>
+  <tr><td><code>widgets/geogit_render_worker.py</code></td><td>512</td><td>Per-viewport feature builder. Cancelable. Emits <code>layer_ready(fp, past[], arrows[], attr_markers[])</code> with raw <code>(wkb_bytes, attrs)</code> tuples and finally <code>all_done({n_entities, n_features, elapsed_ms})</code>.</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<section id="cat-ui">
+<h2>Module catalog &mdash; UI surface</h2>
+
+<div class="tw"><table>
+<thead><tr><th>File</th><th>Lines</th><th>Role</th></tr></thead>
+<tbody>
+  <tr><td><code>widgets/temporal_lens_dock.py</code></td><td>994</td><td>QDockWidget hosting the GeoGit panel: presets, custom date range, op filter, mode selector, entity list, attribute diff panel, status messages, error banner. Fully i18n (FR/EN, 56 entries).</td></tr>
+  <tr><td><code>widgets/temporal_lens_map_tool.py</code></td><td>108</td><td>Rectangle map tool used to draw the GeoGit selection bbox.</td></tr>
+  <tr><td><code>widgets/temporal_lens_polygon_map_tool.py</code></td><td>111</td><td>Polygon map tool variant for irregular zones.</td></tr>
+  <tr><td><code>widgets/geogit_status_widget.py</code></td><td>246</td><td>Status bar pill: phase dot (idle / fetch / render / alert), entity counter, OFF button. Inserted in the QGIS main status bar only when a session is active.</td></tr>
+  <tr><td><code>widgets/geogit_segmented_switch.py</code></td><td>114</td><td>Segmented switch &laquo; Present / GeoGit &raquo; for the dialog header.</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ============================== THREADING ============================== -->
+<section id="threads">
+<h2>Threading model</h2>
+<p>Three threads cooperate, no shared mutable state crosses the boundary except the immutable event cache snapshot passed by reference to the render worker.</p>
+
+<div class="dia">
+<svg viewBox="0 0 640 280" xmlns="http://www.w3.org/2000/svg">
+  <rect x="14" y="14" width="612" height="100" rx="8" fill="var(--bg2)" stroke="var(--ac)" stroke-width="1.5"/>
+  <text x="28" y="38" class="lbl" font-size="12">UI thread</text>
+  <rect x="36" y="50" width="160" height="50" class="nd"/>
+  <text x="116" y="72" text-anchor="middle" class="lbl" font-size="10.5">recover_dialog</text>
+  <text x="116" y="87" text-anchor="middle" class="dim" font-size="9.5">toggle &middot; debounce</text>
+  <rect x="210" y="50" width="170" height="50" class="nd"/>
+  <text x="295" y="72" text-anchor="middle" class="lbl" font-size="10.5">geogit_session</text>
+  <text x="295" y="87" text-anchor="middle" class="dim" font-size="9.5">cache &middot; overlay add</text>
+  <rect x="394" y="50" width="216" height="50" class="nd"/>
+  <text x="502" y="72" text-anchor="middle" class="lbl" font-size="10.5">temporal_lens_dock</text>
+  <text x="502" y="87" text-anchor="middle" class="dim" font-size="9.5">entity list, diff panel</text>
+
+  <rect x="14" y="130" width="612" height="64" rx="8" fill="var(--bg2)" stroke="var(--brd)" stroke-width="1"/>
+  <text x="28" y="154" class="lbl" font-size="12">Worker threads (QThread)</text>
+  <rect x="36" y="166" width="280" height="22" class="nd"/>
+  <text x="176" y="182" text-anchor="middle" class="lbl" font-size="10.5">geogit_worker (cache load &mdash; one-shot)</text>
+  <rect x="330" y="166" width="280" height="22" class="nd"/>
+  <text x="470" y="182" text-anchor="middle" class="lbl" font-size="10.5">geogit_render_worker (per refresh &mdash; cancelable)</text>
+
+  <rect x="180" y="216" width="280" height="50" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
+  <text x="320" y="240" text-anchor="middle" class="lbl" font-size="11.5">SQLite read-only connection</text>
+  <text x="320" y="256" text-anchor="middle" class="dim" font-size="10">PRAGMA query_only=1 &middot; shared with stats &amp; search</text>
+
+  <line x1="295" y1="100" x2="176" y2="166" class="edge-ac"/>
+  <line x1="295" y1="100" x2="470" y2="166" class="edge-ac"/>
+  <line x1="176" y1="188" x2="280" y2="216" class="edge"/>
+  <line x1="470" y1="188" x2="360" y2="216" class="edge"/>
+</svg>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Thread</th><th>Owns</th><th>Lifetime</th></tr></thead>
+<tbody>
+  <tr><td><strong>UI</strong></td><td>Cache mutation, overlay creation, addFeatures, signal handlers</td><td>Plugin lifetime</td></tr>
+  <tr><td><strong>Cache worker</strong></td><td>Initial bulk SELECT into the cache dict</td><td>One shot per session start</td></tr>
+  <tr><td><strong>Render worker</strong></td><td>Envelope filter + planner + repair + reproject + WKB serialization</td><td>One per viewport refresh, cancelable</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ============================== STATUSBAR ============================== -->
+<section id="statusbar">
+<h2>Status bar pill</h2>
+<p>The QGIS status bar carries two RecoverLand widgets with distinct roles. The GeoGit pill is hidden when the mode is off; it appears only when a session runs.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Widget</th><th>Visible when</th><th>Shows</th></tr></thead>
+<tbody>
+  <tr><td><code>StatusBarIndicator</code> (existing)</td><td>Always</td><td>Tracking on/off, journal health, event count.</td></tr>
+  <tr><td><code>GeoGitStatusWidget</code> (new)</td><td>GeoGit session active</td><td>Phase dot (idle / fetch / render / alert), <code>GeoGit &middot; n</code> entity counter, OFF button (&times;).</td></tr>
+</tbody>
+</table></div>
+
+<div class="info"><strong>Insertion order.</strong> The pill is inserted with <code>insertPermanentWidget(0, &hellip;)</code> so it sits left of the QGIS coordinate display. <code>QApplication.processEvents()</code> is called right after insertion to force an immediate repaint before <code>recover_and_load()</code> blocks the UI thread.</div>
+</section>
+
+<!-- ============================== PERFORMANCE ============================== -->
+<section id="perf">
+<h2>Performance budget</h2>
+
+<div class="tw"><table>
+<thead><tr><th>Operation</th><th>Target</th><th>Mechanism</th></tr></thead>
+<tbody>
+  <tr><td>Toggle ON &rarr; pill visible</td><td>&lt; 50 ms</td><td>Synchronous insert + <code>processEvents()</code></td></tr>
+  <tr><td>Cache load (10k events, 5 layers)</td><td>&lt; 1.5 s</td><td>Single bounded SELECT in QThread</td></tr>
+  <tr><td>Viewport refresh (one layer in extent)</td><td>20&ndash;80 ms</td><td>Pure-Python envelope filter on cached dict</td></tr>
+  <tr><td>UI thread <code>addFeatures</code></td><td>&asymp; 5 ms / layer</td><td>Memory provider, batched in one call</td></tr>
+  <tr><td>Live edit &rarr; visible</td><td>&lt; 800 ms</td><td>600 ms debounce + 80 ms render + 5 ms add</td></tr>
+  <tr><td>RAM at 50k cached events</td><td>&asymp; 100 MB</td><td>~2 KB per <code>AuditEvent</code> in cache</td></tr>
+</tbody>
+</table></div>
+
+<div class="warn"><strong>Truncation.</strong> Above <code>MAX_EVENTS_PER_RESTORE</code> events in the time range, the fetch returns a truncated list and <code>fetch_stats.n_events_truncated</code> is non-zero. The dock paints a red header banner; older events are simply not displayed.</div>
+</section>
+
+<!-- ============================== INTEGRATION ============================== -->
+<section id="integration">
+<h2>Integration with Restore</h2>
+<p>GeoGit and Restore consume the same audit events and share four core modules. The relationship is &laquo; same data, opposite verb &raquo;.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Module</th><th>Used by Restore</th><th>Used by GeoGit</th></tr></thead>
+<tbody>
+  <tr><td><code>core/event_stream_repository</code></td><td><code>fetch_events_after_cutoff</code></td><td><code>fetch_events_in_zone</code></td></tr>
+  <tr><td><code>core/geometry_utils</code></td><td>WKB &lrarr; QgsGeometry, comparison</td><td>+ <code>repair_geometry_for_render</code> &middot; <code>reproject_geometry_for_render</code></td></tr>
+  <tr><td><code>core/identity</code></td><td>Match snapshot to live feature</td><td>Group events by entity</td></tr>
+  <tr><td><code>core/journal_manager</code></td><td>Read/write SQLite connection</td><td>Read-only SQLite connection</td></tr>
+</tbody>
+</table></div>
+
+<div class="info"><strong>Why share, not duplicate.</strong> Invariant <em>IL-I4</em> from the Time Lens charter: any logic that already exists for Restore is extended in place, never copied. New GeoGit-specific behaviour goes into <code>lens_*</code> or <code>geogit_*</code> modules; reusable primitives are added to the existing core modules.</div>
+
+<div class="tip"><strong>Read this next.</strong> See <a href="architecture.html">Architecture</a> for the full plugin map. The <a href="architecture.html#capture-pipe">Capture pipeline</a> is the upstream that feeds GeoGit. The <a href="architecture.html#restore-pipe">Restore pipeline</a> is the symmetric write-back path.</div>
+</section>
+
+<!-- ============================== KNOWN DEBT ============================== -->
+<section id="debt">
+<h2>Known debt</h2>
+<p>The mode is healthy on most axes. The debt is concentrated in two exact places. Naming them here makes them easier to attack later.</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-weak">Debt 1</div>
+    <div class="card-t">Two render paths</div>
+    <p>The synchronous <code>core/lens_renderer.execute_lens_render()</code> (used by the standalone dock) and the async <code>widgets/geogit_render_worker</code> (used by the live GeoGit session) duplicate most of the planner-to-feature build logic. A future P2 item should fold the sync path into a thin wrapper around the worker output.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-weak">Debt 2</div>
+    <div class="card-t">Mode A (Snapshot at T) not yet implemented</div>
+    <p>Declared in <code>LensVisualizationMode</code> but no rendering branch. The planner already carries enough information to support it; only the renderer needs an extra strategy.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-strong">Healthy</div>
+    <div class="card-t">Everything else</div>
+    <p>Contracts pure, session bounded, workers cancelable, status pill scoped to active sessions. No leak detected in lifecycle scenarios <code>il9_lifecycle</code> (6/6 PASS) and <code>il15_geogit_mode</code>.</p>
+  </div>
+</div>
+</section>
+
+</main>
+
+<aside class="rp">
+  <div class="srch" style="margin-bottom:16px">
+    <svg class="srch-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="si" placeholder="Search..." autocomplete="off">
+    <div class="srch-res" id="sr"></div>
+  </div>
+  <h4>On this page</h4>
+  <div id="rp-toc"></div>
+</aside>
+</div>
+
+<footer>RecoverLand 4.9.0 &middot; GEODECI &middot; Technical documentation</footer>
+<script src="rl.js?v=20"></script>
+</body>
+</html>

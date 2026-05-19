@@ -75,13 +75,14 @@ _DEFAULT_POLICY = ProviderPolicy(
     False, False, 99, "Unknown provider"
 )
 
+
 def _edit_capabilities_mask():
     from ..compat import QgisCompat
     return (
-        QgisCompat.CAP_ADD_FEATURES
-        | QgisCompat.CAP_DELETE_FEATURES
-        | QgisCompat.CAP_CHANGE_ATTRIBUTE_VALUES
-        | QgisCompat.CAP_CHANGE_GEOMETRIES
+        QgisCompat.CAP_ADD_FEATURES |
+        QgisCompat.CAP_DELETE_FEATURES |
+        QgisCompat.CAP_CHANGE_ATTRIBUTE_VALUES |
+        QgisCompat.CAP_CHANGE_GEOMETRIES
     )
 
 

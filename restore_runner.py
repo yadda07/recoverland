@@ -25,10 +25,16 @@ from .core.workflow_service import GroupedRestoreResult
 from .core.logger import flog
 from .core.observability import log_cycle_summary
 from .core.geometry_utils import (
-    feature_geom_short_repr, wkb_short_repr,
+    feature_geom_short_repr, heavy_diag_enabled, wkb_short_repr,
 )
 
-_CHUNK_SIZE = 20
+# Chunk size for the QTimer-driven restore loop. Each chunk is processed
+# synchronously on the UI thread; smaller chunks = more frequent yields
+# = the logo animation and progress smoother stay responsive. The total
+# rewind throughput is barely affected because the per-chunk overhead
+# (slice + emit + singleShot) is negligible compared to the actual
+# layer.changeGeometry / layer.addFeatures calls inside restore_batch.
+_CHUNK_SIZE = 5
 
 _RUNNER_TO_CYCLE: Dict[str, str] = {
     "RestoreRunner": "event_restore",
@@ -594,18 +600,29 @@ class StrictRestoreRunner(QObject):
         count_before = layer.featureCount()
         self._strict_count_before = count_before
 
-        upd_geom_state = {}
-        for a in group:
-            wkb = getattr(a, 'new_geometry_wkb', None)
-            if not wkb:
-                continue
-            try:
-                fid = json.loads(a.feature_identity_json).get('fid')
-                if fid is not None:
-                    upd_geom_state[fid] = feature_geom_short_repr(layer, fid)
-            except Exception as exc:
-                flog(f"EDIT_START err eid={getattr(a,'event_id','?')} exc={exc}", "WARNING")
-        flog(f"EDIT_START layer={layer_name} n_geom_upd={len(upd_geom_state)} geom_at_start={upd_geom_state}")
+        # Pre-fetch geom snapshots for the forensic EDIT_START log. This is
+        # the single biggest cause of the UI freeze during a rewind: it
+        # does one provider.getFeatures() per UPDATE event before the first
+        # chunk runs. Gate it on the RECOVERLAND_HEAVY_DIAG opt-in.
+        n_update_events = sum(
+            1 for a in group
+            if getattr(a, 'new_geometry_wkb', None)
+        )
+        if heavy_diag_enabled():
+            upd_geom_state = {}
+            for a in group:
+                wkb = getattr(a, 'new_geometry_wkb', None)
+                if not wkb:
+                    continue
+                try:
+                    fid = json.loads(a.feature_identity_json).get('fid')
+                    if fid is not None:
+                        upd_geom_state[fid] = feature_geom_short_repr(layer, fid)
+                except Exception as exc:
+                    flog(f"EDIT_START err eid={getattr(a,'event_id','?')} exc={exc}", "WARNING")
+            flog(f"EDIT_START layer={layer_name} n_geom_upd={len(upd_geom_state)} geom_at_start={upd_geom_state}")
+        else:
+            flog(f"EDIT_START layer={layer_name} n_geom_upd={n_update_events} geom_at_start=diag_off")
 
         layer.beginEditCommand("RecoverLand: temporal restore")
 
@@ -627,6 +644,11 @@ class StrictRestoreRunner(QObject):
             self._errors.append(f"Internal error: {exc}")
             self._rollback_strict(prefix, "internal_crash")
 
+    # Threshold above which a single chunk is suspected of freezing the
+    # UI thread (Windows reports "(Ne repond pas)" around 5 s, but the
+    # animation visibly stutters from ~150-200 ms onwards).
+    _CHUNK_SLOW_MS = 200
+
     def _process_strict_chunk_inner(self) -> None:
         """Inner chunk logic, called by _process_strict_chunk with crash guard."""
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
@@ -636,6 +658,7 @@ class StrictRestoreRunner(QObject):
         actions = plan.actions
         start = self._strict_action_idx
         end = min(start + _CHUNK_SIZE, len(actions))
+        chunk_t0 = time.monotonic()
 
         if self._cancelled:
             self._rollback_strict(prefix, "cancel_requested")
@@ -720,6 +743,12 @@ class StrictRestoreRunner(QObject):
         self._processed += (end - start)
         self.progress.emit(self._processed, len(self._events))
 
+        chunk_elapsed_ms = (time.monotonic() - chunk_t0) * 1000.0
+        if chunk_elapsed_ms > self._CHUNK_SLOW_MS:
+            flog(f"{prefix}CHUNK_SLOW layer={self._strict_layer_name!r} "
+                 f"actions={start}..{end} n={end - start} "
+                 f"elapsed_ms={chunk_elapsed_ms:.0f}", "WARNING")
+
         if self._strict_action_idx >= len(actions):
             self._commit_strict(prefix)
         else:
@@ -780,7 +809,15 @@ class StrictRestoreRunner(QObject):
         persisted geometry does not match the target, the commit silently
         re-applied the buffer state or the provider rejected the geom
         update without flagging an error.
+
+        Gated on RECOVERLAND_HEAVY_DIAG: each iteration does one
+        provider.getFeatures() and we run the loop on the UI thread.
+        Skipped by default to keep the rewind responsive.
         """
+        if not heavy_diag_enabled():
+            flog(f"{prefix}TRACE_POST_COMMIT: layer={layer_name} skipped "
+                 f"(set RECOVERLAND_HEAVY_DIAG=1 to enable per-event check)")
+            return
         try:
             import json
         except ImportError:
@@ -1063,18 +1100,23 @@ class UndoRunner(QObject):
             self._failed_eids.append(eid)
         if report.succeeded:
             layer.reload()
-            import json as _json
-            geom_check = {}
-            for ev in group:
-                if getattr(ev, 'new_geometry_wkb', None) is not None:
-                    try:
-                        fid = _json.loads(ev.feature_identity_json).get('fid')
-                        if fid is not None:
-                            geom_check[fid] = feature_geom_short_repr(layer, fid)
-                    except Exception:
-                        pass
-            flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
-                 f"geom_after_reload={geom_check}")
+            if heavy_diag_enabled():
+                import json as _json
+                geom_check = {}
+                for ev in group:
+                    if getattr(ev, 'new_geometry_wkb', None) is not None:
+                        try:
+                            fid = _json.loads(ev.feature_identity_json).get('fid')
+                            if fid is not None:
+                                geom_check[fid] = feature_geom_short_repr(layer, fid)
+                        except Exception:
+                            pass
+                flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
+                     f"geom_after_reload={geom_check}")
+            else:
+                flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
+                     f"geom_after_reload=diag_off "
+                     f"(set RECOVERLAND_HEAVY_DIAG=1 to enable)")
         count_after = layer.featureCount()
         flog(f"UndoRunner: group_done layer={layer_name_hint!r} "
              f"ok={len(report.succeeded)} fail={len(report.failed)} "
