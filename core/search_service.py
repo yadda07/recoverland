@@ -63,10 +63,10 @@ def search_events(conn: sqlite3.Connection,
         assert_safe_fragment(where_clause)
         # B608: static columns list; `where_clause` built with whitelist; values via `?`.
         query = (
-            "SELECT " + cols  # nosec B608
-            + " FROM audit_event "
-            + where_clause
-            + " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            "SELECT " + cols +  # nosec B608
+            " FROM audit_event " +
+            where_clause +
+            " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         )
         all_params = params + [page_size, offset]
         rows = conn.execute(query, all_params).fetchall()
@@ -87,8 +87,8 @@ def get_event_by_id(conn: sqlite3.Connection, event_id: int) -> Optional[AuditEv
     """Retrieve a single event by its ID."""
     # B608: AUDIT_EVENT_SELECT_SQL is a module-level whitelist; value via `?`.
     query = (
-        "SELECT " + AUDIT_EVENT_SELECT_SQL  # nosec B608
-        + " FROM audit_event WHERE event_id = ?"
+        "SELECT " + AUDIT_EVENT_SELECT_SQL +  # nosec B608
+        " FROM audit_event WHERE event_id = ?"
     )
     row = conn.execute(query, (event_id,)).fetchone()
     if row is None:

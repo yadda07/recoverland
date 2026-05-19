@@ -20,7 +20,8 @@ from .constants import MAKEVALID_DRIFT_TOLERANCE
 from .geometry_utils import (
     rebuild_geometry, is_geometry_present,
     feature_matches_geometry, get_feature_source,
-    wkb_short_repr, feature_geom_short_repr,
+    wkb_short_repr, feature_geom_short_repr_diag,
+    heavy_diag_enabled,
     _compute_makevalid_drift,
 )
 from .serialization import iter_mapped_attributes
@@ -296,7 +297,7 @@ def _buffer_insert(layer, event: AuditEvent,
     fp = event.entity_fingerprint or '?'
     prev = fid_remap.get(fp) if fid_remap and fp != '?' else None
     _record_remap(fid_remap, event, new_fid)
-    geom_repr = feature_geom_short_repr(layer, new_fid) if new_fid else '?'
+    geom_repr = feature_geom_short_repr_diag(layer, new_fid) if new_fid else '?'
     ins_fields = {
         "eid": event.event_id,
         "fp": fp,
@@ -711,20 +712,29 @@ def _buffer_update(layer, event: AuditEvent,
                      f"applying as-is eid={event.event_id} fid={target_fid} "
                      f"(RW-19a: trust original WKB)", "WARNING")
 
-        before_apply = feature_geom_short_repr(layer, target_fid)
-        old_target = wkb_short_repr(event.geometry_wkb)
-
-        identical = _current_geom_matches(layer, target_fid, geom)
+        # TRACE_RESTORE: forensic snapshot of the buffer state around the
+        # changeGeometry call. Costs 1 provider getFeatures and 3 WKB
+        # serializations per UPDATE event; gated to keep the rewind
+        # responsive (~10-50 ms per event saved on shapefile providers).
+        if heavy_diag_enabled():
+            before_apply = feature_geom_short_repr_diag(layer, target_fid)
+            old_target = wkb_short_repr(event.geometry_wkb)
+            identical = _current_geom_matches(layer, target_fid, geom)
+        else:
+            before_apply = "diag_off"
+            old_target = "diag_off"
+            identical = False
 
         change_ok = layer.changeGeometry(target_fid, geom)
-        after_apply = feature_geom_short_repr(layer, target_fid)
 
-        flog(f"TRACE_RESTORE: eid={event.event_id} fid={target_fid} "
-             f"before_apply={before_apply} "
-             f"target_OLD={old_target} "
-             f"changeGeometry={change_ok} "
-             f"after_apply={after_apply} "
-             f"identical={identical}")
+        if heavy_diag_enabled():
+            after_apply = feature_geom_short_repr_diag(layer, target_fid)
+            flog(f"TRACE_RESTORE: eid={event.event_id} fid={target_fid} "
+                 f"before_apply={before_apply} "
+                 f"target_OLD={old_target} "
+                 f"changeGeometry={change_ok} "
+                 f"after_apply={after_apply} "
+                 f"identical={identical}")
 
         if not change_ok:
             geom_status = "changeGeometry_rejected"
@@ -878,10 +888,11 @@ def _target_matches_update_post_state(layer, fid: int, event) -> bool:
     if not is_geometry_present(geom):
         flog(f"POST_CHK eid={event.event_id} fid={fid} new_wkb=unparseable→skip=True", "DEBUG")
         return True
-    expected_repr = wkb_short_repr(bytes(geom.asWkb())) if geom else '?'
     match = _current_geom_matches(layer, fid, geom)
-    flog(f"POST_CHK eid={event.event_id} fid={fid} "
-         f"new={expected_repr} match={match}", "DEBUG")
+    if heavy_diag_enabled():
+        expected_repr = wkb_short_repr(bytes(geom.asWkb())) if geom else '?'
+        flog(f"POST_CHK eid={event.event_id} fid={fid} "
+             f"new={expected_repr} match={match}", "DEBUG")
     return match
 
 
@@ -927,11 +938,16 @@ def _current_geom_matches(layer, fid: int, expected_geom) -> bool:
         request = QgsFeatureRequest(fid)
         source = get_feature_source(layer)
         for feature in source(request):
-            actual = feature.geometry()
-            actual_repr = wkb_short_repr(bytes(actual.asWkb())) \
-                if actual and not actual.isNull() and not actual.isEmpty() else 'absent'
             result = _feature_geometry_matches(feature, expected_geom)
-            flog(f"CUR_GEOM fid={fid} actual={actual_repr} match={result}", "DEBUG")
+            # WKB serialization for the diagnostic CUR_GEOM log is the
+            # 2nd most expensive op per UPDATE event after the
+            # getFeatures itself. Gate the serialization, keep the
+            # matching logic unconditional.
+            if heavy_diag_enabled():
+                actual = feature.geometry()
+                actual_repr = wkb_short_repr(bytes(actual.asWkb())) \
+                    if actual and not actual.isNull() and not actual.isEmpty() else 'absent'
+                flog(f"CUR_GEOM fid={fid} actual={actual_repr} match={result}", "DEBUG")
             return result
         flog(f"CUR_GEOM fid={fid} actual=fid_not_found match=False", "DEBUG")
     except Exception as exc:

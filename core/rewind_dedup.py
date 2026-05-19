@@ -111,9 +111,9 @@ def _apply_fid_recycle_rewrite(
     rewritten: List[AuditEvent] = []
     for e in events:
         fp = e.entity_fingerprint
-        if (fp and fp in fp_split_eid
-                and e.event_id is not None
-                and e.event_id >= fp_split_eid[fp]):
+        if (fp and fp in fp_split_eid and
+                e.event_id is not None and
+                e.event_id >= fp_split_eid[fp]):
             new_fp = f"{fp}@{fp_split_eid[fp]}"
             rewritten.append(e._replace(entity_fingerprint=new_fp))
         else:
@@ -317,8 +317,8 @@ def _collapse_user_chain(events: List[AuditEvent]) -> List[AuditEvent]:
         first_op = oldest.operation_type
         last_op = newest.operation_type
 
-        if first_op == "INSERT" and last_op == "DELETE" \
-                and _intermediates_all_updates(chain):
+        if (first_op == "INSERT" and last_op == "DELETE" and
+                _intermediates_all_updates(chain)):
             skipped_entities += 1
             continue
 
@@ -402,8 +402,8 @@ def _fuse_long_chain(chain: List[AuditEvent]) -> List[AuditEvent]:
     first_op = oldest.operation_type
     last_op = newest.operation_type
 
-    if first_op == "INSERT" and last_op == "DELETE" \
-            and _intermediates_all_updates(chain):
+    if (first_op == "INSERT" and last_op == "DELETE" and
+            _intermediates_all_updates(chain)):
         return []
 
     if first_op == last_op == "UPDATE":

@@ -245,9 +245,9 @@ def _find_by_snapshot(
     relevant = [
         (hist_name, fields.indexOf(hist_name))
         for hist_name in expected_attrs.keys()
-        if not is_layer_audit_field(hist_name)
-        and fields.indexOf(hist_name) >= 0
-        and fields.indexOf(hist_name) not in pk_field_indices
+        if not is_layer_audit_field(hist_name) and
+        fields.indexOf(hist_name) >= 0 and
+        fields.indexOf(hist_name) not in pk_field_indices
     ]
     pk_skipped = [
         hist_name for hist_name in expected_attrs.keys()
@@ -256,9 +256,9 @@ def _find_by_snapshot(
 
     matches: List[int] = []
     request = QgsFeatureRequest()
-    has_geom_filter = (expected_geom is not None
-                       and hasattr(request, "setFilterRect")
-                       and hasattr(expected_geom, "boundingBox"))
+    has_geom_filter = (expected_geom is not None and
+                       hasattr(request, "setFilterRect") and
+                       hasattr(expected_geom, "boundingBox"))
     if has_geom_filter:
         request.setFilterRect(expected_geom.boundingBox())
     source = get_feature_source(layer)
@@ -415,13 +415,13 @@ def _diagnose_snapshot_miss(layer, event: AuditEvent) -> None:
     relevant = [
         (hist_name, fields.indexOf(hist_name))
         for hist_name in expected_attrs.keys()
-        if not is_layer_audit_field(hist_name)
-        and fields.indexOf(hist_name) >= 0
+        if not is_layer_audit_field(hist_name) and
+        fields.indexOf(hist_name) >= 0
     ]
 
     request = QgsFeatureRequest()
-    if hasattr(request, "setFilterRect") \
-            and hasattr(expected_geom, "boundingBox"):
+    if (hasattr(request, "setFilterRect") and
+            hasattr(expected_geom, "boundingBox")):
         request.setFilterRect(expected_geom.boundingBox())
     source = get_feature_source(layer)
 
@@ -670,9 +670,9 @@ def _classify_restore_result(result: Dict[str, Any]) -> str:
     ):
         return "geometry_drift"
     if (
-        "target feature absent" in msg
-        or "feature already absent" in msg
-        or "identity mismatch" in msg
+        "target feature absent" in msg or
+        "feature already absent" in msg or
+        "identity mismatch" in msg
     ):
         return "target_absent"
     if success and skipped:
@@ -855,8 +855,8 @@ def _undo_update_restore(layer, event: AuditEvent,
             return {"success": False, "message": "Provider lacks geometry change capability"}
         geom = rebuild_geometry(new_geom_wkb)
         if geom is not None:
-            from .geometry_utils import wkb_short_repr, feature_geom_short_repr
-            before_repr = feature_geom_short_repr(layer, target_fid)
+            from .geometry_utils import wkb_short_repr, feature_geom_short_repr_diag
+            before_repr = feature_geom_short_repr_diag(layer, target_fid)
             applying_repr = wkb_short_repr(bytes(geom.asWkb()))
             ok = bool(provider.changeGeometryValues({target_fid: geom}))
             flog(f"UNDO_UPD eid={event.event_id} fid={target_fid} "

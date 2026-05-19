@@ -5,10 +5,10 @@ purge actions, vacuum, integrity check and export.
 """
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSpinBox, QGroupBox, QFormLayout, QMessageBox, QFileDialog,
+    QSpinBox, QGroupBox, QMessageBox, QFileDialog,
     QProgressBar, QCheckBox,
 )
-from qgis.PyQt.QtCore import QTimer, QUrl
+from qgis.PyQt.QtCore import QTimer, QUrl, QElapsedTimer
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.core import QgsApplication, QgsSettings
 
@@ -35,6 +35,9 @@ class JournalMaintenanceDialog(QDialog):
     def __init__(self, journal, parent=None):
         super().__init__(parent)
         self._journal = journal
+        self._vacuum_running = False
+        self._vacuum_size_before = 0
+        self._vacuum_timer = QElapsedTimer()
         self.setWindowTitle(self.tr("RecoverLand - Maintenance du journal"))
         self.setMinimumWidth(520)
         self.setMinimumHeight(400)
@@ -44,11 +47,12 @@ class JournalMaintenanceDialog(QDialog):
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout()
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
 
-        info_group = QGroupBox(self.tr("Informations du journal"))
-        info_layout = QFormLayout()
+        info_group = QGroupBox(self.tr("Journal"))
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(4)
         self._path_label = QLabel("")
         self._path_label.setWordWrap(True)
         self._path_label.setTextInteractionFlags(QtCompat.TEXT_SELECTABLE_BY_MOUSE)
@@ -58,21 +62,21 @@ class JournalMaintenanceDialog(QDialog):
         self._schema_label = QLabel("")
         self._health_label = QLabel("")
         self._health_label.setWordWrap(True)
-        info_layout.addRow(self.tr("Chemin :"), self._path_label)
-        info_layout.addRow(self.tr("Taille :"), self._size_label)
-        info_layout.addRow(self.tr("Evenements :"), self._events_label)
-        info_layout.addRow(self.tr("Historique :"), self._span_label)
-        info_layout.addRow(self.tr("Schema :"), self._schema_label)
-        info_layout.addRow(self.tr("Sante :"), self._health_label)
+        info_layout.addWidget(self._path_label)
+        row1 = QHBoxLayout()
+        row1.setSpacing(16)
+        row1.addWidget(self._size_label)
+        row1.addWidget(self._events_label)
+        row1.addWidget(self._span_label)
+        row1.addWidget(self._schema_label)
+        row1.addStretch()
+        info_layout.addLayout(row1)
+        info_layout.addWidget(self._health_label)
         info_group.setLayout(info_layout)
 
-        open_folder_btn = QPushButton(self.tr("Ouvrir le dossier"))
-        open_folder_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileOpen.svg'))
-        open_folder_btn.setToolTip(self.tr("Ouvrir le dossier contenant le journal"))
-        open_folder_btn.clicked.connect(self._open_journal_folder)
-
-        retention_group = QGroupBox(self.tr("Politique de retention"))
-        retention_layout = QFormLayout()
+        retention_group = QGroupBox(self.tr("Retention"))
+        retention_layout = QVBoxLayout()
+        retention_layout.setSpacing(6)
         self._retention_days_spin = QSpinBox()
         self._retention_days_spin.setRange(7, 3650)
         self._retention_days_spin.setSuffix(self.tr(" jours"))
@@ -81,24 +85,34 @@ class JournalMaintenanceDialog(QDialog):
         self._max_events_spin.setRange(10000, 10_000_000)
         self._max_events_spin.setSingleStep(10000)
         self._max_events_spin.setToolTip(self.tr("Nombre maximum d'evenements"))
-        self._auto_purge_check = QCheckBox(self.tr("Purger automatiquement au demarrage"))
+        self._auto_purge_check = QCheckBox(self.tr("Auto-purge au demarrage"))
         self._auto_purge_check.setToolTip(
             self.tr("Si active, les evenements hors politique sont supprimes a l'ouverture du journal"))
-        retention_layout.addRow(self.tr("Conservation :"), self._retention_days_spin)
-        retention_layout.addRow(self.tr("Maximum :"), self._max_events_spin)
-        retention_layout.addRow("", self._auto_purge_check)
-        save_retention_btn = QPushButton(self.tr("Enregistrer la politique"))
-        save_retention_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSave.svg'))
-        save_retention_btn.clicked.connect(self._save_retention)
-        retention_layout.addRow("", save_retention_btn)
+        spin_row = QHBoxLayout()
+        spin_row.setSpacing(10)
+        spin_row.addWidget(QLabel(self.tr("Conservation :")))
+        spin_row.addWidget(self._retention_days_spin, 1)
+        spin_row.addWidget(QLabel(self.tr("Max :")))
+        spin_row.addWidget(self._max_events_spin, 1)
+        retention_layout.addLayout(spin_row)
+        save_row = QHBoxLayout()
+        save_row.setSpacing(8)
+        self._save_retention_btn = QPushButton(self.tr("Enregistrer"))
+        self._save_retention_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSave.svg'))
+        self._save_retention_btn.clicked.connect(self._save_retention)
+        save_row.addWidget(self._auto_purge_check)
+        save_row.addStretch()
+        save_row.addWidget(self._save_retention_btn)
+        retention_layout.addLayout(save_row)
         retention_group.setLayout(retention_layout)
 
         actions_group = QGroupBox(self.tr("Actions"))
         actions_layout = QVBoxLayout()
-        actions_layout.setSpacing(8)
+        actions_layout.setSpacing(6)
 
         purge_row = QHBoxLayout()
-        self._purge_btn = QPushButton(self.tr("Purger les anciens evenements"))
+        purge_row.setSpacing(8)
+        self._purge_btn = QPushButton(self.tr("Purger"))
         self._purge_btn.setIcon(QgsApplication.getThemeIcon('/mActionDeleteSelected.svg'))
         self._purge_btn.setToolTip(self.tr("Supprimer les evenements hors politique de retention"))
         self._purge_btn.clicked.connect(self._purge_events)
@@ -107,41 +121,53 @@ class JournalMaintenanceDialog(QDialog):
         purge_row.addWidget(self._purge_info, 1)
         actions_layout.addLayout(purge_row)
 
-        vacuum_btn = QPushButton(self.tr("Compacter le journal (VACUUM)"))
-        vacuum_btn.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
-        vacuum_btn.setToolTip(self.tr("Recuperer l'espace disque apres une purge"))
-        vacuum_btn.clicked.connect(self._vacuum_journal)
-        actions_layout.addWidget(vacuum_btn)
+        vacuum_row = QHBoxLayout()
+        vacuum_row.setSpacing(8)
+        self._vacuum_btn = QPushButton(self.tr("Compacter (VACUUM)"))
+        self._vacuum_btn.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
+        self._vacuum_btn.setToolTip(self.tr("Recuperer l'espace disque apres une purge"))
+        self._vacuum_btn.clicked.connect(self._vacuum_journal)
+        self._vacuum_status = QLabel("")
+        self._vacuum_status.setWordWrap(True)
+        vacuum_row.addWidget(self._vacuum_btn)
+        vacuum_row.addWidget(self._vacuum_status, 1)
+        actions_layout.addLayout(vacuum_row)
 
-        integrity_btn = QPushButton(self.tr("Verifier l'integrite"))
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(6)
+        integrity_btn = QPushButton(self.tr("Integrite"))
         integrity_btn.setIcon(QgsApplication.getThemeIcon('/mActionCheckGeometry.svg'))
         integrity_btn.setToolTip(self.tr("Lancer une verification d'integrite du journal"))
         integrity_btn.clicked.connect(self._check_integrity)
-        actions_layout.addWidget(integrity_btn)
-
-        export_btn = QPushButton(self.tr("Exporter le journal"))
+        export_btn = QPushButton(self.tr("Exporter"))
         export_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSaveAs.svg'))
         export_btn.setToolTip(self.tr("Copier le fichier journal vers un emplacement choisi"))
         export_btn.clicked.connect(self._export_journal)
-        actions_layout.addWidget(export_btn)
-
-        analyze_btn = QPushButton(self.tr("Analyser le journal"))
+        analyze_btn = QPushButton(self.tr("Analyser"))
         analyze_btn.setIcon(QgsApplication.getThemeIcon('/mActionIdentify.svg'))
         analyze_btn.setToolTip(
             self.tr("Mesurer la distribution, les doublons et le potentiel d'optimisation"))
         analyze_btn.clicked.connect(self._analyze_journal)
-        actions_layout.addWidget(analyze_btn)
+        open_folder_btn = QPushButton(self.tr("Dossier"))
+        open_folder_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileOpen.svg'))
+        open_folder_btn.setToolTip(self.tr("Ouvrir le dossier contenant le journal"))
+        open_folder_btn.clicked.connect(self._open_journal_folder)
+        tools_row.addWidget(integrity_btn)
+        tools_row.addWidget(export_btn)
+        tools_row.addWidget(analyze_btn)
+        tools_row.addWidget(open_folder_btn)
+        actions_layout.addLayout(tools_row)
 
         actions_group.setLayout(actions_layout)
 
         self._progress = QProgressBar()
         self._progress.setVisible(False)
+        self._progress.setMaximumHeight(6)
 
         close_btn = QPushButton(self.tr("Fermer"))
         close_btn.clicked.connect(self.accept)
 
         layout.addWidget(info_group)
-        layout.addWidget(open_folder_btn)
         layout.addWidget(retention_group)
         layout.addWidget(actions_group)
         layout.addWidget(self._progress)
@@ -154,10 +180,10 @@ class JournalMaintenanceDialog(QDialog):
         path = self._journal.path if self._journal and self._journal.is_open else ""
         self._path_label.setText(path or self.tr("Aucun journal actif"))
         if not path:
-            self._size_label.setText("-")
-            self._events_label.setText("-")
-            self._span_label.setText("-")
-            self._schema_label.setText("-")
+            self._size_label.setText("")
+            self._events_label.setText("")
+            self._span_label.setText("")
+            self._schema_label.setText("")
             self._health_label.setText(self.tr("Aucun journal"))
             return
 
@@ -171,9 +197,10 @@ class JournalMaintenanceDialog(QDialog):
             total = stats["total_events"]
             oldest = stats.get("oldest_event", "")
             newest = stats.get("newest_event", "")
-            self._events_label.setText(f"{total:,}".replace(",", " "))
+            count_str = f"{total:,}".replace(",", " ")
+            self._events_label.setText(f"{count_str} evt")
             span = compute_history_span(oldest, newest)
-            self._span_label.setText(span if span else "-")
+            self._span_label.setText(span if span else "")
 
             from .core.sqlite_schema import get_schema_version
             version = get_schema_version(conn)
@@ -229,8 +256,26 @@ class JournalMaintenanceDialog(QDialog):
         settings.setValue("RecoverLand/retention_days", self._retention_days_spin.value())
         settings.setValue("RecoverLand/max_events", self._max_events_spin.value())
         settings.setValue("RecoverLand/auto_purge", self._auto_purge_check.isChecked())
-        flog(f"Retention policy saved: {self._retention_days_spin.value()}d, "
-             f"{self._max_events_spin.value()} max")
+        flog(f"retention: saved days={self._retention_days_spin.value()} "
+             f"max={self._max_events_spin.value()} "
+             f"auto_purge={self._auto_purge_check.isChecked()}", "INFO")
+        self._flash_save_confirm()
+
+    def _flash_save_confirm(self) -> None:
+        """Briefly show success state on the save button (icon + text + color)."""
+        btn = self._save_retention_btn
+        btn.setText(self.tr("Enregistre"))
+        btn.setIcon(QgsApplication.getThemeIcon('/mIconSuccess.svg'))
+        btn.setStyleSheet("color: #2ecc71; font-weight: 600;")
+        btn.setEnabled(False)
+        QTimer.singleShot(2000, self._reset_save_btn)
+
+    def _reset_save_btn(self) -> None:
+        btn = self._save_retention_btn
+        btn.setText(self.tr("Enregistrer"))
+        btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSave.svg'))
+        btn.setStyleSheet("")
+        btn.setEnabled(True)
 
     def _purge_events(self) -> None:
         if not self._journal or not self._journal.is_open:
@@ -276,20 +321,131 @@ class JournalMaintenanceDialog(QDialog):
     def _vacuum_journal(self) -> None:
         if not self._journal or not self._journal.path:
             return
+        if self._vacuum_running:
+            QMessageBox.information(
+                self, self.tr("Compactage"),
+                self.tr("Un compactage est deja en cours. Veuillez patienter."))
+            return
+
+        path = self._journal.path
+        size_before = get_journal_size_bytes(path)
+        size_str = _format_size(size_before)
+
+        free_pages, page_size = self._get_freelist_info(path)
+        reclaimable = free_pages * page_size
+        if free_pages == 0:
+            self._vacuum_status.setText(self.tr("Deja compacte"))
+            self._vacuum_status.setStyleSheet("color: #4285f4; font-weight: 600;")
+            QMessageBox.information(
+                self, self.tr("Compactage inutile"),
+                self.tr(
+                    "Le journal est deja compacte (0 pages libres).\n\n"
+                    "Taille : {size}\n\n"
+                    "Le compactage ne recupere de l'espace que si des\n"
+                    "evenements ont ete purges au prealable.\n\n"
+                    "Utilisez d'abord 'Purger' pour supprimer les anciens\n"
+                    "evenements, puis compactez."
+                ).format(size=size_str))
+            flog(f"vacuum: skipped, freelist_count=0 size={size_before}", "INFO")
+            return
+
+        reclaimable_str = _format_size(reclaimable)
+        reply = QMessageBox.question(
+            self, self.tr("Confirmer le compactage"),
+            self.tr(
+                "Le compactage (VACUUM) reconstruit le fichier journal.\n\n"
+                "Taille actuelle : {size}\n"
+                "Espace recuperable : {reclaimable} ({pages} pages libres)\n\n"
+                "Cette operation reecrit physiquement tout le fichier.\n"
+                "Continuer ?"
+            ).format(size=size_str, reclaimable=reclaimable_str, pages=free_pages),
+            QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_NO)
+        if reply != QtCompat.MSG_YES:
+            return
+
+        self._vacuum_running = True
+        self._vacuum_size_before = size_before
+        self._vacuum_btn.setEnabled(False)
+        self._vacuum_timer.start()
+        self._vacuum_status.setText(self.tr("Compactage en cours..."))
+        self._vacuum_status.setStyleSheet("color: #ff9800; font-weight: 600;")
         self._progress.setRange(0, 0)
         self._progress.setVisible(True)
+        flog(f"vacuum: user initiated, size_before={size_before}", "INFO")
 
         def on_done(success):
             QTimer.singleShot(0, lambda: self._on_vacuum_finished(success))
 
-        vacuum_async(self._journal.path, callback=on_done)
+        vacuum_async(path, callback=on_done)
 
     def _on_vacuum_finished(self, success: bool) -> None:
+        elapsed_ms = self._vacuum_timer.elapsed()
         self._progress.setVisible(False)
+        self._vacuum_running = False
+        self._vacuum_btn.setEnabled(True)
+
         if success:
+            path = self._journal.path
+            size_after = get_journal_size_bytes(path) if path else 0
+            saved = self._vacuum_size_before - size_after
+            elapsed_s = elapsed_ms / 1000.0
+            before_str = _format_size(self._vacuum_size_before)
+            after_str = _format_size(size_after)
+            saved_str = _format_size(max(saved, 0))
+
+            result_msg = self.tr(
+                "Compactage termine en {time:.1f}s\n"
+                "Avant : {before}\n"
+                "Apres : {after}\n"
+                "Espace recupere : {saved}"
+            ).format(time=elapsed_s, before=before_str,
+                     after=after_str, saved=saved_str)
+
+            self._vacuum_status.setText(
+                self.tr("Termine ({time:.1f}s) - {saved} recupere(s)").format(
+                    time=elapsed_s, saved=saved_str))
+            self._vacuum_status.setStyleSheet("color: #2ecc71; font-weight: 600;")
+
+            flog(f"vacuum: done elapsed_ms={elapsed_ms} "
+                 f"size_before={self._vacuum_size_before} "
+                 f"size_after={size_after} saved={saved}", "INFO")
+
+            QMessageBox.information(
+                self, self.tr("Compactage termine"), result_msg)
             self._refresh_stats()
+            self._flash_size_change(before_str, after_str)
         else:
-            QMessageBox.warning(self, self.tr("VACUUM"), self.tr("Le compactage a echoue."))
+            self._vacuum_status.setText(self.tr("Echec du compactage"))
+            self._vacuum_status.setStyleSheet("color: #db4437; font-weight: 600;")
+            flog(f"vacuum: failed elapsed_ms={elapsed_ms}", "ERROR")
+            QMessageBox.warning(
+                self, self.tr("Echec du compactage"),
+                self.tr(
+                    "Le compactage a echoue apres {time:.1f}s.\n"
+                    "Le journal n'a pas ete modifie.\n\n"
+                    "Verifiez l'integrite du journal et consultez les logs."
+                ).format(time=elapsed_ms / 1000.0))
+
+    def _get_freelist_info(self, path: str) -> tuple:
+        """Return (freelist_count, page_size) from SQLite PRAGMAs."""
+        try:
+            conn = sqlite3.connect(path)
+            free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            psize = conn.execute("PRAGMA page_size").fetchone()[0]
+            conn.close()
+            return (free, psize)
+        except (sqlite3.Error, TypeError):
+            return (0, 4096)
+
+    def _flash_size_change(self, before_str: str, after_str: str) -> None:
+        """Animate the size label to show the before→after transition."""
+        self._size_label.setText(f"{before_str}  →  {after_str}")
+        self._size_label.setStyleSheet(
+            "color: #2ecc71; font-weight: 700; font-size: 13px;")
+        QTimer.singleShot(4000, self._reset_size_label_style)
+
+    def _reset_size_label_style(self) -> None:
+        self._size_label.setStyleSheet("")
 
     def _check_integrity(self) -> None:
         if not self._journal or not self._journal.path:

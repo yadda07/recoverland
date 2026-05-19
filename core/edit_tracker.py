@@ -526,8 +526,8 @@ class EditSessionTracker:
         capture entirely. This avoids recording phantom events when a user
         opens edit mode and commits without modifying anything.
 
-        Guards against OOM: checks buffer thresholds after each capture phase
-        and stops capture if the hard memory limit is exceeded.
+        Guards against OOM: checks buffer thresholds after each capture
+        phase, stopping capture if the hard memory limit is exceeded.
         """
         edit_buf = layer.editBuffer()
         if edit_buf is None:
@@ -722,8 +722,8 @@ class EditSessionTracker:
             committedFeaturesRemoved (when at least one such signal was
             received; otherwise we trust the pre-commit deletion buffer).
           * UPDATE events use NEW state from committedAttributeValuesChanges
-            and committedGeometriesChanges when present, falling back to the
-            pre-commit projection captured via layer.getFeatures.
+            plus committedGeometriesChanges when present, falling back to
+            the pre-commit projection captured via layer.getFeatures.
         """
         net = buf.compute_net_effect()
         events: List[AuditEvent] = []

@@ -1146,7 +1146,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._geogit_toggle.setVisible(False)
         self._geogit_toggle.toggled.connect(self._on_geogit_toggle)
 
-        from qgis.PyQt.QtWidgets import QComboBox
         self._geogit_viz_combo = QComboBox(self)
         self._geogit_viz_combo.addItem(self.tr("Diff condense"), "diff_window")
         self._geogit_viz_combo.addItem(self.tr("Empile (ghost)"), "updates_stacked")

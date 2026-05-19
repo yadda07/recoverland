@@ -143,9 +143,12 @@ _ATTR_FIELDS = (
     ("op", "string", 8),
     ("user", "string", 64),
     ("age_label", "string", 16),
+    ("age_days", "integer", None),
     ("is_repaired", "integer", None),
     ("classification", "string", 32),
 )
+
+_GEOGIT_GROUP_NAME = "GeoGit"
 
 
 def _build_memory_uri(geom_family: str, dst_crs_authid: str) -> str:
@@ -171,6 +174,21 @@ def _make_overlay_layer(
     return layer
 
 
+def _age_days(created_at_iso: str, now: Optional[datetime] = None) -> int:
+    """Return the number of days since the event. 0 = today."""
+    if not created_at_iso:
+        return 9999
+    try:
+        ts = datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return 9999
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return max(0, (now - ts).days)
+
+
 def _feature_attrs(
     entity_fp: str,
     state,
@@ -184,6 +202,7 @@ def _feature_attrs(
         state.operation_type,
         state.user_name or "",
         _age_label(state.created_at, now),
+        _age_days(state.created_at, now),
         0,  # is_repaired: phase 08a does not track repair drift yet
         classification,
     ]
@@ -191,23 +210,22 @@ def _feature_attrs(
 
 # ----- Style inheritance (BL-IL-P1-13) ----------------------------------
 
-_GHOST_OPACITY = 0.4
-
-
 def _apply_source_style(overlay_layer, source_layer, trace_id: str = ""):
-    """Clone the source layer QML style onto the overlay and set opacity.
+    """Clone the source layer style + graduated opacity by age_days.
 
-    Uses ``QgsMapLayerStyle`` (cross-version safe) to snapshot the
-    current rendering of *source_layer* and replay it onto *overlay_layer*.
-    If the source layer is unavailable or the style transfer fails, the
-    overlay keeps its default QGIS style — never crashes.
+    Uses ``QgsMapLayerStyle`` to snapshot the source layer rendering,
+    then sets a data-defined opacity expression on the symbol so older
+    features appear more transparent (graduated from 90% to 25%).
     """
     from .logger import flog  # noqa: PLC0415
 
     if source_layer is None:
         return
     try:
-        from qgis.core import QgsMapLayerStyle  # noqa: PLC0415
+        from qgis.core import (  # noqa: PLC0415
+            QgsMapLayerStyle,
+            QgsProperty,
+        )
 
         style = QgsMapLayerStyle()
         style.readFromLayer(source_layer)
@@ -219,18 +237,72 @@ def _apply_source_style(overlay_layer, source_layer, trace_id: str = ""):
             )
             return
         style.writeToLayer(overlay_layer)
-        overlay_layer.setOpacity(_GHOST_OPACITY)
+        overlay_layer.setOpacity(1.0)
+        _apply_age_opacity(overlay_layer, trace_id)
         overlay_layer.triggerRepaint()
         flog(
             f"lens_renderer event=style_cloned "
             f"trace_id={trace_id} source={source_layer.name()} "
-            f"opacity={_GHOST_OPACITY}",
+            f"opacity=graduated_by_age_days",
             "INFO",
         )
     except Exception as exc:  # noqa: BLE001
         flog(
             f"lens_renderer event=style_clone_error "
             f"trace_id={trace_id} type={type(exc).__name__}",
+            "WARNING",
+        )
+
+
+def _apply_age_opacity(overlay_layer, trace_id: str = "") -> None:
+    """Set data-defined opacity on each symbol level based on age_days.
+
+    Expression: scale_linear(age_days, 0, 30, 90, 25) clamped.
+    - today (age_days=0) → 90% opacity
+    - 30+ days → 25% opacity
+    """
+    from .logger import flog  # noqa: PLC0415
+
+    try:
+        from qgis.core import QgsProperty  # noqa: PLC0415
+
+        renderer = overlay_layer.renderer()
+        if renderer is None:
+            return
+        expr = (
+            "scale_linear(\"age_days\", 0, 30, 90, 25)"
+        )
+        prop = QgsProperty.fromExpression(expr)
+        symbol = renderer.symbol() if hasattr(renderer, 'symbol') else None
+        if symbol is not None:
+            for i in range(symbol.symbolLayerCount()):
+                sl = symbol.symbolLayer(i)
+                sl.setDataDefinedProperty(
+                    sl.PropertyFillColor if hasattr(sl, 'PropertyFillColor')
+                    else 0,
+                    QgsProperty(),
+                )
+            symbol.setDataDefinedProperty(
+                symbol.PropertyOpacity, prop,
+            )
+        else:
+            symbols = renderer.symbols(
+                overlay_layer.createMapRenderer(None)
+                if hasattr(overlay_layer, 'createMapRenderer')
+                else None
+            ) if hasattr(renderer, 'symbols') else []
+            for sym in (symbols or []):
+                sym.setDataDefinedProperty(
+                    sym.PropertyOpacity, prop,
+                )
+        flog(
+            f"lens_renderer event=age_opacity_applied trace_id={trace_id}",
+            "DEBUG",
+        )
+    except Exception as exc:  # noqa: BLE001
+        flog(
+            f"lens_renderer event=age_opacity_error "
+            f"trace_id={trace_id} type={type(exc).__name__} err={exc!r}",
             "WARNING",
         )
 
@@ -430,9 +502,16 @@ def execute_lens_render(
     _apply_source_style(past_layer, source_layer, trace_id)
 
     project = QgsProject.instance()
-    project.addMapLayer(past_layer, True)
-    project.addMapLayer(arrows_layer, True)
-    project.addMapLayer(attr_layer, True)
+    root = project.layerTreeRoot()
+    group = root.findGroup(_GEOGIT_GROUP_NAME)
+    if group is None:
+        group = root.insertGroup(0, _GEOGIT_GROUP_NAME)
+    project.addMapLayer(past_layer, False)
+    project.addMapLayer(arrows_layer, False)
+    project.addMapLayer(attr_layer, False)
+    group.addLayer(past_layer)
+    group.addLayer(arrows_layer)
+    group.addLayer(attr_layer)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     flog(

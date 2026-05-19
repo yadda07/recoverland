@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="view-transition" content="same-origin">
+<title>Maintenance - RecoverLand</title>
+<script>(function(){try{var t=localStorage.getItem('rl-theme');var d=document.documentElement;d.setAttribute('data-t',t===null?'d':t);d.setAttribute('data-vt-fresh','1');}catch(e){document.documentElement.setAttribute('data-t','d');}})();</script><link rel="stylesheet" href="rl.css?v=21">
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0"><defs>
+  <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--brd)"/></marker>
+  <marker id="ah2" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="var(--ac)"/></marker>
+</defs></svg>
+
+<header class="bar">
+  <a class="bar-logo" href="index.html">
+    <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">4.9.0</span>
+  </a>
+  <nav class="bar-nav">
+    <a href="index.html">Overview</a>
+    <a href="architecture.html">Architecture</a>
+    <a href="geogit.html">GeoGit</a>
+    <a href="guide.html">Guide</a>
+    <a href="formats.html">Formats</a>
+    <a href="limits.html">Limits</a>
+    <a href="maintenance.html" class="on">Maintenance</a>
+  </nav>
+  <div class="bar-right">
+    <button class="tbtn" onclick="toggleTheme()">&#9789;</button>
+  </div>
+</header>
+
+<div class="layout">
+<aside class="side"><nav>
+  <div class="cat">Overview</div>
+  <a href="#vision">Philosophy</a>
+  <a href="#lifecycle">Journal lifecycle</a>
+  <a href="#health">Health monitoring</a>
+  <div class="cat">Operations</div>
+  <a href="#integrity">Integrity check</a>
+  <a href="#retention">Retention policy</a>
+  <a href="#purge">Purge engine</a>
+  <a href="#vacuum">VACUUM &amp; compaction</a>
+  <a href="#export">Export (backup)</a>
+  <div class="cat">Diagnostics</div>
+  <a href="#diagnostics">Journal analysis</a>
+  <a href="#metrics">Metrics explained</a>
+  <div class="cat">Design</div>
+  <a href="#threading">Thread safety</a>
+  <a href="#invariants">Invariants</a>
+</nav></aside>
+
+<main class="main">
+
+<div class="hero" style="padding:36px 0 24px;text-align:left">
+  <div class="slbl">Maintenance</div>
+  <h1 style="font-size:36px">Journal maintenance &amp; diagnostics</h1>
+  <p class="lead" style="max-width:640px">How RecoverLand keeps its audit journal healthy, compact and reliable. Every purge is explicit, every compaction is confirmed, zero data loss.</p>
+  <div class="hero-line" style="margin:18px 0 0"></div>
+</div>
+
+<!-- ============================== PHILOSOPHY ============================== -->
+<section id="vision">
+<h2>Philosophy</h2>
+<p>The audit journal grows forever by design: every INSERT, UPDATE and DELETE on every tracked layer produces an immutable event. Without maintenance, a journal used daily grows at <strong>1&ndash;5 MB/day</strong> depending on edit intensity.</p>
+<p>RecoverLand takes a conservative stance:</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-core">Explicit only</div>
+    <div class="card-t">No silent deletion</div>
+    <p>Events are never purged silently. Every delete requires user confirmation or an explicit auto-purge policy.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Non-destructive</div>
+    <div class="card-t">Safe export first</div>
+    <p>The user can export a full backup before any purge. Export uses <code>sqlite3.backup()</code>&nbsp;&mdash; crash-safe, lock-free.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-strong">Self-diagnosing</div>
+    <div class="card-t">Health on demand</div>
+    <p>Size, event count, disk space, schema version and SQLite integrity are checked and reported in one panel.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-strong">Async operations</div>
+    <div class="card-t">Never blocks the UI</div>
+    <p>VACUUM runs in a dedicated thread. Purge batches avoid holding the SQLite write lock for more than milliseconds.</p>
+  </div>
+</div>
+</section>
+
+<!-- ============================== LIFECYCLE ============================== -->
+<section id="lifecycle">
+<h2>Journal lifecycle</h2>
+<p>From creation to compaction, the journal passes through four phases. Each phase has a clear trigger and a clear operation.</p>
+
+<div class="dia">
+<svg viewBox="0 0 700 320" xmlns="http://www.w3.org/2000/svg">
+  <!-- Phase 1: Growth -->
+  <rect x="20" y="20" width="150" height="80" class="nd-ac"/>
+  <text x="95" y="48" text-anchor="middle" class="lbl" font-size="11">Growth</text>
+  <text x="95" y="66" text-anchor="middle" class="dim" font-size="10">Events accumulate</text>
+  <text x="95" y="82" text-anchor="middle" class="dim" font-size="10">WAL batches writes</text>
+
+  <!-- Phase 2: Monitoring -->
+  <rect x="200" y="20" width="150" height="80" class="nd"/>
+  <text x="275" y="48" text-anchor="middle" class="lbl" font-size="11">Monitoring</text>
+  <text x="275" y="66" text-anchor="middle" class="dim" font-size="10">Health thresholds</text>
+  <text x="275" y="82" text-anchor="middle" class="dim" font-size="10">Disk space check</text>
+
+  <!-- Phase 3: Purge -->
+  <rect x="380" y="20" width="150" height="80" class="nd-ac"/>
+  <text x="455" y="48" text-anchor="middle" class="lbl" font-size="11">Purge</text>
+  <text x="455" y="66" text-anchor="middle" class="dim" font-size="10">Retention cutoff</text>
+  <text x="455" y="82" text-anchor="middle" class="dim" font-size="10">Batched DELETE</text>
+
+  <!-- Phase 4: Compaction -->
+  <rect x="560" y="20" width="120" height="80" class="nd"/>
+  <text x="620" y="48" text-anchor="middle" class="lbl" font-size="11">Compaction</text>
+  <text x="620" y="66" text-anchor="middle" class="dim" font-size="10">VACUUM (async)</text>
+  <text x="620" y="82" text-anchor="middle" class="dim" font-size="10">Reclaim disk</text>
+
+  <!-- Arrows -->
+  <line x1="170" y1="60" x2="200" y2="60" class="edge-ac"/>
+  <line x1="350" y1="60" x2="380" y2="60" class="edge-ac"/>
+  <line x1="530" y1="60" x2="560" y2="60" class="edge"/>
+
+  <!-- Bottom: Integrity -->
+  <rect x="140" y="140" width="420" height="70" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
+  <text x="350" y="165" text-anchor="middle" class="lbl" font-size="12">Integrity check (on demand or at startup)</text>
+  <text x="350" y="184" text-anchor="middle" class="dim" font-size="10.5">PRAGMA integrity_check &middot; WAL checkpoint &middot; schema version &middot; pending recovery</text>
+  <text x="350" y="200" text-anchor="middle" class="dim" font-size="10.5">Result: is_healthy + issues[] + recovered_events + rejected</text>
+
+  <!-- Bottom: Diagnostics -->
+  <rect x="140" y="230" width="420" height="70" rx="8" fill="var(--bg2)" stroke="var(--brd)" stroke-width="1"/>
+  <text x="350" y="255" text-anchor="middle" class="lbl" font-size="12">Diagnostic analysis (BL-OPT-08)</text>
+  <text x="350" y="274" text-anchor="middle" class="dim" font-size="10.5">Entity distribution &middot; BLOB ratios &middot; geometry dedup &middot; schema JSON redundancy</text>
+  <text x="350" y="292" text-anchor="middle" class="dim" font-size="10.5">INSERT+DELETE pairs &middot; invalidated traces &middot; optimization potential</text>
+
+  <!-- Vertical connectors -->
+  <line x1="275" y1="100" x2="275" y2="140" class="edge-ac"/>
+  <line x1="455" y1="100" x2="455" y2="140" class="edge"/>
+  <line x1="350" y1="210" x2="350" y2="230" class="edge"/>
+</svg>
+</div>
+</section>
+
+<!-- ============================== HEALTH MONITORING ============================== -->
+<section id="health">
+<h2>Health monitoring</h2>
+<p>The <code>health_monitor.py</code> module evaluates journal health from two axes: <strong>size</strong> and <strong>event count</strong>. Each axis has three escalation levels. The worst of both wins.</p>
+
+<div class="dia">
+<svg viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg">
+  <!-- Size axis -->
+  <text x="20" y="30" class="lbl" font-size="11">Size axis</text>
+  <rect x="20" y="40" width="155" height="36" rx="4" fill="#D1FAE5" stroke="#16A34A"/>
+  <text x="97" y="62" text-anchor="middle" class="lbl-success" font-size="10">&lt; 50 MB &mdash; HEALTHY</text>
+  <rect x="185" y="40" width="155" height="36" rx="4" fill="var(--bg2)" stroke="var(--bl)" stroke-width="1.2"/>
+  <text x="262" y="62" text-anchor="middle" class="lbl" font-size="10">50&ndash;200 MB &mdash; INFO</text>
+  <rect x="350" y="40" width="165" height="36" rx="4" class="nd-warn"/>
+  <text x="432" y="62" text-anchor="middle" class="lbl-warn" font-size="10">200&ndash;500 MB &mdash; WARN</text>
+  <rect x="525" y="40" width="175" height="36" rx="4" class="nd-danger"/>
+  <text x="612" y="62" text-anchor="middle" class="lbl-danger" font-size="10">&ge; 500 MB &mdash; CRITICAL</text>
+
+  <!-- Count axis -->
+  <text x="20" y="110" class="lbl" font-size="11">Event count axis</text>
+  <rect x="20" y="120" width="155" height="36" rx="4" fill="#D1FAE5" stroke="#16A34A"/>
+  <text x="97" y="142" text-anchor="middle" class="lbl-success" font-size="10">&lt; 100k &mdash; HEALTHY</text>
+  <rect x="185" y="120" width="155" height="36" rx="4" fill="var(--bg2)" stroke="var(--bl)" stroke-width="1.2"/>
+  <text x="262" y="142" text-anchor="middle" class="lbl" font-size="10">100k&ndash;500k &mdash; INFO</text>
+  <rect x="350" y="120" width="165" height="36" rx="4" class="nd-warn"/>
+  <text x="432" y="142" text-anchor="middle" class="lbl-warn" font-size="10">500k&ndash;1M &mdash; WARNING</text>
+  <rect x="525" y="120" width="175" height="36" rx="4" class="nd-danger"/>
+  <text x="612" y="142" text-anchor="middle" class="lbl-danger" font-size="10">&ge; 1M &mdash; CRITICAL</text>
+
+  <!-- Disk space -->
+  <text x="20" y="192" class="lbl" font-size="11">Disk space</text>
+  <rect x="20" y="200" width="220" height="32" rx="4" fill="#D1FAE5" stroke="#16A34A"/>
+  <text x="130" y="220" text-anchor="middle" class="lbl-success" font-size="10">&gt; 500 MB &mdash; HEALTHY</text>
+  <rect x="250" y="200" width="220" height="32" rx="4" class="nd-warn"/>
+  <text x="360" y="220" text-anchor="middle" class="lbl-warn" font-size="10">100&ndash;500 MB &mdash; WARNING</text>
+  <rect x="480" y="200" width="220" height="32" rx="4" class="nd-danger"/>
+  <text x="590" y="220" text-anchor="middle" class="lbl-danger" font-size="10">&lt; 100 MB &mdash; CRITICAL</text>
+</svg>
+</div>
+
+<div class="info"><strong>Disk critical</strong>: when free disk space drops below 100 MB, the health monitor sets <code>should_disable_tracking = True</code>. The plugin stops capturing new events to avoid filling the disk and corrupting both the journal and the QGIS project file.</div>
+
+<div class="tw"><table>
+<thead><tr><th>Level</th><th>UI feedback</th><th>Action proposed</th></tr></thead>
+<tbody>
+  <tr><td><strong>HEALTHY</strong></td><td>Green label &ldquo;Sain&rdquo;</td><td>None</td></tr>
+  <tr><td><strong>INFO</strong></td><td>Blue temporal coverage message</td><td>None</td></tr>
+  <tr><td><strong>WARNING</strong></td><td>Orange warning + size + count</td><td>Open maintenance, configure retention</td></tr>
+  <tr><td><strong>CRITICAL</strong></td><td>Red alert + suggestion text</td><td>Purge immediately + VACUUM</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ============================== INTEGRITY CHECK ============================== -->
+<section id="integrity">
+<h2>Integrity check</h2>
+<p>The <code>check_journal_integrity()</code> function runs four sequential checks and returns an <code>IntegrityResult</code> NamedTuple. It can be triggered manually from the maintenance dialog or runs at startup.</p>
+
+<div class="dia">
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg">
+  <!-- Step 1 -->
+  <rect x="40" y="20" width="260" height="50" class="nd-ac"/>
+  <text x="170" y="42" text-anchor="middle" class="lbl" font-size="11">1. PRAGMA integrity_check</text>
+  <text x="170" y="58" text-anchor="middle" class="dim" font-size="10">Verifies B-tree, page checksums, freelist</text>
+
+  <!-- Step 2 -->
+  <rect x="40" y="88" width="260" height="50" class="nd"/>
+  <text x="170" y="110" text-anchor="middle" class="lbl" font-size="11">2. PRAGMA wal_checkpoint(PASSIVE)</text>
+  <text x="170" y="126" text-anchor="middle" class="dim" font-size="10">Flushes pending WAL pages to main DB</text>
+
+  <!-- Step 3 -->
+  <rect x="40" y="156" width="260" height="50" class="nd"/>
+  <text x="170" y="178" text-anchor="middle" class="lbl" font-size="11">3. Schema version validation</text>
+  <text x="170" y="194" text-anchor="middle" class="dim" font-size="10">Detects downgrade or missing schema</text>
+
+  <!-- Step 4 -->
+  <rect x="40" y="224" width="260" height="56" class="nd-ac"/>
+  <text x="170" y="248" text-anchor="middle" class="lbl" font-size="11">4. Pending event recovery</text>
+  <text x="170" y="264" text-anchor="middle" class="dim" font-size="10">Reads recoverland_pending.json, validates</text>
+  <text x="170" y="278" text-anchor="middle" class="dim" font-size="10">each event, re-inserts valid ones</text>
+
+  <!-- Arrows -->
+  <line x1="170" y1="70" x2="170" y2="88" class="edge-ac"/>
+  <line x1="170" y1="138" x2="170" y2="156" class="edge"/>
+  <line x1="170" y1="206" x2="170" y2="224" class="edge-ac"/>
+
+  <!-- Result box -->
+  <rect x="380" y="80" width="280" height="140" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
+  <text x="520" y="108" text-anchor="middle" class="lbl" font-size="12">IntegrityResult</text>
+  <text x="520" y="132" text-anchor="middle" class="dim" font-size="10.5">is_healthy: bool</text>
+  <text x="520" y="150" text-anchor="middle" class="dim" font-size="10.5">issues: List[str]</text>
+  <text x="520" y="168" text-anchor="middle" class="dim" font-size="10.5">recovered_events: int</text>
+  <text x="520" y="186" text-anchor="middle" class="dim" font-size="10.5">pending_rejected: int</text>
+  <text x="520" y="210" text-anchor="middle" class="dim" font-size="10">Each rejected event stays in pending file</text>
+
+  <!-- Connector -->
+  <line x1="300" y1="150" x2="380" y2="150" class="edge-ac"/>
+</svg>
+</div>
+
+<div class="tip"><strong>Pending recovery</strong>: when the WriteQueue fails to persist events (SQLite locked, disk full), it saves them to <code>recoverland_pending.json</code>. At next startup, integrity check validates each event (required keys, known keys, valid operation_type) and re-inserts the good ones. Invalid events are kept in the file with a WARNING log.</div>
+</section>
+
+<!-- ============================== RETENTION POLICY ============================== -->
+<section id="retention">
+<h2>Retention policy</h2>
+<p>The retention policy has two axes: time-based (<code>retention_days</code>) and count-based (<code>max_events</code>). Both are user-configurable in the maintenance dialog and persisted in <code>QgsSettings</code>.</p>
+
+<div class="flow">
+  <span class="fn-ac">RetentionPolicy</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">retention_days: 365</span>
+  <span class="fa">+</span>
+  <span class="fn">max_events: 1 000 000</span>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Setting</th><th>Key</th><th>Default</th><th>Range</th></tr></thead>
+<tbody>
+  <tr><td><strong>Conservation</strong></td><td><code>RecoverLand/retention_days</code></td><td>365 jours</td><td>7 &ndash; 3650</td></tr>
+  <tr><td><strong>Maximum</strong></td><td><code>RecoverLand/max_events</code></td><td>1 000 000</td><td>10 000 &ndash; 10 000 000</td></tr>
+  <tr><td><strong>Auto-purge</strong></td><td><code>RecoverLand/auto_purge</code></td><td>False</td><td>On / Off</td></tr>
+</tbody>
+</table></div>
+
+<div class="warn"><strong>Auto-purge</strong>: when enabled, events outside the retention window are deleted at startup without user confirmation. Disabled by default. The user must activate it consciously in the maintenance dialog.</div>
+</section>
+
+<!-- ============================== PURGE ENGINE ============================== -->
+<section id="purge">
+<h2>Purge engine</h2>
+<p>The purge engine in <code>retention.py</code> deletes events that fall outside the retention policy. It operates in <strong>batches of 5 000</strong> to avoid holding the SQLite write lock for extended periods.</p>
+
+<div class="dia">
+<svg viewBox="0 0 700 340" xmlns="http://www.w3.org/2000/svg">
+  <!-- Step 1 -->
+  <rect x="40" y="20" width="260" height="48" class="nd"/>
+  <text x="170" y="40" text-anchor="middle" class="lbl" font-size="11">1. Compute cutoff timestamp</text>
+  <text x="170" y="56" text-anchor="middle" class="dim" font-size="10">UTC now - retention_days</text>
+
+  <!-- Step 2 -->
+  <rect x="40" y="86" width="260" height="48" class="nd-ac"/>
+  <text x="170" y="106" text-anchor="middle" class="lbl" font-size="11">2. Batch DELETE (5k rows/batch)</text>
+  <text x="170" y="122" text-anchor="middle" class="dim" font-size="10">WHERE created_at &lt; cutoff LIMIT 5000</text>
+
+  <!-- Loop arrow -->
+  <path d="M300 96 C330 96, 330 118, 300 118" fill="none" stroke="var(--ac)" stroke-width="1.4" marker-end="url(#ah2)"/>
+  <text x="345" y="110" class="dim" font-size="9.5">loop until &lt; batch</text>
+
+  <!-- Step 3 -->
+  <rect x="40" y="152" width="260" height="48" class="nd"/>
+  <text x="170" y="172" text-anchor="middle" class="lbl" font-size="11">3. Enforce max_events cap</text>
+  <text x="170" y="188" text-anchor="middle" class="dim" font-size="10">DELETE oldest if total &gt; max_events</text>
+
+  <!-- Step 4 -->
+  <rect x="40" y="218" width="260" height="48" class="nd"/>
+  <text x="170" y="238" text-anchor="middle" class="lbl" font-size="11">4. Post-purge maintenance</text>
+  <text x="170" y="254" text-anchor="middle" class="dim" font-size="10">ANALYZE + WAL checkpoint</text>
+
+  <!-- Step 5 -->
+  <rect x="40" y="284" width="260" height="40" class="nd"/>
+  <text x="170" y="308" text-anchor="middle" class="lbl" font-size="11">5. Purge orphan datasources</text>
+
+  <!-- Arrows -->
+  <line x1="170" y1="68" x2="170" y2="86" class="edge-ac"/>
+  <line x1="170" y1="134" x2="170" y2="152" class="edge"/>
+  <line x1="170" y1="200" x2="170" y2="218" class="edge"/>
+  <line x1="170" y1="266" x2="170" y2="284" class="edge"/>
+
+  <!-- Result box -->
+  <rect x="380" y="80" width="280" height="100" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
+  <text x="520" y="108" text-anchor="middle" class="lbl" font-size="12">PurgeResult</text>
+  <text x="520" y="132" text-anchor="middle" class="dim" font-size="10.5">deleted_count: int</text>
+  <text x="520" y="150" text-anchor="middle" class="dim" font-size="10.5">vacuum_done: bool (always False here)</text>
+  <text x="520" y="168" text-anchor="middle" class="dim" font-size="10.5">error: str (empty on success)</text>
+
+  <!-- Connector -->
+  <line x1="300" y1="130" x2="380" y2="130" class="edge-ac"/>
+</svg>
+</div>
+
+<div class="info"><strong>Why batches?</strong> SQLite in WAL mode allows concurrent readers during writes, but the write lock is exclusive. Deleting 100k rows in one statement blocks all writes for seconds. By chunking to 5k, each lock hold is &lt; 50 ms and the WriteQueue can interleave new events between batches.</div>
+
+<h3>Orphan trace purge</h3>
+<p>After a time-based purge, some restore trace events may reference deleted user events. The <code>_purge_orphan_traces()</code> function cleans these:</p>
+<pre>DELETE FROM audit_event
+WHERE restored_from_event_id IS NOT NULL
+  AND restored_from_event_id NOT IN
+  (SELECT event_id FROM audit_event
+   WHERE restored_from_event_id IS NULL)</pre>
+
+<h3>Session-level purge</h3>
+<p><code>purge_by_session(session_id)</code> deletes all events from a specific editing session. Used for test cleanup and debug scenarios.</p>
+</section>
+
+<!-- ============================== VACUUM ============================== -->
+<section id="vacuum">
+<h2>VACUUM &amp; compaction</h2>
+<p>SQLite <code>DELETE</code> does not reclaim disk space&mdash;it marks pages as free for reuse. Only <code>VACUUM</code> physically rebuilds the file. Because VACUUM rewrites the entire database, it must run in a dedicated thread.</p>
+
+<div class="dia">
+<svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- UI thread -->
+  <rect x="20" y="20" width="200" height="56" rx="8" fill="var(--bg2)" stroke="var(--ac)" stroke-width="1.5"/>
+  <text x="120" y="42" text-anchor="middle" class="lbl" font-size="11">UI thread</text>
+  <text x="120" y="58" text-anchor="middle" class="dim" font-size="10">Click &ldquo;Compacter&rdquo;</text>
+  <text x="120" y="72" text-anchor="middle" class="dim" font-size="10">Show progress (indeterminate)</text>
+
+  <!-- Arrow -->
+  <line x1="220" y1="48" x2="278" y2="48" class="edge-ac"/>
+  <text x="250" y="38" text-anchor="middle" class="dim" font-size="9">vacuum_async()</text>
+
+  <!-- Vacuum thread -->
+  <rect x="280" y="20" width="240" height="56" rx="8" fill="var(--bg2)" stroke="var(--brd)"/>
+  <text x="400" y="42" text-anchor="middle" class="lbl" font-size="11">RecoverLand-Vacuum thread</text>
+  <text x="400" y="58" text-anchor="middle" class="dim" font-size="10">WAL checkpoint (TRUNCATE)</text>
+  <text x="400" y="72" text-anchor="middle" class="dim" font-size="10">VACUUM (full rewrite)</text>
+
+  <!-- Arrow back -->
+  <line x1="400" y1="76" x2="400" y2="110" class="edge"/>
+  <text x="400" y="100" text-anchor="middle" class="dim" font-size="9">callback(success)</text>
+
+  <!-- Callback -->
+  <rect x="280" y="112" width="240" height="44" class="nd"/>
+  <text x="400" y="132" text-anchor="middle" class="lbl" font-size="11">UI callback (QTimer.singleShot)</text>
+  <text x="400" y="148" text-anchor="middle" class="dim" font-size="10">Refresh stats &middot; hide progress bar</text>
+
+  <!-- Lock box -->
+  <rect x="560" y="20" width="120" height="56" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.4"/>
+  <text x="620" y="44" text-anchor="middle" class="lbl" font-size="11">_vacuum_lock</text>
+  <text x="620" y="60" text-anchor="middle" class="dim" font-size="10">threading.Lock()</text>
+  <text x="620" y="74" text-anchor="middle" class="dim" font-size="10">1 VACUUM at a time</text>
+
+  <line x1="520" y1="48" x2="560" y2="48" class="edge-ac"/>
+</svg>
+</div>
+
+<div class="tw"><table>
+<thead><tr><th>Step</th><th>Operation</th><th>Why</th></tr></thead>
+<tbody>
+  <tr><td><strong>1</strong></td><td><code>wal_checkpoint(TRUNCATE)</code></td><td>Flush all WAL pages into the main DB file before VACUUM</td></tr>
+  <tr><td><strong>2</strong></td><td><code>VACUUM</code></td><td>Rebuild the database file, releasing freed pages to the OS</td></tr>
+  <tr><td><strong>3</strong></td><td>Callback</td><td>Notify UI on main thread (Qt thread safety via <code>QTimer.singleShot(0)</code>)</td></tr>
+</tbody>
+</table></div>
+
+<div class="warn"><strong>Lock protection</strong>: if a second VACUUM attempt arrives while one is running, it logs a WARNING and returns immediately via <code>_vacuum_lock.acquire(blocking=False)</code>. No crash, no deadlock.</div>
+</section>
+
+<!-- ============================== EXPORT ============================== -->
+<section id="export">
+<h2>Export (backup)</h2>
+<p>The export uses Python&rsquo;s <code>sqlite3.Connection.backup()</code> API, which performs a page-level copy that is:</p>
+<ul style="margin:8px 0 14px 24px;color:var(--tx2);font-size:14px;line-height:1.8">
+  <li><strong>Crash-safe</strong>: the copy is atomic at the page level</li>
+  <li><strong>Lock-free for readers</strong>: uses a separate read connection</li>
+  <li><strong>Consistent</strong>: the backup is a point-in-time snapshot</li>
+</ul>
+
+<div class="flow">
+  <span class="fn">create_read_connection()</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">sqlite3.connect(dest)</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn-ac">src_conn.backup(dst_conn)</span>
+  <span class="fa">&rarr;</span>
+  <span class="fn">Close both</span>
+</div>
+
+<div class="tip"><strong>Why not shutil.copy2?</strong> A file copy while the journal is open (WAL mode active) can produce a corrupted backup if the -wal file is not copied in sync. The <code>backup()</code> API handles this atomically inside SQLite.</div>
+</section>
+
+<!-- ============================== DIAGNOSTICS ============================== -->
+<section id="diagnostics">
+<h2>Journal analysis</h2>
+<p>The diagnostic engine (<code>journal_diagnostics.py</code>, BL-OPT-08) runs read-only queries to measure storage patterns and identify optimization potential. It produces a <code>JournalDiagnosticReport</code> displayed in a monospace text dialog.</p>
+
+<div class="dia">
+<svg viewBox="0 0 700 280" xmlns="http://www.w3.org/2000/svg">
+  <!-- Queries -->
+  <rect x="20" y="20" width="300" height="240" rx="8" fill="var(--bg2)" stroke="var(--brd)"/>
+  <text x="170" y="42" text-anchor="middle" class="lbl" font-size="12">6 diagnostic queries</text>
+
+  <rect x="40" y="56" width="260" height="30" class="nd"/>
+  <text x="170" y="74" text-anchor="middle" class="dim" font-size="10">COUNT(*) active events</text>
+
+  <rect x="40" y="94" width="260" height="30" class="nd"/>
+  <text x="170" y="112" text-anchor="middle" class="dim" font-size="9.5">GROUP BY entity_fingerprint &rarr; buckets</text>
+
+  <rect x="40" y="132" width="260" height="30" class="nd"/>
+  <text x="170" y="150" text-anchor="middle" class="dim" font-size="9.5">BLOB presence: geometry_wkb / new_geom</text>
+
+  <rect x="40" y="170" width="260" height="30" class="nd"/>
+  <text x="170" y="188" text-anchor="middle" class="dim" font-size="9.5">Geometry duplicates (old == new)</text>
+
+  <rect x="40" y="208" width="260" height="30" class="nd"/>
+  <text x="170" y="226" text-anchor="middle" class="dim" font-size="9.5">field_schema_json: bytes vs distinct</text>
+
+  <rect x="40" y="246" width="260" height="30" class="nd"/>
+  <text x="170" y="264" text-anchor="middle" class="dim" font-size="9.5">INSERT+DELETE pairs + invalidated</text>
+
+  <!-- Report box -->
+  <rect x="380" y="20" width="290" height="240" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
+  <text x="525" y="44" text-anchor="middle" class="lbl" font-size="12">JournalDiagnosticReport</text>
+  <text x="525" y="68" text-anchor="middle" class="dim" font-size="10">total_events / total_entities</text>
+  <text x="525" y="86" text-anchor="middle" class="dim" font-size="9.5">entity_distribution: {1, 2-5, 6-10, 11-50, 51+}</text>
+  <text x="525" y="106" text-anchor="middle" class="dim" font-size="9.5">blob_geom_count / blob_geom_null_count</text>
+  <text x="525" y="124" text-anchor="middle" class="dim" font-size="9.5">blob_new_geom_count / blob_new_geom_null_count</text>
+  <text x="525" y="144" text-anchor="middle" class="dim" font-size="9.5">geom_duplicate_count / geom_duplicate_bytes_saved</text>
+  <text x="525" y="164" text-anchor="middle" class="dim" font-size="9.5">schema_json_total / distinct_count / dedup_bytes</text>
+  <text x="525" y="184" text-anchor="middle" class="dim" font-size="10">invalidated_count / insert_delete_pairs</text>
+  <text x="525" y="210" text-anchor="middle" class="dim" font-size="10">elapsed_ms: query duration (< 500ms typical)</text>
+
+  <!-- Arrow -->
+  <line x1="320" y1="140" x2="380" y2="140" class="edge-ac"/>
+</svg>
+</div>
+</section>
+
+<!-- ============================== METRICS EXPLAINED ============================== -->
+<section id="metrics">
+<h2>Metrics explained</h2>
+
+<div class="tw"><table>
+<thead><tr><th>Metric</th><th>Meaning</th><th>Optimization signal</th></tr></thead>
+<tbody>
+  <tr><td><strong>Entity distribution</strong></td><td>How many events per entity. &ldquo;51+&rdquo; bucket means entities with long update chains.</td><td>High count in 51+ &rarr; UPDATE coalescing would save space (BL-OPT-01)</td></tr>
+  <tr><td><strong>Geometry duplicates</strong></td><td>Events where <code>geometry_wkb == new_geometry_wkb</code> (attribute-only UPDATE stored both BLOBs)</td><td>Many duplicates &rarr; skip BLOB on attr-only UPDATEs (BL-OPT-02)</td></tr>
+  <tr><td><strong>Schema JSON redundancy</strong></td><td>Total bytes in <code>field_schema_json</code> vs. distinct schemas</td><td>High dedup savings &rarr; normalize to lookup table (BL-OPT-03)</td></tr>
+  <tr><td><strong>Invalidated traces</strong></td><td>Restore trace events already marked invalid</td><td>&gt; 0 &rarr; auto-purge them during maintenance (BL-OPT-07)</td></tr>
+  <tr><td><strong>INSERT+DELETE pairs</strong></td><td>Same entity created and deleted in same session</td><td>&gt; 0 &rarr; offline compaction can annul them (BL-OPT-04)</td></tr>
+</tbody>
+</table></div>
+</section>
+
+<!-- ============================== THREAD SAFETY ============================== -->
+<section id="threading">
+<h2>Thread safety</h2>
+<p>The maintenance dialog interacts with three connection types. Each has clear threading constraints.</p>
+
+<div class="dia">
+<svg viewBox="0 0 700 186" xmlns="http://www.w3.org/2000/svg">
+  <!-- Read connection -->
+  <rect x="20" y="20" width="200" height="64" class="nd"/>
+  <text x="120" y="42" text-anchor="middle" class="lbl" font-size="11">Read connection</text>
+  <text x="120" y="58" text-anchor="middle" class="dim" font-size="10">create_read_connection()</text>
+  <text x="120" y="72" text-anchor="middle" class="dim" font-size="10">Stats, integrity, diagnostics</text>
+
+  <!-- Write connection -->
+  <rect x="250" y="20" width="200" height="64" class="nd-ac"/>
+  <text x="350" y="42" text-anchor="middle" class="lbl" font-size="11">Write connection</text>
+  <text x="350" y="58" text-anchor="middle" class="dim" font-size="10">get_connection()</text>
+  <text x="350" y="72" text-anchor="middle" class="dim" font-size="10">Purge (batched DELETEs)</text>
+
+  <!-- Vacuum thread connection -->
+  <rect x="480" y="20" width="200" height="64" class="nd"/>
+  <text x="580" y="42" text-anchor="middle" class="lbl" font-size="11">Vacuum connection</text>
+  <text x="580" y="58" text-anchor="middle" class="dim" font-size="10">sqlite3.connect(path)</text>
+  <text x="580" y="72" text-anchor="middle" class="dim" font-size="10">Dedicated thread + lock</text>
+
+  <!-- Rules -->
+  <rect x="20" y="108" width="660" height="62" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1"/>
+  <text x="350" y="128" text-anchor="middle" class="lbl" font-size="11">Threading rules</text>
+  <text x="350" y="145" text-anchor="middle" class="dim" font-size="10">Reads: any thread (WAL allows concurrent readers)</text>
+  <text x="350" y="160" text-anchor="middle" class="dim" font-size="10">Writes: main thread only (journal.get_connection) &middot; VACUUM: dedicated daemon thread with mutex</text>
+</svg>
+</div>
+</section>
+
+<!-- ============================== INVARIANTS ============================== -->
+<section id="invariants">
+<h2>Invariants</h2>
+<p>The maintenance system guarantees these properties at all times:</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="card-tag tag-strong">Zero implicit loss</div>
+    <div class="card-t">Every deletion is traced</div>
+    <p>No event is deleted without (a) user confirmation or (b) explicit auto-purge policy. Purge count is logged with <code>flog()</code> at INFO level.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-strong">Crash recovery</div>
+    <div class="card-t">Pending file survives</div>
+    <p>If a crash occurs mid-write, unsaved events survive in <code>recoverland_pending.json</code> and are recovered at next startup.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-strong">No lock starvation</div>
+    <div class="card-t">Batched operations</div>
+    <p>Purge in 5k batches. VACUUM in dedicated thread with non-blocking lock acquire. WriteQueue can always interleave.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-strong">Consistent backup</div>
+    <div class="card-t">sqlite3.backup() API</div>
+    <p>Export is a page-level consistent snapshot. No manual file copy. No WAL corruption risk.</p>
+  </div>
+</div>
+
+<div class="info"><strong>Module map</strong>: <code>journal_maintenance.py</code> (UI dialog) &rarr; <code>core/retention.py</code> (purge + VACUUM) &middot; <code>core/integrity.py</code> (check + recovery) &middot; <code>core/health_monitor.py</code> (thresholds + messages) &middot; <code>core/journal_diagnostics.py</code> (analysis report)</div>
+</section>
+
+</main>
+
+<aside class="rp">
+  <div class="srch" style="margin-bottom:16px">
+    <svg class="srch-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="si" placeholder="Search..." autocomplete="off">
+    <div class="srch-res" id="sr"></div>
+  </div>
+  <h4>On this page</h4>
+  <div id="rp-toc"></div>
+</aside>
+</div>
+
+<footer>RecoverLand 4.9.0 &middot; GEODECI &middot; Technical documentation</footer>
+<script src="rl.js?v=18"></script>
+</body>
+</html>
