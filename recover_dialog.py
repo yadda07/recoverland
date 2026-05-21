@@ -2376,6 +2376,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.update_phase("")
         if self._geogit_status_widget is not None:
             self._geogit_status_widget.deactivate()
+        self._hide_geogit_status_bar()
         flog("geogit: session stopped", "INFO")
 
     def _geogit_done(self, trace_id: str, reason: str) -> None:
@@ -2387,6 +2388,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._geogit_toggle.setChecked(False)
         self._geogit_toggle.blockSignals(False)
         self._geogit_toggle.setEnabled(True)
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.deactivate()
+        self._hide_geogit_status_bar()
 
     def _init_snapshot_direct(self, layer_infos: list, src_crs: str, trace_id: str) -> None:
         """Start snapshot mode: create overlays + date bar. Zero pre-load.
