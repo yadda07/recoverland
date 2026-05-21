@@ -323,6 +323,14 @@ This action is irreversible.</translation>
         <source>{n} entité(s) reconstituée(s)</source>
         <translation>{n} entity(ies) reconstructed</translation>
     </message>
+    <message>
+        <source>Export</source>
+        <translation>Export</translation>
+    </message>
+    <message>
+        <source>Exporter le snapshot vers GeoPackage</source>
+        <translation>Export snapshot to GeoPackage</translation>
+    </message>
 </context>
 <context>
     <name>RecoverDialog</name>
@@ -341,6 +349,26 @@ This action is irreversible.</translation>
     <message>
         <source>GeoGit Snapshot : création des couches…</source>
         <translation>GeoGit Snapshot: creating layers…</translation>
+    </message>
+    <message>
+        <source>Export partiel</source>
+        <translation>Partial export</translation>
+    </message>
+    <message>
+        <source>{n} couche(s) en erreur : {errors}</source>
+        <translation>{n} layer(s) with errors: {errors}</translation>
+    </message>
+    <message>
+        <source>Export terminé</source>
+        <translation>Export complete</translation>
+    </message>
+    <message>
+        <source>Snapshot exporté : {n_layers} couche(s), {n_features} entité(s) ({elapsed_ms} ms).
+
+{path}</source>
+        <translation>Snapshot exported: {n_layers} layer(s), {n_features} entity(ies) ({elapsed_ms} ms).
+
+{path}</translation>
     </message>
     <message>
         <source>Enregistrement désactivé</source>

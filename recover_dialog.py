@@ -2426,6 +2426,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         bar = CanvasDateBar(canvas)
         bar.set_range(first_iso, last_iso)
         bar.date_changed.connect(self._on_snapshot_date_changed)
+        bar.export_requested.connect(self._on_snapshot_export_requested)
         try:
             canvas.mapCanvasRefreshed.connect(bar.raise_)
             flog(f"[{trace_id}] geogit: bar_raise_connected_to_canvas_refresh", "DEBUG")
@@ -2653,6 +2654,59 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
 
         snap.update_async(result, _on_update_done)
+
+    def _on_snapshot_export_requested(self) -> None:
+        """Slot: user clicked Export — save snapshot overlays to GeoPackage."""
+        snap = self._geogit_snap_session
+        bar = self._geogit_date_bar
+        if snap is None or not snap.is_active:
+            flog("geogit: export_requested but no active snapshot session", "WARNING")
+            return
+
+        from datetime import datetime as _dt  # noqa: PLC0415
+        ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"recoverland_snapshot_{ts}.gpkg"
+        iso = bar.current_date_iso() if bar else "?"
+
+        from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox  # noqa: PLC0415
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.tr("Exporter le snapshot vers GeoPackage"),
+            default_name,
+            "GeoPackage (*.gpkg)",
+        )
+        if not path:
+            return
+
+        flog(
+            f"geogit: snapshot_export_start path={path} iso={iso}",
+            "INFO",
+        )
+        result = snap.export_to_geopackage(path)
+        if result["errors"]:
+            QMessageBox.warning(
+                self,
+                self.tr("Export partiel"),
+                self.tr("{n} couche(s) en erreur : {errors}").format(
+                    n=len(result["errors"]),
+                    errors="; ".join(result["errors"]),
+                ),
+            )
+        else:
+            QMessageBox.information(
+                self,
+                self.tr("Export terminé"),
+                self.tr(
+                    "Snapshot exporté : {n_layers} couche(s), "
+                    "{n_features} entité(s) ({elapsed_ms} ms).\n\n{path}"
+                ).format(**result, path=path),
+            )
+        flog(
+            f"geogit: snapshot_export_done n_layers={result['n_layers']} "
+            f"n_features={result['n_features']} "
+            f"errors={len(result['errors'])} elapsed_ms={result['elapsed_ms']}",
+            "INFO",
+        )
 
     def _on_snapshot_error(self, trace_id: str, message: str) -> None:
         """Slot: SnapshotRebuildWorker encountered a fatal error."""
