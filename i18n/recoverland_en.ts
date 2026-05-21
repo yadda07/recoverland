@@ -306,10 +306,41 @@ This action is irreversible.</translation>
     </message>
 </context>
 <context>
+    <name>CanvasDateBar</name>
+    <message>
+        <source>Aujourd&apos;hui</source>
+        <translation>Today</translation>
+    </message>
+    <message>
+        <source>Reconstruction…</source>
+        <translation>Reconstruction…</translation>
+    </message>
+    <message>
+        <source>Aucune entité à cette date</source>
+        <translation>No entity at this date</translation>
+    </message>
+    <message>
+        <source>{n} entité(s) reconstituée(s)</source>
+        <translation>{n} entity(ies) reconstructed</translation>
+    </message>
+</context>
+<context>
     <name>RecoverDialog</name>
     <message>
         <source>RecoverLand - Récupération de données</source>
         <translation>RecoverLand - Data Recovery</translation>
+    </message>
+    <message>
+        <source>Snapshot (état à T)</source>
+        <translation>Snapshot (state at T)</translation>
+    </message>
+    <message>
+        <source>GeoGit Snapshot : initialisation...</source>
+        <translation>GeoGit Snapshot: initializing...</translation>
+    </message>
+    <message>
+        <source>GeoGit Snapshot : création des couches…</source>
+        <translation>GeoGit Snapshot: creating layers…</translation>
     </message>
     <message>
         <source>Enregistrement désactivé</source>
