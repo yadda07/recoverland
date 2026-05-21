@@ -2635,7 +2635,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                 "INFO",
             )
 
-        unique_dates = list(result.all_event_dates) if result.all_event_dates else sorted({
+        unique_dates = list(result.all_event_markers) if result.all_event_markers else sorted({
             sf.last_created_at
             for entity_map in result.features.values()
             for sf in (entity_map.values() if isinstance(entity_map, dict) else [entity_map])

@@ -43,8 +43,8 @@ _SQL_DATE_RANGE = (
     " AND invalidated_at IS NULL"
 )
 
-_SQL_ALL_EVENT_DATES = (
-    "SELECT DISTINCT created_at FROM audit_event"
+_SQL_ALL_EVENT_MARKERS = (
+    "SELECT DISTINCT created_at, operation_type FROM audit_event"
     " WHERE datasource_fingerprint = ?"
     " AND invalidated_at IS NULL"
     " AND created_at IS NOT NULL"
@@ -132,20 +132,23 @@ class SnapshotRebuildWorker(QThread):
             )
             result = reconstruct_snapshot_at(mini_cache, cutoff_dt, trace_id=tid)
 
-            all_dates_set: set = set()
+            all_markers_set: set = set()
             for info in self._layer_infos:
-                rows_d = conn.execute(
-                    _SQL_ALL_EVENT_DATES, (info["fingerprint"],)
+                rows_m = conn.execute(
+                    _SQL_ALL_EVENT_MARKERS, (info["fingerprint"],)
                 ).fetchall()
-                all_dates_set.update(r[0] for r in rows_d if r[0])
-            all_event_dates = tuple(sorted(all_dates_set))
-            result = result._replace(all_event_dates=all_event_dates)
+                all_markers_set.update(
+                    (r[0], (r[1] or "INSERT").upper())
+                    for r in rows_m if r[0]
+                )
+            all_event_markers = tuple(sorted(all_markers_set))
+            result = result._replace(all_event_markers=all_event_markers)
 
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             flog(
                 f"[{tid}] snap_worker: done "
                 f"n_entities={result.n_entities} "
-                f"n_all_dates={len(all_event_dates)} "
+                f"n_all_markers={len(all_event_markers)} "
                 f"total_rows={total_rows} elapsed_ms={elapsed_ms}",
                 "INFO",
             )
