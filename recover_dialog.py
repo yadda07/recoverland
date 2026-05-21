@@ -150,7 +150,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._geogit_status_widget = None
         self._geogit_worker = None
         self._geogit_session = None
-        self._geogit_viz_mode = "diff_window"
+        self._geogit_viz_mode = "snapshot_at_t"
+        self._geogit_snap_mode = False
+        self._geogit_snap_session = None
+        self._geogit_date_bar = None
+        self._geogit_snap_pending_iso = ""
+        self._geogit_snap_cache: dict = {}
+        self._geogit_snap_worker = None
 
         self.setup_ui()
 
@@ -985,8 +991,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         date_shortcuts.addWidget(all_btn)
         date_shortcuts.addStretch()
 
-        event_vbox.addLayout(dates_row)
-        event_vbox.addLayout(date_shortcuts)
+        self._dates_container = QWidget()
+        _dc_lay = QVBoxLayout(self._dates_container)
+        _dc_lay.setContentsMargins(0, 0, 0, 0)
+        _dc_lay.setSpacing(6)
+        _dc_lay.addLayout(dates_row)
+        _dc_lay.addLayout(date_shortcuts)
+        event_vbox.addWidget(self._dates_container)
 
         self.time_slider = TimeSliderWidget()
 
@@ -1147,12 +1158,8 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._geogit_toggle.toggled.connect(self._on_geogit_toggle)
 
         self._geogit_viz_combo = QComboBox(self)
-        self._geogit_viz_combo.addItem(self.tr("Diff condense"), "diff_window")
-        self._geogit_viz_combo.addItem(self.tr("Empile (ghost)"), "updates_stacked")
-        self._geogit_viz_combo.setToolTip(
-            self.tr("Mode de visualisation : condense (1 feature/entite) ou empile (gradient opacite)"))
+        self._geogit_viz_combo.addItem(self.tr("Snapshot (état à T)"), "snapshot_at_t")
         self._geogit_viz_combo.setVisible(False)
-        self._geogit_viz_combo.currentIndexChanged.connect(self._on_geogit_viz_changed)
 
         button_layout.addWidget(self.help_button)
         button_layout.addStretch()
@@ -1604,6 +1611,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._refresh_slider_bounds()
         elif is_geogit:
             self._period_stack.setCurrentIndex(0)
+            self._dates_container.setVisible(False)
             self.layer_input.setVisible(False)
             self._layer_sel_stack.setCurrentIndex(1)
             self.results_group.setVisible(False)
@@ -1613,6 +1621,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.undo_last_btn.setVisible(False)
             self._geogit_toggle.setVisible(True)
         else:
+            self._dates_container.setVisible(True)
             self._geogit_stop_session()
             self._geogit_toggle.blockSignals(True)
             self._geogit_toggle.setChecked(False)
@@ -1951,6 +1960,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._geogit_t_min = t_min
         self._geogit_t_max = t_max
 
+        if self._geogit_viz_mode == "snapshot_at_t":
+            import uuid as _uuid
+            trace_id = _uuid.uuid4().hex[:8]
+            flog(
+                f"[{trace_id}] geogit: snapshot_mode_start "
+                f"n_layers={len(layer_infos)}",
+                "INFO",
+            )
+            self.update_phase(self.tr("GeoGit Snapshot : initialisation..."))
+            self._init_snapshot_direct(layer_infos, src_crs, trace_id)
+            return
+
         if self._geogit_status_widget is not None:
             self._geogit_status_widget.set_phase("fetch")
         self.update_phase(self.tr("GeoGit : chargement du cache..."))
@@ -2273,10 +2294,17 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _on_geogit_toggle(self, checked: bool) -> None:
         """Handle Apple toggle ON/OFF for GeoGit mode."""
+        flog(
+            f"geogit: toggle_called checked={checked} "
+            f"snap_mode={self._geogit_snap_mode} "
+            f"wants_persist={self._geogit_wants_persist} "
+            f"bar={'yes' if self._geogit_date_bar is not None else 'none'} "
+            f"session={'yes' if self._geogit_snap_session is not None else 'none'}",
+            "INFO",
+        )
         if checked:
             flog("geogit: toggle ON", "INFO")
             self._geogit_wants_persist = True
-            self._geogit_viz_combo.setVisible(True)
             self._show_geogit_status_bar()
             if self._geogit_status_widget is not None:
                 self._geogit_status_widget.activate()
@@ -2290,18 +2318,27 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._geogit_stop_session()
 
     def _on_geogit_viz_changed(self, index: int) -> None:
-        """Switch between diff_window (condensed) and updates_stacked (Mode C)."""
+        """Switch between diff modes and snapshot mode."""
         mode = self._geogit_viz_combo.itemData(index) or "diff_window"
         if mode == self._geogit_viz_mode:
             return
+        prev_mode = self._geogit_viz_mode
         self._geogit_viz_mode = mode
-        flog(f"geogit: viz_mode changed to {mode}", "INFO")
-        if self._geogit_active:
+        flog(f"geogit: viz_mode changed prev={prev_mode} new={mode}", "INFO")
+        switching_snapshot = (mode == "snapshot_at_t" or prev_mode == "snapshot_at_t")
+        if switching_snapshot:
+            self._stop_snapshot_mode()
+            self._geogit_stop_session()
+            if self._geogit_toggle.isChecked():
+                self.recover_and_load()
+        elif self._geogit_active:
             self._geogit_start_render(is_first=False)
 
     def _geogit_stop_from_statusbar(self) -> None:
         """Slot: user clicked OFF on the QGIS status bar widget."""
-        flog("geogit: stop_from_statusbar", "INFO")
+        import traceback as _tb
+        _stack = "".join(_tb.format_stack(limit=8))
+        flog(f"geogit: stop_from_statusbar STACK={_stack!r}", "WARNING")
         self._geogit_stop_session()
         self._geogit_toggle.blockSignals(True)
         self._geogit_toggle.setChecked(False)
@@ -2310,6 +2347,14 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _geogit_stop_session(self) -> None:
         """Stop GeoGit session, remove overlays, reset state."""
+        flog(
+            f"geogit: stop_session snap_mode={self._geogit_snap_mode} "
+            f"wants_persist={self._geogit_wants_persist} "
+            f"bar={'yes' if self._geogit_date_bar is not None else 'none'} "
+            f"session={'yes' if self._geogit_snap_session is not None else 'none'}",
+            "INFO",
+        )
+        self._stop_snapshot_mode()
         self._geogit_wants_persist = False
         if getattr(self, '_geogit_render_worker', None) is not None:
             self._geogit_render_worker.cancel()
@@ -2341,6 +2386,203 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._geogit_toggle.setChecked(False)
         self._geogit_toggle.blockSignals(False)
         self._geogit_toggle.setEnabled(True)
+
+    def _init_snapshot_direct(self, layer_infos: list, src_crs: str, trace_id: str) -> None:
+        """Start snapshot mode: create overlays + date bar. Zero pre-load.
+
+        Layer creation is async (one per event-loop tick) to keep the UI
+        responsive during the transition from normal mode to GeoGit mode.
+        The first snapshot load is triggered only AFTER all overlays exist.
+        """
+        import datetime as _dt
+        from .core.snapshot_overlay_session import SnapshotOverlaySession
+        from .widgets.canvas_date_bar import CanvasDateBar
+
+        flog(
+            f"[{trace_id}] geogit: snapshot_init_direct n_layers={len(layer_infos)}",
+            "INFO",
+        )
+
+        snap = SnapshotOverlaySession()
+        self._geogit_snap_session = snap
+        self._geogit_snap_mode = True
+
+        today = _dt.date.today().isoformat()
+        first_iso = ((_dt.date.today() - _dt.timedelta(days=5 * 365)).isoformat()
+                     + "T00:00:00")
+        last_iso = today + "T23:59:59"
+
+        canvas = self.iface.mapCanvas()
+        flog(
+            f"[{trace_id}] geogit: canvas_size={canvas.width()}x{canvas.height()}",
+            "DEBUG",
+        )
+        bar = CanvasDateBar(canvas)
+        bar.set_range(first_iso, last_iso)
+        bar.date_changed.connect(self._on_snapshot_date_changed)
+        try:
+            canvas.mapCanvasRefreshed.connect(bar.raise_)
+            flog(f"[{trace_id}] geogit: bar_raise_connected_to_canvas_refresh", "DEBUG")
+        except Exception as _e:
+            flog(f"[{trace_id}] geogit: bar_raise_connect_failed err={_e}", "WARNING")
+        bar.show()
+        self._geogit_date_bar = bar
+
+        self._is_recovering = False
+        self.enable_controls(True)
+        self._geogit_toggle.setEnabled(True)
+        self.update_phase(self.tr("GeoGit Snapshot : création des couches…"))
+        flog(
+            f"[{trace_id}] geogit: snapshot_bar_shown "
+            f"bar_visible={bar.isVisible()} "
+            f"bar_geom={bar.x()},{bar.y()} {bar.width()}x{bar.height()}",
+            "INFO",
+        )
+
+        def _on_layers_ready() -> None:
+            if not self._geogit_snap_mode:
+                return
+            self.update_phase("")
+            flog(
+                f"[{trace_id}] geogit: snapshot_ready n_layers={snap.n_layers}",
+                "INFO",
+            )
+            QTimer.singleShot(100, lambda: self._deferred_set_bar_range(layer_infos))
+            self._on_snapshot_date_changed(bar.current_date_iso())
+
+        snap.start_async_create(layer_infos, src_crs, trace_id, _on_layers_ready)
+
+    def _deferred_set_bar_range(self, layer_infos: list) -> None:
+        """Run date-range SQL off the critical path — updates bar after first paint."""
+        from .widgets.snapshot_rebuild_worker import query_snapshot_date_range
+        bar = self._geogit_date_bar
+        if bar is None or not self._geogit_snap_mode:
+            return
+        first_iso, last_iso = query_snapshot_date_range(self._journal, layer_infos)
+        bar.set_range(first_iso, last_iso)
+        flog(
+            f"geogit: bar_range_updated first={first_iso} last={last_iso}",
+            "DEBUG",
+        )
+
+    def _stop_snapshot_mode(self) -> None:
+        """Cleanup worker + date bar + snapshot overlay. No-op if not active."""
+        flog(
+            f"geogit: stop_snapshot_mode_called snap_mode={self._geogit_snap_mode} "
+            f"bar={'yes' if self._geogit_date_bar is not None else 'none'} "
+            f"session={'yes' if self._geogit_snap_session is not None else 'none'}",
+            "INFO",
+        )
+        if not self._geogit_snap_mode:
+            flog("geogit: stop_snapshot_mode NOOP snap_mode=False", "INFO")
+            return
+        self._geogit_snap_mode = False
+        if self._geogit_snap_worker is not None:
+            self._geogit_snap_worker.cancel()
+            if self._geogit_snap_worker.isRunning():
+                self._geogit_snap_worker.wait(300)
+            self._geogit_snap_worker = None
+            flog("geogit: snap_worker cancelled", "DEBUG")
+        if self._geogit_date_bar is not None:
+            try:
+                self.iface.mapCanvas().mapCanvasRefreshed.disconnect(
+                    self._geogit_date_bar.raise_
+                )
+            except Exception:
+                pass
+            self._geogit_date_bar.cleanup()
+            self._geogit_date_bar = None
+            flog("geogit: date_bar cleaned up", "INFO")
+            try:
+                self.iface.mapCanvas().update()
+            except Exception:
+                pass
+        else:
+            flog("geogit: date_bar was already None", "WARNING")
+        if self._geogit_snap_session is not None:
+            self._geogit_snap_session.stop()
+            self._geogit_snap_session = None
+            flog("geogit: snap_session stopped", "INFO")
+        else:
+            flog("geogit: snap_session was already None", "WARNING")
+        self._geogit_snap_cache = {}
+        flog("geogit: snapshot_mode_stopped", "INFO")
+
+    def _on_snapshot_date_changed(self, iso: str) -> None:
+        """Slot: CanvasDateBar emitted date → cancel previous worker + launch new."""
+        from .widgets.snapshot_rebuild_worker import SnapshotRebuildWorker
+
+        self._geogit_snap_pending_iso = iso
+        flog(f"geogit: snapshot_date_changed iso={iso}", "DEBUG")
+
+        if self._geogit_snap_worker is not None:
+            try:
+                self._geogit_snap_worker.result_ready.disconnect()
+                self._geogit_snap_worker.error.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self._geogit_snap_worker.cancel()
+            self._geogit_snap_worker = None
+
+        if not self._geogit_snap_mode or self._geogit_snap_session is None:
+            flog("geogit: snapshot_date_changed skipped mode_inactive", "DEBUG")
+            return
+
+        if self._geogit_date_bar is not None:
+            self._geogit_date_bar.set_loading()
+
+        worker = SnapshotRebuildWorker(
+            self._journal,
+            self._geogit_layer_infos,
+            iso,
+            parent=self,
+        )
+        worker.result_ready.connect(self._on_snapshot_result)
+        worker.error.connect(self._on_snapshot_error)
+        self._geogit_snap_worker = worker
+        worker.start()
+        flog(
+            f"[{worker.trace_id}] geogit: snap_worker_started iso={iso}",
+            "INFO",
+        )
+
+    def _on_snapshot_result(self, trace_id: str, result) -> None:
+        """Slot: SnapshotRebuildWorker delivered a result."""
+        self._geogit_snap_worker = None
+        snap = self._geogit_snap_session
+        bar = self._geogit_date_bar
+        if snap is None or not self._geogit_snap_mode:
+            flog(f"[{trace_id}] geogit: snap_result_discarded mode_inactive", "DEBUG")
+            return
+
+        unique_dates = sorted({
+            sf.last_created_at
+            for entity_map in result.features.values()
+            for sf in (entity_map.values() if isinstance(entity_map, dict) else [entity_map])
+            if hasattr(sf, 'last_created_at') and sf.last_created_at
+        })
+
+        def _on_update_done(stats: dict) -> None:
+            if bar is not None and self._geogit_snap_mode:
+                bar.set_markers(unique_dates)
+                bar.set_stats(stats["n_entities"])
+            flog(
+                f"[{trace_id}] geogit: snap_result_applied "
+                f"n_entities={stats['n_entities']} elapsed_ms={stats['elapsed_ms']}",
+                "INFO",
+            )
+
+        snap.update_async(result, _on_update_done)
+
+    def _on_snapshot_error(self, trace_id: str, message: str) -> None:
+        """Slot: SnapshotRebuildWorker encountered a fatal error."""
+        self._geogit_snap_worker = None
+        if self._geogit_date_bar is not None:
+            self._geogit_date_bar.set_stats(0)
+        flog(
+            f"[{trace_id}] geogit: snap_worker_error msg={message}",
+            "ERROR",
+        )
 
     def _setup_geogit_status_bar(self) -> None:
         """Create the GeoGit status widget (not yet in status bar)."""
@@ -2380,6 +2622,8 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _teardown_geogit_status_bar(self) -> None:
         """Destroy the GeoGit status widget entirely."""
         self._hide_geogit_status_bar()
+        if self._geogit_status_widget is not None:
+            self._geogit_status_widget.deleteLater()
         self._geogit_status_widget = None
 
     def _geogit_connect_auto_refresh(self) -> None:
@@ -4037,11 +4281,16 @@ class RecoverDialog(QDialog, LoggerMixin):
         if hasattr(self, '_layer_refresh_timer'):
             self._layer_refresh_timer.start()
         self._refresh_journal_status()
-        if self._geogit_wants_persist:
+        if self._geogit_wants_persist and self._geogit_snap_mode:
+            self.restore_mode_selector.setMode("geogit")
             self._geogit_toggle.blockSignals(True)
             self._geogit_toggle.setChecked(True)
             self._geogit_toggle.blockSignals(False)
             self._geogit_toggle.setEnabled(True)
+            flog("showEvent: geogit_snap_mode restored on reopen", "INFO")
+        elif self._geogit_snap_mode and not self._geogit_wants_persist:
+            flog("showEvent: snap_mode orphan detected — stopping", "WARNING")
+            self._stop_snapshot_mode()
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -4121,8 +4370,33 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self.logo_label.stop_recovery_effect()
             if hasattr(self, '_geom_preview'):
                 self._geom_preview.clear()
-            if self._geogit_wants_persist and self._geogit_session is not None:
-                flog("cleanup_resources: GeoGit active, keeping session alive", "INFO")
+            snap_persist = self._geogit_snap_mode and self._geogit_wants_persist
+            if snap_persist:
+                flog(
+                    "cleanup_resources: GeoGit snapshot persisting "
+                    f"geogit_snap_mode={self._geogit_snap_mode}",
+                    "INFO",
+                )
+                bar = self._geogit_date_bar
+                if bar is not None:
+                    from qgis.PyQt.QtCore import QTimer as _QTimer  # noqa: PLC0415
+                    _QTimer.singleShot(200, bar._reposition)
+                    _QTimer.singleShot(600, bar._reposition)
+                    _QTimer.singleShot(1200, bar._reposition)
+                    flog("cleanup_resources: date_bar raise scheduled x3", "DEBUG")
+            else:
+                self._stop_snapshot_mode()
+
+            geogit_persist = snap_persist or (
+                self._geogit_wants_persist and self._geogit_session is not None
+            )
+            if geogit_persist:
+                flog(
+                    "cleanup_resources: GeoGit active keeping session alive "
+                    f"snap_persist={snap_persist} "
+                    f"diff_session={'yes' if self._geogit_session is not None else 'none'}",
+                    "INFO",
+                )
             else:
                 if getattr(self, '_geogit_render_worker', None) is not None:
                     self._geogit_render_worker.cancel()

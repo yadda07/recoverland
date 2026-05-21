@@ -143,6 +143,9 @@ _INDEX_DDL = [
     """CREATE INDEX IF NOT EXISTS idx_event_active_created
        ON audit_event(created_at)
        WHERE restored_from_event_id IS NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_event_snap_lookup
+       ON audit_event(datasource_fingerprint, entity_fingerprint, created_at)
+       WHERE invalidated_at IS NULL""",
     """CREATE INDEX IF NOT EXISTS idx_datasource_alias_target
        ON datasource_alias(target_fingerprint)""",
 ]
