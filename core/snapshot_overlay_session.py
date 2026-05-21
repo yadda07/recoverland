@@ -62,7 +62,6 @@ class SnapshotOverlaySession:
         self._dst_crs: str = ""
         self.trace_id: str = ""
         self._update_gen: int = 0
-        self._hidden_source_ids: List[str] = []
 
     @property
     def is_active(self) -> bool:
@@ -131,7 +130,6 @@ class SnapshotOverlaySession:
                     f"created={created[0]}/{total}",
                     "INFO",
                 )
-                self._hide_source_layers()
                 on_done()
                 return
             info = pending.pop(0)
@@ -269,7 +267,6 @@ class SnapshotOverlaySession:
             return
         tid = self.trace_id
         self._active = False
-        self._restore_source_visibility()
         self._remove_layers()
         n = len(self._overlays)
         self._overlays.clear()
@@ -415,22 +412,121 @@ class SnapshotOverlaySession:
     def _remove_layers(self) -> None:
         from qgis.core import QgsProject  # noqa: PLC0415
         project = QgsProject.instance()
-        ids = [ovl.layer_id for ovl in self._overlays.values() if ovl.layer_id]
-        if ids:
-            project.removeMapLayers(ids)
         root = project.layerTreeRoot()
+
+        for ovl in self._overlays.values():
+            if not ovl.layer_id:
+                continue
+            node = root.findLayer(ovl.layer_id)
+            if node is not None:
+                node_parent = node.parent()
+                if node_parent is not None:
+                    node_parent.removeChildNode(node)
+
         group = root.findGroup(_GROUP_NAME)
         if group is not None:
             group.removeAllChildren()
             parent = group.parent() or root
             parent.removeChildNode(group)
             flog(f"[{self.trace_id}] snapshot_overlay: group_removed name={_GROUP_NAME}", "INFO")
+        else:
+            flog(f"[{self.trace_id}] snapshot_overlay: group_not_found name={_GROUP_NAME}", "WARNING")
+
+        ids = [ovl.layer_id for ovl in self._overlays.values() if ovl.layer_id]
+        if ids:
+            project.removeMapLayers(ids)
+
         try:
             from qgis.utils import iface  # noqa: PLC0415
             if iface is not None:
                 iface.mapCanvas().refresh()
         except Exception:  # noqa: BLE001
             pass
+
+    def overlay_layer_ids(self) -> List[str]:
+        """Return QGIS layer IDs for all current overlay layers."""
+        return [ovl.layer_id for ovl in self._overlays.values() if ovl.layer_id]
+
+    def export_to_geopackage(self, output_path: str) -> dict:
+        """Export all snapshot overlays to a single GeoPackage file.
+
+        Returns dict: {n_layers, n_features, elapsed_ms, errors}.
+        """
+        from qgis.core import (  # noqa: PLC0415
+            QgsCoordinateTransformContext,
+            QgsProject,
+            QgsVectorFileWriter,
+        )
+
+        t0 = time.monotonic()
+        project = QgsProject.instance()
+        ctx = QgsCoordinateTransformContext()
+        try:
+            ctx = project.transformContext()
+        except Exception:  # noqa: BLE001
+            pass
+
+        n_layers = 0
+        n_features = 0
+        errors: List[str] = []
+        first = True
+
+        for fp, ovl in self._overlays.items():
+            lyr = project.mapLayer(ovl.layer_id)
+            if lyr is None or lyr.featureCount() == 0:
+                continue
+
+            opts = QgsVectorFileWriter.SaveVectorOptions()
+            opts.driverName = "GPKG"
+            opts.layerName = ovl.layer_name or fp[:16]
+            if first:
+                opts.actionOnExistingFile = (
+                    QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteFile
+                    if hasattr(QgsVectorFileWriter, 'ActionOnExistingFile')
+                    else QgsVectorFileWriter.CreateOrOverwriteFile
+                )
+                first = False
+            else:
+                opts.actionOnExistingFile = (
+                    QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteLayer
+                    if hasattr(QgsVectorFileWriter, 'ActionOnExistingFile')
+                    else QgsVectorFileWriter.CreateOrOverwriteLayer
+                )
+
+            _err, msg, _new_file, _new_layer = (
+                QgsVectorFileWriter.writeAsVectorFormatV3(lyr, output_path, ctx, opts)
+            )
+            _NO_ERR = getattr(
+                QgsVectorFileWriter, 'NoError',
+                getattr(getattr(QgsVectorFileWriter, 'WriterError', None), 'NoError', 0),
+            )
+            if _err != _NO_ERR:
+                err_msg = f"{ovl.layer_name}: {msg}"
+                errors.append(err_msg)
+                flog(
+                    f"[{self.trace_id}] snapshot_export: layer_error "
+                    f"layer={ovl.layer_name} error={msg}",
+                    "ERROR",
+                )
+            else:
+                fc = lyr.featureCount()
+                n_features += fc
+                n_layers += 1
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        flog(
+            f"[{self.trace_id}] snapshot_export: done "
+            f"path={output_path} n_layers={n_layers} "
+            f"n_features={n_features} errors={len(errors)} "
+            f"elapsed_ms={elapsed_ms}",
+            "INFO",
+        )
+        return {
+            "n_layers": n_layers,
+            "n_features": n_features,
+            "elapsed_ms": elapsed_ms,
+            "errors": errors,
+        }
 
     def _clone_style_only(self, overlay_layer, source_layer) -> None:
         """Clone renderer style without age-opacity (no createMapRenderer call)."""
@@ -450,42 +546,6 @@ class SnapshotOverlaySession:
                 f"[{self.trace_id}] snapshot_overlay: style_clone_error={exc!r}",
                 "WARNING",
             )
-
-    def _hide_source_layers(self) -> None:
-        """Hide source layers so only snapshot overlays are visible."""
-        from qgis.core import QgsProject  # noqa: PLC0415
-        root = QgsProject.instance().layerTreeRoot()
-        self._hidden_source_ids = []
-        for info in self._layer_info_map.values():
-            lid = info.get("layer_id", "")
-            if not lid:
-                continue
-            node = root.findLayer(lid)
-            if node is not None and node.isVisible():
-                node.setItemVisibilityChecked(False)
-                self._hidden_source_ids.append(lid)
-        flog(
-            f"[{self.trace_id}] snapshot_overlay: source_layers_hidden "
-            f"n={len(self._hidden_source_ids)}",
-            "INFO",
-        )
-
-    def _restore_source_visibility(self) -> None:
-        """Restore source layers that were hidden on start."""
-        if not self._hidden_source_ids:
-            return
-        from qgis.core import QgsProject  # noqa: PLC0415
-        root = QgsProject.instance().layerTreeRoot()
-        for lid in self._hidden_source_ids:
-            node = root.findLayer(lid)
-            if node is not None:
-                node.setItemVisibilityChecked(True)
-        flog(
-            f"[{self.trace_id}] snapshot_overlay: source_layers_restored "
-            f"n={len(self._hidden_source_ids)}",
-            "INFO",
-        )
-        self._hidden_source_ids = []
 
     def _detect_geom_family(self, source_layer) -> Optional[str]:
         """Return Point/LineString/Polygon from layer wkbType — O(1), no I/O."""

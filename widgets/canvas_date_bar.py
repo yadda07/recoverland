@@ -121,6 +121,7 @@ class CanvasDateBar(QWidget):
     """
 
     date_changed = pyqtSignal(str)
+    export_requested = pyqtSignal()
 
     def __init__(self, canvas, parent=None):
         _purge_stale_bars()
@@ -304,6 +305,11 @@ class CanvasDateBar(QWidget):
         self._btn_today.setFixedWidth(90)
         layout.addWidget(self._btn_today)
 
+        self._btn_export = QPushButton(self.tr("Export"), self)
+        self._btn_export.setFixedWidth(60)
+        self._btn_export.setToolTip(self.tr("Exporter le snapshot vers GeoPackage"))
+        layout.addWidget(self._btn_export)
+
         self._lbl_status = QLabel("", self)
         self._lbl_status.setMinimumWidth(210)
         layout.addWidget(self._lbl_status)
@@ -311,6 +317,7 @@ class CanvasDateBar(QWidget):
         self._date_edit.dateChanged.connect(self._on_date_edit_changed)
         self._time_edit.timeChanged.connect(self._on_time_changed)
         self._btn_today.clicked.connect(self._go_today)
+        self._btn_export.clicked.connect(self.export_requested)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
