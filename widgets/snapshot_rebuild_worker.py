@@ -176,18 +176,87 @@ def _filter_by_bbox(events: list, bbox) -> list:
         return events
 
     result = []
+    _diag_done = False
     for ev in events:
         wkb = ev.new_geometry_wkb or ev.geometry_wkb
         if not wkb:
+            if not _diag_done:
+                flog(
+                    f"bbox_filter_diag: first_ev op={ev.operation_type} "
+                    f"geom_wkb={type(ev.geometry_wkb).__name__}:{len(ev.geometry_wkb) if ev.geometry_wkb else 0} "
+                    f"new_geom_wkb={type(ev.new_geometry_wkb).__name__}:{len(ev.new_geometry_wkb) if ev.new_geometry_wkb else 0} "
+                    "→ no_wkb_kept",
+                    "DEBUG",
+                )
+                _diag_done = True
             result.append(ev)
             continue
         try:
             geom = QgsGeometry.fromWkb(wkb)
-            if geom.isNull() or geom.boundingBox().intersects(bbox):
+            is_null = geom.isNull()
+            intersects = (not is_null) and geom.boundingBox().intersects(bbox)
+            if not _diag_done:
+                flog(
+                    f"bbox_filter_diag: first_ev op={ev.operation_type} "
+                    f"wkb_len={len(wkb)} geom_null={is_null} intersects={intersects}",
+                    "DEBUG",
+                )
+                _diag_done = True
+            if is_null or intersects:
                 result.append(ev)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            if not _diag_done:
+                flog(f"bbox_filter_diag: fromWkb_exception={_exc!r}", "DEBUG")
+                _diag_done = True
             result.append(ev)
     return result
+
+
+def filter_snapshot_by_bbox(result, bbox_per_layer: dict):
+    """Filter a SnapshotResult by bbox using the resolved geom_wkb per feature.
+
+    Must be called on the main thread (QgsGeometry).
+    bbox_per_layer: {datasource_fingerprint: QgsRectangle} in layer CRS.
+    Returns a new SnapshotResult with updated features and n_entities.
+    """
+    if not bbox_per_layer:
+        return result
+    try:
+        from qgis.core import QgsGeometry  # noqa: PLC0415
+    except ImportError:
+        return result
+
+    filtered: dict = {}
+    n_kept = 0
+    n_dropped = 0
+
+    for ds_fp, entity_map in result.features.items():
+        bbox = bbox_per_layer.get(ds_fp)
+        if bbox is None:
+            filtered[ds_fp] = entity_map
+            n_kept += len(entity_map)
+            continue
+        kept: dict = {}
+        for entity_fp, sf in entity_map.items():
+            if not sf.geom_wkb:
+                kept[entity_fp] = sf
+                continue
+            try:
+                geom = QgsGeometry.fromWkb(sf.geom_wkb)
+                if geom.isNull() or geom.boundingBox().intersects(bbox):
+                    kept[entity_fp] = sf
+                else:
+                    n_dropped += 1
+            except Exception:  # noqa: BLE001
+                kept[entity_fp] = sf
+        filtered[ds_fp] = kept
+        n_kept += len(kept)
+
+    flog(
+        f"filter_snapshot_by_bbox: n_kept={n_kept} n_dropped={n_dropped}",
+        "DEBUG",
+    )
+    return result._replace(features=filtered, n_entities=n_kept)
 
 
 def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
@@ -231,4 +300,4 @@ def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
     )
 
 
-__all__ = ["SnapshotRebuildWorker", "query_snapshot_date_range"]
+__all__ = ["SnapshotRebuildWorker", "query_snapshot_date_range", "filter_snapshot_by_bbox"]

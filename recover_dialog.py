@@ -158,6 +158,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._geogit_snap_cache: dict = {}
         self._geogit_snap_worker = None
         self._geogit_snap_ext_debounce = None
+        self._geogit_snap_bbox_per_layer: dict = {}
 
         self.setup_ui()
 
@@ -2583,6 +2584,14 @@ class RecoverDialog(QDialog, LoggerMixin):
                         bbox_per_layer[_fp] = _tr.transformBoundingBox(extent)
                     except Exception:  # noqa: BLE001
                         bbox_per_layer[_fp] = extent
+        self._geogit_snap_bbox_per_layer = bbox_per_layer
+        for _fp2, _bb in bbox_per_layer.items():
+            flog(
+                f"geogit: snap_bbox_detail fp={_fp2[:8]} "
+                f"xmin={_bb.xMinimum():.1f} xmax={_bb.xMaximum():.1f} "
+                f"ymin={_bb.yMinimum():.1f} ymax={_bb.yMaximum():.1f}",
+                "DEBUG",
+            )
         flog(
             f"geogit: snap_bbox_computed n_layers={len(bbox_per_layer)} "
             f"project_crs={project_crs.authid()}",
@@ -2607,12 +2616,24 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _on_snapshot_result(self, trace_id: str, result) -> None:
         """Slot: SnapshotRebuildWorker delivered a result."""
+        from .widgets.snapshot_rebuild_worker import filter_snapshot_by_bbox
         self._geogit_snap_worker = None
         snap = self._geogit_snap_session
         bar = self._geogit_date_bar
         if snap is None or not self._geogit_snap_mode:
             flog(f"[{trace_id}] geogit: snap_result_discarded mode_inactive", "DEBUG")
             return
+
+        bbox_per_layer = self._geogit_snap_bbox_per_layer
+        if bbox_per_layer:
+            n_before = result.n_entities
+            result = filter_snapshot_by_bbox(result, bbox_per_layer)
+            flog(
+                f"[{trace_id}] geogit: snap_bbox_post_filter "
+                f"before={n_before} after={result.n_entities} "
+                f"dropped={n_before - result.n_entities}",
+                "INFO",
+            )
 
         unique_dates = sorted({
             sf.last_created_at
@@ -2647,6 +2668,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         """Slot: canvas extent changed — (re)start spatial debounce."""
         if not self._geogit_snap_mode:
             return
+        flog("geogit: snap_extent_signal_received debounce_alive=%s" % (self._geogit_snap_ext_debounce is not None), "DEBUG")
         if self._geogit_snap_ext_debounce is not None:
             self._geogit_snap_ext_debounce.start()
 
