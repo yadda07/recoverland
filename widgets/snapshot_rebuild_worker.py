@@ -198,40 +198,52 @@ def _filter_by_bbox(events: list, bbox) -> list:
 def filter_snapshot_by_bbox(result, bbox_per_layer: dict):
     """Filter a SnapshotResult by bbox using the resolved geom_wkb per feature.
 
-    Must be called on the main thread (QgsGeometry).
     bbox_per_layer: {datasource_fingerprint: QgsRectangle} in layer CRS.
     Returns a new SnapshotResult with updated features and n_entities.
+    Uses pure-Python WKB parser (wkb_envelope) — no QgsGeometry dependency.
     """
     if not bbox_per_layer:
         return result
-    try:
-        from qgis.core import QgsGeometry  # noqa: PLC0415
-    except ImportError:
-        return result
+
+    from ..core.wkb_envelope import envelope_intersects, parse_envelope  # noqa: PLC0415
 
     filtered: dict = {}
     n_kept = 0
     n_dropped = 0
+    _diag_done = False
 
     for ds_fp, entity_map in result.features.items():
-        bbox = bbox_per_layer.get(ds_fp)
-        if bbox is None:
+        bbox_rect = bbox_per_layer.get(ds_fp)
+        if not _diag_done and entity_map:
+            first_sf = next(iter(entity_map.values()))
+            _gwkb = first_sf.geom_wkb
+            _env = parse_envelope(_gwkb) if _gwkb else None
+            flog(
+                f"filter_snapshot_diag: ds_fp={ds_fp[:8]} "
+                f"bbox_found={bbox_rect is not None} "
+                f"geom_wkb_len={len(_gwkb) if _gwkb else 0} "
+                f"parsed_env={_env} last_op={first_sf.last_op}",
+                "DEBUG",
+            )
+            _diag_done = True
+        if bbox_rect is None:
             filtered[ds_fp] = entity_map
             n_kept += len(entity_map)
             continue
+        bbox_tuple = (
+            bbox_rect.xMinimum(), bbox_rect.yMinimum(),
+            bbox_rect.xMaximum(), bbox_rect.yMaximum(),
+        )
         kept: dict = {}
         for entity_fp, sf in entity_map.items():
             if not sf.geom_wkb:
                 kept[entity_fp] = sf
                 continue
-            try:
-                geom = QgsGeometry.fromWkb(sf.geom_wkb)
-                if geom.isNull() or geom.boundingBox().intersects(bbox):
-                    kept[entity_fp] = sf
-                else:
-                    n_dropped += 1
-            except Exception:  # noqa: BLE001
+            env = parse_envelope(sf.geom_wkb)
+            if envelope_intersects(env, bbox_tuple):
                 kept[entity_fp] = sf
+            else:
+                n_dropped += 1
         filtered[ds_fp] = kept
         n_kept += len(kept)
 
