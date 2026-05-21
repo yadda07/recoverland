@@ -127,6 +127,12 @@ from .rewind_dedup import (
     collapse_rewind_events,
     collapse_rewind_events_with_stats,
 )
+from .temporal_snapshot_engine import (
+    SnapshotFeature,
+    SnapshotResult,
+    reconstruct_snapshot_at,
+)
+from .snapshot_overlay_session import SnapshotOverlaySession
 
 __all__ = (
     "PLUGIN_NAME",
@@ -190,6 +196,8 @@ __all__ = (
     "plan_event_restore", "plan_temporal_restore", "preflight_check",
     "check_retention_coverage",
     "plan_lens_view", "execute_lens_render",
+    "SnapshotFeature", "SnapshotResult", "reconstruct_snapshot_at",
+    "SnapshotOverlaySession",
     "execute_restore_plan", "preflight_layer_check", "build_restore_session",
     "format_plan_summary", "format_preflight_report", "format_dry_run_message",
     "evaluate_journal_health", "check_disk_space", "format_integrity_message",
