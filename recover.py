@@ -181,6 +181,20 @@ class RecoverPlugin:
         if self.lens_action is not None:
             self.iface.removePluginMenu("RecoverLand", self.lens_action)
             self.lens_action = None
+        if self.dlg is not None:
+            try:
+                self.dlg._geogit_wants_persist = False
+                self.dlg.cleanup_resources()
+            except Exception as exc:  # noqa: BLE001
+                flog(f"RecoverPlugin.unload: dlg cleanup error: {exc}", "WARNING")
+            try:
+                self.dlg.close()
+                self.dlg.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+            self.dlg = None
+            flog("RecoverPlugin.unload: dialog cleaned", "INFO")
+
         if self._lens_dock is not None:
             try:
                 self._lens_dock.close()
