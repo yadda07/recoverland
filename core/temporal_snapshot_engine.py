@@ -241,7 +241,7 @@ def _resolve_at_cutoff(
         return None
     return SnapshotFeature(
         entity_fp=entity_fp,
-        geom_wkb=_geom_at_cutoff(last),
+        geom_wkb=_geom_at_cutoff(visible),
         attrs_json=_build_attrs_at_cutoff(visible),
         crs_authid=last.crs_authid,
         last_event_id=last.event_id or 0,
@@ -250,24 +250,27 @@ def _resolve_at_cutoff(
     )
 
 
-def _geom_at_cutoff(event) -> Optional[bytes]:
-    """Extract the post-event geometry from the last visible event."""
-    op = event.operation_type
-    if op == "INSERT":
-        if event.geometry_wkb is None:
-            flog(
-                f"geogit_snapshot: insert_no_geom event_id={event.event_id}",
-                "WARNING",
-            )
-        return event.geometry_wkb
-    if op == "UPDATE":
-        if event.new_geometry_wkb is None and event.geometry_wkb is not None:
-            flog(
-                f"geogit_snapshot: new_geom_missing "
-                f"fallback=old_geom event_id={event.event_id}",
-                "WARNING",
-            )
-        return event.new_geometry_wkb or event.geometry_wkb
+def _geom_at_cutoff(visible: list) -> Optional[bytes]:
+    """Return the geometry the entity had at cutoff.
+
+    Walks visible events backwards to find the last known geometry:
+    - INSERT          : geometry_wkb (the created geometry).
+    - UPDATE with geo : new_geometry_wkb, or geometry_wkb as fallback.
+    - UPDATE attrs-only (both None): keep walking back to a prior event.
+    """
+    for ev in reversed(visible):
+        op = ev.operation_type
+        if op == "INSERT":
+            if ev.geometry_wkb is None:
+                flog(
+                    f"geogit_snapshot: insert_no_geom event_id={ev.event_id}",
+                    "WARNING",
+                )
+            return ev.geometry_wkb
+        if op == "UPDATE":
+            geom = ev.new_geometry_wkb or ev.geometry_wkb
+            if geom is not None:
+                return geom
     return None
 
 
