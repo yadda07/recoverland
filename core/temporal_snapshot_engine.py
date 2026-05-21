@@ -69,6 +69,7 @@ class SnapshotResult(NamedTuple):
     n_unknown: int
     elapsed_ms: int
     trace_id: str
+    all_event_dates: tuple = ()
 
 
 # ------------------------------------------------------------------ #

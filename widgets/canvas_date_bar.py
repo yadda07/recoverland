@@ -406,6 +406,7 @@ class CanvasDateBar(QWidget):
         self._slider.setMaximum(_SLIDER_MAX)
         sp = QSizePolicy(QtCompat.SIZE_EXPANDING, QtCompat.SIZE_FIXED)
         self._slider.setSizePolicy(sp)
+        self._slider.setMouseTracking(True)
         layout.addWidget(self._slider)
 
         self._marker_overlay = _HistoryMarkers(self)
@@ -571,9 +572,20 @@ class CanvasDateBar(QWidget):
                 _format_iso_for_tooltip(iso),
                 self._slider,
             )
+            flog(
+                f"canvas_date_bar: marker_hover x={pos.x()} "
+                f"overlay_w={self._marker_overlay.width()} iso={iso}",
+                "DEBUG",
+            )
 
     def _snap_to_nearest_marker(self, pos) -> bool:
         """Double-click near a marker: snap date+time and emit immediately."""
+        flog(
+            f"canvas_date_bar: snap_attempt x={pos.x()} "
+            f"overlay_w={self._marker_overlay.width()} "
+            f"n_markers={len(self._marker_overlay._positions)}",
+            "DEBUG",
+        )
         if self._base_date is None:
             return False
         iso = self._marker_overlay.date_at_x(pos.x())
