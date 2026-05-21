@@ -157,6 +157,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._geogit_snap_pending_iso = ""
         self._geogit_snap_cache: dict = {}
         self._geogit_snap_worker = None
+        self._geogit_snap_ext_debounce = None
 
         self.setup_ui()
 
@@ -2428,6 +2429,17 @@ class RecoverDialog(QDialog, LoggerMixin):
         bar.show()
         self._geogit_date_bar = bar
 
+        ext_debounce = QTimer(self)
+        ext_debounce.setSingleShot(True)
+        ext_debounce.setInterval(800)
+        ext_debounce.timeout.connect(self._on_geogit_snap_bbox_fire)
+        self._geogit_snap_ext_debounce = ext_debounce
+        canvas.extentsChanged.connect(self._on_geogit_snap_extent_changed)
+        flog(
+            f"[{trace_id}] geogit: snap_extent_debounce_wired interval_ms=800",
+            "DEBUG",
+        )
+
         self._is_recovering = False
         self.enable_controls(True)
         self._geogit_toggle.setEnabled(True)
@@ -2477,6 +2489,16 @@ class RecoverDialog(QDialog, LoggerMixin):
             flog("geogit: stop_snapshot_mode NOOP snap_mode=False", "INFO")
             return
         self._geogit_snap_mode = False
+        try:
+            self.iface.mapCanvas().extentsChanged.disconnect(
+                self._on_geogit_snap_extent_changed
+            )
+        except (TypeError, RuntimeError):
+            pass
+        if self._geogit_snap_ext_debounce is not None:
+            self._geogit_snap_ext_debounce.stop()
+            self._geogit_snap_ext_debounce.deleteLater()
+            self._geogit_snap_ext_debounce = None
         if self._geogit_snap_worker is not None:
             self._geogit_snap_worker.cancel()
             if self._geogit_snap_worker.isRunning():
@@ -2531,10 +2553,43 @@ class RecoverDialog(QDialog, LoggerMixin):
         if self._geogit_date_bar is not None:
             self._geogit_date_bar.set_loading()
 
+        from qgis.core import (  # noqa: PLC0415
+            QgsCoordinateReferenceSystem,
+            QgsCoordinateTransform,
+            QgsProject,
+        )
+        canvas = self.iface.mapCanvas()
+        extent = canvas.extent()
+        project_crs = QgsProject.instance().crs()
+        bbox_per_layer: dict = {}
+        for _info in self._geogit_layer_infos:
+            _fp = _info["fingerprint"]
+            _scrs = _info.get("storage_crs", "")
+            if not _scrs or _scrs == project_crs.authid():
+                bbox_per_layer[_fp] = extent
+            else:
+                _lcrs = QgsCoordinateReferenceSystem(_scrs)
+                if not _lcrs.isValid():
+                    bbox_per_layer[_fp] = extent
+                else:
+                    _tr = QgsCoordinateTransform(
+                        project_crs, _lcrs, QgsProject.instance()
+                    )
+                    try:
+                        bbox_per_layer[_fp] = _tr.transformBoundingBox(extent)
+                    except Exception:  # noqa: BLE001
+                        bbox_per_layer[_fp] = extent
+        flog(
+            f"geogit: snap_bbox_computed n_layers={len(bbox_per_layer)} "
+            f"project_crs={project_crs.authid()}",
+            "DEBUG",
+        )
+
         worker = SnapshotRebuildWorker(
             self._journal,
             self._geogit_layer_infos,
             iso,
+            bbox_per_layer=bbox_per_layer,
             parent=self,
         )
         worker.result_ready.connect(self._on_snapshot_result)
@@ -2583,6 +2638,23 @@ class RecoverDialog(QDialog, LoggerMixin):
             f"[{trace_id}] geogit: snap_worker_error msg={message}",
             "ERROR",
         )
+
+    def _on_geogit_snap_extent_changed(self) -> None:
+        """Slot: canvas extent changed — (re)start spatial debounce."""
+        if not self._geogit_snap_mode:
+            return
+        if self._geogit_snap_ext_debounce is not None:
+            self._geogit_snap_ext_debounce.start()
+
+    def _on_geogit_snap_bbox_fire(self) -> None:
+        """Slot: spatial debounce expired — reload snapshot for current extent."""
+        if not self._geogit_snap_mode or not self._geogit_snap_pending_iso:
+            return
+        flog(
+            f"geogit: snap_bbox_reload iso={self._geogit_snap_pending_iso}",
+            "DEBUG",
+        )
+        self._on_snapshot_date_changed(self._geogit_snap_pending_iso)
 
     def _setup_geogit_status_bar(self) -> None:
         """Create the GeoGit status widget (not yet in status bar)."""
