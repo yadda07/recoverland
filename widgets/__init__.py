@@ -5,9 +5,11 @@ from .themed_logo import ThemedLogoWidget
 from .restore_mode_selector import RestoreModeSelector
 from .restore_preflight_dialog import RestorePreflightDialog
 from .time_slider import TimeSliderWidget
+from .canvas_date_bar import CanvasDateBar
 
 __all__ = (
     "AppleToggleSwitch",
+    "CanvasDateBar",
     "GeoGitSegmentedSwitch",
     "ThemedLogoWidget",
     "RestoreModeSelector",

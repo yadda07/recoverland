@@ -106,6 +106,8 @@ class GeoGitStatusWidget(QWidget):
         self._active = True
         self._dot.setStyleSheet(self._dot_css("#2ecc71"))
         self._stop_btn.setVisible(True)
+        self._stop_btn.setEnabled(False)
+        QTimer.singleShot(600, lambda: self._stop_btn.setEnabled(True))
         self.setStyleSheet(_PILL_ACTIVE)
         self._update_text()
         self.setToolTip(self._build_tooltip())

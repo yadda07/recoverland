@@ -269,7 +269,9 @@ def purge_lens_overlays(context: str = "manual") -> int:
         ids = [
             lyr.id() for lyr in project.mapLayers().values()
             if (lyr.name().startswith(_LENS_LAYER_PREFIX)
-                or lyr.customProperty("_rl_lens_managed") == "1")
+                or lyr.name().startswith("__rl_snap_")
+                or lyr.customProperty("_rl_lens_managed") == "1"
+                or lyr.customProperty("_rl_snap_managed") == "1")
         ]
         if ids:
             project.removeMapLayers(ids)
