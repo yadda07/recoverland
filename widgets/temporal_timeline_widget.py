@@ -222,7 +222,7 @@ class TemporalTimelineWidget(QWidget):
                 break
 
     def mousePressEvent(self, event) -> None:
-        if int(event.button()) == int(QtCompat.LEFT_BUTTON):
+        if event.button() == QtCompat.LEFT_BUTTON:
             self._dragging = True
             self._move_to_x(event.pos().x(), emit=False)
             snapped = self._try_snap(event.pos().x())
