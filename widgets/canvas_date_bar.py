@@ -25,87 +25,14 @@ from typing import Optional
 from qgis.PyQt.QtCore import QDate, QEvent, QPoint, Qt, QTime, QTimer, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QDateEdit, QHBoxLayout, QLabel, QPushButton,
-    QSizePolicy, QSlider, QTimeEdit, QToolTip, QWidget,
+    QSizePolicy, QTimeEdit, QWidget,
 )
 
 from ..compat import QtCompat
 from ..core.logger import flog
+from .temporal_timeline_widget import TemporalTimelineWidget
 
 _BAR_HEIGHT = 40
-_SLIDER_MAX = 10_000
-_MARKER_H = 8
-_MARKER_W = 5
-
-
-try:
-    _WA_MOUSE_TRANSPARENT = Qt.WidgetAttribute.WA_TransparentForMouseEvents
-except AttributeError:
-    _WA_MOUSE_TRANSPARENT = Qt.WA_TransparentForMouseEvents
-
-
-class _HistoryMarkers(QWidget):
-    """Transparent overlay that draws ▲ event-date markers on the slider groove.
-
-    Positions are set as normalized floats in [0.0, 1.0].
-    Completely mouse-transparent so the slider underneath still works.
-    """
-
-    def __init__(self, parent: QWidget):
-        super().__init__(parent)
-        self.setAttribute(_WA_MOUSE_TRANSPARENT, True)
-        self._positions: list = []
-        self._date_isos: list = []
-
-    def set_positions(self, positions: list, date_isos: list = None) -> None:
-        self._positions = list(positions)
-        self._date_isos = list(date_isos) if date_isos else []
-        self.update()
-
-    def clear(self) -> None:
-        self._positions = []
-        self._date_isos = []
-        self.update()
-
-    def date_at_x(self, x: int, threshold_px: int = 10):
-        """Return ISO string of marker nearest to x, or None if none within threshold."""
-        if not self._positions:
-            return None
-        w = max(1, self.width())
-        best_idx, best_dist = -1, threshold_px + 1
-        for i, pos in enumerate(self._positions):
-            dist = abs(x - int(pos * w))
-            if dist < best_dist:
-                best_dist = dist
-                best_idx = i
-        if best_idx < 0 or best_idx >= len(self._date_isos):
-            return None
-        return self._date_isos[best_idx]
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        if not self._positions:
-            return
-        from qgis.PyQt.QtGui import QBrush, QColor, QPainter, QPolygon  # noqa: PLC0415
-        try:
-            aa = QPainter.RenderHint.Antialiasing
-            no_pen = Qt.PenStyle.NoPen
-        except AttributeError:
-            aa = QPainter.Antialiasing
-            no_pen = Qt.NoPen
-        p = QPainter(self)
-        p.setRenderHint(aa)
-        p.setBrush(QBrush(QColor(255, 200, 60, 220)))
-        p.setPen(no_pen)
-        w = max(1, self.width())
-        h = self.height()
-        for pos in self._positions:
-            x = int(pos * w)
-            poly = QPolygon([
-                QPoint(x - _MARKER_W, h),
-                QPoint(x + _MARKER_W, h),
-                QPoint(x, h - _MARKER_H),
-            ])
-            p.drawPolygon(poly)
-        p.end()
 
 
 def _qevent_resize_type() -> int:
@@ -149,35 +76,6 @@ _CANVAS_EVENT_TYPES = frozenset({_RESIZE_EVENT_TYPE, _MOVE_EVENT_TYPE})
 _WIN_EVENT_TYPES = frozenset({_RESIZE_EVENT_TYPE, _MOVE_EVENT_TYPE, _LAYOUT_REQUEST_TYPE})
 
 
-def _qevent_mouse_move_type() -> int:
-    ns = getattr(QEvent, 'Type', None)
-    if ns is not None:
-        val = getattr(ns, 'MouseMove', None)
-        if val is not None:
-            return int(val)
-    return int(getattr(QEvent, 'MouseMove', 5))
-
-
-def _qevent_dbl_click_type() -> int:
-    ns = getattr(QEvent, 'Type', None)
-    if ns is not None:
-        val = getattr(ns, 'MouseButtonDblClick', None)
-        if val is not None:
-            return int(val)
-    return int(getattr(QEvent, 'MouseButtonDblClick', 4))
-
-
-_MOUSE_MOVE_EVENT_TYPE = _qevent_mouse_move_type()
-_DBL_CLICK_EVENT_TYPE = _qevent_dbl_click_type()
-
-
-def _format_iso_for_tooltip(iso: str) -> str:
-    """Format ISO datetime string for marker tooltip display."""
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.strftime("%d/%m/%Y %H:%M:%S")
-    except (ValueError, TypeError):
-        return iso
 
 
 def _purge_stale_bars() -> None:
@@ -265,7 +163,6 @@ class CanvasDateBar(QWidget):
         canvas.installEventFilter(self)
         if self._main_win is not None:
             self._main_win.installEventFilter(self)
-        self._slider.installEventFilter(self)
         self._reposition()
         self._set_transient_parent()
         flog(
@@ -294,6 +191,7 @@ class CanvasDateBar(QWidget):
         self._date_edit.setMaximumDate(
             QDate(today.year, today.month, today.day)
         )
+        self._timeline.set_range(first_iso, last_iso)
         self._go_today()
         flog(
             f"canvas_date_bar: range_set "
@@ -369,12 +267,6 @@ class CanvasDateBar(QWidget):
             QTimer.singleShot(150, self._reposition)
         elif obj is self._main_win and evt in _WIN_EVENT_TYPES:
             self._reposition_timer.start()  # coalesced at +200ms
-        elif obj is self._slider:
-            if evt == _MOUSE_MOVE_EVENT_TYPE:
-                self._on_slider_hover(event.pos())
-            elif evt == _DBL_CLICK_EVENT_TYPE:
-                if self._snap_to_nearest_marker(event.pos()):
-                    return True
         return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------ #
@@ -401,15 +293,12 @@ class CanvasDateBar(QWidget):
         self._time_edit.setFixedWidth(58)
         layout.addWidget(self._time_edit)
 
-        self._slider = QSlider(QtCompat.HORIZONTAL, self)
-        self._slider.setMinimum(0)
-        self._slider.setMaximum(_SLIDER_MAX)
+        self._timeline = TemporalTimelineWidget(self)
         sp = QSizePolicy(QtCompat.SIZE_EXPANDING, QtCompat.SIZE_FIXED)
-        self._slider.setSizePolicy(sp)
-        self._slider.setMouseTracking(True)
-        layout.addWidget(self._slider)
-
-        self._marker_overlay = _HistoryMarkers(self)
+        self._timeline.setSizePolicy(sp)
+        self._timeline.setFixedHeight(28)
+        layout.addWidget(self._timeline)
+        self._timeline.date_changed.connect(self._on_timeline_date_changed)
 
         self._btn_today = QPushButton(self.tr("Aujourd'hui"), self)
         self._btn_today.setFixedWidth(90)
@@ -419,7 +308,6 @@ class CanvasDateBar(QWidget):
         self._lbl_status.setMinimumWidth(210)
         layout.addWidget(self._lbl_status)
 
-        self._slider.valueChanged.connect(self._on_slider_changed)
         self._date_edit.dateChanged.connect(self._on_date_edit_changed)
         self._time_edit.timeChanged.connect(self._on_time_changed)
         self._btn_today.clicked.connect(self._go_today)
@@ -443,16 +331,6 @@ class CanvasDateBar(QWidget):
             "  padding: 1px 4px; font-size: 12px;"
             "}"
             "QDateEdit::drop-down { border: none; width: 16px; }"
-            "QSlider::groove:horizontal {"
-            "  height: 4px; background: #505050; border-radius: 2px;"
-            "}"
-            "QSlider::handle:horizontal {"
-            "  width: 14px; height: 14px; margin: -5px 0;"
-            "  background: #4a90d9; border-radius: 7px;"
-            "}"
-            "QSlider::sub-page:horizontal {"
-            "  background: #4a90d9; border-radius: 2px;"
-            "}"
         )
 
     def _set_transient_parent(self) -> None:
@@ -488,46 +366,22 @@ class CanvasDateBar(QWidget):
             f"visible={self.isVisible()} pos=({self.x()},{self.y()})",
             "DEBUG",
         )
-        QTimer.singleShot(0, self._reposition_markers)
 
     def set_markers(self, date_isos: list) -> None:
-        """Draw ▲ markers at each date position. date_isos is a list of ISO strings."""
-        if self._base_date is None or self._total_days < 1:
-            self._marker_overlay.clear()
-            return
-        positions = []
-        for iso in date_isos:
-            try:
-                d = _parse_iso_date(iso)
-                offset = (d - self._base_date).days
-                pos = max(0.0, min(1.0, offset / self._total_days))
-                positions.append(pos)
-            except (ValueError, TypeError, AttributeError):
-                pass
-        self._marker_overlay.set_positions(positions, date_isos)
-        flog(f"canvas_date_bar: markers_set n={len(positions)}", "DEBUG")
+        """Pass markers to timeline. Accepts plain ISO strings or (iso, op_type) tuples."""
+        self._timeline.set_markers(date_isos)
+        flog(f"canvas_date_bar: markers_set n={len(date_isos)}", "DEBUG")
 
-    def _reposition_markers(self) -> None:
-        """Align the marker overlay to the slider's current screen geometry."""
-        if not hasattr(self, '_marker_overlay'):
-            return
-        sr = self._slider.geometry()
-        self._marker_overlay.setGeometry(sr.x(), sr.y(), sr.width(), sr.height())
-        self._marker_overlay.raise_()
-
-    def _on_slider_changed(self, value: int) -> None:
-        if self._syncing or self._base_date is None:
+    def _on_timeline_date_changed(self, iso: str) -> None:
+        """Sync QDateEdit when user drags the timeline handle."""
+        if self._syncing:
             return
         self._syncing = True
         try:
-            offset = int(round(value / _SLIDER_MAX * self._total_days))
-            new_date = min(
-                self._base_date + timedelta(days=offset),
-                date.today(),
-            )
-            self._date_edit.setDate(
-                QDate(new_date.year, new_date.month, new_date.day)
-            )
+            d = _parse_iso_date(iso)
+            self._date_edit.setDate(QDate(d.year, d.month, d.day))
+        except (ValueError, TypeError):
+            pass
         finally:
             self._syncing = False
         self._debounce.start()
@@ -537,10 +391,8 @@ class CanvasDateBar(QWidget):
             return
         self._syncing = True
         try:
-            d = date(qd.year(), qd.month(), qd.day())
-            offset = max(0, (d - self._base_date).days)
-            value = int(round(offset / self._total_days * _SLIDER_MAX))
-            self._slider.setValue(max(0, min(_SLIDER_MAX, value)))
+            iso = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}T00:00:00"
+            self._timeline.set_value_iso(iso)
         finally:
             self._syncing = False
         self._debounce.start()
@@ -553,7 +405,9 @@ class CanvasDateBar(QWidget):
         try:
             self._date_edit.setDate(qd)
             self._time_edit.setTime(QTime(now.hour, now.minute, 0))
-            self._slider.setValue(_SLIDER_MAX)
+            self._timeline.set_value_iso(
+                f"{today.year:04d}-{today.month:02d}-{today.day:02d}T00:00:00"
+            )
         finally:
             self._syncing = False
         self._emit_date_changed()
@@ -562,53 +416,6 @@ class CanvasDateBar(QWidget):
         if self._syncing:
             return
         self._debounce.start()
-
-    def _on_slider_hover(self, pos) -> None:
-        """Show tooltip when cursor is near a marker."""
-        iso = self._marker_overlay.date_at_x(pos.x())
-        if iso:
-            QToolTip.showText(
-                self._slider.mapToGlobal(pos),
-                _format_iso_for_tooltip(iso),
-                self._slider,
-            )
-            flog(
-                f"canvas_date_bar: marker_hover x={pos.x()} "
-                f"overlay_w={self._marker_overlay.width()} iso={iso}",
-                "DEBUG",
-            )
-
-    def _snap_to_nearest_marker(self, pos) -> bool:
-        """Double-click near a marker: snap date+time and emit immediately."""
-        flog(
-            f"canvas_date_bar: snap_attempt x={pos.x()} "
-            f"overlay_w={self._marker_overlay.width()} "
-            f"n_markers={len(self._marker_overlay._positions)}",
-            "DEBUG",
-        )
-        if self._base_date is None:
-            return False
-        iso = self._marker_overlay.date_at_x(pos.x())
-        if not iso:
-            return False
-        try:
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            return False
-        qd = QDate(dt.year, dt.month, dt.day)
-        qt_time = QTime(dt.hour, dt.minute, dt.second)
-        self._syncing = True
-        try:
-            self._date_edit.setDate(qd)
-            self._time_edit.setTime(qt_time)
-            offset = max(0, (dt.date() - self._base_date).days)
-            value = int(round(offset / self._total_days * _SLIDER_MAX))
-            self._slider.setValue(max(0, min(_SLIDER_MAX, value)))
-        finally:
-            self._syncing = False
-        self._emit_date_changed()
-        flog(f"canvas_date_bar: marker_snapped iso={iso}", "DEBUG")
-        return True
 
     def _emit_date_changed(self) -> None:
         iso = self.current_date_iso()
