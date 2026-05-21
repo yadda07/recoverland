@@ -27,20 +27,13 @@ from ..core.sqlite_schema import AUDIT_EVENT_COLUMNS
 
 _ALIASED_COLS = ", ".join(f"ae.{c}" for c in AUDIT_EVENT_COLUMNS)
 
-_SQL_LATEST_STATE = (
-    "WITH latest_ts AS ("
-    "  SELECT entity_fingerprint, MAX(created_at) AS max_ts"
-    "  FROM audit_event"
-    "  WHERE datasource_fingerprint = ? AND created_at <= ?"
-    "  AND invalidated_at IS NULL"
-    "  GROUP BY entity_fingerprint"
-    ") SELECT " + _ALIASED_COLS +
+_SQL_ALL_EVENTS_BEFORE = (
+    "SELECT " + _ALIASED_COLS +
     " FROM audit_event ae"
-    " INNER JOIN latest_ts"
-    " ON ae.entity_fingerprint = latest_ts.entity_fingerprint"
-    " AND ae.created_at = latest_ts.max_ts"
     " WHERE ae.datasource_fingerprint = ?"
+    " AND ae.created_at <= ?"
     " AND ae.invalidated_at IS NULL"
+    " ORDER BY ae.entity_fingerprint, ae.created_at, ae.event_id"
 )
 
 _SQL_DATE_RANGE = (
@@ -96,10 +89,9 @@ class SnapshotRebuildWorker(QThread):
         tid = self.trace_id
         conn = None
 
-        has_bbox = bool(self._bbox_per_layer)
         flog(
             f"[{tid}] snap_worker: start cutoff={self._cutoff_iso} "
-            f"n_layers={len(self._layer_infos)} bbox_filter={has_bbox}",
+            f"n_layers={len(self._layer_infos)}",
             "INFO",
         )
 
@@ -115,25 +107,16 @@ class SnapshotRebuildWorker(QThread):
 
                 fp = info["fingerprint"]
                 rows = conn.execute(
-                    _SQL_LATEST_STATE,
-                    (fp, self._cutoff_iso, fp),
+                    _SQL_ALL_EVENTS_BEFORE,
+                    (fp, self._cutoff_iso),
                 ).fetchall()
                 events = [_row_to_event(r) for r in rows]
-                bbox = self._bbox_per_layer.get(fp)
-                if bbox is not None:
-                    n_before = len(events)
-                    events = _filter_by_bbox(events, bbox)
-                    flog(
-                        f"[{tid}] snap_worker: layer={info['layer_name']} "
-                        f"bbox_kept={len(events)} bbox_dropped={n_before - len(events)}",
-                        "DEBUG",
-                    )
                 mini_cache[fp] = events
                 total_rows += len(events)
 
                 flog(
                     f"[{tid}] snap_worker: layer={info['layer_name']} "
-                    f"n_entity_states={len(events)} cutoff={self._cutoff_iso}",
+                    f"n_events={len(events)} cutoff={self._cutoff_iso}",
                     "INFO",
                 )
 
