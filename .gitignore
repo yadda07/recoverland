@@ -50,6 +50,9 @@ scripts/SESSION_REWIND.md
 conftest.py
 tests/
 
+# Auto-installed dependencies (fallback vendor dir created by deps.py)
+_vendor/
+
 # Release build artefacts (produced by scripts/build_release.py).
 build/
 dist/

@@ -1,17 +1,17 @@
 """
-il15_geogit_mode.py  -  Validation BL-IL-P1-15 (mode GeoGit integre dans RecoverDialog)
+il15_geogit_mode.py  -  Validation BL-IL-P1-15 (mode Review integre dans RecoverDialog)
 =========================================================================================
 Lance depuis la console Python QGIS :
 
     exec(compile(Path('C:/Users/yadda/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/lens/il15_geogit_mode.py').read_text(), 'C:/Users/yadda/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/lens/il15_geogit_mode.py', 'exec'))
 
 Verifie :
- 1. RestoreModeSelector a 3 modes valides (event, temporal, geogit)
- 2. RestoreModeSelector a un bouton _btn_geogit
- 3. setMode('geogit') fonctionne sans erreur
- 4. recover_dialog source contient _recover_geogit_mode
- 5. Mode geogit: bouton Recover texte=Visualiser + layer_input visible
- 6. Mode geogit: results_group masque + restore_button masque
+ 1. RestoreModeSelector a 3 modes valides (event, temporal, review)
+ 2. RestoreModeSelector a un bouton _btn_review
+ 3. setMode('review') fonctionne sans erreur
+ 4. recover_dialog source contient _recover_review_mode
+ 5. Mode review: bouton Recover texte=Visualiser + layer_input visible
+ 6. Mode review: results_group masque + restore_button masque
 """
 import importlib
 import sys
@@ -41,7 +41,7 @@ from recoverland.widgets.restore_mode_selector import RestoreModeSelector
 # --- Test 1 : VALID_MODES contains 3 modes ---
 ok = hasattr(RestoreModeSelector, 'VALID_MODES')
 modes = getattr(RestoreModeSelector, 'VALID_MODES', ())
-ok = ok and set(modes) == {'event', 'temporal', 'geogit'}
+ok = ok and set(modes) == {'event', 'temporal', 'review'}
 results.append((
     'valid_modes_3',
     ok,
@@ -49,44 +49,44 @@ results.append((
 ))
 
 
-# --- Test 2 : _btn_geogit exists ---
+# --- Test 2 : _btn_review exists ---
 sel = RestoreModeSelector()
-ok = hasattr(sel, '_btn_geogit')
+ok = hasattr(sel, '_btn_review')
 results.append((
-    'btn_geogit_exists',
+    'btn_review_exists',
     ok,
     f"has_btn={ok}",
 ))
 
 
-# --- Test 3 : setMode('geogit') works ---
+# --- Test 3 : setMode('review') works ---
 try:
-    sel.setMode('geogit')
-    ok = sel.mode() == 'geogit'
+    sel.setMode('review')
+    ok = sel.mode() == 'review'
     msg = f"mode_after_set={sel.mode()}"
 except Exception as exc:
     ok, msg = False, f"raised: {exc!r}"
 results.append((
-    'setMode_geogit_works',
+    'setMode_review_works',
     ok,
     msg,
 ))
 sel.deleteLater()
 
 
-# --- Test 4 : _recover_geogit_mode exists in RecoverDialog source ---
+# --- Test 4 : _recover_review_mode exists in RecoverDialog source ---
 dialog_src = (
     _PLUGIN / 'recover_dialog.py'
 ).read_text(encoding='utf-8')
-ok = 'def _recover_geogit_mode(self)' in dialog_src
+ok = 'def _recover_review_mode(self)' in dialog_src
 results.append((
-    'recover_geogit_mode_exists',
+    'recover_review_mode_exists',
     ok,
     f"found={ok}",
 ))
 
 
-# --- Test 5+6 : instantiate dialog, switch to geogit, check widget state ---
+# --- Test 5+6 : instantiate dialog, switch to review, check widget state ---
 plugin = plugins.get('recoverland')
 journal = getattr(plugin, '_journal', None) if plugin is not None else None
 tracker = getattr(plugin, '_tracker', None) if plugin is not None else None
@@ -97,14 +97,14 @@ from recoverland.recover_dialog import RecoverDialog
 try:
     dlg = RecoverDialog(iface, journal=journal, tracker=tracker,
                         write_queue=write_queue)
-    dlg.restore_mode_selector.setMode('geogit')
-    dlg._on_period_mode_changed('geogit')
+    dlg.restore_mode_selector.setMode('review')
+    dlg._on_period_mode_changed('review')
 
     btn_text = dlg.recover_button.text()
     layer_visible = dlg.layer_input.isVisible()
     ok5 = ('Visualiser' in btn_text) and layer_visible
     results.append((
-        'geogit_btn_text_and_layer_visible',
+        'review_btn_text_and_layer_visible',
         ok5,
         f"btn_text={btn_text!r} layer_visible={layer_visible}",
     ))
@@ -113,14 +113,14 @@ try:
     restore_hidden = not dlg.restore_button.isVisible()
     ok6 = results_hidden and restore_hidden
     results.append((
-        'geogit_results_and_restore_hidden',
+        'review_results_and_restore_hidden',
         ok6,
         f"results_hidden={results_hidden} restore_hidden={restore_hidden}",
     ))
     dlg.deleteLater()
 except Exception as exc:
-    results.append(('geogit_btn_text_and_layer_visible', False, f"raised: {exc!r}"))
-    results.append(('geogit_results_and_restore_hidden', False, f"raised: {exc!r}"))
+    results.append(('review_btn_text_and_layer_visible', False, f"raised: {exc!r}"))
+    results.append(('review_results_and_restore_hidden', False, f"raised: {exc!r}"))
 
 
 # --- Bilan ---

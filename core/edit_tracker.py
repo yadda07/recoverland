@@ -88,6 +88,23 @@ class EditSessionTracker:
             self._suppress_depth -= 1
         flog(f"EditSessionTracker: unsuppressed (depth={self._suppress_depth})")
 
+    def suppressed(self):
+        """Context manager for safe suppress/unsuppress pairing.
+
+        Usage: with tracker.suppressed(): ...
+        Guarantees unsuppress even if the body raises.
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            self.suppress()
+            try:
+                yield
+            finally:
+                self.unsuppress()
+        return _ctx()
+
     def force_unsuppress(self) -> None:
         """Force-reset suppress depth to 0 (cleanup/teardown only)."""
         prev = self._suppress_depth

@@ -488,6 +488,38 @@ def feature_geom_short_repr_diag(layer, fid: int) -> str:
     return feature_geom_short_repr(layer, fid)
 
 
+def reproject_bbox(
+    bbox_xy: Tuple[float, ...], src_crs: str, dst_crs: str,
+) -> Tuple[float, ...]:
+    """Reproject a bounding box tuple (xmin, ymin, xmax, ymax) between CRS.
+
+    Returns the original bbox on error or if CRS are identical.
+    Consolidated from review session and render worker (BL-DIAG-P1-10).
+    """
+    if not dst_crs or dst_crs == src_crs:
+        return bbox_xy
+    try:
+        from qgis.core import (  # noqa: PLC0415
+            QgsCoordinateReferenceSystem,
+            QgsCoordinateTransform,
+            QgsGeometry,
+            QgsProject,
+            QgsRectangle,
+        )
+        rect = QgsRectangle(bbox_xy[0], bbox_xy[1], bbox_xy[2], bbox_xy[3])
+        geom = QgsGeometry.fromRect(rect)
+        xform = QgsCoordinateTransform(
+            QgsCoordinateReferenceSystem(src_crs),
+            QgsCoordinateReferenceSystem(dst_crs),
+            QgsProject.instance(),
+        )
+        geom.transform(xform)
+        b = geom.boundingBox()
+        return (b.xMinimum(), b.yMinimum(), b.xMaximum(), b.yMaximum())
+    except Exception:  # noqa: BLE001
+        return bbox_xy
+
+
 def capture_geometry_info(layer, feature) -> Tuple[Optional[bytes], str, Optional[str]]:
     """Capture geometry WKB, type, and CRS from a layer+feature.
 

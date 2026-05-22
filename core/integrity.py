@@ -124,7 +124,16 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> tuple:
     if not os.path.isfile(pending_path):
         return 0, 0
 
+    _MAX_PENDING_SIZE = 50 * 1024 * 1024  # 50 MB
     try:
+        file_size = os.path.getsize(pending_path)
+        if file_size > _MAX_PENDING_SIZE:
+            flog(
+                f"integrity: pending file too large size_bytes={file_size} "
+                f"max={_MAX_PENDING_SIZE}, skipping auto-recovery",
+                "ERROR",
+            )
+            return 0, 0
         with open(pending_path, "r", encoding="utf-8") as f:
             events = json.load(f)
 
@@ -221,7 +230,16 @@ def save_pending_events(db_path: str, events: list) -> None:
             if usage.free < 10 * 1024 * 1024:
                 flog(f"integrity: skip pending save, disk free={usage.free} < 10 MB", "ERROR")
                 return
-        serializable = []
+        existing = []
+        if os.path.isfile(pending_path):
+            try:
+                with open(pending_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                flog(f"integrity: appending to existing pending n_existing={len(existing)}")
+            except (json.JSONDecodeError, OSError) as read_err:
+                flog(f"integrity: cannot read existing pending, overwriting: {read_err}", "WARNING")
+                existing = []
+        serializable = list(existing)
         for evt in events:
             if hasattr(evt, '_asdict'):
                 serializable.append(_prepare_event_for_json(evt._asdict()))
@@ -229,7 +247,8 @@ def save_pending_events(db_path: str, events: list) -> None:
                 serializable.append(_prepare_event_for_json(evt))
         with open(pending_path, "w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False)
-        flog(f"integrity: saved {len(serializable)} pending events")
+        flog(f"integrity: saved {len(serializable)} pending events "
+             f"(new={len(serializable) - len(existing)})")
     except (OSError, TypeError) as e:
         flog(f"integrity: cannot save pending events: {e}", "ERROR")
 

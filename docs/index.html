@@ -20,7 +20,7 @@
   <nav class="bar-nav">
     <a href="index.html" class="on">Overview</a>
     <a href="architecture.html">Architecture</a>
-    <a href="geogit.html">GeoGit</a>
+    <a href="review.html">Review</a>
     <a href="guide.html">Guide</a>
     <a href="formats.html">Formats</a>
     <a href="limits.html">Limits</a>
@@ -76,8 +76,8 @@
   </div>
   <p class="hero-sub">Smart local audit, delta storage, surgical restore: travel back in time through your QGIS edits</p>
   <div class="hero-badges">
-    <span class="hero-badge hero-badge-ac">v4.3</span>
-    <span class="hero-badge">QGIS 3.44 - 4.x</span>
+    <span class="hero-badge hero-badge-ac">v4.9</span>
+    <span class="hero-badge">QGIS 3.40 - 4.x</span>
     <span class="hero-badge">Local SQLite</span>
     <span class="hero-badge">Automatic capture</span>
     <span class="hero-badge">Multi-format</span>
@@ -87,7 +87,7 @@
   <div class="hero-line"></div>
 </div>
 
-<div class="info"><strong>Version 4.3</strong>: 100% local journal (SQLite, schema v4). Smart delta storage (only changed attributes are recorded). Automatic schema drift detection. Datasource alias resolver (reconcile fingerprints after path moves). PID-based writer lock preventing concurrent QGIS instances from corrupting the journal. Consolidated audit report (top users, top layers, operation counts). Asynchronous writes with no UI freeze. Health monitoring with disk space alerts. Maintenance dialog with export. Automatic user identity resolution. Works with all editable formats: GeoPackage, Shapefile, PostgreSQL, SpatiaLite, MSSQL, Oracle, GeoJSON, CSV, and more.</div>
+<div class="info"><strong>Version 4.9</strong>: 100% local journal (SQLite, schema v5). Smart delta storage (only changed attributes are recorded). Automatic schema drift detection. Datasource alias resolver (reconcile fingerprints after path moves). PID-based writer lock preventing concurrent QGIS instances from corrupting the journal. Consolidated audit report (top users, top layers, operation counts). Asynchronous writes with no UI freeze. Health monitoring with disk space alerts. Maintenance dialog with export. Automatic user identity resolution. Review mode: reconstruct and display the state of tracked layers at any past date T via a canvas-anchored date bar (Google Earth style), read-only overlay, zero write to source layers. Works with all editable formats: GeoPackage, Shapefile, PostgreSQL, SpatiaLite, MSSQL, Oracle, GeoJSON, CSV, and more.</div>
 
 <div class="cards">
   <div class="card">
@@ -102,8 +102,13 @@
   </div>
   <div class="card">
     <div class="card-tag tag-core">Restore</div>
-    <div class="card-t">Selective restore</div>
-    <p>Individual or batch selection. Schema compatibility check before restore. Rollback on error.</p>
+    <div class="card-t">Selective restore (Action)</div>
+    <p>Pick individual events and apply them back. Schema compatibility check before restore. Rollback on error.</p>
+  </div>
+  <div class="card">
+    <div class="card-tag tag-core">Rewind</div>
+    <div class="card-t">Temporal rewind (Version)</div>
+    <p>Select a past date and rewind tracked layers to their state at that moment. Deduplication cancels inverse pairs (INSERT&rarr;DELETE). Bounded by time range.</p>
   </div>
   <div class="card">
     <div class="card-tag tag-core">Self-contained</div>
@@ -120,6 +125,11 @@
     <div class="card-t">Maintenance dialog</div>
     <p>Retention policy, purge by age or session, async VACUUM, integrity check, and journal export from a single panel.</p>
   </div>
+  <div class="card">
+    <div class="card-tag tag-core">Review</div>
+    <div class="card-t">Time travel at date T</div>
+    <p>Canvas date bar (Google Earth style) lets you pick any past date and instantly see the reconstructed state of tracked layers at that moment. Read-only overlay, zero write to source layers, zero SQL per date change.</p>
+  </div>
 </div>
 
 <!-- ====== WHAT IT DOES ====== -->
@@ -131,7 +141,9 @@
   <li>Smart edit buffer: merges multiple changes on the same feature into one net event before writing</li>
   <li>Automatically filters layer audit fields (<code>date_modif</code>, <code>updated_by</code>, etc.) so metadata-only changes are not recorded</li>
   <li>Paginated history search by layer, operation type, time window, and user</li>
-  <li>Selective restore with schema compatibility report before applying</li>
+  <li>Three modes: <strong>Restore</strong> (action-level, pick individual events), <strong>Rewind</strong> (temporal, roll layers back to a past date), <strong>Review</strong> (read-only snapshot at date T on canvas)</li>
+  <li>Restore: selective restore with schema compatibility report before applying</li>
+  <li>Rewind: temporal restore with deduplication of inverse pairs and bounded time range</li>
   <li>Schema drift detection between the saved state and the current layer structure</li>
   <li>Datasource alias resolver: reconcile fingerprints after a project path move without losing history</li>
   <li>Writer lock: refuses to open the journal when another live QGIS instance is already writing to it (PID-based, Windows and POSIX)</li>
@@ -143,6 +155,8 @@
   <li>Maintenance dialog: retention policy, purge by age or session, async VACUUM, integrity check, journal export</li>
   <li>Orphan journal cleanup: unsaved-project journals older than 30 days are automatically removed</li>
   <li>Works with all editable formats: GeoPackage, Shapefile, PostGIS, SpatiaLite, GeoJSON, CSV, FlatGeobuf, MS SQL Server, Oracle Spatial</li>
+  <li>Review mode: reconstruct and display the state of tracked layers at any past date T via a canvas-anchored date bar (Google Earth style) with a custom painted timeline showing event markers. Read-only overlay, zero write to source layers</li>
+  <li>DB-backed layer restore: PostgreSQL, MS SQL Server, and Oracle layers reconnect via QGIS saved connections (credentials resolved transiently, never persisted)</li>
 </ul>
 </section>
 

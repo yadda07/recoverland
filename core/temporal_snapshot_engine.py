@@ -2,7 +2,7 @@
 
 Zero QGIS dependency. Zero Qt dependency. Pure Python.
 
-Takes an in-memory event_cache (populated by GeoGitCacheWorker, already
+Takes an in-memory event_cache (populated by ReviewCacheWorker, already
 bounded to a time range) and a cutoff datetime, and returns a SnapshotResult
 mapping entity_fp → SnapshotFeature for every entity that existed at T.
 
@@ -85,7 +85,7 @@ def reconstruct_snapshot_at(
     """Reconstruct entity states at cutoff_dt from the in-memory event cache.
 
     Args:
-        event_cache : {fingerprint: [AuditEvent]} from GeoGitCacheWorker.
+        event_cache : {fingerprint: [AuditEvent]} from ReviewCacheWorker.
         cutoff_dt   : target instant (naive = assumed UTC).
         trace_id    : correlation id; auto-generated if empty.
 
@@ -121,7 +121,7 @@ def reconstruct_snapshot_at(
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     flog(
-        f"[{trace_id}] geogit_snapshot: reconstruct_at "
+        f"[{trace_id}] review_snapshot: reconstruct_at "
         f"cutoff={cutoff_utc.isoformat()} "
         f"n_fps={len(event_cache)} n_entities={n_entities} "
         f"n_absent={n_absent} n_unknown={n_unknown} "
@@ -264,14 +264,21 @@ def _geom_at_cutoff(visible: list) -> Optional[bytes]:
         if op == "INSERT":
             if ev.geometry_wkb is None:
                 flog(
-                    f"geogit_snapshot: insert_no_geom event_id={ev.event_id}",
+                    f"review_snapshot: insert_no_geom event_id={ev.event_id}",
                     "WARNING",
                 )
             return ev.geometry_wkb
         if op == "UPDATE":
-            geom = ev.new_geometry_wkb or ev.geometry_wkb
-            if geom is not None:
-                return geom
+            if ev.new_geometry_wkb is not None:
+                return ev.new_geometry_wkb
+            if ev.geometry_wkb is not None:
+                flog(
+                    f"review_snapshot: pre_v2_geom_fallback "
+                    f"event_id={ev.event_id} "
+                    f"op=UPDATE using_old_geom=True",
+                    "WARNING",
+                )
+                return ev.geometry_wkb
     return None
 
 

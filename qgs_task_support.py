@@ -33,6 +33,8 @@ class TaskEnabledThread(QThread):
             self._task.cancel()
 
     def start(self):
+        if self._running:
+            return
         self._stopped = False
         if supports_qgs_task():
             self._start_task()

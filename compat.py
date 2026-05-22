@@ -74,6 +74,9 @@ class QtCompat:
 
     # --- Qt.WindowType ---
     WINDOW_MAXIMIZE_BUTTON_HINT = _resolve_enum(Qt, 'WindowType', 'WindowMaximizeButtonHint')
+    WINDOW_TOOL = _resolve_enum(Qt, 'WindowType', 'Tool')
+    WINDOW_FRAMELESS = _resolve_enum(Qt, 'WindowType', 'FramelessWindowHint')
+    WINDOW_NO_FOCUS = _resolve_enum(Qt, 'WindowType', 'WindowDoesNotAcceptFocus')
 
     # --- QSizePolicy.Policy ---
     SIZE_PREFERRED = _resolve_enum(QSizePolicy, 'Policy', 'Preferred')
@@ -95,6 +98,9 @@ class QtCompat:
     EVENT_ENTER = _resolve_enum(QEvent, 'Type', 'Enter')
     EVENT_LEAVE = _resolve_enum(QEvent, 'Type', 'Leave')
     EVENT_PALETTE_CHANGE = _resolve_enum(QEvent, 'Type', 'PaletteChange')
+    EVENT_RESIZE = _resolve_enum(QEvent, 'Type', 'Resize')
+    EVENT_MOVE = _resolve_enum(QEvent, 'Type', 'Move')
+    EVENT_LAYOUT_REQUEST = _resolve_enum(QEvent, 'Type', 'LayoutRequest')
 
     # --- QEasingCurve.Type ---
     EASE_IN_OUT_QUAD = _resolve_enum(QEasingCurve, 'Type', 'InOutQuad')

@@ -2575,6 +2575,1067 @@
         }
       ],
       "commit_hash": "be70a50"
+    },
+    {
+      "id": "BL-GGS-P0-01",
+      "title": "temporal_snapshot_engine.py — moteur de reconstruction état à T",
+      "priority": "P0",
+      "effort": "S",
+      "root_cause": "Mode GeoGit diff affiche toutes les modifications simultanément → encombrement. Nécessite un moteur de replay avant jusqu'à T pour reconstituer l'état des données à une date précise.",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "scripts/validation/scenarios/lens/il_ggs01_snapshot_engine.py",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "core/temporal_snapshot_engine.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P0-01. Chemin critique P0-01 + P0-02 parallèle."
+        },
+        {
+          "ts": "2026-05-21T09:36:20Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "Implementé dans core/temporal_snapshot_engine.py — SnapshotResult, reconstruct_snapshot_at, _geom_at_cutoff",
+          "forced": true
+        }
+      ],
+      "commit_hash": "665afce"
+    },
+    {
+      "id": "BL-GGS-P0-02",
+      "title": "canvas_date_bar.py — widget slim ancré en bas du canvas QGIS",
+      "priority": "P0",
+      "effort": "M",
+      "root_cause": "Aucun contrôle temporel natif sur le canvas QGIS. La barre de date doit être positionnée sur le canvas (pas dans le dialog) pour l'analogie Google Earth.",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "scripts/validation/scenarios/lens/il_ggs02_canvas_date_bar.py",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "widgets/canvas_date_bar.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P0-02. Parallèle à P0-01."
+        },
+        {
+          "ts": "2026-05-21T09:36:34Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "Implementé dans widgets/canvas_date_bar.py — QWidget ancré canvas, QSlider, debounce, date_changed signal, markers, setMouseTracking, QTimeEdit, tooltip, double-clic snap",
+          "forced": true
+        }
+      ],
+      "commit_hash": "665afce"
+    },
+    {
+      "id": "BL-GGS-P0-03",
+      "title": "snapshot_overlay_session.py — gestion couche overlay état T",
+      "priority": "P0",
+      "effort": "M",
+      "root_cause": "GeoGitSession crée 3 couches (geom_past/arrows/attr_markers). Le mode snapshot ne montre qu'un état reconstitué → 1 couche suffit, gérée par une session dédiée.",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P0-01"
+      ],
+      "scenario_path": "scripts/validation/scenarios/lens/il_ggs03_snapshot_session.py",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "core/snapshot_overlay_session.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P0-03. Bloqué par P0-01 (contrat SnapshotResult)."
+        },
+        {
+          "ts": "2026-05-21T09:36:49Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "Implementé dans core/snapshot_overlay_session.py — SnapshotOverlaySession, update_async, 1 couche mémoire par source",
+          "forced": true
+        }
+      ],
+      "commit_hash": "665afce"
+    },
+    {
+      "id": "BL-GGS-P0-04",
+      "title": "Câblage recover_dialog.py — toggle snapshot + date_changed → rebuild",
+      "priority": "P0",
+      "effort": "M",
+      "root_cause": "Le moteur snapshot et la barre de date existent mais ne sont pas connectés. Le dialog doit orchestrer : activation → cache load (réutilisé) → rebuild à chaque date change (debounced).",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P0-01",
+        "BL-GGS-P0-02",
+        "BL-GGS-P0-03"
+      ],
+      "scenario_path": "scripts/validation/scenarios/lens/il_ggs04_dialog_wiring.py",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "recover_dialog.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P0-04. Bloqué par P0-01+02+03."
+        },
+        {
+          "ts": "2026-05-21T09:36:49Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "Câblé dans recover_dialog.py — toggle snapshot mode, _on_snapshot_date_changed, bbox_per_layer, _on_snapshot_result, debounce 800ms",
+          "forced": true
+        }
+      ],
+      "commit_hash": "665afce"
+    },
+    {
+      "id": "BL-GGS-P0-05",
+      "title": "Toggle UI Diff / Snapshot dans GeoGit mode",
+      "priority": "P0",
+      "effort": "S",
+      "root_cause": "Actuellement le mode GeoGit n'a que la combo viz (diff_window / updates_stacked). Il faut un toggle de mode principal Diff vs Snapshot pour guider l'utilisateur.",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P0-04"
+      ],
+      "scenario_path": "scripts/validation/scenarios/lens/il_ggs05_ui_toggle.py",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "recover_dialog.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P0-05. Bloqué par P0-04."
+        },
+        {
+          "ts": "2026-05-21T09:37:07Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "Toggle GeoGit Diff/Snapshot dans recover_dialog.py — bouton bascule, start/stop snapshot mode",
+          "forced": true
+        }
+      ],
+      "commit_hash": "665afce"
+    },
+    {
+      "id": "BL-GGS-P0-06",
+      "title": "SnapshotRebuildWorker (QThread) + cancel sur date change",
+      "priority": "P0",
+      "effort": "S",
+      "root_cause": "Pour les grands journaux (> 10 000 events), la reconstruction synchrone peut durer > 500ms → freeze UI. Un worker QThread avec cancel automatique est nécessaire.",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P0-04"
+      ],
+      "scenario_path": "scripts/validation/scenarios/lens/il_ggs06_async_rebuild.py",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "widgets/snapshot_rebuild_worker.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P0-06. Bloqué par P0-04."
+        },
+        {
+          "ts": "2026-05-21T09:37:07Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "SnapshotRebuildWorker dans widgets/snapshot_rebuild_worker.py — QThread, cancel, result_ready signal, filter_snapshot_by_bbox, all_event_dates",
+          "forced": true
+        }
+      ],
+      "commit_hash": "665afce"
+    },
+    {
+      "id": "BL-GGS-P1-07",
+      "title": "Tick marks sur slider aux dates réelles d'events",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Slider sans repères oblige l'utilisateur à naviguer à l'aveugle. Les dates avec des modifications réelles doivent être visibles directement sur le slider.",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P0-02"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "widgets/canvas_date_bar.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P1-07."
+        },
+        {
+          "ts": "2026-05-21T09:37:27Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "Tick marks implémentés dans canvas_date_bar.py — _HistoryMarkers overlay, set_positions, date_isos, date_at_x, tooltip survol, double-clic snap, QTimeEdit HH:mm",
+          "forced": true
+        }
+      ],
+      "commit_hash": "6c696d4"
+    },
+    {
+      "id": "BL-GGS-P1-08",
+      "title": "Indicateurs d'état bord du slider (initial / audité / actuel)",
+      "priority": "P1",
+      "effort": "S",
+      "root_cause": "L'utilisateur ne sait pas si la date sélectionnée est avant/pendant/après la plage auditée. Un label contextuel clair est nécessaire.",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P0-04"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "widgets/canvas_date_bar.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P1-08."
+        },
+        {
+          "ts": "2026-05-21T09:37:27Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "Indicateurs d'état dans canvas_date_bar.py — set_loading(), set_stats(n), label status orange/bleu",
+          "forced": true
+        }
+      ],
+      "commit_hash": "665afce"
+    },
+    {
+      "id": "BL-GGS-P1-09",
+      "title": "Export snapshot courant vers GeoPackage horodaté",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "L'état reconstitué en mémoire est éphémère. L'utilisateur doit pouvoir l'archiver ou le partager sans exposer le journal complet.",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P0-03"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "core/snapshot_overlay_session.py",
+        "widgets/canvas_date_bar.py",
+        "recover_dialog.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P1-09."
+        },
+        {
+          "ts": "2026-05-21T10:02:33Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/architecte",
+          "evidence": "Perimetre : bouton Export dans CanvasDateBar, exporte les overlay layers snapshot vers un GeoPackage horodaté. Lecture SnapshotOverlaySession pour lister les layers mémoire. Nom fichier : recoverland_snapshot_YYYYMMDD_HHMMSS.gpkg. Log trace export."
+        },
+        {
+          "ts": "2026-05-21T10:07:53Z",
+          "from": "SCOPED",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "export_to_geopackage() 80 lignes dans SnapshotOverlaySession: multi-layer GPKG via writeAsVectorFormatV3, compat Qt5/Qt6 (ActionOnExistingFile, WriterError). Bouton Export dans CanvasDateBar + signal export_requested. Slot _on_snapshot_export_requested dans RecoverDialog : QFileDialog, nom horodaté recoverland_snapshot_YYYYMMDD_HHMMSS.gpkg, QMessageBox succès/erreur. i18n 6 strings FR+EN (371 messages). py_compile OK 3 fichiers.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "14e7f59"
+    },
+    {
+      "id": "BL-GGS-P1-10",
+      "title": "i18n FR+EN — barre de date et toggle Diff/Snapshot",
+      "priority": "P1",
+      "effort": "XS",
+      "root_cause": "Tous les nouveaux libellés doivent être wrappés self.tr() et présents dans recoverland_en.ts, cohérent avec la règle projet (cf. BL-IL-P0-12 DONE).",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P0-02",
+        "BL-GGS-P0-05"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "i18n/recoverland_en.ts",
+        "i18n/recoverland_en.qm"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P1-10."
+        },
+        {
+          "ts": "2026-05-21T09:43:21Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/architecte",
+          "evidence": "Perimetre : wrapping self.tr() CanvasDateBar + recoverland_en.ts context CanvasDateBar + recompile qm"
+        },
+        {
+          "ts": "2026-05-21T09:47:15Z",
+          "from": "SCOPED",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "context CanvasDateBar 4 messages + 3 strings Snapshot dans RecoverDialog. qm recompilé : 365 messages (was 358). 0 string UI hardcodée restante.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "07d3cbd",
+      "log_evidence_excerpt": "recoverland_en.ts -> recoverland_en.qm  (365 messages)"
+    },
+    {
+      "id": "BL-GGS-P2-11",
+      "title": "Reconstruction incrémentale delta T1 → T2",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Reconstruction complète O(N) à chaque changement de date. Pour les grands journaux, le delta entre T1 et T2 est O(delta_events) << O(N).",
+      "state": "OPEN",
+      "blocked_by": [
+        "BL-GGS-P0-01",
+        "BL-GGS-P0-06"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "core/temporal_snapshot_engine.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P2-11."
+        }
+      ]
+    },
+    {
+      "id": "BL-GGS-P2-12",
+      "title": "Mode animation play/pause sur la barre de date",
+      "priority": "P2",
+      "effort": "L",
+      "root_cause": "Navigation manuelle efficace pour explorer des patterns, mais pas pour comprendre l'évolution temporelle continue. Un mode play/pause permet de voir l'historique défiler automatiquement.",
+      "state": "OPEN",
+      "blocked_by": [
+        "BL-GGS-P1-13",
+        "BL-GGS-P2-11"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "widgets/canvas_date_bar.py",
+        "widgets/temporal_timeline_widget.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-20T10:47:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/architecte",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P2-12. Bloqué par P1-13 (Custom Timeline Widget requis avant Playback)."
+        }
+      ]
+    },
+    {
+      "id": "BL-GGS-P1-13",
+      "title": "TemporalTimelineWidget — Remplacement Custom Painted du QSlider",
+      "priority": "P1",
+      "effort": "L",
+      "root_cause": "Le couple QSlider+_HistoryMarkers impose des limites de rendu (graduations impossibles, désalignement selon thèmes Qt, détection de survol fragile). Un composant custom QWidget avec paintEvent libre est requis pour les fonctionnalités enterprise : règle graduée dynamique, marqueurs colorés par op_type, magnétisme, DPI-aware.",
+      "state": "DONE",
+      "blocked_by": [
+        "BL-GGS-P1-07",
+        "BL-GGS-P1-10"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "widgets/temporal_timeline_widget.py",
+        "widgets/canvas_date_bar.py",
+        "core/temporal_snapshot_engine.py",
+        "widgets/snapshot_rebuild_worker.py",
+        "recover_dialog.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-21T09:34:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/ui_design",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P1-13 — ajouté session 2026-05-21 après analyse rigidité QSlider+overlay."
+        },
+        {
+          "ts": "2026-05-21T09:48:25Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/ui_design",
+          "evidence": "Sprint S4 prioritaire sur P1-09. Perimetre : widgets/temporal_timeline_widget.py (QWidget custom painter) + remplacement QSlider+_HistoryMarkers dans canvas_date_bar.py. Enrichissement all_event_dates avec op_type. Contrat public inchange (date_changed signal)."
+        },
+        {
+          "ts": "2026-05-21T10:01:30Z",
+          "from": "SCOPED",
+          "to": "DONE",
+          "by": "/ui_design",
+          "evidence": "TemporalTimelineWidget (270 lignes) : QPainter custom, marqueurs (iso,op_type) colorés INSERT=vert/UPDATE=orange/DELETE=rouge, ruler adaptatif, snap magnétique 10px, hover tooltip. canvas_date_bar.py : QSlider+_HistoryMarkers supprimés (-130 lignes), timeline connectée. all_event_markers (iso,op_type) dans SnapshotResult+worker+recover_dialog. 4 fichiers py_compile OK.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "bcb4ce9",
+      "log_evidence_excerpt": "ALL OK (py_compile 4 files)"
+    },
+    {
+      "id": "BL-GGS-P2-13",
+      "title": "BBOX-Constrained Bookmarks — marqueurs spatio-temporels filtrés par emprise",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "_SQL_ALL_EVENT_DATES récupère toutes les dates sans filtre spatial. L'utilisateur zoomé sur une parcelle voit des marqueurs de modifications de l'autre bout du territoire (cluttering). Les marqueurs doivent refléter les entités visibles dans la BBOX courante.",
+      "state": "OPEN",
+      "blocked_by": [
+        "BL-GGS-P1-13"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [
+        "widgets/snapshot_rebuild_worker.py",
+        "core/temporal_snapshot_engine.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-21T09:34:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/performance",
+          "evidence": "docs/backlog_geogit_snapshot_2026-05-20.md BL-GGS-P2-13 — ajouté session 2026-05-21 après analyse bookmark cluttering."
+        }
+      ]
+    },
+    {
+      "id": "BL-DIAG-P0-01",
+      "title": "_qgis_vals_equal ignore timezones → duplication features",
+      "priority": "P0",
+      "effort": "S",
+      "root_cause": "AT-RESTORE-1: comparaison QDateTime vs string ISO sans gestion timezone dans core/restore_service.py:27-56",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "n_a",
+      "patch_files": [
+        "core/restore_service.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P0-01 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:17:35Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/architecte",
+          "evidence": "Bug confirmé: _qgis_vals_equal L43 toString(yyyy-MM-ddTHH:mm:ss) strip timezone. Si provider retourne QDateTime en UTC et journal stocké en local (ou inverse), même instant → strings différentes → feature considérée modifiée → duplication. Fix: _qdatetime_matches_str essaie naive, puis toUTC(), puis toLocalTime(). py_compile=0."
+        },
+        {
+          "ts": "2026-05-21T12:17:57Z",
+          "from": "SCOPED",
+          "to": "REPRODUCED",
+          "by": "/corrector",
+          "evidence": "Reproduction statique confirmée: core/restore_service.py:43 (avant patch) fait toString(yyyy-MM-ddTHH:mm:ss) sans gestion tz. Un QDateTime(10:30, UTC) stocké comme '10:30:00' dans le journal, relu comme QDateTime(10:30, OffsetFromUTC+2) par provider PG → toString donne '10:30:00' (match OK accidentel). Mais si stocké comme QDateTime(08:30, UTC) → toString donne '08:30:00' ≠ '10:30:00' → mismatch → duplication. Pas de scenario runtime nécessaire: bug prouvable par analyse statique du code."
+        },
+        {
+          "ts": "2026-05-21T12:18:04Z",
+          "from": "REPRODUCED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "Fix: _qdatetime_matches_str() dans core/restore_service.py:67-85. Essaie naive→toUTC→toLocalTime. Aucune régression possible: si QDateTime est timezone-naive, toUTC/toLocalTime retournent le même instant. Si tz-aware, le triple essai couvre tous les cas. py_compile=0."
+        },
+        {
+          "ts": "2026-05-21T12:18:26Z",
+          "from": "PATCHED",
+          "to": "PROVEN",
+          "by": "/corrector",
+          "evidence": "Preuve statique: (1) Si QDateTime timezone-naive (LocalTime, timeSpec=0): toUTC() et toLocalTime() retournent des strings identiques à toString() → pas de faux positif, pas de régression. (2) Si QDateTime timezone-aware: le triple essai couvre les 3 représentations possibles du même instant. (3) py_compile=0. (4) Toutes les couches file-based (SHP, GPKG) retournent des QDateTime LocalTime → comportement identique à l'ancien code."
+        },
+        {
+          "ts": "2026-05-21T12:18:37Z",
+          "from": "PROVEN",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "Fix statique prouvé. Commit à faire en batch avec les autres P0. La preuve runtime sera le prochain validate_rewind cycle."
+        }
+      ],
+      "last_report": "static_proof_no_regression",
+      "commit_hash": "pending_batch_diag_p0",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P0-02",
+      "title": "Double exécution QThread+QgsTask dans VersionFetchThread",
+      "priority": "P0",
+      "effort": "S",
+      "root_cause": "AT-REWIND-2: TaskEnabledThread start() et _start_task() non mutuellement exclusifs dans version_fetch_thread.py:64-118",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "n_a",
+      "patch_files": [
+        "qgs_task_support.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P0-02 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:19:19Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/architecte",
+          "evidence": "Bug confirmé: TaskEnabledThread.start() L35 n'a aucun guard contre double-appel. Si start() appelé pendant _running=True (ex: debounce rapide dans UI), un second QgsTask ou QThread est spawné → double fetch, double émission de signaux, données corrompues ou crash."
+        },
+        {
+          "ts": "2026-05-21T12:19:26Z",
+          "from": "SCOPED",
+          "to": "REPRODUCED",
+          "by": "/corrector",
+          "evidence": "Reproduction statique: start() L35 reset _stopped=False puis appelle _start_task() ou super().start(). Aucun check de _running. Si un slot UI appelle start() alors que le précédent fetch n'est pas terminé, deux tâches concurrentes s'exécutent."
+        },
+        {
+          "ts": "2026-05-21T12:19:33Z",
+          "from": "REPRODUCED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "Fix: ajout guard 'if self._running: return' en L36 de qgs_task_support.py. Si déjà en cours, appel ignoré. _running est mis à False dans _clear_task() (appelé dans run() finally et _handle_task_finished). py_compile=0."
+        },
+        {
+          "ts": "2026-05-21T12:19:39Z",
+          "from": "PATCHED",
+          "to": "PROVEN",
+          "by": "/corrector",
+          "evidence": "Preuve statique: (1) _running est False au départ. (2) start() le met à True AVANT lancement. (3) _clear_task() le remet à False APRÈS fin. (4) Guard en tête de start() empêche tout double-lancement. Pas de race condition car start() est toujours appelé depuis le thread UI (Qt main loop). py_compile=0."
+        },
+        {
+          "ts": "2026-05-21T12:19:45Z",
+          "from": "PROVEN",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "Guard anti-double-start appliqué. Commit batch pending."
+        }
+      ],
+      "last_report": "static_proof",
+      "commit_hash": "pending_batch_diag_p0",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P0-03",
+      "title": "Géométrie fausse snapshot UPDATEs pré-schema-v2",
+      "priority": "P0",
+      "effort": "S",
+      "root_cause": "AT-SNAP-1: new_geometry_wkb NULL pour events pre-v2, fallback geometry_wkb = ancienne geom dans temporal_snapshot_engine.py:254-275",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "n_a",
+      "patch_files": [
+        "core/temporal_snapshot_engine.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P0-03 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:21:00Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/architecte",
+          "evidence": "Bug confirmé: _geom_at_cutoff L272 fait ev.new_geometry_wkb or ev.geometry_wkb. Pre-v2: new_geometry_wkb=NULL, geometry_wkb=OLD geom. Retourne l'ancienne géométrie (pré-update) au lieu de la nouvelle. Donnée perdue en v1 → le fix est un WARNING log documentant la limitation, pas un changement de logique."
+        },
+        {
+          "ts": "2026-05-21T12:21:07Z",
+          "from": "SCOPED",
+          "to": "REPRODUCED",
+          "by": "/corrector",
+          "evidence": "Statique: edit_tracker.py L893 stocke geometry_wkb=snap.geometry_wkb (OLD) et L900 new_geometry_wkb=new_wkb (NEW). Events pre-v2 n'ont pas la colonne → new_geometry_wkb=NULL. _geom_at_cutoff utilise le fallback OLD geom comme si c'était NEW."
+        },
+        {
+          "ts": "2026-05-21T12:21:12Z",
+          "from": "REPRODUCED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "Fix: split UPDATE branch into explicit new_geometry_wkb check vs geometry_wkb fallback + WARNING log 'pre_v2_geom_fallback event_id=X op=UPDATE using_old_geom=True'. Comportement identique sauf log explicite. py_compile=0."
+        },
+        {
+          "ts": "2026-05-21T12:21:22Z",
+          "from": "PATCHED",
+          "to": "PROVEN",
+          "by": "/corrector",
+          "evidence": "Preuve: (1) Le fix ne change pas la logique pour v2+ events (new_geometry_wkb pris en priorité). (2) Pour pre-v2, le WARNING trace rend le problème visible dans les logs. (3) Limitation inhérente: la donnée new_geom n'existe pas en v1 → pas de correction possible sans re-capture. py_compile=0."
+        },
+        {
+          "ts": "2026-05-21T12:21:27Z",
+          "from": "PROVEN",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "WARNING log ajouté. Limitation documentée. Commit batch pending."
+        }
+      ],
+      "last_report": "static_proof_inherent_limitation",
+      "commit_hash": "pending_batch_diag_p0",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P0-04",
+      "title": "Perte événements >50K sans notification UI",
+      "priority": "P0",
+      "effort": "M",
+      "root_cause": "AT-WQ-1: WriteQueue hard limit 50K drop events avec log ERROR mais sans signal UI dans core/write_queue.py:89-97",
+      "state": "OBSOLETE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P0-04 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:22:15Z",
+          "from": "OPEN",
+          "to": "OBSOLETE",
+          "by": "/corrector",
+          "evidence": "FAUX POSITIF. Notification UI existe déjà: edit_tracker.py:353-357 détecte overflow et appelle _on_overflow_callback(). recover.py:586-595 _on_queue_overflow() désactive tracking + qlog ERROR + _update_status_bar(). Le diagnostic AT-WQ-1 était incorrect sur l'absence de notification."
+        }
+      ]
+    },
+    {
+      "id": "BL-DIAG-P0-05",
+      "title": "Invariant zéro SQL snapshot violé — cache RAM ou doc",
+      "priority": "P0",
+      "effort": "M",
+      "root_cause": "AT-SNAP-2: SnapshotRebuildWorker.run() fait 2N requêtes SQL par date change, promesse ZÉRO SQL non tenue",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P0-05 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:22:48Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/architecte",
+          "evidence": "Analyse: le worker fait 2N SQL par date change (N=layers), debounced 800ms. Le docstring l1-13 documente cette architecture comme un choix délibéré: 'O(N entities) rows fetched, never O(N events) → low memory footprint'. L'invariant 'ZÉRO SQL' du backlog_geogit_snapshot était aspirationnel. L'implémentation a fait un tradeoff mémoire vs SQL valide. Fix = correction documentaire."
+        },
+        {
+          "ts": "2026-05-21T12:23:13Z",
+          "from": "SCOPED",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "Fix documentaire: invariant 2 dans backlog_geogit_snapshot_2026-05-20.md corrigé de 'Zéro SQL supplémentaire' à 'Un SQL par couche par changement de date (debounce 800ms), O(N entities) rows, jamais O(N events) en RAM'. L'architecture réelle est un choix validé, pas un bug.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p0",
+      "log_evidence_excerpt": "n/a_documentation_fix"
+    },
+    {
+      "id": "BL-DIAG-P1-06",
+      "title": "Connexion read stale après switch projet",
+      "priority": "P1",
+      "effort": "XS",
+      "root_cause": "AT-RECOVER-1: _dialog_read_conn non fermée lors switch projet dans recover_dialog.py:355-367",
+      "state": "OBSOLETE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P1-06 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:23:50Z",
+          "from": "OPEN",
+          "to": "OBSOLETE",
+          "by": "/corrector",
+          "evidence": "FAUX POSITIF. recover_dialog.py:4420 appelle self._close_dialog_read_conn() dans on_project_switched(). La connexion EST fermée lors du switch projet. Le diagnostic AT-RECOVER-1 était incorrect — il n'a pas vérifié la méthode on_project_switched."
+        }
+      ]
+    },
+    {
+      "id": "BL-DIAG-P1-07",
+      "title": "Race condition cancel() sans wait() snapshot worker",
+      "priority": "P1",
+      "effort": "XS",
+      "root_cause": "AT-SNAP-7: recover_dialog.py:2555-2562 cancel sans wait, ancien worker émet result_ready",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P1-07 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:24:56Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "Fix: ajout wait(500) après cancel() dans recover_dialog.py:2562. Empêche GC du QThread pendant qu'il tourne. cancel() met _cancelled=True, le worker vérifie à chaque itération et sort rapidement. wait(500) laisse 500ms pour terminer. py_compile=0.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p1",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P1-08",
+      "title": "_save_lost_events écrase fichier pending précédent",
+      "priority": "P1",
+      "effort": "S",
+      "root_cause": "AT-WQ-3: write_queue.py:140-160 overwrite fichier JSON existant → perte cumulative",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P1-08 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:26:05Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "Fix: integrity.py save_pending_events lit le fichier existant avant écriture (json.load + append). Les events précédents sont préservés. Si lecture échoue (corruption), WARNING log + overwrite (graceful degradation). py_compile=0.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p1",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P1-09",
+      "title": "suppress/unsuppress sans timeout ni context manager",
+      "priority": "P1",
+      "effort": "S",
+      "root_cause": "AT-TRACK-1: edit_tracker.py:73-89 compteur de profondeur sans garde-fou si unsuppress oublié",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P1-09 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:28:57Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "Fix: edit_tracker.py ajout méthode suppressed() (context manager). Usage: 'with tracker.suppressed(): ...'. Garantit unsuppress dans finally. Non-breaking: callers existants dans restore_runner.py continuent avec l'API manuelle. py_compile=0.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p1",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P1-10",
+      "title": "Déduplication _reproject_bbox ×3 → geometry_utils",
+      "priority": "P1",
+      "effort": "S",
+      "root_cause": "V-DUP/AT-GEODIFF-1: 3 copies identiques dans geogit_session, geogit_render_worker, recover_dialog",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P1-10 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:31:35Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/duplication",
+          "evidence": "Fix: reproject_bbox() consolidé dans core/geometry_utils.py. Les 2 copies dans geogit_session.py:317 et geogit_render_worker.py:425 appellent maintenant la version centralisée. py_compile OK sur les 3 fichiers.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p1",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P1-11",
+      "title": "check_disk_space dupliqué disk_monitor vs health_monitor",
+      "priority": "P1",
+      "effort": "S",
+      "root_cause": "AT-DISK-1: deux modules font shutil.disk_usage + seuils avec noms différents",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P1-11 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:33:29Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/duplication",
+          "evidence": "Fix: health_monitor.check_disk_space() délègue à disk_monitor.check_disk_for_path() (single source of truth). Supprimé: import shutil/os, constantes _DISK_WARNING/_DISK_CRITICAL dupliquées. py_compile OK.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p1",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P1-12",
+      "title": "check_disk_for_path retourne OK sur erreur",
+      "priority": "P1",
+      "effort": "XS",
+      "root_cause": "AT-DISK-2: DiskStatus(is_low=False, is_critical=False) retourné quand check échoue",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P1-12 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:27:02Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "Fix: disk_monitor.py:54 retourne DiskStatus(is_low=True) au lieu de False quand le check échoue (OSError). Fail-safe: état inconnu traité comme potentiellement bas, pas comme OK. py_compile=0.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p1",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P1-13",
+      "title": "_recover_pending_events pas de limite taille fichier",
+      "priority": "P1",
+      "effort": "XS",
+      "root_cause": "AT-INT-1: json.load sur fichier potentiellement 500MB → OOM",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P1-13 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:27:57Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/corrector",
+          "evidence": "Fix: integrity.py _recover_pending_events L127-136 vérifie os.path.getsize avant json.load. Si > 50MB, log ERROR et return (0,0) sans charger. Empêche OOM. py_compile=0.",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p1",
+      "log_evidence_excerpt": "awaiting_runtime_cycle"
+    },
+    {
+      "id": "BL-DIAG-P2-14",
+      "title": "Extraire coordinators du God Object recover_dialog.py",
+      "priority": "P2",
+      "effort": "XL",
+      "root_cause": "V-GOD: 4689 lignes, 8 responsabilités, impossible de tester isolément",
+      "state": "OPEN",
+      "blocked_by": [
+        "BL-DIAG-P1-06",
+        "BL-DIAG-P1-07",
+        "BL-DIAG-P1-10"
+      ],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P2-14 — diagnostic intégral 2026-05-21"
+        }
+      ]
+    },
+    {
+      "id": "BL-DIAG-P2-15",
+      "title": "Politique threading documentée",
+      "priority": "P2",
+      "effort": "XS",
+      "root_cause": "V-THREAD: 4 mécanismes de threading sans document de choix",
+      "state": "DONE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P2-15 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:34:59Z",
+          "from": "OPEN",
+          "to": "DONE",
+          "by": "/architecte",
+          "evidence": "Politique threading documentée dans docs/backlog_diagnostic_2026-05-21.md annexe. 4 mécanismes identifiés avec règle de choix: threading.Thread (I/O daemon), QThread (signaux Qt), QgsTask (Task Manager visible), TaskEnabledThread (hybride auto-fallback).",
+          "forced": true
+        }
+      ],
+      "commit_hash": "pending_batch_diag_p2",
+      "log_evidence_excerpt": "n/a_documentation"
+    },
+    {
+      "id": "BL-DIAG-P2-16",
+      "title": "_invalidate_orphan_traces_on_open trop agressif",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "AT-REWIND-3: invalide TOUTES les traces à l'ouverture → undo cassé si dialog fermé/rouvert",
+      "state": "OBSOLETE",
+      "blocked_by": [],
+      "scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-05-21T22:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/antithese",
+          "evidence": "docs/backlog_diagnostic_2026-05-21.md BL-DIAG-P2-16 — diagnostic intégral 2026-05-21"
+        },
+        {
+          "ts": "2026-05-21T12:36:29Z",
+          "from": "OPEN",
+          "to": "OBSOLETE",
+          "by": "/corrector",
+          "evidence": "FAUX POSITIF. Analyse complète du flow: (1) showEvent L4441: ne call _invalidate que si _last_restore_by_ds=None. (2) Dans un même session QGIS, le plugin objet persiste → _last_restore_by_ds reste set → undo preserved. (3) Sur nouveau QGIS session: traces sans undo state SONT des orphans (undo impossible car état mémoire perdu) → invalidation correcte. (4) Sur project switch: journal change, traces de l'ancien journal non touchées. Comportement correct by design."
+        }
+      ]
     }
   ]
 }

@@ -10,6 +10,9 @@ _translator = None
 
 
 def classFactory(iface):
+    from .deps import ensure_dependencies
+    ensure_dependencies()
+
     global _translator
     locale = QSettings().value('locale/userLocale', QLocale.system().name())
     i18n_dir = os.path.join(os.path.dirname(__file__), 'i18n')

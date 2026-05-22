@@ -44,6 +44,7 @@ class WriteQueue:
         self._running = False
         self._early_warning_emitted = False
         self._on_early_warning = None
+        self._pending_lock = threading.Lock()
 
     def start(self, db_path: str) -> None:
         """Start the writer thread for the given database path."""
@@ -214,14 +215,20 @@ class WriteQueue:
         self._save_lost_events(batch)
 
     def _save_lost_events(self, events: List[AuditEvent]) -> None:
-        """Persist unwritten events to the recovery file."""
+        """Persist unwritten events to the recovery file.
+
+        Thread-safe: uses _pending_lock to serialize concurrent calls
+        from the producer (UI thread, enqueue overflow) and the writer
+        thread (batch failure).
+        """
         if not self._db_path:
             return
-        try:
-            from .integrity import save_pending_events
-            save_pending_events(self._db_path, list(events))
-        except Exception as e:
-            flog(f"WriteQueue: cannot save pending events: {e}", "ERROR")
+        with self._pending_lock:
+            try:
+                from .integrity import save_pending_events
+                save_pending_events(self._db_path, list(events))
+            except Exception as e:
+                flog(f"WriteQueue: cannot save pending events: {e}", "ERROR")
 
 
 def _validate_event(event: AuditEvent) -> bool:

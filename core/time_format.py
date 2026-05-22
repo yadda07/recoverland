@@ -3,7 +3,7 @@
 Converts ISO timestamps to relative or short absolute representations.
 Pure Python, no Qt dependency.
 """
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from qgis.PyQt.QtCore import QCoreApplication
@@ -116,3 +116,12 @@ def _parse_iso(timestamp: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
+
+
+def parse_iso_date(iso: str) -> date:
+    """Parse ISO date/datetime string to a date object.
+
+    Handles trailing 'Z' and timezone-aware ISO strings.
+    Raises ValueError/TypeError on unparseable input.
+    """
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).date()

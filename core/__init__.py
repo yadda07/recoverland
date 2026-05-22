@@ -78,11 +78,6 @@ from .restore_contracts import (
     default_atomicity, scope_requires_confirmation,
     RestoreSession,
 )
-from .lens_contracts import (
-    LensOpFilter, LensVisualizationMode, EntityClassification,
-    LensSelection, LensFetchStats, EntityState, EntityTimeline,
-    LensRenderPlan, LensRenderResult,
-)
 from .identity import compute_entity_fingerprint
 from .event_stream_repository import (
     fetch_entity_stream, fetch_events_after_cutoff,
@@ -95,8 +90,6 @@ from .restore_planner import (
     plan_event_restore, plan_temporal_restore, preflight_check,
     check_retention_coverage,
 )
-from .lens_planner import plan_lens_view
-from .lens_renderer import execute_lens_render
 from .restore_executor import execute_restore_plan, preflight_layer_check, build_restore_session
 from .restore_service import undo_restore_batch
 from .search_service import reconstruct_new_attributes
@@ -109,7 +102,7 @@ from .health_monitor import (
 )
 from .time_format import (
     format_relative_time, format_short_absolute, format_full_timestamp,
-    compute_history_span,
+    compute_history_span, parse_iso_date,
 )
 from .disk_monitor import check_disk_for_path, format_disk_message, DiskStatus
 from .db_maintenance import (
@@ -121,7 +114,6 @@ from .layer_stats_cache import LayerStatsCache, LayerStats
 from .workflow_service import (
     execute_grouped_restore, execute_grouped_undo,
     find_target_layer, cleanup_temp_layers, GroupedRestoreResult,
-    purge_lens_overlays, execute_grouped_lens_view,
 )
 from .rewind_dedup import (
     collapse_rewind_events,
@@ -185,9 +177,6 @@ __all__ = (
     "is_restore_allowed", "validate_cutoff", "check_volume_limits",
     "default_atomicity", "scope_requires_confirmation",
     "RestoreSession",
-    "LensOpFilter", "LensVisualizationMode", "EntityClassification",
-    "LensSelection", "LensFetchStats", "EntityState", "EntityTimeline",
-    "LensRenderPlan", "LensRenderResult",
     "fetch_entity_stream", "fetch_events_after_cutoff",
     "count_events_after_cutoff", "fetch_events_by_ids",
     "fetch_events_by_session", "count_events_by_session",
@@ -195,7 +184,6 @@ __all__ = (
     "get_oldest_event_date",
     "plan_event_restore", "plan_temporal_restore", "preflight_check",
     "check_retention_coverage",
-    "plan_lens_view", "execute_lens_render",
     "SnapshotFeature", "SnapshotResult", "reconstruct_snapshot_at",
     "SnapshotOverlaySession",
     "execute_restore_plan", "preflight_layer_check", "build_restore_session",
@@ -203,7 +191,7 @@ __all__ = (
     "evaluate_journal_health", "check_disk_space", "format_integrity_message",
     "format_user_error", "HealthLevel", "JournalHealthStatus", "DiskSpaceStatus",
     "format_relative_time", "format_short_absolute", "format_full_timestamp",
-    "compute_history_span",
+    "compute_history_span", "parse_iso_date",
     "check_disk_for_path", "format_disk_message", "DiskStatus",
     "run_analyze", "check_integrity_quick", "wal_checkpoint",
     "run_maintenance", "MaintenanceResult",
@@ -211,6 +199,5 @@ __all__ = (
     "LayerStatsCache", "LayerStats",
     "execute_grouped_restore", "execute_grouped_undo",
     "find_target_layer", "cleanup_temp_layers", "GroupedRestoreResult",
-    "purge_lens_overlays", "execute_grouped_lens_view",
     "collapse_rewind_events", "collapse_rewind_events_with_stats",
 )

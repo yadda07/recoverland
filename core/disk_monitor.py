@@ -51,7 +51,7 @@ def check_disk_for_path(path: str) -> DiskStatus:
         )
     except (OSError, ValueError) as e:
         flog(f"disk_monitor: check failed for {target}: {e}", "WARNING")
-        return DiskStatus(0, 0, "", False, False)
+        return DiskStatus(0, 0, "", True, False)
 
 
 def format_disk_message(status: DiskStatus) -> str:

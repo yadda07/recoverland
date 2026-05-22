@@ -1,11 +1,11 @@
 """Snapshot overlay session — manages 1 memory layer per source layer.
 
 One layer per fingerprint, showing the RECONSTRUCTED STATE at date T.
-Distinct from GeoGitSession (3 layers/source, diff mode).
+Single Review mode — no diff layers.
 
 Naming convention: ``__rl_snap_{uid}_geom``  (prefix avoids purge crosstalk
 with ``__rl_lens_`` layers managed by purge_lens_overlays).
-Group: ``GeoGit Snapshot`` (distinct from the ``GeoGit`` diff group).
+Group: ``Review Snapshot``.
 
 Lifecycle::
 
@@ -30,7 +30,7 @@ _SNAP_META_FIELDS = [
     ("_rl_snap_user", "string"),
 ]
 
-_GROUP_NAME = "GeoGit Snapshot"
+_GROUP_NAME = "Review Snapshot"
 
 
 class _SnapOverlay:
@@ -96,7 +96,6 @@ class SnapshotOverlaySession:
         self.trace_id = trace_id or uuid.uuid4().hex[:8]
         self._dst_crs = dst_crs
         self._layer_info_map = {info["fingerprint"]: info for info in layer_infos}
-        self._ensure_group()
         self._active = True
         flog(
             f"[{self.trace_id}] snapshot_overlay: started_lazy "
@@ -311,7 +310,13 @@ class SnapshotOverlaySession:
         root = project.layerTreeRoot()
         group = root.findGroup(_GROUP_NAME) or root.insertGroup(0, _GROUP_NAME)
         project.addMapLayer(snap_lyr, False)
-        group.addLayer(snap_lyr)
+        idx = self._group_insert_index(group, info["layer_id"])
+        group.insertLayer(idx, snap_lyr)
+        flog(
+            f"[{self.trace_id}] snapshot_overlay: insert_at "
+            f"idx={idx}/{len(group.children())} layer={info['layer_name']}",
+            "DEBUG",
+        )
 
         ovl = _SnapOverlay()
         ovl.layer_id = snap_lyr.id()
@@ -330,7 +335,6 @@ class SnapshotOverlaySession:
 
     def _build_snap_layer(self, uid, geom_family, dst_crs, source_layer):
         from qgis.core import QgsVectorLayer  # noqa: PLC0415
-        from .lens_renderer import _make_overlay_layer  # noqa: PLC0415
 
         uri_parts = [f"{geom_family}?crs={dst_crs}"]
         for field in source_layer.fields():
@@ -340,7 +344,8 @@ class SnapshotOverlaySession:
         uri = "&".join(uri_parts)
         lyr = QgsVectorLayer(uri, f"__rl_snap_{uid}_geom", "memory")
         if not lyr.isValid():
-            lyr = _make_overlay_layer(f"__rl_snap_{uid}_geom", geom_family, dst_crs)
+            fallback_uri = f"{geom_family}?crs={dst_crs}"
+            lyr = QgsVectorLayer(fallback_uri, f"__rl_snap_{uid}_geom", "memory")
             flog(
                 f"[{self.trace_id}] snapshot_overlay: "
                 f"source_schema_copy_failed, using minimal schema",
@@ -429,8 +434,6 @@ class SnapshotOverlaySession:
             parent = group.parent() or root
             parent.removeChildNode(group)
             flog(f"[{self.trace_id}] snapshot_overlay: group_removed name={_GROUP_NAME}", "INFO")
-        else:
-            flog(f"[{self.trace_id}] snapshot_overlay: group_not_found name={_GROUP_NAME}", "WARNING")
 
         ids = [ovl.layer_id for ovl in self._overlays.values() if ovl.layer_id]
         if ids:
@@ -547,14 +550,50 @@ class SnapshotOverlaySession:
                 "WARNING",
             )
 
+    def _source_tree_position(self, source_layer_id: str) -> int:
+        """Return position of source layer in the layer tree (0=top)."""
+        from qgis.core import QgsProject  # noqa: PLC0415
+        root = QgsProject.instance().layerTreeRoot()
+        for i, node in enumerate(root.findLayers()):
+            if node.layerId() == source_layer_id:
+                return i
+        return 999999
+
+    def _group_insert_index(self, group, source_layer_id: str) -> int:
+        """Compute insertion index in snapshot group to mirror source tree order."""
+        new_pos = self._source_tree_position(source_layer_id)
+        for i, child in enumerate(group.children()):
+            if not hasattr(child, 'layerId'):
+                continue
+            child_lid = child.layerId()
+            for ovl in self._overlays.values():
+                if ovl.layer_id == child_lid:
+                    if self._source_tree_position(ovl.source_layer_id) > new_pos:
+                        return i
+                    break
+        return len(group.children())
+
     def _detect_geom_family(self, source_layer) -> Optional[str]:
-        """Return Point/LineString/Polygon from layer wkbType — O(1), no I/O."""
+        """Return Point/LineString/Polygon from layer wkbType — O(1), no I/O.
+
+        Resolution order (QGIS 3.40 → 4.x compat):
+        1. ``Qgis.GeometryType`` enum via ``layer.geometryType()`` (3.30+)
+        2. ``QgsWkbTypes.geometryType(wkbType)`` static (3.x legacy)
+        3. ``int(wkbType) % 1000 // 1`` bit extraction fallback
+        """
+        _MAP = {0: "Point", 1: "LineString", 2: "Polygon"}
+        try:
+            gtype = int(source_layer.geometryType())
+            return _MAP.get(gtype)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             from qgis.core import QgsWkbTypes  # noqa: PLC0415
             gtype = int(QgsWkbTypes.geometryType(source_layer.wkbType()))
-            return {0: "Point", 1: "LineString", 2: "Polygon"}.get(gtype)
+            return _MAP.get(gtype)
         except Exception:  # noqa: BLE001
-            return None
+            pass
+        return None
 
 
 # ------------------------------------------------------------------ #
