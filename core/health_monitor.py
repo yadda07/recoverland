@@ -3,8 +3,6 @@
 Provides threshold evaluation, disk space checks, and user-facing
 diagnostic messages. Pure logic module with no Qt dependency.
 """
-import os
-import shutil
 from typing import NamedTuple, Optional
 
 from qgis.PyQt.QtCore import QCoreApplication
@@ -50,9 +48,7 @@ _COUNT_INFO = 100_000
 _COUNT_WARNING = 500_000
 _COUNT_CRITICAL = 1_000_000
 
-# --- Disk space thresholds (bytes) ---
-_DISK_WARNING = 500 * 1024 * 1024    # 500 MB
-_DISK_CRITICAL = 100 * 1024 * 1024   # 100 MB
+# Disk thresholds are defined in disk_monitor.py (single source of truth).
 
 
 def evaluate_journal_health(
@@ -86,7 +82,13 @@ def evaluate_journal_health(
 
 
 def check_disk_space(journal_path: str) -> DiskSpaceStatus:
-    """Check free disk space on the volume hosting the journal."""
+    """Check free disk space on the volume hosting the journal.
+
+    Delegates to disk_monitor.check_disk_for_path (single source of truth
+    for thresholds and disk_usage call — BL-DIAG-P1-11).
+    """
+    from .disk_monitor import check_disk_for_path
+
     if not journal_path:
         return DiskSpaceStatus(
             level=HealthLevel.HEALTHY,
@@ -94,35 +96,26 @@ def check_disk_space(journal_path: str) -> DiskSpaceStatus:
             message="",
             should_disable_tracking=False,
         )
-    try:
-        usage = shutil.disk_usage(os.path.dirname(journal_path))
-        free = usage.free
-    except (OSError, ValueError) as e:
-        flog(f"health_monitor: disk_usage failed: {e}", "WARNING")
-        return DiskSpaceStatus(
-            level=HealthLevel.WARNING,
-            free_bytes=0,
-            message=_tr("Impossible de verifier l'espace disque."),
-            should_disable_tracking=False,
-        )
 
-    if free < _DISK_CRITICAL:
+    ds = check_disk_for_path(journal_path)
+
+    if ds.is_critical:
         return DiskSpaceStatus(
             level=HealthLevel.CRITICAL,
-            free_bytes=free,
-            message=_tr("Espace disque critique : {size} libre.").format(size=_format_size(free)),
+            free_bytes=ds.free_bytes,
+            message=_tr("Espace disque critique : {size} libre.").format(size=_format_size(ds.free_bytes)),
             should_disable_tracking=True,
         )
-    if free < _DISK_WARNING:
+    if ds.is_low:
         return DiskSpaceStatus(
             level=HealthLevel.WARNING,
-            free_bytes=free,
-            message=_tr("Espace disque faible : {size} libre.").format(size=_format_size(free)),
+            free_bytes=ds.free_bytes,
+            message=_tr("Espace disque faible : {size} libre.").format(size=_format_size(ds.free_bytes)),
             should_disable_tracking=False,
         )
     return DiskSpaceStatus(
         level=HealthLevel.HEALTHY,
-        free_bytes=free,
+        free_bytes=ds.free_bytes,
         message="",
         should_disable_tracking=False,
     )

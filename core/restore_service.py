@@ -32,6 +32,12 @@ def _qgis_vals_equal(actual, expected) -> bool:
     always returns True (unequal types), causing snapshot matching to fail
     and re-inserted features to never be found during undo, which leads to
     feature accumulation on repeated rewinds (BUG-REWIND-02).
+
+    Timezone handling (BL-DIAG-P0-01): The journal stores QDateTime WITHOUT
+    timezone suffix (serialization.py uses toString without tz). If the
+    provider returns the same instant in a different timeSpec (e.g. UTC vs
+    OffsetFromUTC), naive toString produces different digits for the same
+    instant.  We try UTC-normalized comparison as fallback.
     """
     if actual == expected:
         return True
@@ -40,19 +46,42 @@ def _qgis_vals_equal(actual, expected) -> bool:
         if isinstance(actual, QDate) and not isinstance(actual, QDateTime):
             return actual.toString('yyyy-MM-dd') == expected
         if isinstance(actual, QDateTime):
-            iso = actual.toString('yyyy-MM-ddTHH:mm:ss')
-            return iso == expected or iso.replace('T', ' ') == expected
+            if _qdatetime_matches_str(actual, expected):
+                return True
+            return False
         if isinstance(actual, QTime):
             return actual.toString('HH:mm:ss') == expected
         if isinstance(expected, QDate) and not isinstance(expected, QDateTime):
             return expected.toString('yyyy-MM-dd') == actual
         if isinstance(expected, QDateTime):
-            iso = expected.toString('yyyy-MM-ddTHH:mm:ss')
-            return iso == actual or iso.replace('T', ' ') == actual
+            if _qdatetime_matches_str(expected, actual):
+                return True
+            return False
         if isinstance(expected, QTime):
             return expected.toString('HH:mm:ss') == actual
     except ImportError:
         pass
+    return False
+
+
+def _qdatetime_matches_str(dt, s) -> bool:
+    """Compare a QDateTime against a stored ISO string, timezone-aware.
+
+    Tries:
+    1. Naive toString (original timeSpec digits)
+    2. UTC-normalized digits (handles provider returning different timeSpec)
+    3. LocalTime-normalized digits (handles stored as local, read as UTC)
+    """
+    fmt = 'yyyy-MM-ddTHH:mm:ss'
+    iso = dt.toString(fmt)
+    if iso == s or iso.replace('T', ' ') == s:
+        return True
+    utc_iso = dt.toUTC().toString(fmt)
+    if utc_iso == s or utc_iso.replace('T', ' ') == s:
+        return True
+    local_iso = dt.toLocalTime().toString(fmt)
+    if local_iso == s or local_iso.replace('T', ' ') == s:
+        return True
     return False
 
 

@@ -5,14 +5,20 @@ All queries use parameterized SQL and respect volume limits.
 No QGIS dependency.
 """
 import sqlite3
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
+
+
+class FetchStats(NamedTuple):
+    n_events_total: int
+    n_events_returned: int
+    n_events_truncated: int
+    elapsed_ms: int
 
 from .audit_backend import AuditEvent
 from .search_service import _row_to_event
 from .restore_contracts import (
     RestoreCutoff, CutoffType, MAX_EVENTS_PER_RESTORE,
 )
-from .lens_contracts import LensFetchStats
 from .logger import flog, timed_op
 from .sql_safety import assert_safe_fragment
 from .sqlite_schema import AUDIT_EVENT_SELECT_SQL
@@ -171,7 +177,7 @@ def fetch_events_in_zone(
             else:
                 n_dropped_bbox += 1
 
-        stats = LensFetchStats(
+        stats = FetchStats(
             n_events_total=n_total,
             n_events_returned=len(events),
             n_events_truncated=truncated,

@@ -238,11 +238,10 @@ def _try_restore_from_registry(event: AuditEvent, read_conn) -> object:
         return None
 
 
-# ----- Time Lens lifecycle (BL-IL-P0-09, CR-IL-6) -----------------------
+# ----- Overlay cleanup ---------------------------------------------------
 
 
 _LENS_LAYER_PREFIX = "__rl_lens_"
-_lens_layer_ids: List[str] = []
 
 
 def purge_lens_overlays(context: str = "manual") -> int:
@@ -275,7 +274,6 @@ def purge_lens_overlays(context: str = "manual") -> int:
         ]
         if ids:
             project.removeMapLayers(ids)
-        _lens_layer_ids.clear()
         flog(
             f"lens_lifecycle event={context}_cleanup "
             f"n_orphan_layers={len(ids)}",
@@ -291,68 +289,3 @@ def purge_lens_overlays(context: str = "manual") -> int:
         return 0
 
 
-def execute_grouped_lens_view(
-    events,
-    selection,
-    layer_name: str,
-    fetch_stats,
-    dst_crs_authid: str,
-    trace_id: str = "",
-    source_layer=None,
-):
-    """Plan + render facade for the Time Lens dock (BL-IL-P0-09).
-
-    Acceptance section 3 of BL-IL-P0-09: every refresh purges the
-    previous overlay AGAINST QgsProject before adding the new one.
-    No accumulation, no layer leak between successive clicks on the
-    Rafraichir button.
-
-    Args:
-        events: bounded list of `AuditEvent` from
-            `event_stream_repository.fetch_events_in_zone`.
-        selection: the immutable `LensSelection` that produced *events*.
-        layer_name: human-readable layer name (forwarded to the planner
-            metadata; used by the dock for titles and toast messages).
-        fetch_stats: `LensFetchStats` propagated from the repository.
-        dst_crs_authid: canvas CRS authority id (e.g. "EPSG:3857").
-        trace_id: opaque correlation id propagated end-to-end.
-
-    Returns:
-        ``LensRefreshOutcome(plan, result)`` (BL-IL-P0-10c). The dock
-        uses ``outcome.result.overlay_layer_ids`` for legend toggle /
-        ``outcome.result.warnings`` for truncation banner, and
-        ``outcome.plan.entities`` for the clickable entity list and
-        the attribute diff panel.
-
-        Phase 10b returned the bare ``LensRenderResult``; phase 10c
-        aggregates plan + result so the dock does not have to recall
-        ``plan_lens_view`` just to obtain the per-entity timelines.
-
-    Emits:
-        flog: lens_lifecycle event=refresh trace_id=<id>
-              n_removed=<n> n_added=<n> n_entities=<n> elapsed_ms=<n>
-    """
-    import time as _time  # noqa: PLC0415
-    from .lens_contracts import LensRefreshOutcome  # noqa: PLC0415
-    from .lens_planner import plan_lens_view  # noqa: PLC0415
-    from .lens_renderer import execute_lens_render  # noqa: PLC0415
-
-    t0 = _time.monotonic()
-    n_removed = purge_lens_overlays("refresh")
-
-    plan = plan_lens_view(events, selection, layer_name, fetch_stats)
-    result = execute_lens_render(
-        plan, dst_crs_authid, trace_id=trace_id, source_layer=source_layer,
-    )
-
-    _lens_layer_ids.clear()
-    _lens_layer_ids.extend(result.overlay_layer_ids)
-
-    elapsed_ms = int((_time.monotonic() - t0) * 1000)
-    flog(
-        f"lens_lifecycle event=refresh trace_id={trace_id} "
-        f"n_removed={n_removed} n_added={len(result.overlay_layer_ids)} "
-        f"n_entities={result.n_entities} elapsed_ms={elapsed_ms}",
-        "INFO",
-    )
-    return LensRefreshOutcome(plan=plan, result=result)

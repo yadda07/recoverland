@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from qgis.PyQt.QtCore import QDate, QEvent, QPoint, Qt, QTime, QTimer, pyqtSignal
+from qgis.PyQt.QtCore import QDate, QPoint, QTime, QTimer, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QDateEdit, QHBoxLayout, QLabel, QPushButton,
     QSizePolicy, QTimeEdit, QWidget,
@@ -30,52 +30,13 @@ from qgis.PyQt.QtWidgets import (
 
 from ..compat import QtCompat
 from ..core.logger import flog
+from ..core.time_format import parse_iso_date
 from .temporal_timeline_widget import TemporalTimelineWidget
 
 _BAR_HEIGHT = 40
 
-
-def _qevent_resize_type() -> int:
-    """Return QEvent.Resize integer value, Qt5/Qt6 compatible."""
-    ns = getattr(QEvent, 'Type', None)
-    if ns is not None:
-        val = getattr(ns, 'Resize', None)
-        if val is not None:
-            return int(val)
-    return int(getattr(QEvent, 'Resize', 14))
-
-
-_RESIZE_EVENT_TYPE = _qevent_resize_type()
-
-
-def _qevent_move_type() -> int:
-    """Return QEvent.Move integer value, Qt5/Qt6 compatible."""
-    ns = getattr(QEvent, 'Type', None)
-    if ns is not None:
-        val = getattr(ns, 'Move', None)
-        if val is not None:
-            return int(val)
-    return int(getattr(QEvent, 'Move', 13))
-
-
-_MOVE_EVENT_TYPE = _qevent_move_type()
-
-
-def _qevent_layout_request_type() -> int:
-    """Return QEvent.LayoutRequest integer value, Qt5/Qt6 compatible."""
-    ns = getattr(QEvent, 'Type', None)
-    if ns is not None:
-        val = getattr(ns, 'LayoutRequest', None)
-        if val is not None:
-            return int(val)
-    return int(getattr(QEvent, 'LayoutRequest', 76))
-
-
-_LAYOUT_REQUEST_TYPE = _qevent_layout_request_type()
-_CANVAS_EVENT_TYPES = frozenset({_RESIZE_EVENT_TYPE, _MOVE_EVENT_TYPE})
-_WIN_EVENT_TYPES = frozenset({_RESIZE_EVENT_TYPE, _MOVE_EVENT_TYPE, _LAYOUT_REQUEST_TYPE})
-
-
+_CANVAS_EVENT_TYPES = frozenset({int(QtCompat.EVENT_RESIZE), int(QtCompat.EVENT_MOVE)})
+_WIN_EVENT_TYPES = frozenset({int(QtCompat.EVENT_RESIZE), int(QtCompat.EVENT_MOVE), int(QtCompat.EVENT_LAYOUT_REQUEST)})
 
 
 def _purge_stale_bars() -> None:
@@ -129,25 +90,18 @@ class CanvasDateBar(QWidget):
         self._rl_canvas_date_bar = True  # marker for _purge_stale_bars
         self._canvas = canvas
         self._main_win = canvas.window()
+        self._ceiling = None
         self._closing = False
         self._base_date: Optional[date] = None
         self._end_date: Optional[date] = None
         self._total_days: int = 1
         self._syncing: bool = False
 
-        try:
-            _flags = (
-                Qt.WindowType.Tool
-                | Qt.WindowType.FramelessWindowHint
-                | Qt.WindowType.WindowDoesNotAcceptFocus
-            )
-        except AttributeError:
-            _flags = (
-                Qt.Tool
-                | Qt.FramelessWindowHint
-                | Qt.WindowDoesNotAcceptFocus
-            )
-        self.setWindowFlags(_flags)
+        self.setWindowFlags(
+            QtCompat.WINDOW_TOOL
+            | QtCompat.WINDOW_FRAMELESS
+            | QtCompat.WINDOW_NO_FOCUS
+        )
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -178,8 +132,8 @@ class CanvasDateBar(QWidget):
     def set_range(self, first_iso: str, last_iso: str) -> None:
         """Configure slider range. first_iso / last_iso are ISO date strings."""
         try:
-            self._base_date = _parse_iso_date(first_iso)
-            self._end_date = _parse_iso_date(last_iso)
+            self._base_date = parse_iso_date(first_iso)
+            self._end_date = parse_iso_date(last_iso)
         except (ValueError, TypeError):
             self._base_date = date.today() - timedelta(days=365)
             self._end_date = date.today()
@@ -365,7 +319,7 @@ class CanvasDateBar(QWidget):
             self.move(g)
         except Exception as _e:
             flog(f"canvas_date_bar: reposition_err {_e}", "WARNING")
-        self.raise_()
+        self._raise_safe()
         if not self.isVisible():
             self.show()
         flog(
@@ -373,6 +327,28 @@ class CanvasDateBar(QWidget):
             f"visible={self.isVisible()} pos=({self.x()},{self.y()})",
             "DEBUG",
         )
+
+    def set_ceiling(self, widget) -> None:
+        """Set the widget that must always stay above this bar (e.g. the dialog)."""
+        self._ceiling = widget
+        flog(f"canvas_date_bar: ceiling_set widget={widget.__class__.__name__}", "DEBUG")
+
+    def raise_safe(self) -> None:
+        """Raise bar above canvas, then re-raise ceiling widget above bar.
+
+        Guarantees z-order: canvas < bar < ceiling (dialog).
+        Use this as slot for mapCanvasRefreshed instead of bare raise_().
+        """
+        self._raise_safe()
+
+    def _raise_safe(self) -> None:
+        self.raise_()
+        if self._ceiling is not None:
+            try:
+                if self._ceiling.isVisible():
+                    self._ceiling.raise_()
+            except RuntimeError:
+                self._ceiling = None
 
     def set_markers(self, date_isos: list) -> None:
         """Pass markers to timeline. Accepts plain ISO strings or (iso, op_type) tuples."""
@@ -385,7 +361,7 @@ class CanvasDateBar(QWidget):
             return
         self._syncing = True
         try:
-            d = _parse_iso_date(iso)
+            d = parse_iso_date(iso)
             self._date_edit.setDate(QDate(d.year, d.month, d.day))
         except (ValueError, TypeError):
             pass
@@ -428,11 +404,6 @@ class CanvasDateBar(QWidget):
         iso = self.current_date_iso()
         flog(f"canvas_date_bar: date_changed iso={iso}", "DEBUG")
         self.date_changed.emit(iso)
-
-
-def _parse_iso_date(iso: str) -> date:
-    """Parse ISO date/datetime string to a date object."""
-    return datetime.fromisoformat(iso.replace("Z", "+00:00")).date()
 
 
 __all__ = ["CanvasDateBar"]

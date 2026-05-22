@@ -20,7 +20,7 @@
   <nav class="bar-nav">
     <a href="index.html">Overview</a>
     <a href="architecture.html" class="on">Architecture</a>
-    <a href="geogit.html">GeoGit</a>
+    <a href="review.html">Review</a>
     <a href="guide.html">Guide</a>
     <a href="formats.html">Formats</a>
     <a href="limits.html">Limits</a>
@@ -51,6 +51,7 @@
   <a href="#cat-storage">Storage &amp; registry</a>
   <a href="#cat-read">Read &amp; search</a>
   <a href="#cat-restore">Restore engine</a>
+  <a href="#cat-review">Review</a>
   <a href="#cat-health">Health &amp; maintenance</a>
   <a href="#cat-infra">Infrastructure</a>
   <div class="cat">Honest view</div>
@@ -70,7 +71,7 @@
 <section id="vision">
 <h2>Vision</h2>
 <p>RecoverLand replaces a server-side audit trigger with a client-side capture pipeline driven by QGIS events. Because the plugin must work where no DB server runs (Shapefile, GeoPackage, SpatiaLite, Memory) and where the user has no DBA rights (most PostgreSQL setups), the trigger&rsquo;s guarantees must be rebuilt in Python: atomicity, identity, durability, schema typing, concurrent access.</p>
-<p>The result is six functional layers, each with a single responsibility. Domain logic stays pure Python (testable in isolation). Qt and QGIS APIs are confined to the outer rings. SQLite holds the journal. A handful of background threads keep the UI fluid.</p>
+<p>The result is six functional layers, each with a single responsibility. Domain logic stays pure Python (testable in isolation). Qt and QGIS APIs are confined to the outer rings. SQLite holds the journal. A handful of background threads keep the UI fluid. Review mode adds read-only time-travel visualization: reconstruct the state of tracked layers at any past date without touching source data.</p>
 
 <div class="cards">
   <div class="card">
@@ -112,12 +113,12 @@
   <rect x="20" y="84" width="600" height="64" class="nd"/>
   <text x="36" y="108" class="lbl" font-size="11">L2 &mdash; UI surface (Qt)</text>
   <text x="36" y="124" class="dim" font-size="10.5">recover_dialog &middot; journal_info_bar &middot; journal_maintenance &middot; status_bar_widget</text>
-  <text x="36" y="140" class="dim" font-size="10.5">widgets/ (time_slider, restore_mode_selector, restore_preflight_dialog, toggle_switch, themed_logo)</text>
+  <text x="36" y="140" class="dim" font-size="10.5">widgets/ (time_slider, restore_mode_selector, restore_preflight_dialog, toggle_switch, themed_logo, canvas_date_bar, temporal_timeline)</text>
 
   <!-- Layer 3: Threads -->
   <rect x="20" y="162" width="600" height="50" class="nd"/>
   <text x="36" y="184" class="lbl" font-size="11">L3 &mdash; Background threads</text>
-  <text x="36" y="200" class="dim" font-size="10.5">local_search_thread &middot; journal_stats_thread &middot; version_fetch_thread &middot; qgs_task_support</text>
+  <text x="36" y="200" class="dim" font-size="10.5">local_search_thread &middot; journal_stats_thread &middot; version_fetch_thread &middot; qgs_task_support &middot; snapshot_rebuild_worker</text>
 
   <!-- Layer 4: Orchestration -->
   <rect x="20" y="226" width="600" height="44" class="nd"/>
@@ -126,13 +127,13 @@
 
   <!-- Layer 5: Core (the big one) -->
   <rect x="20" y="284" width="600" height="116" class="nd-ac"/>
-  <text x="36" y="306" class="lbl" font-size="11">L5 &mdash; Core domain (39 modules)</text>
-  <text x="36" y="322" class="dim" font-size="10.5">Contracts: audit_backend &middot; restore_contracts</text>
+  <text x="36" y="306" class="lbl" font-size="11">L5 &mdash; Core domain (44 modules)</text>
+  <text x="36" y="322" class="dim" font-size="10.5">Contracts: audit_backend &middot; restore_contracts &middot; lens_contracts</text>
   <text x="36" y="338" class="dim" font-size="10.5">Identity &amp; data: identity &middot; serialization &middot; geometry_utils &middot; schema_drift &middot; audit_field_policy &middot; support_policy</text>
   <text x="36" y="354" class="dim" font-size="10.5">Capture: edit_tracker &middot; edit_buffer &middot; write_queue</text>
   <text x="36" y="370" class="dim" font-size="10.5">Storage: sqlite_schema &middot; sqlite_backend &middot; journal_manager &middot; datasource_registry &middot; datasource_alias &middot; local_settings</text>
   <text x="36" y="386" class="dim" font-size="10.5">Read: search_service &middot; event_stream_repository &middot; journal_audit &middot; layer_stats_cache</text>
-  <text x="36" y="402" class="dim" font-size="10.5" style="display:none">Restore: planner, dedup, executor, service, workflow</text>
+  <text x="36" y="402" class="dim" font-size="10.5">Review: lens_planner &middot; lens_renderer &middot; wkb_envelope &middot; temporal_snapshot_engine &middot; snapshot_overlay_session</text>
 
   <!-- Layer 6: Infra -->
   <rect x="20" y="414" width="600" height="38" class="nd"/>
@@ -195,7 +196,7 @@
     <div class="arch-detail-head">
       <div class="arch-detail-eyebrow">Active module</div>
       <div class="arch-detail-title" id="arch-title">Hover a module to explore</div>
-      <div class="arch-detail-cluster" id="arch-cluster-label">50 modules</div>
+      <div class="arch-detail-cluster" id="arch-cluster-label">60 modules</div>
       <div class="arch-detail-meta"><span id="arch-lines">&mdash;</span></div>
     </div>
     <div class="arch-detail-body">
@@ -346,7 +347,7 @@
 <!-- ============================== RESTORE PIPELINE ============================== -->
 <section id="restore-pipe">
 <h2>Restore pipeline</h2>
-<p>Restore is the hardest part of the plugin. It must reconstruct a past state in a present world that may have drifted. Two entry modes fork into one common applier.</p>
+<p>Restore is the hardest part of the plugin. It must reconstruct a past state in a present world that may have drifted. Two write-back modes share the same applier: <strong>Restore</strong> (action-level: pick individual events and apply them) and <strong>Rewind</strong> (temporal: roll layers back to a past date with deduplication of inverse pairs).</p>
 
 <div class="dia">
 <svg viewBox="0 0 640 540" xmlns="http://www.w3.org/2000/svg">
@@ -449,6 +450,10 @@
   <tr><td><code>widgets/restore_mode_selector.py</code></td><td>80</td><td>Switch between Mode A (event) and Mode B (temporal).</td></tr>
   <tr><td><code>widgets/restore_preflight_dialog.py</code></td><td>94</td><td>Confirmation dialog showing the plan summary before apply.</td></tr>
   <tr><td><code>widgets/toggle_switch.py</code></td><td>64</td><td>iOS-style toggle switch used in several panels.</td></tr>
+  <tr><td><code>widgets/canvas_date_bar.py</code></td><td>410</td><td>Slim date bar anchored to the bottom of the QGIS canvas (Google Earth style). QDateEdit + custom painted timeline + debounced <code>date_changed</code> signal for the Review Snapshot mode.</td></tr>
+  <tr><td><code>widgets/temporal_timeline_widget.py</code></td><td>343</td><td>Custom-painted timeline: DPI-aware, operation-colored markers (INSERT green, UPDATE orange, DELETE red), adaptive ruler, magnetic snap, tooltip preview. Replaces QSlider + overlay combo.</td></tr>
+  <tr><td><code>widgets/review_status_widget.py</code></td><td>246</td><td>Status bar pill visible when a Review session is active: phase dot (idle / fetch / render / alert), entity counter, OFF button.</td></tr>
+  <tr><td><code>widgets/review_segmented_switch.py</code></td><td>114</td><td>Segmented switch &laquo;&nbsp;Present / Review&nbsp;&raquo; in the dialog header.</td></tr>
 </tbody>
 </table></div>
 </section>
@@ -464,6 +469,8 @@
   <tr><td><code>journal_stats_thread.py</code></td><td>118</td><td>Debounced (300&nbsp;ms) aggregate query for the smart bar.</td></tr>
   <tr><td><code>version_fetch_thread.py</code></td><td>104</td><td>Fetches post-cutoff events for the Rewind preview.</td></tr>
   <tr><td><code>qgs_task_support.py</code></td><td>64</td><td>Abstraction over <code>QThread</code> / <code>QgsTask</code>. Same API on QGIS 3.40 (Qt5) and 4.x (Qt6).</td></tr>
+  <tr><td><code>widgets/review_render_worker.py</code></td><td>512</td><td>Per-viewport feature builder for Review diff mode. Cancelable. Emits raw <code>(wkb_bytes, attrs)</code> tuples to the UI thread.</td></tr>
+  <tr><td><code>widgets/snapshot_rebuild_worker.py</code></td><td>319</td><td>Per-date SQL query for Review Snapshot mode. One CTE per date change (debounced 800&nbsp;ms). Returns last entity state per fingerprint. O(N entities) rows, not O(N events).</td></tr>
 </tbody>
 </table></div>
 </section>
@@ -480,6 +487,7 @@
   <tr><td><code>core/restore_contracts.py</code></td><td>164</td><td>Enums (<code>RestoreMode</code>, <code>ConflictPolicy</code>, <code>AtomicityPolicy</code>, <code>PreflightVerdict</code>), <code>PlannedAction</code>, <code>RestorePlan</code>, <code>PreflightReport</code>, volume limits, <code>COMPENSATORY_OPS</code> matrix.</td></tr>
   <tr><td><code>core/support_policy.py</code></td><td>136</td><td>Per-provider capture/restore matrix. Decides if a layer is FULL/PARTIAL/INFO support and STRONG/MEDIUM/WEAK identity.</td></tr>
   <tr><td><code>core/audit_field_policy.py</code></td><td>51</td><td>Single source of truth for &quot;audit metadata&quot; field names (<code>date_modif</code>, <code>updated_at</code>, <code>gid</code>, etc.). Used by capture, delta, and restore so they agree on what to ignore.</td></tr>
+  <tr><td><code>core/lens_contracts.py</code></td><td>186</td><td>Review vocabulary. Enums (<code>LensOpFilter</code>, <code>LensVisualizationMode</code>, <code>EntityClassification</code>) and NamedTuples (<code>LensSelection</code>, <code>EntityState</code>, <code>EntityTimeline</code>, <code>LensFetchStats</code>, <code>LensRenderPlan</code>, <code>LensRenderResult</code>, <code>LensRefreshOutcome</code>). Zero QGIS.</td></tr>
 </tbody>
 </table></div>
 </section>
@@ -564,6 +572,23 @@
 </table></div>
 </section>
 
+<section id="cat-review">
+<h2>Module catalog &mdash; Review</h2>
+<p>The read-only visualization layer. Review reconstructs the state of tracked layers at a user-chosen date T and projects them onto the QGIS canvas as transient overlays. Reuses the same journal and event contracts as Restore; never writes back to source layers.</p>
+
+<div class="tw"><table>
+<thead><tr><th>File</th><th>Lines</th><th>Role</th></tr></thead>
+<tbody>
+  <tr><td><code>core/lens_planner.py</code></td><td>236</td><td>Groups events by entity (fingerprint preferred, identity_json fallback), orders timelines, builds <code>EntityState</code>s with old/new geom and attr delta, classifies entities. Output: <code>LensRenderPlan</code>. Pure Python, zero QGIS.</td></tr>
+  <tr><td><code>core/lens_renderer.py</code></td><td>549</td><td>Synchronous renderer that consumes a plan and creates three QGIS memory layers in one call (geom_past, arrows, attr_markers). Reused by <code>review_session</code> for overlay primitives.</td></tr>
+  <tr><td><code>core/wkb_envelope.py</code></td><td>250</td><td>WKB bounding-box parser using only the standard library. <code>parse_envelope(wkb)</code> returns a 4-tuple; <code>envelope_intersects(a, b)</code> answers in O(1) without GEOS.</td></tr>
+  <tr><td><code>core/temporal_snapshot_engine.py</code></td><td>290</td><td><strong>Snapshot mode core.</strong> Forward-replays cached events until a cutoff date T. Returns <code>SnapshotResult</code> mapping entity_fp &rarr; <code>SnapshotFeature</code> for every entity that existed at T. Pure Python, O(N) over cached events, ~1&ndash;5&nbsp;ms per 5000 events.</td></tr>
+  <tr><td><code>core/snapshot_overlay_session.py</code></td><td>650</td><td>Manages one memory layer per source layer showing the reconstructed state at date T. Single Review mode. Prefix <code>__rl_snap_</code>.</td></tr>
+  <tr><td><code>core/journal_diagnostics.py</code></td><td>200</td><td>Diagnostic queries: event distribution per entity, BLOB ratio, dedup potential. Used by the maintenance panel for journal health reporting.</td></tr>
+</tbody>
+</table></div>
+</section>
+
 <section id="cat-health">
 <h2>Module catalog &mdash; Health &amp; maintenance</h2>
 <p>The plugin watches its own state: integrity at startup, disk space periodically, journal size against thresholds, retention purge with VACUUM. All operations are bounded and logged.</p>
@@ -605,7 +630,7 @@
   <div class="card">
     <div class="card-tag tag-weak">Debt 1</div>
     <div class="card-t">recover_dialog.py monolith</div>
-    <p>2&nbsp;797 lines, five responsibilities (widget build, restore orchestration, geometry preview, smart bar, state machine). Every restore fix touches this file because the orchestration logic lives inside the UI.</p>
+    <p>2&nbsp;800+ lines, six responsibilities (widget build, restore orchestration, geometry preview, smart bar, state machine, Review session wiring). Every restore or Review fix touches this file because the orchestration logic lives inside the UI.</p>
   </div>
   <div class="card">
     <div class="card-tag tag-weak">Debt 2</div>
@@ -615,12 +640,12 @@
   <div class="card">
     <div class="card-tag tag-weak">Debt 3</div>
     <div class="card-t">core/__init__.py over-exports</div>
-    <p>191 symbols re-exported. Any module can <code>from .core import X</code>. The real dependency graph is invisible without grep.</p>
+    <p>200+ symbols re-exported. Any module can <code>from .core import X</code>. The real dependency graph is invisible without grep.</p>
   </div>
   <div class="card">
     <div class="card-tag tag-strong">Healthy</div>
     <div class="card-t">Everything else</div>
-    <p>Contracts, persistence, capture, compat layer, observability and 30+ small core modules pass the &quot;one file = one responsibility&quot; rule and stay under 300 lines.</p>
+    <p>Contracts, persistence, capture, compat layer, Review domain, observability and 40+ small core modules pass the &quot;one file = one responsibility&quot; rule and stay under 300 lines.</p>
   </div>
 </div>
 

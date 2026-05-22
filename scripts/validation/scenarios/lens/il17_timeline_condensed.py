@@ -9,9 +9,9 @@ Verifie :
  1. diff_table has 4 columns (Date|Op|Utilisateur|Resume)
  2. _populate_diff_panel produces 1 row per event (not 1 per field)
  3. _build_event_summary returns correct labels for INSERT/DELETE/UPDATE
- 4. GeoGit render loop produces max 1 past feature per entity
- 5. GeoGit render loop produces max 1 arrow per entity
- 6. GeoGit render loop produces max 1 attr marker per entity
+ 4. Review render loop produces max 1 past feature per entity
+ 5. Review render loop produces max 1 arrow per entity
+ 6. Review render loop produces max 1 attr marker per entity
 """
 import importlib
 import sys
@@ -27,8 +27,8 @@ results = []
 for mod_name in (
     'recoverland.widgets.temporal_lens_dock',
     'recoverland.core.lens_contracts',
-    'recoverland.core.geogit_session',
-    'recoverland.widgets.geogit_render_worker',
+    'recoverland.core.snapshot_overlay_session',
+    'recoverland.widgets.snapshot_rebuild_worker',
     'recoverland.core.geometry_utils',
 ):
     if mod_name in sys.modules:
@@ -143,10 +143,10 @@ results.append((
 
 dock.deleteLater()
 
-# --- Test 5+6: GeoGit render condensation (structural check) ---
-# Read geogit_session source and verify the condensation pattern
+# --- Test 5+6: Review render condensation (structural check) ---
+# Read snapshot_overlay_session source and verify the condensation pattern
 _PLUGIN = Path(sys.modules['recoverland'].__file__).parent
-session_src = (_PLUGIN / 'core' / 'geogit_session.py').read_text(encoding='utf-8')
+session_src = (_PLUGIN / 'core' / 'snapshot_overlay_session.py').read_text(encoding='utf-8')
 
 # The old pattern "for state in timeline.states:" inside the entity loop should NOT exist
 # The new pattern uses oldest_state/newest_state/representative
@@ -154,13 +154,13 @@ has_old_pattern = 'for state in timeline.states:' in session_src
 has_new_pattern = 'oldest_state = timeline.states[0]' in session_src
 ok5 = not has_old_pattern and has_new_pattern
 results.append((
-    'geogit_session_condensed',
+    'review_session_condensed',
     ok5,
     f"old_loop_gone={not has_old_pattern} new_pattern={has_new_pattern}",
 ))
 
 # Same for render worker
-worker_src = (_PLUGIN / 'widgets' / 'geogit_render_worker.py').read_text(encoding='utf-8')
+worker_src = (_PLUGIN / 'widgets' / 'snapshot_rebuild_worker.py').read_text(encoding='utf-8')
 has_old_w = 'for state in timeline.states:' in worker_src
 has_new_w = 'oldest_state = timeline.states[0]' in worker_src
 ok6 = not has_old_w and has_new_w

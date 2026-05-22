@@ -19,6 +19,7 @@ from qgis.PyQt.QtWidgets import QToolTip, QWidget
 
 from ..compat import QtCompat
 from ..core.logger import flog
+from ..core.time_format import parse_iso_date
 
 _TRACK_H = 4
 _HANDLE_R = 7
@@ -76,8 +77,8 @@ class TemporalTimelineWidget(QWidget):
 
     def set_range(self, first_iso: str, last_iso: str) -> None:
         try:
-            self._base_date = _parse_iso_date(first_iso)
-            self._end_date = _parse_iso_date(last_iso)
+            self._base_date = parse_iso_date(first_iso)
+            self._end_date = parse_iso_date(last_iso)
             self._total_days = max(1, (self._end_date - self._base_date).days)
         except (ValueError, TypeError) as exc:
             flog(f"timeline: set_range error {exc!r}", "WARNING")
@@ -103,7 +104,7 @@ class TemporalTimelineWidget(QWidget):
             else:
                 iso, op = str(item), "default"
             try:
-                d = _parse_iso_date(iso)
+                d = parse_iso_date(iso)
                 frac = max(0.0, min(1.0, (d - self._base_date).days / self._total_days))
                 markers.append((frac, iso, op))
             except (ValueError, TypeError):
@@ -300,9 +301,6 @@ class TemporalTimelineWidget(QWidget):
                 best_iso = iso
         return best_iso
 
-
-def _parse_iso_date(iso: str) -> date:
-    return datetime.fromisoformat(iso.replace("Z", "+00:00")).date()
 
 
 def _format_tooltip(iso: str) -> str:

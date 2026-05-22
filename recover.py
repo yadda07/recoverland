@@ -10,7 +10,7 @@ from .themed_action_icon import ThemedActionIconController
 from .core import (
     flog, qlog, JournalManager, WriteQueue, EditSessionTracker,
     SQLiteAuditBackend,
-    check_journal_integrity, purge_lens_overlays,
+    check_journal_integrity,
     get_journal_size_bytes, format_journal_size,
     get_journal_stats, evaluate_journal_health,
     format_integrity_message,
@@ -49,9 +49,7 @@ class RecoverPlugin:
     def __init__(self, iface):
         self.iface = iface
         self.action = None
-        self.lens_action = None
         self.dlg = None
-        self._lens_dock = None
         self._themed_action_icon = None
         self._journal = JournalManager()
         self._write_queue = WriteQueue()
@@ -107,13 +105,6 @@ class RecoverPlugin:
         self.iface.addPluginToMenu("RecoverLand", self.action)
         self.iface.addToolBarIcon(self.action)
 
-        self.lens_action = QAction("Time Lens", self.iface.mainWindow())
-        self.lens_action.setToolTip(QCoreApplication.translate(
-            "RecoverPlugin", "RecoverLand - Time Lens (visualisation temporelle)",
-        ))
-        self.lens_action.triggered.connect(self.open_lens_dock)
-        self.iface.addPluginToMenu("RecoverLand", self.lens_action)
-
         if theme_icon_path:
             self._themed_action_icon = ThemedActionIconController(
                 self.iface.mainWindow(),
@@ -128,7 +119,6 @@ class RecoverPlugin:
 
         self._init_local_backend()
         self._setup_status_bar()
-        purge_lens_overlays("startup")
         flog("RecoverPlugin: initGui complete")
 
     def _show_duplicate_warning(self):
@@ -159,7 +149,6 @@ class RecoverPlugin:
             return
 
         self._shutdown_local_backend()
-        purge_lens_overlays("shutdown")
 
         try:
             QgsProject.instance().layersAdded.disconnect(self._on_layers_added)
@@ -178,12 +167,9 @@ class RecoverPlugin:
             self._themed_action_icon = None
         self.iface.removePluginMenu("RecoverLand", self.action)
         self.iface.removeToolBarIcon(self.action)
-        if self.lens_action is not None:
-            self.iface.removePluginMenu("RecoverLand", self.lens_action)
-            self.lens_action = None
         if self.dlg is not None:
             try:
-                self.dlg._geogit_wants_persist = False
+                self.dlg._review_wants_persist = False
                 self.dlg.cleanup_resources()
             except Exception as exc:  # noqa: BLE001
                 flog(f"RecoverPlugin.unload: dlg cleanup error: {exc}", "WARNING")
@@ -194,33 +180,6 @@ class RecoverPlugin:
                 pass
             self.dlg = None
             flog("RecoverPlugin.unload: dialog cleaned", "INFO")
-
-        if self._lens_dock is not None:
-            try:
-                self._lens_dock.close()
-                self._lens_dock.deleteLater()
-            except (RuntimeError, AttributeError):
-                pass
-            self._lens_dock = None
-
-    def open_lens_dock(self):
-        if self._duplicate_of is not None:
-            self._show_duplicate_warning()
-            return
-        from qgis.PyQt.QtCore import Qt
-        from .widgets.temporal_lens_dock import TemporalLensDock
-        if self._lens_dock is None:
-            self._lens_dock = TemporalLensDock(
-                self.iface, journal=self._journal,
-            )
-            self.iface.addDockWidget(
-                Qt.RightDockWidgetArea, self._lens_dock,
-            )
-        else:
-            self._lens_dock._populate_layers_combo()
-        self._lens_dock.show()
-        self._lens_dock.raise_()
-        flog("RecoverPlugin: Time Lens dock opened")
 
     def run(self):
         if self._duplicate_of is not None:
