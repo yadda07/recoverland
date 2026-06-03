@@ -70,6 +70,7 @@ class SnapshotResult(NamedTuple):
     elapsed_ms: int
     trace_id: str
     all_event_markers: tuple = ()
+    tracked_fps: dict = {}
 
 
 # ------------------------------------------------------------------ #
@@ -206,8 +207,15 @@ def _to_utc(dt: datetime) -> datetime:
 
 
 def _build_attrs_at_cutoff(visible: list) -> Optional[str]:
-    """Replay INSERT base + UPDATE deltas to build full {field: value} at T."""
+    """Replay INSERT base + UPDATE deltas to build full {field: value} at T.
+
+    For pre-existing entities (first visible event is UPDATE, no INSERT),
+    seeds ``attrs`` from the **old** values of the first UPDATE's
+    ``changed_only`` to fill classification fields that were never
+    modified.  Subsequent UPDATEs only apply the new values.
+    """
     attrs: Dict[str, object] = {}
+    has_base = False
     for ev in visible:
         if not ev.attributes_json:
             continue
@@ -221,9 +229,15 @@ def _build_attrs_at_cutoff(visible: list) -> Optional[str]:
             base = parsed.get("all_attributes", {})
             if isinstance(base, dict):
                 attrs.update(base)
+                has_base = True
         elif ev.operation_type == "UPDATE":
             changed = parsed.get("changed_only", {})
             if isinstance(changed, dict):
+                if not has_base:
+                    for field, val in changed.items():
+                        if isinstance(val, (list, tuple)) and len(val) == 2:
+                            attrs.setdefault(field, val[0])
+                    has_base = True
                 for field, val in changed.items():
                     if isinstance(val, (list, tuple)) and len(val) == 2:
                         attrs[field] = val[1]

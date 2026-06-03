@@ -14,6 +14,7 @@ join fetches the full row.  With an index on
 """
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from datetime import datetime
@@ -48,6 +49,13 @@ _SQL_ALL_EVENT_MARKERS = (
     " WHERE datasource_fingerprint = ?"
     " AND invalidated_at IS NULL"
     " AND created_at IS NOT NULL"
+)
+
+_SQL_TRACKED_FPS = (
+    "SELECT DISTINCT entity_fingerprint FROM audit_event"
+    " WHERE datasource_fingerprint = ?"
+    " AND invalidated_at IS NULL"
+    " AND entity_fingerprint IS NOT NULL"
 )
 
 
@@ -144,11 +152,23 @@ class SnapshotRebuildWorker(QThread):
             all_event_markers = tuple(sorted(all_markers_set))
             result = result._replace(all_event_markers=all_event_markers)
 
+            tracked_fps: dict = {}
+            n_tracked_total = 0
+            for info in self._layer_infos:
+                rows_t = conn.execute(
+                    _SQL_TRACKED_FPS, (info["fingerprint"],)
+                ).fetchall()
+                fps = {r[0] for r in rows_t if r[0]}
+                tracked_fps[info["fingerprint"]] = fps
+                n_tracked_total += len(fps)
+            result = result._replace(tracked_fps=tracked_fps)
+
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             flog(
                 f"[{tid}] snap_worker: done "
                 f"n_entities={result.n_entities} "
                 f"n_all_markers={len(all_event_markers)} "
+                f"n_tracked_fps={n_tracked_total} "
                 f"total_rows={total_rows} elapsed_ms={elapsed_ms}",
                 "INFO",
             )
@@ -272,6 +292,152 @@ def filter_snapshot_by_bbox(result, bbox_per_layer: dict):
         "DEBUG",
     )
     return result._replace(features=filtered, n_entities=n_kept)
+
+
+_BASE_FEATURE_CAP = 50000  # per-layer, viewport-bounded volume guard (BL-RVF-P0-06)
+
+
+def _resolve_pk_field(layer):
+    """Return the layer's primary-key field name, or None (FID-only identity)."""
+    try:
+        pk_idx = layer.dataProvider().pkAttributeIndexes()
+    except Exception:  # noqa: BLE001
+        return None
+    if not pk_idx:
+        return None
+    fields = layer.fields()
+    for idx in pk_idx:
+        if 0 <= idx < fields.count():
+            return fields.at(idx).name()
+    return None
+
+
+def _feature_entity_fp(feat, pk_field):
+    """Recompute a source feature's entity fingerprint.
+
+    Mirrors identity.compute_entity_fingerprint(compute_feature_identity(...)):
+    'pk:<field>=<value>' when a PK value is present, else 'fid:<id>'.
+    """
+    if pk_field:
+        try:
+            val = feat[pk_field]
+        except (KeyError, IndexError):
+            val = None
+        if val is not None:
+            if not isinstance(val, (int, float, str)):
+                val = str(val)
+            return f"pk:{pk_field}={val}"
+    return f"fid:{feat.id()}"
+
+
+def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
+    """Merge current source features that have NO audit events into the snapshot.
+
+    A feature with no event was never modified since tracking began, so its
+    CURRENT state IS its state at T (Review = full state, like Rewind but read
+    only). Tracked entities (any event, incl. created-after-T) are skipped here
+    because the reconstruction engine already resolves them.
+
+    Runs on the QGIS main thread (reads QgsVectorLayer). Bounded by the viewport
+    bbox + a hard per-layer feature cap (_BASE_FEATURE_CAP); beyond the cap the
+    overflow is dropped with a WARNING (degraded, never unbounded).
+
+    Returns a new SnapshotResult with untracked features appended.
+    """
+    from qgis.core import QgsFeatureRequest, QgsProject  # noqa: PLC0415
+    from ..core.geometry_utils import geometry_to_wkb  # noqa: PLC0415
+    from ..core.serialization import serialize_attributes  # noqa: PLC0415
+    from ..core.temporal_snapshot_engine import SnapshotFeature  # noqa: PLC0415
+
+    tracked = result.tracked_fps or {}
+    project = QgsProject.instance()
+    features = {ds: dict(em) for ds, em in result.features.items()}
+    n_added_total = 0
+
+    for info in layer_infos:
+        ds_fp = info["fingerprint"]
+        layer_name = info.get("layer_name", "?")
+        try:
+            layer = project.mapLayer(info.get("layer_id", ""))
+            if layer is None:
+                flog(
+                    f"[{trace_id}] base_merge: source_layer_missing "
+                    f"layer={layer_name}",
+                    "WARNING",
+                )
+                continue
+            tracked_set = tracked.get(ds_fp, set())
+            ds_feats = features.get(ds_fp) or {}
+            field_names = [f.name() for f in layer.fields()]
+            pk_field = _resolve_pk_field(layer)
+            crs_authid = layer.crs().authid() if layer.crs().isValid() else None
+
+            req = QgsFeatureRequest()
+            bbox = bbox_per_layer.get(ds_fp) if bbox_per_layer else None
+            if bbox is not None:
+                req.setFilterRect(bbox)
+
+            n_seen = 0
+            n_added = 0
+            n_skip_tracked = 0
+            capped = False
+            for feat in layer.getFeatures(req):
+                n_seen += 1
+                if n_seen > _BASE_FEATURE_CAP:
+                    capped = True
+                    break
+                efp = _feature_entity_fp(feat, pk_field)
+                if efp in tracked_set or efp in ds_feats:
+                    n_skip_tracked += 1
+                    continue
+                wkb = geometry_to_wkb(feat.geometry())
+                if wkb is None:
+                    continue
+                try:
+                    attrs_json = json.dumps(
+                        serialize_attributes(feat, field_names),
+                        ensure_ascii=False,
+                    )
+                except (TypeError, ValueError):
+                    attrs_json = None
+                ds_feats[efp] = SnapshotFeature(
+                    entity_fp=efp, geom_wkb=wkb, attrs_json=attrs_json,
+                    crs_authid=crs_authid, last_event_id=0,
+                    last_op="UNCHANGED", last_created_at="",
+                )
+                n_added += 1
+
+            if n_added:
+                features[ds_fp] = ds_feats
+                n_added_total += n_added
+
+            if capped:
+                flog(
+                    f"[{trace_id}] base_merge: capped layer={layer_name} "
+                    f"cap={_BASE_FEATURE_CAP} overflow_dropped",
+                    "WARNING",
+                )
+            flog(
+                f"[{trace_id}] base_merge: layer={layer_name} "
+                f"n_seen={n_seen} n_tracked_skip={n_skip_tracked} "
+                f"n_added={n_added}",
+                "INFO",
+            )
+        except Exception as exc:  # noqa: BLE001
+            flog(
+                f"[{trace_id}] base_merge: layer_error layer={layer_name} "
+                f"error={exc!r}",
+                "ERROR",
+            )
+            continue
+
+    new_n = result.n_entities + n_added_total
+    flog(
+        f"[{trace_id}] base_merge: done n_added={n_added_total} "
+        f"n_entities={new_n}",
+        "INFO",
+    )
+    return result._replace(features=features, n_entities=new_n)
 
 
 def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
