@@ -38,6 +38,7 @@ docs/support_policy.md
 
 # Cascade workflows (local-only, never in public repo)
 .windsurf/
+.devin/
 
 # Internal tooling (orchestrator + validation toolkit)
 scripts/orchestrator/
