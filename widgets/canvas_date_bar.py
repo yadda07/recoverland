@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from qgis.PyQt.QtCore import QDate, QPoint, QTime, QTimer, pyqtSignal
+from qgis.PyQt.QtCore import QDate, QTime, QTimer, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QDateEdit, QHBoxLayout, QLabel, QPushButton,
     QSizePolicy, QTimeEdit, QWidget,
@@ -36,19 +36,26 @@ from .temporal_timeline_widget import TemporalTimelineWidget
 _BAR_HEIGHT = 40
 
 _CANVAS_EVENT_TYPES = frozenset({int(QtCompat.EVENT_RESIZE), int(QtCompat.EVENT_MOVE)})
-_WIN_EVENT_TYPES = frozenset({int(QtCompat.EVENT_RESIZE), int(QtCompat.EVENT_MOVE), int(QtCompat.EVENT_LAYOUT_REQUEST)})
 
 
-def _purge_stale_bars() -> None:
+def _purge_stale_bars(canvas) -> None:
     """Destroy any orphan CanvasDateBar widgets left over from a previous load.
 
     Works across plugin reloads: identifies bars by the ``_rl_canvas_date_bar``
     marker attribute rather than isinstance(), which would fail after module reload.
+    Checks both canvas children (current architecture) and top-level widgets
+    (previous architecture) for backward compatibility.
     """
     try:
-        from qgis.PyQt.QtWidgets import QApplication  # noqa: PLC0415
+        from qgis.PyQt.QtWidgets import QApplication, QWidget as _QW  # noqa: PLC0415
         destroyed = 0
-        for w in QApplication.topLevelWidgets():
+        seen = set()
+        candidates = list(canvas.findChildren(_QW)) + list(QApplication.topLevelWidgets())
+        for w in candidates:
+            wid = id(w)
+            if wid in seen:
+                continue
+            seen.add(wid)
             if not getattr(w, '_rl_canvas_date_bar', False):
                 continue
             if getattr(w, '_closing', False):
@@ -57,11 +64,13 @@ def _purge_stale_bars() -> None:
                 w._closing = True
                 if hasattr(w, '_debounce'):
                     w._debounce.stop()
+                if hasattr(w, '_viewport') and w._viewport is not None:
+                    w._viewport.removeEventFilter(w)
                 if hasattr(w, '_canvas'):
                     w._canvas.removeEventFilter(w)
                 if hasattr(w, '_main_win') and w._main_win is not None:
                     w._main_win.removeEventFilter(w)
-                w.close()
+                w.hide()
                 w.deleteLater()
                 destroyed += 1
             except Exception:  # noqa: BLE001
@@ -85,23 +94,18 @@ class CanvasDateBar(QWidget):
     export_requested = pyqtSignal()
 
     def __init__(self, canvas, parent=None):
-        _purge_stale_bars()
-        super().__init__(None)          # intentionally no Qt parent
+        _purge_stale_bars(canvas)
+        viewport = canvas.viewport()    # canvas is a QGraphicsView/QAbstractScrollArea
+        super().__init__(viewport)      # child of the viewport → actually rendered on top
         self._rl_canvas_date_bar = True  # marker for _purge_stale_bars
         self._canvas = canvas
-        self._main_win = canvas.window()
+        self._viewport = viewport
         self._ceiling = None
         self._closing = False
         self._base_date: Optional[date] = None
         self._end_date: Optional[date] = None
         self._total_days: int = 1
         self._syncing: bool = False
-
-        self.setWindowFlags(
-            QtCompat.WINDOW_TOOL
-            | QtCompat.WINDOW_FRAMELESS
-            | QtCompat.WINDOW_NO_FOCUS
-        )
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -113,13 +117,12 @@ class CanvasDateBar(QWidget):
         self._reposition_timer.setInterval(200)
         self._reposition_timer.timeout.connect(self._reposition)
 
+        self.setAttribute(QtCompat.WA_STYLED_BACKGROUND, True)
+        self.setAutoFillBackground(True)
         self._build_ui()
         self._apply_style()
-        canvas.installEventFilter(self)
-        if self._main_win is not None:
-            self._main_win.installEventFilter(self)
+        viewport.installEventFilter(self)
         self._reposition()
-        self._set_transient_parent()
         flog(
             f"canvas_date_bar: created canvas={canvas.__class__.__name__}",
             "DEBUG",
@@ -154,20 +157,44 @@ class CanvasDateBar(QWidget):
             "DEBUG",
         )
 
-    def set_stats(self, n_entities: int) -> None:
-        """Update right-side status label after a successful reconstruction."""
-        if n_entities == 0:
-            self._lbl_status.setText(self.tr("Aucune entité à cette date"))
-            self._lbl_status.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+    def set_stats(self, n_entities: int, n_total: int = -1) -> None:
+        """Update right-side status indicator after a successful reconstruction.
+
+        Uses compact icons to avoid layout shifts:
+        - ``∅``       — no data at this date
+        - ``◎ N ↗``   — N entities outside viewport (orange)
+        - ``✦ N``     — N entities visible (blue)
+
+        Full description is available via tooltip.
+
+        Args:
+            n_entities: entities visible in the current viewport.
+            n_total: entities globally at this date (-1 = unknown/same as n_entities).
+        """
+        if n_total < 0:
+            n_total = n_entities
+        if n_entities == 0 and n_total == 0:
+            self._lbl_status.setText("∅")
+            self._lbl_status.setToolTip(self.tr("Aucune entité à cette date"))
+            self._lbl_status.setStyleSheet("color: #888888; font-size: 13px;")
+        elif n_entities == 0 and n_total > 0:
+            self._lbl_status.setText(f"◎ {n_total} ↗")
+            self._lbl_status.setToolTip(
+                self.tr("{n} entité(s) hors de l'emprise actuelle").format(n=n_total)
+            )
+            self._lbl_status.setStyleSheet("color: #ffaa44; font-size: 12px;")
         else:
-            txt = self.tr("{n} entité(s) reconstituée(s)").format(n=n_entities)
-            self._lbl_status.setText(txt)
-            self._lbl_status.setStyleSheet("color: #80c8ff; font-size: 11px;")
+            self._lbl_status.setText(f"✦ {n_entities}")
+            self._lbl_status.setToolTip(
+                self.tr("{n} entité(s) reconstituée(s)").format(n=n_entities)
+            )
+            self._lbl_status.setStyleSheet("color: #80c8ff; font-size: 12px;")
 
     def set_loading(self) -> None:
         """Show loading indicator while the rebuild worker is running."""
-        self._lbl_status.setText(self.tr("Reconstruction…"))
-        self._lbl_status.setStyleSheet("color: #ffcc44; font-size: 11px;")
+        self._lbl_status.setText("⟳")
+        self._lbl_status.setToolTip(self.tr("Reconstruction en cours…"))
+        self._lbl_status.setStyleSheet("color: #ffcc44; font-size: 14px;")
 
     def current_date_iso(self) -> str:
         """Return selected date+time as ISO 8601 string."""
@@ -183,10 +210,8 @@ class CanvasDateBar(QWidget):
         self._closing = True
         self._debounce.stop()
         self._reposition_timer.stop()
-        self._canvas.removeEventFilter(self)
-        if self._main_win is not None:
-            self._main_win.removeEventFilter(self)
-        self.close()
+        self._viewport.removeEventFilter(self)
+        self.hide()
         self.deleteLater()
         flog("canvas_date_bar: cleanup done", "DEBUG")
 
@@ -216,12 +241,10 @@ class CanvasDateBar(QWidget):
         super().closeEvent(event)
 
     def eventFilter(self, obj, event) -> bool:
-        """Reposition after any canvas resize/move or main-window layout change."""
+        """Reposition after any viewport resize/move."""
         evt = int(event.type())
-        if obj is self._canvas and evt in _CANVAS_EVENT_TYPES:
+        if obj is self._viewport and evt in _CANVAS_EVENT_TYPES:
             QTimer.singleShot(150, self._reposition)
-        elif obj is self._main_win and evt in _WIN_EVENT_TYPES:
-            self._reposition_timer.start()  # coalesced at +200ms
         return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------ #
@@ -265,7 +288,7 @@ class CanvasDateBar(QWidget):
         layout.addWidget(self._btn_export)
 
         self._lbl_status = QLabel("", self)
-        self._lbl_status.setMinimumWidth(210)
+        self._lbl_status.setFixedWidth(72)
         layout.addWidget(self._lbl_status)
 
         self._date_edit.dateChanged.connect(self._on_date_edit_changed)
@@ -294,32 +317,14 @@ class CanvasDateBar(QWidget):
             "QDateEdit::drop-down { border: none; width: 16px; }"
         )
 
-    def _set_transient_parent(self) -> None:
-        """Make bar stay on top of QGIS only (not all apps)."""
-        try:
-            if self._main_win is None:
-                return
-            self.show()  # windowHandle() only valid after show
-            bar_win = self.windowHandle()
-            main_win = self._main_win.windowHandle()
-            if bar_win is not None and main_win is not None:
-                bar_win.setTransientParent(main_win)
-                flog("canvas_date_bar: transient_parent_set", "DEBUG")
-        except Exception as _e:  # noqa: BLE001
-            flog(f"canvas_date_bar: transient_parent_err {_e}", "WARNING")
-
     def _reposition(self) -> None:
         if self._closing:
             return
-        cw = self._canvas.width()
-        ch = self._canvas.height()
-        try:
-            g = self._canvas.mapToGlobal(QPoint(0, ch - _BAR_HEIGHT))
-            self.resize(cw, _BAR_HEIGHT)
-            self.move(g)
-        except Exception as _e:
-            flog(f"canvas_date_bar: reposition_err {_e}", "WARNING")
-        self._raise_safe()
+        cw = self._viewport.width()
+        ch = self._viewport.height()
+        self.resize(cw, _BAR_HEIGHT)
+        self.move(0, ch - _BAR_HEIGHT)
+        self.raise_()
         if not self.isVisible():
             self.show()
         flog(
@@ -343,12 +348,6 @@ class CanvasDateBar(QWidget):
 
     def _raise_safe(self) -> None:
         self.raise_()
-        if self._ceiling is not None:
-            try:
-                if self._ceiling.isVisible():
-                    self._ceiling.raise_()
-            except RuntimeError:
-                self._ceiling = None
 
     def set_markers(self, date_isos: list) -> None:
         """Pass markers to timeline. Accepts plain ISO strings or (iso, op_type) tuples."""

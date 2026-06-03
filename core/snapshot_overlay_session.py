@@ -123,7 +123,14 @@ class SnapshotOverlaySession:
         created = [0]
 
         def _step() -> None:
-            if not pending or not self._active:
+            if not self._active:
+                flog(
+                    f"[{self.trace_id}] snapshot_overlay: async_create "
+                    f"aborted (inactive) created={created[0]}/{total}",
+                    "WARNING",
+                )
+                return
+            if not pending:
                 flog(
                     f"[{self.trace_id}] snapshot_overlay: async_create done "
                     f"created={created[0]}/{total}",
@@ -132,8 +139,15 @@ class SnapshotOverlaySession:
                 on_done()
                 return
             info = pending.pop(0)
-            self._create_overlay(info)
-            created[0] += 1
+            try:
+                self._create_overlay(info)
+                created[0] += 1
+            except (RuntimeError, Exception) as exc:  # noqa: BLE001
+                flog(
+                    f"[{self.trace_id}] snapshot_overlay: create_overlay_error "
+                    f"layer={info.get('layer_name', '?')} error={exc!r}",
+                    "ERROR",
+                )
             QTimer.singleShot(0, _step)
 
         QTimer.singleShot(0, _step)
@@ -189,6 +203,12 @@ class SnapshotOverlaySession:
             f"elapsed_ms={elapsed_ms}",
             "INFO",
         )
+        try:
+            from qgis.utils import iface  # noqa: PLC0415
+            if iface is not None:
+                iface.mapCanvas().refresh()
+        except Exception:  # noqa: BLE001
+            pass
         return {"n_entities": n_ent, "n_features": total_feats, "elapsed_ms": elapsed_ms}
 
     def update_async(self, snapshot_result, on_done=None) -> None:
@@ -259,6 +279,7 @@ class SnapshotOverlaySession:
             lyr = project.mapLayer(ovl.layer_id)
             if lyr is not None:
                 lyr.dataProvider().truncate()
+                lyr.triggerRepaint()
 
     def stop(self) -> None:
         """Remove all overlay layers and clean up the group."""
@@ -300,8 +321,9 @@ class SnapshotOverlaySession:
             return
 
         geom_family = self._detect_geom_family(source_layer) or "Polygon"
+        overlay_crs = info.get("storage_crs", self._dst_crs)
         snap_lyr = self._build_snap_layer(
-            uid, geom_family, self._dst_crs, source_layer,
+            uid, geom_family, overlay_crs, source_layer,
         )
         snap_lyr.setName(f"{info['layer_name']} (snapshot)")
         snap_lyr.setCustomProperty("_rl_snap_managed", "1")
@@ -329,7 +351,8 @@ class SnapshotOverlaySession:
         flog(
             f"[{self.trace_id}] snapshot_overlay: created "
             f"layer={info['layer_name']} "
-            f"geom={geom_family} uid={uid}",
+            f"geom={geom_family} uid={uid} "
+            f"overlay_crs={overlay_crs} dst_crs={self._dst_crs}",
             "DEBUG",
         )
 
@@ -395,19 +418,55 @@ class SnapshotOverlaySession:
             f.setAttribute("_rl_snap_op", snap_feat.last_op)
             feats.append(f)
 
-        if n_skipped:
-            flog(
-                f"[{self.trace_id}] snapshot_overlay: geom_type_skipped "
-                f"layer={ovl.layer_name} n_skipped={n_skipped}",
-                "WARNING",
-            )
+        n_no_geom = sum(
+            1 for sf in entity_feats.values() if sf.geom_wkb is None
+        )
+        n_null_geom = sum(
+            1 for sf in entity_feats.values()
+            if sf.geom_wkb is not None and rebuild_geometry(sf.geom_wkb) is None
+        ) if n_no_geom < len(entity_feats) else 0
+
+        flog(
+            f"[{self.trace_id}] snapshot_overlay: populate_layer "
+            f"layer={ovl.layer_name} "
+            f"n_entities={len(entity_feats)} n_no_geom={n_no_geom} "
+            f"n_null_geom={n_null_geom} n_type_skip={n_skipped} "
+            f"n_feats_built={len(feats)} "
+            f"lyr_crs={lyr.crs().authid() if lyr.crs().isValid() else '?'} "
+            f"storage_crs={ovl.storage_crs}",
+            "INFO",
+        )
+        fc = 0
         lyr.blockSignals(True)
         try:
             if feats:
-                lyr.dataProvider().addFeatures(feats)
+                ok, added = lyr.dataProvider().addFeatures(feats)
+                n_accepted = len(added) if added else 0
+                if not ok:
+                    flog(
+                        f"[{self.trace_id}] snapshot_overlay: addFeatures FAILED "
+                        f"layer={ovl.layer_name} n_feats={len(feats)}",
+                        "ERROR",
+                    )
+                elif n_accepted != len(feats):
+                    flog(
+                        f"[{self.trace_id}] snapshot_overlay: addFeatures "
+                        f"partial layer={ovl.layer_name} "
+                        f"sent={len(feats)} accepted={n_accepted} "
+                        f"lyr_wkb={lyr.wkbType()}",
+                        "WARNING",
+                    )
             lyr.updateExtents()
+            fc = lyr.featureCount()
         finally:
             lyr.blockSignals(False)
+        lyr.triggerRepaint()
+        flog(
+            f"[{self.trace_id}] snapshot_overlay: provider_count "
+            f"layer={ovl.layer_name} featureCount={fc} "
+            f"lyr_wkb={lyr.wkbType()}",
+            "DEBUG",
+        )
         return len(feats)
 
     # ------------------------------------------------------------------ #
@@ -531,24 +590,42 @@ class SnapshotOverlaySession:
             "errors": errors,
         }
 
+    _SNAP_OPACITY = 0.65
+
     def _clone_style_only(self, overlay_layer, source_layer) -> None:
-        """Clone renderer style without age-opacity (no createMapRenderer call)."""
+        """Clone source renderer via ``renderer().clone()`` + reduce opacity.
+
+        Uses direct C++ clone (no XML round-trip) to avoid segfaults that
+        ``QgsMapLayerStyle.writeToLayer()`` causes on certain renderer types.
+        Falls back to default renderer if clone fails.
+        """
+        cloned = False
         try:
-            from qgis.core import QgsMapLayerStyle  # noqa: PLC0415
-            style = QgsMapLayerStyle()
-            style.readFromLayer(source_layer)
-            if style.isValid():
-                style.writeToLayer(overlay_layer)
-                flog(
-                    f"[{self.trace_id}] snapshot_overlay: style_cloned "
-                    f"source={source_layer.name()}",
-                    "DEBUG",
-                )
-        except Exception as exc:  # noqa: BLE001
+            renderer = source_layer.renderer()
+            if renderer is not None:
+                overlay_layer.setRenderer(renderer.clone())
+                cloned = True
+        except (RuntimeError, Exception) as exc:  # noqa: BLE001
             flog(
-                f"[{self.trace_id}] snapshot_overlay: style_clone_error={exc!r}",
+                f"[{self.trace_id}] snapshot_overlay: renderer_clone_error="
+                f"{exc!r} source={source_layer.name()}",
                 "WARNING",
             )
+
+        try:
+            overlay_layer.setOpacity(self._SNAP_OPACITY)
+        except (RuntimeError, Exception) as exc:  # noqa: BLE001
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: setOpacity_error={exc!r}",
+                "WARNING",
+            )
+
+        flog(
+            f"[{self.trace_id}] snapshot_overlay: style_applied "
+            f"source={source_layer.name()} opacity={self._SNAP_OPACITY} "
+            f"renderer_cloned={cloned}",
+            "DEBUG",
+        )
 
     def _source_tree_position(self, source_layer_id: str) -> int:
         """Return position of source layer in the layer tree (0=top)."""
@@ -574,23 +651,43 @@ class SnapshotOverlaySession:
         return len(group.children())
 
     def _detect_geom_family(self, source_layer) -> Optional[str]:
-        """Return Point/LineString/Polygon from layer wkbType — O(1), no I/O.
+        """Return geometry URI token from layer wkbType — O(1), no I/O.
+
+        Returns the *Multi* variant when the source uses multi-part
+        geometries.  A memory layer created as ``"Point"`` silently
+        rejects MultiPoint features from ``addFeatures``, which causes
+        massive data loss on common Multi* source layers.
 
         Resolution order (QGIS 3.40 → 4.x compat):
-        1. ``Qgis.GeometryType`` enum via ``layer.geometryType()`` (3.30+)
-        2. ``QgsWkbTypes.geometryType(wkbType)`` static (3.x legacy)
-        3. ``int(wkbType) % 1000 // 1`` bit extraction fallback
+        1. ``wkbType()`` → raw WKB code → Multi detection + base family.
+        2. ``geometryType()`` enum fallback (loses Multi info).
         """
-        _MAP = {0: "Point", 1: "LineString", 2: "Polygon"}
+        _BASE = {0: "Point", 1: "LineString", 2: "Polygon"}
+        _MULTI = {0: "MultiPoint", 1: "MultiLineString", 2: "MultiPolygon"}
+        _WKB_MULTI_CODES = frozenset({4, 5, 6, 11, 12, 1004, 1005, 1006,
+                                      2004, 2005, 2006, 3004, 3005, 3006})
+
+        is_multi = False
         try:
-            gtype = int(source_layer.geometryType())
-            return _MAP.get(gtype)
+            raw_wkb = int(source_layer.wkbType())
+            base_code = raw_wkb % 1000
+            if base_code in _WKB_MULTI_CODES:
+                is_multi = True
         except Exception:  # noqa: BLE001
             pass
+
+        try:
+            gtype = int(source_layer.geometryType())
+            family = (_MULTI if is_multi else _BASE).get(gtype)
+            if family:
+                return family
+        except Exception:  # noqa: BLE001
+            pass
+
         try:
             from qgis.core import QgsWkbTypes  # noqa: PLC0415
             gtype = int(QgsWkbTypes.geometryType(source_layer.wkbType()))
-            return _MAP.get(gtype)
+            return (_MULTI if is_multi else _BASE).get(gtype)
         except Exception:  # noqa: BLE001
             pass
         return None

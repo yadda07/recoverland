@@ -1956,6 +1956,11 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_done("--------", "no valid layers")
             return
 
+        tree_root = root
+        tree_layers = tree_root.findLayers()
+        tree_order = {n.layerId(): i for i, n in enumerate(tree_layers)}
+        layer_infos.sort(key=lambda x: tree_order.get(x["layer_id"], 999999))
+
         self._review_layer_infos = layer_infos
         self._review_src_crs = src_crs
         self._review_t_min = t_min
@@ -2019,9 +2024,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             if self._review_status_widget is not None:
                 self._review_status_widget.activate()
                 self._review_status_widget.set_phase("fetch")
-            from qgis.PyQt.QtWidgets import QApplication
-            QApplication.processEvents()
-            self.recover_and_load()
+            QTimer.singleShot(0, self.recover_and_load)
         else:
             flog("review: toggle OFF", "INFO")
             self._review_viz_combo.setVisible(False)
@@ -2292,7 +2295,10 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _on_snapshot_result(self, trace_id: str, result) -> None:
         """Slot: SnapshotRebuildWorker delivered a result."""
-        from .widgets.snapshot_rebuild_worker import filter_snapshot_by_bbox
+        from .widgets.snapshot_rebuild_worker import (
+            filter_snapshot_by_bbox,
+            merge_untracked_base,
+        )
         self._review_snap_worker = None
         snap = self._review_snap_session
         bar = self._review_date_bar
@@ -2311,6 +2317,17 @@ class RecoverDialog(QDialog, LoggerMixin):
                 "INFO",
             )
 
+        n_reconstructed = result.n_entities
+        result = merge_untracked_base(
+            result, self._review_layer_infos, bbox_per_layer, trace_id=trace_id,
+        )
+        flog(
+            f"[{trace_id}] review: base_merged "
+            f"reconstructed={n_reconstructed} total={result.n_entities} "
+            f"base_added={result.n_entities - n_reconstructed}",
+            "INFO",
+        )
+
         unique_dates = list(result.all_event_markers) if result.all_event_markers else sorted({
             sf.last_created_at
             for entity_map in result.features.values()
@@ -2318,13 +2335,16 @@ class RecoverDialog(QDialog, LoggerMixin):
             if hasattr(sf, 'last_created_at') and sf.last_created_at
         })
 
+        n_total_before_bbox = n_before if bbox_per_layer else result.n_entities
+
         def _on_update_done(stats: dict) -> None:
             if bar is not None and self._review_snap_mode:
                 bar.set_markers(unique_dates)
-                bar.set_stats(stats["n_entities"])
+                bar.set_stats(stats["n_entities"], n_total=n_total_before_bbox)
             flog(
                 f"[{trace_id}] review: snap_result_applied "
-                f"n_entities={stats['n_entities']} elapsed_ms={stats['elapsed_ms']}",
+                f"n_entities={stats['n_entities']} "
+                f"n_total={n_total_before_bbox} elapsed_ms={stats['elapsed_ms']}",
                 "INFO",
             )
 
@@ -4298,8 +4318,13 @@ class RecoverDialog(QDialog, LoggerMixin):
                 qlog(self.tr("Date de retour invalide. Deplacez le curseur temporel."), "WARNING")
                 return False
             return True
-        start_datetime = self.start_input.dateTime().toPyDateTime()
-        end_datetime = self.end_input.dateTime().toPyDateTime()
+        start_qdt = self.start_input.dateTime()
+        end_qdt = self.end_input.dateTime()
+        if not start_qdt.isValid() or not end_qdt.isValid():
+            qlog(self.tr("Dates invalides. Selectionnez une periode valide."), "WARNING")
+            return False
+        start_datetime = start_qdt.toPyDateTime()
+        end_datetime = end_qdt.toPyDateTime()
         if start_datetime >= end_datetime:
             qlog(self.tr(
                 "La date de debut doit etre anterieure a la date de fin. "

@@ -138,6 +138,7 @@ class QtCompat:
 
     # --- Qt.WidgetAttribute ---
     WA_TRANSPARENT_FOR_MOUSE = _resolve_enum(Qt, 'WidgetAttribute', 'WA_TransparentForMouseEvents')
+    WA_STYLED_BACKGROUND = _resolve_enum(Qt, 'WidgetAttribute', 'WA_StyledBackground')
 
     # --- Qt.Orientation ---
     HORIZONTAL = _resolve_enum(Qt, 'Orientation', 'Horizontal')
