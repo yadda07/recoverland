@@ -122,8 +122,31 @@ class SnapshotOverlaySession:
         total = len(pending)
         created = [0]
 
+        # Freeze the canvas for the whole batch. Each addMapLayer() schedules a
+        # full re-render of the (heavy) source project; because creation is
+        # spread across event-loop ticks, that render actually executes between
+        # every layer (~350ms x N), which froze the UI for ~18s on a 23-layer
+        # project (recoverland_debug.log session bbd0d574). Freezing collapses
+        # those N renders into a single repaint once creation completes.
+        canvas = None
+        try:
+            from qgis.utils import iface  # noqa: PLC0415
+            if iface is not None:
+                canvas = iface.mapCanvas()
+                canvas.freeze(True)
+        except Exception:  # noqa: BLE001
+            canvas = None
+
+        def _thaw() -> None:
+            if canvas is not None:
+                try:
+                    canvas.freeze(False)
+                except Exception:  # noqa: BLE001
+                    pass
+
         def _step() -> None:
             if not self._active:
+                _thaw()
                 flog(
                     f"[{self.trace_id}] snapshot_overlay: async_create "
                     f"aborted (inactive) created={created[0]}/{total}",
@@ -131,6 +154,7 @@ class SnapshotOverlaySession:
                 )
                 return
             if not pending:
+                _thaw()
                 flog(
                     f"[{self.trace_id}] snapshot_overlay: async_create done "
                     f"created={created[0]}/{total}",

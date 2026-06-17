@@ -200,6 +200,35 @@ def compute_update_delta(old_attrs: Dict, new_attrs: Dict,
     return json.dumps({"changed_only": changed}, ensure_ascii=False)
 
 
+def extract_delta_new(change: Any) -> Any:
+    """Return the post-edit ("new") value of a ``changed_only`` delta entry.
+
+    Single source of truth for reading an UPDATE delta, shared by the
+    temporal snapshot engine and ``search_service.reconstruct_new_attributes``.
+    Supports both the production dict form ``{"old": .., "new": ..}`` and the
+    legacy list form ``[old, new]``; any other shape is returned as-is so a
+    field whose value happens to be a plain scalar/list is left untouched.
+    """
+    if isinstance(change, dict) and "new" in change:
+        return change["new"]
+    if isinstance(change, (list, tuple)) and len(change) == 2:
+        return change[1]
+    return change
+
+
+def extract_delta_old(change: Any) -> Any:
+    """Return the pre-edit ("old") value of a ``changed_only`` delta entry.
+
+    Mirror of :func:`extract_delta_new` for the ``old`` side. Used to seed the
+    attributes of pre-existing entities whose first tracked event is an UPDATE.
+    """
+    if isinstance(change, dict) and "old" in change:
+        return change["old"]
+    if isinstance(change, (list, tuple)) and len(change) == 2:
+        return change[0]
+    return change
+
+
 def build_full_snapshot(attrs: Dict) -> str:
     """Build a full attribute snapshot JSON for DELETE/INSERT events."""
     return json.dumps({"all_attributes": attrs}, ensure_ascii=False)

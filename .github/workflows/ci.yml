@@ -3,11 +3,11 @@ name: CI
 # Decision D-2026-05-14-01 (docs/rewind_charter.md §11):
 # RecoverLand validation runs as runtime QGIS scenarios under
 # `scripts/validation/scenarios/`, not as pytest with mocked QGIS.
-# The historical `unit-tests` and `qgis-runtime` jobs targeted a
-# `tests/` tree that was removed in commit bea5792.
 #
-# Until the runtime scenarios are wired into CI (BL-RW-P2-12 in the
-# rewind backlog), this workflow only enforces static analysis.
+# RL-E3-02: the runtime scenarios are now wired into CI via a headless
+# QGIS docker matrix (LTR + latest). The headless runner is
+# `scripts/validation/ci_run.py` (mirrors `scenario.run()` in the QGIS
+# Python console) and exits non-zero on any FAIL.
 
 on:
   push:
@@ -34,3 +34,28 @@ jobs:
 
       - name: Run flake8
         run: flake8 . --count --statistics
+
+  qgis-runtime:
+    name: QGIS runtime scenarios (${{ matrix.qgis_tag }})
+    runs-on: ubuntu-latest
+    container:
+      image: qgis/qgis:${{ matrix.qgis_tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # LTR (matches qgisMinimumVersion=3.40) + latest, per RL-E3-02.
+        qgis_tag: [release-3_40, latest]
+    steps:
+      # Check out into a `recoverland` directory so the plugin is importable
+      # as the `recoverland` package by the runtime scenarios.
+      - uses: actions/checkout@v6
+        with:
+          path: recoverland
+
+      - name: Run runtime validation scenarios (headless)
+        env:
+          # Parent of the plugin dir on PYTHONPATH -> `import recoverland.*`.
+          PYTHONPATH: ${{ github.workspace }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          xvfb-run -a python3 -m recoverland.scripts.validation.ci_run

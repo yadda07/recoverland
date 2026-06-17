@@ -45,6 +45,7 @@ from .widgets import (AppleToggleSwitch, ReviewSegmentedSwitch,
 import os
 import json
 import time
+import uuid
 
 CHANGE_TYPE_COLORS = {
     "modified":  QColor(66, 133, 244, 60),
@@ -152,11 +153,17 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._review_snap_session = None
         self._review_date_bar = None
         self._review_snap_pending_iso = ""
+        self._review_global_t0_iso = ""
         self._review_snap_cache: dict = {}
         self._review_snap_worker = None
         self._review_snap_zombies: list = []
         self._review_snap_ext_debounce = None
         self._review_snap_bbox_per_layer: dict = {}
+        # Raw reconstruction (tracked entities, pre-bbox-filter, pre-merge)
+        # cached per cutoff date so pan/zoom can re-apply it WITHOUT re-querying
+        # the journal (reconstruction depends only on the date, not the extent).
+        self._review_snap_raw_result = None
+        self._review_snap_raw_iso = ""
 
         self.setup_ui()
 
@@ -2167,8 +2174,10 @@ class RecoverDialog(QDialog, LoggerMixin):
             return
         first_iso, last_iso = query_snapshot_date_range(self._journal, layer_infos)
         bar.set_range(first_iso, last_iso)
+        self._review_global_t0_iso = first_iso
         flog(
-            f"review: bar_range_updated first={first_iso} last={last_iso}",
+            f"review: bar_range_updated first={first_iso} last={last_iso} "
+            f"global_t0={first_iso}",
             "DEBUG",
         )
 
@@ -2219,24 +2228,38 @@ class RecoverDialog(QDialog, LoggerMixin):
         else:
             flog("review: snap_session was already None", "WARNING")
         self._review_snap_cache = {}
+        self._review_snap_raw_result = None
+        self._review_snap_raw_iso = ""
         flog("review: snapshot_mode_stopped", "INFO")
 
-    def _on_snapshot_date_changed(self, iso: str) -> None:
-        """Slot: CanvasDateBar emitted date → cancel previous worker + launch new."""
-        from .widgets.snapshot_rebuild_worker import SnapshotRebuildWorker
+    def _clamp_cutoff_to_baseline(self, iso: str) -> str:
+        """Never request a cutoff earlier than the global tracking start (t0).
 
-        self._review_snap_pending_iso = iso
-        flog(f"review: snapshot_date_changed iso={iso}", "DEBUG")
+        Scrubbing before t0 lands in the empty 'pre-tracking void' where every
+        layer is flagged before-baseline (noisy). We snap the requested cutoff
+        (and the visible slider) up to t0 instead (RL-E1-03).
+        """
+        t0_iso = self._review_global_t0_iso
+        if not t0_iso:
+            return iso
+        req_dt = self._parse_iso_datetime(iso)
+        t0_dt = self._parse_iso_datetime(t0_iso)
+        if req_dt.isValid() and t0_dt.isValid() and req_dt < t0_dt:
+            flog(
+                f"review: cutoff_clamped_to_t0 requested={iso} t0={t0_iso}",
+                "DEBUG",
+            )
+            if self._review_date_bar is not None:
+                self._review_date_bar.set_value_iso(t0_iso)
+            return t0_iso
+        return iso
 
-        self._cancel_snap_worker(disconnect_signals=True)
+    def _compute_bbox_per_layer(self) -> dict:
+        """Map each layer fingerprint → current canvas extent in its storage CRS.
 
-        if not self._review_snap_mode or self._review_snap_session is None:
-            flog("review: snapshot_date_changed skipped mode_inactive", "DEBUG")
-            return
-
-        if self._review_date_bar is not None:
-            self._review_date_bar.set_loading()
-
+        Cheap (no I/O): a single canvas.extent() read + per-layer CRS transform.
+        Used by the apply step on both date change and pan/zoom.
+        """
         from qgis.core import (  # noqa: PLC0415
             QgsCoordinateReferenceSystem,
             QgsCoordinateTransform,
@@ -2263,25 +2286,50 @@ class RecoverDialog(QDialog, LoggerMixin):
                         bbox_per_layer[_fp] = _tr.transformBoundingBox(extent)
                     except Exception:  # noqa: BLE001
                         bbox_per_layer[_fp] = extent
-        self._review_snap_bbox_per_layer = bbox_per_layer
-        for _fp2, _bb in bbox_per_layer.items():
-            flog(
-                f"review: snap_bbox_detail fp={_fp2[:8]} "
-                f"xmin={_bb.xMinimum():.1f} xmax={_bb.xMaximum():.1f} "
-                f"ymin={_bb.yMinimum():.1f} ymax={_bb.yMaximum():.1f}",
-                "DEBUG",
-            )
         flog(
             f"review: snap_bbox_computed n_layers={len(bbox_per_layer)} "
             f"project_crs={project_crs.authid()}",
             "DEBUG",
         )
+        return bbox_per_layer
+
+    def _on_snapshot_date_changed(self, iso: str) -> None:
+        """Slot: CanvasDateBar emitted a NEW date → reconstruct via worker.
+
+        Reconstruction reads the journal, so a date change always needs the
+        background worker. Pan/zoom keeps the same date and is handled by
+        _refresh_snapshot_for_extent WITHOUT a worker (see
+        _on_review_snap_bbox_fire) — that is the core fix for the review-mode
+        slowness: panning no longer re-runs SQL + event replay.
+        """
+        from .widgets.snapshot_rebuild_worker import SnapshotRebuildWorker
+
+        iso = self._clamp_cutoff_to_baseline(iso)
+        self._review_snap_pending_iso = iso
+        flog(f"review: snapshot_date_changed iso={iso}", "DEBUG")
+
+        self._cancel_snap_worker(disconnect_signals=True)
+
+        if not self._review_snap_mode or self._review_snap_session is None:
+            flog("review: snapshot_date_changed skipped mode_inactive", "DEBUG")
+            return
+
+        # Same cutoff already reconstructed → no journal re-read, just re-apply
+        # the cached result to the current viewport.
+        if (self._review_snap_raw_result is not None
+                and self._review_snap_raw_iso == iso):
+            flog(f"review: snapshot_reuse_cached iso={iso}", "DEBUG")
+            self._refresh_snapshot_for_extent()
+            return
+
+        if self._review_date_bar is not None:
+            self._review_date_bar.set_loading()
 
         worker = SnapshotRebuildWorker(
             self._journal,
             self._review_layer_infos,
             iso,
-            bbox_per_layer=bbox_per_layer,
+            bbox_per_layer=None,
             parent=self,
         )
         worker.result_ready.connect(self._on_snapshot_result)
@@ -2294,21 +2342,50 @@ class RecoverDialog(QDialog, LoggerMixin):
         )
 
     def _on_snapshot_result(self, trace_id: str, result) -> None:
-        """Slot: SnapshotRebuildWorker delivered a result."""
-        from .widgets.snapshot_rebuild_worker import (
-            filter_snapshot_by_bbox,
-            merge_untracked_base,
-        )
+        """Slot: SnapshotRebuildWorker delivered a reconstruction.
+
+        Caches the RAW result (pre-bbox, pre-merge) keyed by date so pan/zoom
+        can re-apply it cheaply, then applies it to the current extent.
+        """
         self._review_snap_worker = None
         snap = self._review_snap_session
-        bar = self._review_date_bar
         if snap is None or not self._review_snap_mode:
             flog(f"[{trace_id}] review: snap_result_discarded mode_inactive", "DEBUG")
             return
 
-        bbox_per_layer = self._review_snap_bbox_per_layer
+        self._review_snap_raw_result = result
+        self._review_snap_raw_iso = self._review_snap_pending_iso
+        self._apply_snapshot_to_extent(result, trace_id)
+
+    def _refresh_snapshot_for_extent(self) -> None:
+        """Re-apply the cached reconstruction to the current viewport (pan/zoom).
+
+        Runs on the UI thread but never touches the journal — only the bbox
+        filter, the untracked-base merge (bounded by viewport + cap) and the
+        overlay repaint. Safe to call on every settled pan/zoom.
+        """
+        if self._review_snap_raw_result is None or not self._review_snap_mode:
+            return
+        trace_id = uuid.uuid4().hex[:8]
+        self._apply_snapshot_to_extent(self._review_snap_raw_result, trace_id)
+
+    def _apply_snapshot_to_extent(self, result, trace_id: str) -> None:
+        """Filter a reconstruction by the current extent, merge untracked base
+        features and repaint the overlays. No journal access (UI-thread safe)."""
+        from .widgets.snapshot_rebuild_worker import (
+            filter_snapshot_by_bbox,
+            merge_untracked_base,
+        )
+        snap = self._review_snap_session
+        bar = self._review_date_bar
+        if snap is None or not self._review_snap_mode:
+            return
+
+        bbox_per_layer = self._compute_bbox_per_layer()
+        self._review_snap_bbox_per_layer = bbox_per_layer
+
+        n_before = result.n_entities
         if bbox_per_layer:
-            n_before = result.n_entities
             result = filter_snapshot_by_bbox(result, bbox_per_layer)
             flog(
                 f"[{trace_id}] review: snap_bbox_post_filter "
@@ -2327,6 +2404,8 @@ class RecoverDialog(QDialog, LoggerMixin):
             f"base_added={result.n_entities - n_reconstructed}",
             "INFO",
         )
+
+        self._surface_snapshot_warnings(trace_id, result)
 
         unique_dates = list(result.all_event_markers) if result.all_event_markers else sorted({
             sf.last_created_at
@@ -2349,6 +2428,65 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
 
         snap.update_async(result, _on_update_done)
+
+    def _surface_snapshot_warnings(self, trace_id: str, result) -> None:
+        """Surface degraded/at-risk snapshot conditions to the user (RL-E1-04/E1-02).
+
+        Pushed as persistent (duration=0) message-bar warnings so the user is
+        never left with a silently-wrong or silently-partial as-of-T view.
+        """
+        fid_only = getattr(result, "fid_only_layers", ()) or ()
+        if fid_only:
+            names = ", ".join(str(n) for n in fid_only)
+            flog(
+                f"[{trace_id}] review: warn_fid_only_identity layers=[{names}]",
+                "WARNING",
+            )
+            self.iface.messageBar().pushMessage(
+                self.tr("Identite instable (format a FID non stable)"),
+                self.tr(
+                    "Instantane a risque pour : {names}. Ces couches utilisent un "
+                    "format dont le FID n'est pas stable (CSV, KML, couche "
+                    "temporaire) et n'ont pas de cle primaire : une entite "
+                    "historique peut etre attribuee a la mauvaise entite. Utilisez "
+                    "un format a identifiant stable (GeoPackage, PostGIS) ou "
+                    "definissez une cle primaire pour fiabiliser la vue."
+                ).format(names=names),
+                QgisCompat.MSG_WARNING, 0,
+            )
+
+        baseline_missing = getattr(result, "baseline_missing_layers", ()) or ()
+        if baseline_missing:
+            names = ", ".join(str(n) for n in baseline_missing)
+            flog(
+                f"[{trace_id}] review: warn_before_baseline layers=[{names}]",
+                "WARNING",
+            )
+            self.iface.messageBar().pushMessage(
+                self.tr("Date anterieure au suivi"),
+                self.tr(
+                    "{n} couche(s) sans information a cette date : la date "
+                    "demandee precede le debut de leur suivi. Les entites non "
+                    "suivies ne sont PAS affichees (elles seraient presumees "
+                    "presentes a tort). Voir le journal pour le detail des couches."
+                ).format(n=len(baseline_missing)),
+                QgisCompat.MSG_WARNING, 0,
+            )
+
+        if getattr(result, "partial", False):
+            flog(
+                f"[{trace_id}] review: warn_partial reason={result.partial_reason}",
+                "WARNING",
+            )
+            self.iface.messageBar().pushMessage(
+                self.tr("Instantane partiel"),
+                self.tr(
+                    "Le journal depasse le budget de lecture : l'instantane affiche "
+                    "est INCOMPLET ({reason}). Reduisez la fenetre temporelle ou la "
+                    "zone d'affichage pour un resultat complet."
+                ).format(reason=result.partial_reason),
+                QgisCompat.MSG_WARNING, 0,
+            )
 
     def _on_snapshot_export_requested(self) -> None:
         """Slot: user clicked Export — save snapshot overlays to GeoPackage."""
@@ -2430,14 +2568,27 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_snap_ext_debounce.start()
 
     def _on_review_snap_bbox_fire(self) -> None:
-        """Slot: spatial debounce expired — reload snapshot for current extent."""
+        """Slot: spatial debounce expired — refresh snapshot for current extent.
+
+        Pan/zoom only changes the viewport, not the cutoff date: re-apply the
+        cached reconstruction instead of spawning a worker (no SQL + replay).
+        Falls back to a full reload only if no cached result matches the date.
+        """
         if not self._review_snap_mode or not self._review_snap_pending_iso:
             return
-        flog(
-            f"review: snap_bbox_reload iso={self._review_snap_pending_iso}",
-            "DEBUG",
-        )
-        self._on_snapshot_date_changed(self._review_snap_pending_iso)
+        if (self._review_snap_raw_result is not None
+                and self._review_snap_raw_iso == self._review_snap_pending_iso):
+            flog(
+                f"review: snap_extent_reapply iso={self._review_snap_pending_iso}",
+                "DEBUG",
+            )
+            self._refresh_snapshot_for_extent()
+        else:
+            flog(
+                f"review: snap_extent_reload iso={self._review_snap_pending_iso}",
+                "DEBUG",
+            )
+            self._on_snapshot_date_changed(self._review_snap_pending_iso)
 
     def _setup_review_status_bar(self) -> None:
         """Create the Review status widget (not yet in status bar)."""
@@ -4129,6 +4280,21 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_toggle.blockSignals(False)
             self._review_toggle.setEnabled(True)
             flog("showEvent: review_snap_mode restored on reopen", "INFO")
+            # The date bar lives on the canvas viewport, so it survives the
+            # dialog hide — but its geometry/z-order can be stale after a
+            # canvas resize while we were hidden, leaving it invisible. Force
+            # a reposition (which re-shows it) once Qt has re-mapped us.
+            bar = self._review_date_bar
+            if bar is not None:
+                QTimer.singleShot(0, bar._reposition)
+                QTimer.singleShot(250, bar._reposition)
+                flog("showEvent: date_bar reposition rescheduled on reopen", "DEBUG")
+            else:
+                flog(
+                    "showEvent: date_bar missing on reopen "
+                    "(snap_mode=True, bar=None) — bar lost",
+                    "WARNING",
+                )
         elif self._review_snap_mode and not self._review_wants_persist:
             flog("showEvent: snap_mode orphan detected — stopping", "WARNING")
             self._stop_snapshot_mode()

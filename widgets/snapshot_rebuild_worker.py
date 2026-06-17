@@ -23,8 +23,10 @@ from typing import List
 from qgis.PyQt.QtCore import QThread, pyqtSignal
 
 from ..core.logger import flog
+from ..core.identity import get_identity_strength_for_layer
 from ..core.search_service import _row_to_event
 from ..core.sqlite_schema import AUDIT_EVENT_COLUMNS
+from ..core.support_policy import IdentityStrength
 
 _ALIASED_COLS = ", ".join(f"ae.{c}" for c in AUDIT_EVENT_COLUMNS)
 
@@ -57,6 +59,23 @@ _SQL_TRACKED_FPS = (
     " AND invalidated_at IS NULL"
     " AND entity_fingerprint IS NOT NULL"
 )
+
+# RL-E1-03: tracking-start baseline T0 = earliest recorded event per datasource.
+# Cheap (indexed MIN). If the requested cutoff is < T0, the journal has no
+# information at that date and untracked features must NOT be assumed present.
+_SQL_MIN_CREATED = (
+    "SELECT MIN(created_at) FROM audit_event"
+    " WHERE datasource_fingerprint = ?"
+    " AND invalidated_at IS NULL"
+    " AND created_at IS NOT NULL"
+)
+
+# RL-E1-02 (Option A): volume guard. The reconstruction needs the FULL event
+# chain per entity (attrs deltas + geometry walk-back), so we keep the full
+# replay but stream rows with a hard budget instead of an unbounded fetchall().
+# Beyond the budget the snapshot is flagged ``partial`` (degraded, never silent),
+# rather than risking an OOM/UI freeze on very large journals. Tunable.
+_SNAPSHOT_ROW_BUDGET = 500000
 
 
 class SnapshotRebuildWorker(QThread):
@@ -114,6 +133,7 @@ class SnapshotRebuildWorker(QThread):
             conn = self._journal.create_read_connection()
             mini_cache: dict = {}
             total_rows = 0
+            partial = False
 
             for info in self._layer_infos:
                 if self._cancelled:
@@ -121,24 +141,50 @@ class SnapshotRebuildWorker(QThread):
                     return
 
                 fp = info["fingerprint"]
-                rows = conn.execute(
+                # Stream the cursor (bounded), never fetchall() unbounded.
+                events = []
+                cursor = conn.execute(
                     _SQL_ALL_EVENTS_BEFORE,
                     (fp, self._cutoff_iso),
-                ).fetchall()
-                events = [_row_to_event(r) for r in rows]
+                )
+                for row in cursor:
+                    events.append(_row_to_event(row))
+                    total_rows += 1
+                    if total_rows > _SNAPSHOT_ROW_BUDGET:
+                        partial = True
+                        break
                 mini_cache[fp] = events
-                total_rows += len(events)
 
                 flog(
                     f"[{tid}] snap_worker: layer={info['layer_name']} "
-                    f"n_events={len(events)} cutoff={self._cutoff_iso}",
-                    "INFO",
+                    f"n_events={len(events)} cutoff={self._cutoff_iso}"
+                    f"{' PARTIAL_BUDGET_HIT' if partial else ''}",
+                    "WARNING" if partial else "INFO",
                 )
+                if partial:
+                    break
 
             cutoff_dt = datetime.fromisoformat(
                 self._cutoff_iso.replace("Z", "+00:00")
             )
-            result = reconstruct_snapshot_at(mini_cache, cutoff_dt, trace_id=tid)
+            result = reconstruct_snapshot_at(
+                mini_cache, cutoff_dt, trace_id=tid,
+                should_cancel=lambda: self._cancelled,
+            )
+            if self._cancelled:
+                flog(f"[{tid}] snap_worker: cancelled post-reconstruct", "INFO")
+                return
+            if partial:
+                result = result._replace(
+                    partial=True,
+                    partial_reason=f"row_budget_exceeded:{_SNAPSHOT_ROW_BUDGET}",
+                )
+                flog(
+                    f"[{tid}] snap_worker: PARTIAL snapshot "
+                    f"total_rows>{_SNAPSHOT_ROW_BUDGET} "
+                    f"reason=row_budget_exceeded degraded=True",
+                    "WARNING",
+                )
 
             all_markers_set: set = set()
             for info in self._layer_infos:
@@ -154,14 +200,21 @@ class SnapshotRebuildWorker(QThread):
 
             tracked_fps: dict = {}
             n_tracked_total = 0
+            layer_baseline: dict = {}
             for info in self._layer_infos:
+                fp = info["fingerprint"]
                 rows_t = conn.execute(
-                    _SQL_TRACKED_FPS, (info["fingerprint"],)
+                    _SQL_TRACKED_FPS, (fp,)
                 ).fetchall()
                 fps = {r[0] for r in rows_t if r[0]}
-                tracked_fps[info["fingerprint"]] = fps
+                tracked_fps[fp] = fps
                 n_tracked_total += len(fps)
-            result = result._replace(tracked_fps=tracked_fps)
+                row_min = conn.execute(_SQL_MIN_CREATED, (fp,)).fetchone()
+                if row_min and row_min[0]:
+                    layer_baseline[fp] = row_min[0]
+            result = result._replace(
+                tracked_fps=tracked_fps, layer_baseline=layer_baseline,
+            )
 
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             flog(
@@ -172,6 +225,9 @@ class SnapshotRebuildWorker(QThread):
                 f"total_rows={total_rows} elapsed_ms={elapsed_ms}",
                 "INFO",
             )
+            if self._cancelled:
+                flog(f"[{tid}] snap_worker: cancelled pre-emit", "INFO")
+                return
             self.result_ready.emit(tid, result)
 
         except Exception as exc:  # noqa: BLE001
@@ -206,9 +262,11 @@ def _filter_by_bbox(events: list, bbox) -> list:
             if not _diag_done:
                 flog(
                     f"bbox_filter_diag: first_ev op={ev.operation_type} "
-                    f"geom_wkb={type(ev.geometry_wkb).__name__}:{len(ev.geometry_wkb) if ev.geometry_wkb else 0} "
-                    f"new_geom_wkb={type(ev.new_geometry_wkb).__name__}:{len(ev.new_geometry_wkb) if ev.new_geometry_wkb else 0} "
-                    "→ no_wkb_kept",
+                    f"geom_wkb={type(ev.geometry_wkb).__name__}:"
+                    f"{len(ev.geometry_wkb) if ev.geometry_wkb else 0} "
+                    f"new_geom_wkb={type(ev.new_geometry_wkb).__name__}:"
+                    f"{len(ev.new_geometry_wkb) if ev.new_geometry_wkb else 0} "
+                    "no_wkb_kept",
                     "DEBUG",
                 )
                 _diag_done = True
@@ -297,6 +355,20 @@ def filter_snapshot_by_bbox(result, bbox_per_layer: dict):
 _BASE_FEATURE_CAP = 50000  # per-layer, viewport-bounded volume guard (BL-RVF-P0-06)
 
 
+def _parse_iso_utc(iso):
+    """Parse an ISO string to a UTC-aware datetime, or None on failure."""
+    if not iso:
+        return None
+    try:
+        from datetime import timezone  # noqa: PLC0415
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
 def _resolve_pk_field(layer):
     """Return the layer's primary-key field name, or None (FID-only identity)."""
     try:
@@ -349,14 +421,37 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
     from ..core.serialization import serialize_attributes  # noqa: PLC0415
     from ..core.temporal_snapshot_engine import SnapshotFeature  # noqa: PLC0415
 
+    t0 = time.monotonic()
     tracked = result.tracked_fps or {}
+    baseline = result.layer_baseline or {}
+    cutoff_dt = result.cutoff_dt
     project = QgsProject.instance()
     features = {ds: dict(em) for ds, em in result.features.items()}
     n_added_total = 0
+    n_seen_total = 0
+    fid_only_layers: list = []
+    baseline_missing_layers: list = []
 
     for info in layer_infos:
         ds_fp = info["fingerprint"]
         layer_name = info.get("layer_name", "?")
+
+        # RL-E1-03: if the requested date is BEFORE the tracking-start baseline
+        # (earliest recorded event), the journal has no information at T. We
+        # must NOT assume untracked features were present at T — skip the merge
+        # for this layer and flag it so the UI can warn (no silent false-present).
+        t0_iso = baseline.get(ds_fp)
+        t0_dt = _parse_iso_utc(t0_iso)
+        if t0_dt is not None and cutoff_dt is not None and cutoff_dt < t0_dt:
+            baseline_missing_layers.append(layer_name)
+            flog(
+                f"[{trace_id}] base_merge: skip_before_baseline layer={layer_name} "
+                f"cutoff={cutoff_dt.isoformat()} t0={t0_iso} "
+                f"reason=no_tracking_info_at_T",
+                "WARNING",
+            )
+            continue
+
         try:
             layer = project.mapLayer(info.get("layer_id", ""))
             if layer is None:
@@ -371,6 +466,30 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
             field_names = [f.name() for f in layer.fields()]
             pk_field = _resolve_pk_field(layer)
             crs_authid = layer.crs().authid() if layer.crs().isValid() else None
+
+            if pk_field is None:
+                # F-3: with no provider PK, identity falls back to fid:<id>.
+                # FID stability depends on the FORMAT, so we reuse RecoverLand's
+                # identity-strength model instead of warning on every keyless
+                # layer (RL-E1-04): GPKG/SpatiaLite/FlatGeobuf FIDs are STRONG
+                # (stable), Shapefile/GeoJSON are MEDIUM (stable unless packed),
+                # only CSV/KML/memory are WEAK/NONE (genuine renumber risk).
+                strength = get_identity_strength_for_layer(layer)
+                if strength in (IdentityStrength.WEAK, IdentityStrength.NONE):
+                    fid_only_layers.append(layer_name)
+                    flog(
+                        f"[{trace_id}] base_merge: no_pk layer={layer_name} "
+                        f"identity=fid-only strength={strength.value} "
+                        f"unstable_across_renumber as_of_T_risk",
+                        "WARNING",
+                    )
+                else:
+                    flog(
+                        f"[{trace_id}] base_merge: no_pk layer={layer_name} "
+                        f"identity=fid-only strength={strength.value} "
+                        f"fid_considered_stable no_warning",
+                        "INFO",
+                    )
 
             req = QgsFeatureRequest()
             bbox = bbox_per_layer.get(ds_fp) if bbox_per_layer else None
@@ -407,6 +526,7 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
                 )
                 n_added += 1
 
+            n_seen_total += n_seen
             if n_added:
                 features[ds_fp] = ds_feats
                 n_added_total += n_added
@@ -432,12 +552,30 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
             continue
 
     new_n = result.n_entities + n_added_total
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
     flog(
         f"[{trace_id}] base_merge: done n_added={n_added_total} "
-        f"n_entities={new_n}",
+        f"n_seen={n_seen_total} n_entities={new_n} cap={_BASE_FEATURE_CAP} "
+        f"elapsed_ms={elapsed_ms}",
         "INFO",
     )
-    return result._replace(features=features, n_entities=new_n)
+    if n_added_total:
+        # F-2: an untracked feature is assumed present at T (its current state
+        # is its state at T, since it was never edited). A feature created
+        # after T WITHOUT any tracked event is indistinguishable here and will
+        # appear at T. Documented limitation; correct handling would require a
+        # tracking-start baseline per layer.
+        flog(
+            f"[{trace_id}] base_merge: semantics untracked_assumed_present_at_T "
+            f"n_added={n_added_total} caveat=created_after_T_untracked_shown",
+            "INFO",
+        )
+    return result._replace(
+        features=features,
+        n_entities=new_n,
+        fid_only_layers=tuple(fid_only_layers),
+        baseline_missing_layers=tuple(baseline_missing_layers),
+    )
 
 
 def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
