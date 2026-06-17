@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Dict, NamedTuple, Optional
 
 from .logger import flog
+from .serialization import extract_delta_new, extract_delta_old
 
 
 # ------------------------------------------------------------------ #
@@ -59,6 +60,18 @@ class SnapshotResult(NamedTuple):
     features  : {datasource_fp: {entity_fp: SnapshotFeature}} — present entities only.
     n_absent  : entities whose last event <= T was DELETE.
     n_unknown : fingerprints with no events <= cutoff (entity born after T).
+    partial   : True if the result is incomplete (e.g. volume guard tripped);
+                callers MUST surface a degraded/partial indicator (never silent).
+    partial_reason : short machine-readable reason when ``partial`` is True.
+    fid_only_layers : layer names whose identity falls back to fid:<id> (no
+                stable PK). The as-of-T view for these layers is at risk of
+                FID re-numbering; callers MUST surface a persistent warning.
+    layer_baseline : {datasource_fp: earliest_event_iso} — the tracking-start
+                baseline T0 (first recorded event). Used to decide whether
+                untracked features may be assumed present at T.
+    baseline_missing_layers : layer names for which T < T0 (the journal has no
+                information at the requested date); untracked features were NOT
+                assumed present and the caller MUST warn.
     """
 
     features: dict
@@ -71,6 +84,11 @@ class SnapshotResult(NamedTuple):
     trace_id: str
     all_event_markers: tuple = ()
     tracked_fps: dict = {}
+    partial: bool = False
+    partial_reason: str = ""
+    fid_only_layers: tuple = ()
+    layer_baseline: dict = {}
+    baseline_missing_layers: tuple = ()
 
 
 # ------------------------------------------------------------------ #
@@ -82,6 +100,7 @@ def reconstruct_snapshot_at(
     event_cache: Dict[str, list],
     cutoff_dt: datetime,
     trace_id: str = "",
+    should_cancel=None,
 ) -> SnapshotResult:
     """Reconstruct entity states at cutoff_dt from the in-memory event cache.
 
@@ -89,6 +108,10 @@ def reconstruct_snapshot_at(
         event_cache : {fingerprint: [AuditEvent]} from ReviewCacheWorker.
         cutoff_dt   : target instant (naive = assumed UTC).
         trace_id    : correlation id; auto-generated if empty.
+        should_cancel : optional zero-arg callable. Checked once per datasource;
+                    when it returns True the replay bails out early (the caller
+                    is responsible for discarding the partial result). Lets a
+                    superseded worker stop wasting CPU during rapid scrubbing.
 
     Returns:
         SnapshotResult with features dict and counters.
@@ -104,6 +127,9 @@ def reconstruct_snapshot_at(
     n_entities = 0
 
     for ds_fp, events in event_cache.items():
+        if should_cancel is not None and should_cancel():
+            flog(f"[{trace_id}] review_snapshot: reconstruct cancelled", "DEBUG")
+            break
         entity_groups = _group_by_entity(events)
         ds_feats: Dict[str, SnapshotFeature] = {}
         for entity_fp, ev_list in entity_groups.items():
@@ -146,11 +172,42 @@ def reconstruct_snapshot_at(
 # ------------------------------------------------------------------ #
 
 
+def _canonical_fallback_key(feature_identity_json) -> str:
+    """Canonical entity key when entity_fingerprint is absent.
+
+    Mirrors identity.compute_entity_fingerprint so the reconstruction key
+    matches the one recomputed live by snapshot_rebuild_worker._feature_entity_fp
+    (``pk:<field>=<value>`` or ``fid:<id>``). Without this alignment a
+    NULL-fingerprint entity is reconstructed under ``fid:<raw_json>`` while the
+    baseline merge keys it ``fid:<id>`` — the same feature is then painted twice
+    (once reconstructed at T, once live). Kept QGIS-free (pure json).
+    """
+    try:
+        identity = json.loads(feature_identity_json) if feature_identity_json else None
+    except (ValueError, TypeError):
+        identity = None
+    if isinstance(identity, dict):
+        pk_field = identity.get("pk_field")
+        pk_value = identity.get("pk_value")
+        if pk_field and pk_value is not None:
+            return f"pk:{pk_field}={pk_value}"
+        fid = identity.get("fid")
+        if fid is not None:
+            return f"fid:{fid}"
+    return f"fid:{feature_identity_json}"
+
+
 def _entity_key(event) -> str:
-    """Stable per-entity key — mirrors lens_planner._entity_key."""
+    """Stable per-entity key — mirrors lens_planner._entity_key.
+
+    Prefers the stored ``entity_fingerprint`` (canonical, written by
+    identity.compute_entity_fingerprint). Falls back to a canonical key derived
+    from ``feature_identity_json`` so it stays consistent with the baseline
+    merge (see _canonical_fallback_key).
+    """
     if event.entity_fingerprint:
         return event.entity_fingerprint
-    return f"fid:{event.feature_identity_json}"
+    return _canonical_fallback_key(event.feature_identity_json)
 
 
 def _group_by_entity(events: list) -> Dict[str, list]:
@@ -235,14 +292,10 @@ def _build_attrs_at_cutoff(visible: list) -> Optional[str]:
             if isinstance(changed, dict):
                 if not has_base:
                     for field, val in changed.items():
-                        if isinstance(val, (list, tuple)) and len(val) == 2:
-                            attrs.setdefault(field, val[0])
+                        attrs.setdefault(field, extract_delta_old(val))
                     has_base = True
                 for field, val in changed.items():
-                    if isinstance(val, (list, tuple)) and len(val) == 2:
-                        attrs[field] = val[1]
-                    else:
-                        attrs[field] = val
+                    attrs[field] = extract_delta_new(val)
     return json.dumps(attrs, ensure_ascii=False) if attrs else None
 
 

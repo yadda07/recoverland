@@ -33,7 +33,7 @@ from ..core.logger import flog
 from ..core.time_format import parse_iso_date
 from .temporal_timeline_widget import TemporalTimelineWidget
 
-_BAR_HEIGHT = 40
+_BAR_HEIGHT = 46
 
 _CANVAS_EVENT_TYPES = frozenset({int(QtCompat.EVENT_RESIZE), int(QtCompat.EVENT_MOVE)})
 
@@ -205,6 +205,25 @@ class CanvasDateBar(QWidget):
             f"T{qt.hour():02d}:{qt.minute():02d}:{qt.second():02d}"
         )
 
+    def set_value_iso(self, iso: str) -> None:
+        """Move the handle to ``iso`` programmatically, without emitting.
+
+        Used to snap the slider after the requested cutoff is clamped to the
+        tracking-start baseline (RL-E1-03).
+        """
+        try:
+            d = parse_iso_date(iso)
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return
+        self._syncing = True
+        try:
+            self._date_edit.setDate(QDate(d.year, d.month, d.day))
+            self._time_edit.setTime(QTime(dt.hour, dt.minute, dt.second))
+            self._timeline.set_value_iso(iso)
+        finally:
+            self._syncing = False
+
     def cleanup(self) -> None:
         """Detach event filter and schedule widget deletion."""
         self._closing = True
@@ -241,11 +260,39 @@ class CanvasDateBar(QWidget):
         super().closeEvent(event)
 
     def eventFilter(self, obj, event) -> bool:
-        """Reposition after any viewport resize/move."""
-        evt = int(event.type())
-        if obj is self._viewport and evt in _CANVAS_EVENT_TYPES:
-            QTimer.singleShot(150, self._reposition)
+        """Reposition after viewport resize/move; steal wheel over the timeline.
+
+        QgsMapCanvas is a QGraphicsView that grabs wheel events at the viewport
+        level to zoom the map, so the timeline's own wheelEvent rarely fires.
+        We intercept wheel events landing on the timeline here and redirect them
+        to its zoom, consuming the event so the map does not zoom underneath.
+        """
+        if obj is self._viewport:
+            evt = int(event.type())
+            if evt in _CANVAS_EVENT_TYPES:
+                QTimer.singleShot(150, self._reposition)
+            elif evt == int(QtCompat.EVENT_WHEEL) and self._maybe_zoom_timeline(event):
+                return True
         return super().eventFilter(obj, event)
+
+    def _maybe_zoom_timeline(self, event) -> bool:
+        """Forward a viewport wheel event to the timeline when it is on top of it."""
+        if self._closing or self._timeline is None:
+            return False
+        try:
+            gp = event.globalPosition().toPoint()
+        except (AttributeError, TypeError):
+            gp = event.globalPos()
+        local = self._timeline.mapFromGlobal(gp)
+        over = self._timeline.rect().contains(local)
+        flog(
+            f"canvas_date_bar: viewport_wheel over_timeline={over} "
+            f"local=({local.x()},{local.y()})",
+            "DEBUG",
+        )
+        if not over:
+            return False
+        return self._timeline.handle_wheel(local.x(), event.angleDelta().y())
 
     # ------------------------------------------------------------------ #
     # Private                                                              #
@@ -274,7 +321,13 @@ class CanvasDateBar(QWidget):
         self._timeline = TemporalTimelineWidget(self)
         sp = QSizePolicy(QtCompat.SIZE_EXPANDING, QtCompat.SIZE_FIXED)
         self._timeline.setSizePolicy(sp)
-        self._timeline.setFixedHeight(28)
+        self._timeline.setFixedHeight(36)
+        self._timeline.setToolTip(
+            self.tr(
+                "Molette : zoomer/dezoomer • Clic droit glisser : se deplacer • "
+                "Double-clic : reinitialiser le zoom"
+            )
+        )
         layout.addWidget(self._timeline)
         self._timeline.date_changed.connect(self._on_timeline_date_changed)
 
@@ -355,13 +408,18 @@ class CanvasDateBar(QWidget):
         flog(f"canvas_date_bar: markers_set n={len(date_isos)}", "DEBUG")
 
     def _on_timeline_date_changed(self, iso: str) -> None:
-        """Sync QDateEdit when user drags the timeline handle."""
+        """Sync QDateEdit + QTimeEdit when user drags / zooms the timeline."""
         if self._syncing:
             return
         self._syncing = True
         try:
             d = parse_iso_date(iso)
             self._date_edit.setDate(QDate(d.year, d.month, d.day))
+            try:
+                dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                self._time_edit.setTime(QTime(dt.hour, dt.minute, dt.second))
+            except (ValueError, TypeError):
+                pass
         except (ValueError, TypeError):
             pass
         finally:

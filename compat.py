@@ -101,6 +101,7 @@ class QtCompat:
     EVENT_RESIZE = _resolve_enum(QEvent, 'Type', 'Resize')
     EVENT_MOVE = _resolve_enum(QEvent, 'Type', 'Move')
     EVENT_LAYOUT_REQUEST = _resolve_enum(QEvent, 'Type', 'LayoutRequest')
+    EVENT_WHEEL = _resolve_enum(QEvent, 'Type', 'Wheel')
 
     # --- QEasingCurve.Type ---
     EASE_IN_OUT_QUAD = _resolve_enum(QEasingCurve, 'Type', 'InOutQuad')
@@ -110,10 +111,14 @@ class QtCompat:
     ALIGN_RIGHT = _resolve_enum(Qt, 'AlignmentFlag', 'AlignRight')
     ALIGN_HCENTER = _resolve_enum(Qt, 'AlignmentFlag', 'AlignHCenter')
     ALIGN_VCENTER = _resolve_enum(Qt, 'AlignmentFlag', 'AlignVCenter')
+    ALIGN_TOP = _resolve_enum(Qt, 'AlignmentFlag', 'AlignTop')
 
     # --- Qt.CursorShape ---
     POINTING_HAND_CURSOR = _resolve_enum(Qt, 'CursorShape', 'PointingHandCursor')
     CROSS_CURSOR = _resolve_enum(Qt, 'CursorShape', 'CrossCursor')
+    OPEN_HAND_CURSOR = _resolve_enum(Qt, 'CursorShape', 'OpenHandCursor')
+    CLOSED_HAND_CURSOR = _resolve_enum(Qt, 'CursorShape', 'ClosedHandCursor')
+    SIZE_HOR_CURSOR = _resolve_enum(Qt, 'CursorShape', 'SizeHorCursor')
 
     # --- Qt.Key ---
     KEY_ESCAPE = _resolve_enum(Qt, 'Key', 'Key_Escape')
@@ -132,9 +137,16 @@ class QtCompat:
     # --- Qt.MouseButton ---
     LEFT_BUTTON = _resolve_enum(Qt, 'MouseButton', 'LeftButton')
     RIGHT_BUTTON = _resolve_enum(Qt, 'MouseButton', 'RightButton')
+    MIDDLE_BUTTON = _resolve_enum(Qt, 'MouseButton', 'MiddleButton')
 
     # --- Qt.PenStyle ---
     NO_PEN = _resolve_enum(Qt, 'PenStyle', 'NoPen')
+    SOLID_LINE = _resolve_enum(Qt, 'PenStyle', 'SolidLine')
+
+    # --- Qt.BrushStyle ---
+    NO_BRUSH = _resolve_enum(Qt, 'BrushStyle', 'NoBrush')
+    BRUSH_BDIAG = _resolve_enum(Qt, 'BrushStyle', 'BDiagPattern')
+    BRUSH_FDIAG = _resolve_enum(Qt, 'BrushStyle', 'FDiagPattern')
 
     # --- Qt.WidgetAttribute ---
     WA_TRANSPARENT_FOR_MOUSE = _resolve_enum(Qt, 'WidgetAttribute', 'WA_TransparentForMouseEvents')

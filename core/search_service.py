@@ -11,7 +11,9 @@ from typing import List, Optional, Dict, Any, Tuple
 
 from .audit_backend import AuditEvent, SearchCriteria, SearchResult
 from .logger import flog, timed_op
-from .serialization import is_layer_audit_field
+from .serialization import (
+    extract_delta_new, extract_delta_old, is_layer_audit_field,
+)
 from .sql_safety import assert_safe_fragment
 from .sqlite_schema import (
     AUDIT_EVENT_SELECT_SQL, build_lightweight_select_sql,
@@ -274,10 +276,7 @@ def reconstruct_attributes(event: AuditEvent) -> Dict[str, Any]:
         for key, change in data["changed_only"].items():
             if is_layer_audit_field(key):
                 continue
-            if isinstance(change, dict) and "old" in change:
-                result[key] = change["old"]
-            else:
-                result[key] = change
+            result[key] = extract_delta_old(change)
         return result
 
     return data
@@ -302,10 +301,7 @@ def reconstruct_new_attributes(event: AuditEvent) -> Dict[str, Any]:
         for key, change in data["changed_only"].items():
             if is_layer_audit_field(key):
                 continue
-            if isinstance(change, dict) and "new" in change:
-                result[key] = change["new"]
-            else:
-                result[key] = change
+            result[key] = extract_delta_new(change)
         return result
 
     return data

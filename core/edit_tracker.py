@@ -177,6 +177,19 @@ class EditSessionTracker:
         are refused with reason=capture_disabled.
         """
         layer_id = layer.id()
+        # Skip RecoverLand's own ephemeral overlay layers (Review snapshot /
+        # lens). They are pure visualisation, are always refused below anyway,
+        # and during Review entry dozens are added in one batch — running the
+        # full identity/support evaluation on each was pure overhead. Marked
+        # via custom property before they ever reach the project registry.
+        try:
+            if (
+                layer.customProperty("_rl_snap_managed") == "1"
+                or layer.customProperty("_rl_lens_managed") == "1"
+            ):
+                return
+        except (RuntimeError, AttributeError):
+            pass
         layer_fp = compute_datasource_fingerprint(layer)
         if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
             return
