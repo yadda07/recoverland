@@ -30,14 +30,14 @@ from ..core.support_policy import IdentityStrength
 
 _ALIASED_COLS = ", ".join(f"ae.{c}" for c in AUDIT_EVENT_COLUMNS)
 
-_SQL_ALL_EVENTS_BEFORE = (
-    "SELECT " + _ALIASED_COLS +
-    " FROM audit_event ae"
-    " WHERE ae.datasource_fingerprint = ?"
-    " AND ae.created_at <= ?"
-    " AND ae.invalidated_at IS NULL"
-    " ORDER BY ae.entity_fingerprint, ae.created_at, ae.event_id"
-)
+_SQL_ALL_EVENTS_BEFORE = "".join([
+    "SELECT ", _ALIASED_COLS,
+    " FROM audit_event ae",
+    " WHERE ae.datasource_fingerprint = ?",
+    " AND ae.created_at <= ?",
+    " AND ae.invalidated_at IS NULL",
+    " ORDER BY ae.entity_fingerprint, ae.created_at, ae.event_id",
+])
 
 _SQL_DATE_RANGE = (
     "SELECT MIN(created_at), MAX(created_at)"
