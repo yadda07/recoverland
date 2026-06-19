@@ -28,7 +28,6 @@ docs/backlog_rewind_v2.md
 docs/backlog_*.md
 docs/validation_strategy.md
 docs/orchestrator.md
-docs/orchestrator_state.json
 docs/audit_profond_recoverland.md
 docs/audit_*.md
 docs/dead_code_audit.md
