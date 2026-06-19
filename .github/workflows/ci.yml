@@ -43,8 +43,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # LTR (matches qgisMinimumVersion=3.40) + latest, per RL-E3-02.
-        qgis_tag: [release-3_40, latest]
+        # Minimum supported (3.30) + latest (4.0.x target), per RL-E3-02.
+        qgis_tag: [release-3_30, latest]
     steps:
       # Check out into a `recoverland` directory so the plugin is importable
       # as the `recoverland` package by the runtime scenarios.
