@@ -30,6 +30,7 @@ the captured NEW.
 
 Zero QGIS dependency. Pure deterministic logic.
 """
+import json
 from typing import List, Dict, Tuple
 
 from .audit_backend import AuditEvent
@@ -55,10 +56,21 @@ def _detect_fid_recycle(
     splitting, both end up in the same dedup bucket.
 
     Walks events ordered ASC by event_id and runs a per-fp state machine:
-        None        --INSERT--> open
-        open        --DELETE--> closed
-        closed      --INSERT--> open + SPLIT recorded
-        any         --UPDATE--> unchanged
+        None          --INSERT--> open
+        None          --DELETE--> closed       (pre-existing entity deleted)
+        None          --UPDATE--> pre_existing (pre-existing entity modified)
+        open          --DELETE--> closed
+        closed        --INSERT--> open + SPLIT recorded
+        closed        --UPDATE--> pre_existing + SPLIT (recycled entity updated)
+        pre_existing  --DELETE--> closed
+        pre_existing  --INSERT--> open + SPLIT (FID recycled, no DELETE in window)
+        open/pre_existing --UPDATE--> unchanged
+
+    The pre_existing state (BL-RW-P1-23-A2) captures entities that existed
+    at cutoff time and were modified or deleted after cutoff without an
+    INSERT event in the rewind window.  When OGR recycles the FID for a
+    new INSERT, the split separates the original entity's events from
+    the recycled entity's events so they are bucketed independently.
 
     Args:
         events: any iterable of AuditEvent. event_id=None and missing
@@ -82,17 +94,26 @@ def _detect_fid_recycle(
         op = e.operation_type
         state = fp_state.get(fp)
         if op == "INSERT":
-            if state == "closed":
+            if state in ("closed", "pre_existing"):
                 fp_split_eid[fp] = e.event_id
-                splits.append((fp, fp_first_eid[fp], e.event_id))
+                splits.append((fp, fp_first_eid.get(fp), e.event_id))
                 fp_first_eid[fp] = e.event_id
             elif state is None:
                 fp_first_eid[fp] = e.event_id
             fp_state[fp] = "open"
         elif op == "DELETE":
-            if state == "open":
+            if state in ("open", "pre_existing", None):
                 fp_state[fp] = "closed"
-        # UPDATE: state unchanged
+        elif op == "UPDATE":
+            if state is None:
+                fp_state[fp] = "pre_existing"
+                fp_first_eid[fp] = e.event_id
+            elif state == "closed":
+                fp_split_eid[fp] = e.event_id
+                splits.append((fp, fp_first_eid.get(fp), e.event_id))
+                fp_first_eid[fp] = e.event_id
+                fp_state[fp] = "pre_existing"
+            # state "open" or "pre_existing": no change
     return fp_split_eid, splits
 
 
@@ -263,6 +284,13 @@ def _collapse_user_chain(events: List[AuditEvent]) -> List[AuditEvent]:
       - INSERT(oldest) -> only UPDATEs -> DELETE(newest): net no-op,
         skip the entire chain. Intermediate non-UPDATEs (e.g. a second
         INSERT from fid reuse) prevent the skip so no events are lost.
+      - UPDATE(oldest) -> only UPDATEs -> DELETE(newest): fuse into a
+        single synthetic DELETE carrying the oldest UPDATE's OLD state
+        (= cutoff state).  This eliminates the Phase 1 UPDATE comp that
+        would fail with target_absent because the feature was deleted
+        and Phase 2 (INSERT) has not yet re-created it.  The synthetic
+        DELETE's INSERT compensation restores the entity directly to
+        its cutoff state in a single action (BL-RW-P1-23-A2).
       - Chain longer than _MAX_CHAIN: fuse into a synthetic event pair
         (oldest + newest) to cap the number of compensatory actions.
         The synthetic oldest keeps OLD geometry/attrs from the real
@@ -320,6 +348,13 @@ def _collapse_user_chain(events: List[AuditEvent]) -> List[AuditEvent]:
         if (first_op == "INSERT" and last_op == "DELETE" and
                 _intermediates_all_updates(chain)):
             skipped_entities += 1
+            continue
+
+        if (first_op == "UPDATE" and last_op == "DELETE" and
+                _intermediates_all_updates(chain)):
+            fused = _fuse_update_delete(chain)
+            result.append(fused)
+            fused_entities += 1
             continue
 
         if len(chain) > _MAX_CHAIN:
@@ -421,3 +456,50 @@ def _fuse_long_chain(chain: List[AuditEvent]) -> List[AuditEvent]:
          f"(oldest={first_op} eid={oldest.event_id}, "
          f"newest={last_op} eid={newest.event_id})")
     return [newest, oldest]
+
+
+def _fuse_update_delete(chain: List[AuditEvent]) -> AuditEvent:
+    """Fuse an UPDATE->DELETE chain into a single synthetic DELETE.
+
+    For entities that existed before the rewind window and were UPDATEd
+    then DELETEd, the cutoff state is the oldest UPDATE's OLD state.
+    By fusing into a synthetic DELETE with that state, a single INSERT
+    compensation (Phase 2) restores the entity to its cutoff state,
+    eliminating the Phase 1 UPDATE comp that would fail with target_absent
+    (the feature was deleted, and Phase 2 has not yet re-inserted it).
+
+    The synthetic DELETE carries:
+      - operation_type = "DELETE" (compensation = INSERT)
+      - geometry_wkb = oldest UPDATE's old geometry (pre-UPDATE = cutoff)
+        with fallback to newest DELETE's geometry when the UPDATE was
+        attribute-only (geometry_wkb is None)
+      - attributes_json = full snapshot of oldest UPDATE's old attrs
+        (format: {"all_attributes": {...}}) so the INSERT compensation
+        restores all fields to their cutoff state
+      - identity = newest DELETE's identity (same FID)
+    """
+    from .search_service import reconstruct_attributes
+
+    oldest = chain[-1]
+    newest = chain[0]
+
+    old_attrs = reconstruct_attributes(oldest)
+    synthetic_attrs = json.dumps(
+        {"all_attributes": old_attrs}, ensure_ascii=False)
+    synthetic_geom = (
+        oldest.geometry_wkb
+        if oldest.geometry_wkb is not None
+        else newest.geometry_wkb
+    )
+
+    synthetic = oldest._replace(
+        operation_type="DELETE",
+        attributes_json=synthetic_attrs,
+        geometry_wkb=synthetic_geom,
+        feature_identity_json=newest.feature_identity_json,
+        entity_fingerprint=newest.entity_fingerprint,
+    )
+    flog(f"rewind_dedup: fused UPDATE->DELETE chain ({len(chain)} events) "
+         f"into 1 synthetic DELETE (oldest_eid={oldest.event_id} "
+         f"newest_eid={newest.event_id})")
+    return synthetic

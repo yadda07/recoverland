@@ -45,6 +45,38 @@ def fetch_entity_stream(
     return [_row_to_event(r) for r in rows]
 
 
+def has_active_restore_traces(
+    conn: sqlite3.Connection,
+    datasource_fps: List[str],
+    trace_id: str = "",
+) -> bool:
+    """Return True if any datasource has a non-invalidated restore trace.
+
+    Active traces mean a previous Rewind/Restore has already been applied to
+    that layer.  Rewinding again without undoing the previous restore first
+    can re-apply compensation on top of a moved/inserted feature, especially
+    dangerous for FID-only layers (shapefiles).  This is a guard used by the
+    dialog before launching a new rewind session.
+    """
+    if not datasource_fps:
+        return False
+    placeholders = ",".join("?" for _ in datasource_fps)
+    query = (
+        "SELECT 1 FROM audit_event WHERE "
+        "restored_from_event_id IS NOT NULL AND invalidated_at IS NULL "
+        f"AND datasource_fingerprint IN ({placeholders})"
+        " LIMIT 1"
+    )
+    row = conn.execute(query, list(datasource_fps)).fetchone()
+    result = row is not None
+    flog(
+        f"has_active_restore_traces: trace_id={trace_id} "
+        f"datasource_count={len(datasource_fps)} result={result}",
+        "INFO" if result else "DEBUG",
+    )
+    return result
+
+
 def fetch_events_after_cutoff(
     conn: sqlite3.Connection,
     datasource_fp: str,
@@ -89,15 +121,44 @@ def fetch_events_after_cutoff(
         )
         params.append(limit)
         events = [_row_to_event(r) for r in conn.execute(query, params).fetchall()]
-        flog(
-            f"fetch_events_after_cutoff: trace_id={trace_id} "
-            f"datasource={datasource_fp} "
-            f"cutoff_type={cutoff.cutoff_type.value} "
-            f"inclusive={cutoff.inclusive} "
-            f"include_traces={include_traces} "
-            f"n_events={len(events)}",
-            "INFO",
-        )
+        if len(events) >= limit:
+            n_total = count_events_after_cutoff(
+                conn, datasource_fp, cutoff, trace_id=trace_id,
+                include_traces=include_traces)
+            if n_total > len(events):
+                flog(
+                    f"fetch_events_after_cutoff: trace_id={trace_id} "
+                    f"datasource={datasource_fp} "
+                    f"cutoff_type={cutoff.cutoff_type.value} "
+                    f"inclusive={cutoff.inclusive} "
+                    f"include_traces={include_traces} "
+                    f"n_events_returned={len(events)} "
+                    f"n_events_total={n_total} "
+                    f"n_events_truncated={n_total - len(events)} "
+                    f"status=truncated",
+                    "WARNING",
+                )
+            else:
+                flog(
+                    f"fetch_events_after_cutoff: trace_id={trace_id} "
+                    f"datasource={datasource_fp} "
+                    f"cutoff_type={cutoff.cutoff_type.value} "
+                    f"inclusive={cutoff.inclusive} "
+                    f"include_traces={include_traces} "
+                    f"n_events={len(events)} "
+                    f"status=complete",
+                    "INFO",
+                )
+        else:
+            flog(
+                f"fetch_events_after_cutoff: trace_id={trace_id} "
+                f"datasource={datasource_fp} "
+                f"cutoff_type={cutoff.cutoff_type.value} "
+                f"inclusive={cutoff.inclusive} "
+                f"include_traces={include_traces} "
+                f"n_events={len(events)}",
+                "INFO",
+            )
         return events
 
 
