@@ -197,6 +197,18 @@ def _canonical_fallback_key(feature_identity_json) -> str:
     return f"fid:{feature_identity_json}"
 
 
+def compute_entity_key(entity_fingerprint, feature_identity_json) -> str:
+    """Canonical per-entity key from the two raw event columns.
+
+    Public twin of :func:`_entity_key` that works on raw column values instead
+    of an event object, so off-engine callers (e.g. the snapshot worker's
+    ``changed-after-T`` filter) key entities EXACTLY like the reconstruction.
+    """
+    if entity_fingerprint:
+        return entity_fingerprint
+    return _canonical_fallback_key(feature_identity_json)
+
+
 def _entity_key(event) -> str:
     """Stable per-entity key — mirrors lens_planner._entity_key.
 
@@ -205,9 +217,7 @@ def _entity_key(event) -> str:
     from ``feature_identity_json`` so it stays consistent with the baseline
     merge (see _canonical_fallback_key).
     """
-    if event.entity_fingerprint:
-        return event.entity_fingerprint
-    return _canonical_fallback_key(event.feature_identity_json)
+    return compute_entity_key(event.entity_fingerprint, event.feature_identity_json)
 
 
 def _group_by_entity(events: list) -> Dict[str, list]:
@@ -353,4 +363,5 @@ __all__ = [
     "SnapshotFeature",
     "SnapshotResult",
     "reconstruct_snapshot_at",
+    "compute_entity_key",
 ]

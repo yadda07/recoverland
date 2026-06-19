@@ -15,6 +15,7 @@ from .core import (
     get_journal_stats, evaluate_journal_health,
     format_integrity_message,
     generate_trace_id,
+    set_project_log_path, remove_project_log_handler,
 )
 from .core.journal_manager import cleanup_orphan_journals, JournalLockError
 from .core.user_identity import invalidate_cache as _invalidate_user_cache
@@ -202,6 +203,7 @@ class RecoverPlugin:
             project_path = QgsProject.instance().absoluteFilePath() or ""
             profile_path = QgsApplication.qgisSettingsDirPath()
             journal_path = self._journal.open_for_project(project_path, profile_path)
+            set_project_log_path(journal_path)
 
             integrity_trace_id = generate_trace_id()
             flog(f"[{integrity_trace_id}] RecoverPlugin: integrity check start path={journal_path}")
@@ -302,6 +304,7 @@ class RecoverPlugin:
             self._sqlite_backend = None
 
         self._journal.close()
+        remove_project_log_handler()
 
     def _connect_existing_layers(self) -> None:
         """Connect edit tracking to all currently loaded vector layers."""
@@ -529,6 +532,7 @@ class RecoverPlugin:
                 flog(f"RecoverPlugin: rename failed: {e}", "ERROR")
 
         new_path = self._journal.open_for_project(project_path, profile_path)
+        set_project_log_path(new_path)
         flog(f"RecoverPlugin: fresh journal created at {new_path}")
         return new_path
 

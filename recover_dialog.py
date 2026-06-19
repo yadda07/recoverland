@@ -41,7 +41,8 @@ from .restore_runner import RestoreRunner, StrictRestoreRunner, UndoRunner
 from .version_fetch_thread import VersionFetchThread
 from .widgets import (AppleToggleSwitch, ReviewSegmentedSwitch,
                       ThemedLogoWidget, RestoreModeSelector,
-                      RestorePreflightDialog, TimeSliderWidget)
+                      RestorePreflightDialog, TimeSliderWidget,
+                      ActionButtonBar)
 import os
 import json
 import time
@@ -159,11 +160,17 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._review_snap_zombies: list = []
         self._review_snap_ext_debounce = None
         self._review_snap_bbox_per_layer: dict = {}
-        # Raw reconstruction (tracked entities, pre-bbox-filter, pre-merge)
+        # Raw reconstruction (tracked entities, pre-bbox-filter)
         # cached per cutoff date so pan/zoom can re-apply it WITHOUT re-querying
         # the journal (reconstruction depends only on the date, not the extent).
         self._review_snap_raw_result = None
         self._review_snap_raw_iso = ""
+        # Extent-scoped marker scanner (CHANGE C): runs on pan/zoom settle to show
+        # modification dates only inside the current viewport.
+        self._review_marker_worker = None
+        self._review_marker_zombies: list = []
+        self._review_marker_bbox_signature = ""
+        self._review_global_t1_iso = ""
 
         self.setup_ui()
 
@@ -1133,36 +1140,53 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         button_layout = QHBoxLayout()
         button_layout.setSpacing(10)
-        button_width = 120
         button_height = 35
 
-        self.cancel_button = QPushButton(self.tr("Fermer"))
-        self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
-        self.cancel_button.setFixedSize(button_width, button_height)
+        self._action_bar = ActionButtonBar(
+            [
+                {
+                    "label": self.tr("Fermer"),
+                    "icon": QgsApplication.getThemeIcon('/mActionRemove.svg'),
+                    "tooltip": self.tr("Fermer"),
+                    "enabled": True,
+                    "visible": True,
+                },
+                {
+                    "label": "Recover",
+                    "icon": QgsApplication.getThemeIcon('/mActionRefresh.svg'),
+                    "tooltip": self.tr("Lancer la recherche (F5)"),
+                    "enabled": True,
+                    "visible": True,
+                },
+                {
+                    "label": "Restore",
+                    "icon": QgsApplication.getThemeIcon('/mActionSaveAllEdits.svg'),
+                    "tooltip": "",
+                    "enabled": False,
+                    "visible": True,
+                },
+                {
+                    "label": "Last",
+                    "icon": QgsApplication.getThemeIcon('/mActionUndo.svg'),
+                    "tooltip": self.tr("Annuler le dernier restore"),
+                    "enabled": False,
+                    "visible": True,
+                },
+            ],
+            self,
+        )
+        self._action_bar.setPrimaryIndex(-1)
+        self.cancel_button = self._action_bar.segment(0)
+        self.recover_button = self._action_bar.segment(1)
+        self.restore_button = self._action_bar.segment(2)
+        self.undo_last_btn = self._action_bar.segment(3)
         self.cancel_button.clicked.connect(self.cancel_operation)
-
-        self.undo_last_btn = QPushButton("Last")
-        self.undo_last_btn.setIcon(QgsApplication.getThemeIcon('/mActionUndo.svg'))
-        self.undo_last_btn.setFixedSize(button_width, button_height)
-        self.undo_last_btn.setToolTip(self.tr("Annuler le dernier restore"))
-        self.undo_last_btn.clicked.connect(self._undo_last_restore)
-        self.undo_last_btn.setEnabled(False)
-
-        self.recover_button = QPushButton("Recover")
-        self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
-        self.recover_button.setFixedSize(button_width, button_height)
         self.recover_button.clicked.connect(self.recover_and_load)
-
-        self.restore_button = QPushButton("Restore")
-        self.restore_button.setIcon(QgsApplication.getThemeIcon('/mActionSaveAllEdits.svg'))
-        self.restore_button.setFixedSize(button_width, button_height)
         self.restore_button.clicked.connect(self.restore_selected_data)
-        self.restore_button.setEnabled(False)
+        self.undo_last_btn.clicked.connect(self._undo_last_restore)
 
         pal_hl = self.palette().highlight().color()
         glow_color = QColor(pal_hl.red(), pal_hl.green(), pal_hl.blue(), 180)
-        self._apply_glow_effect(self.recover_button, glow_color)
-        self._apply_glow_effect(self.restore_button, glow_color)
         self._glow_color = glow_color
         self._apply_logo_glow_effect()
 
@@ -1186,13 +1210,13 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         button_layout.addWidget(self.help_button)
         button_layout.addStretch()
+        button_layout.addWidget(self._action_bar)
         button_layout.addWidget(self._review_viz_combo)
         button_layout.addWidget(self._review_toggle)
-        button_layout.addWidget(self.cancel_button)
-        button_layout.addWidget(self.recover_button)
-        button_layout.addWidget(self.restore_button)
-        button_layout.addWidget(self.undo_last_btn)
         button_layout.addStretch()
+        right_spacer = QWidget(self)
+        right_spacer.setFixedSize(button_height, button_height)
+        button_layout.addWidget(right_spacer)
         main_layout.addWidget(logo_label, 0, QtCompat.ALIGN_HCENTER)
         main_layout.addWidget(status_frame)
         main_layout.addWidget(layers_group)
@@ -1629,6 +1653,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.restore_button.setVisible(False)
             self.recover_button.setText(self.tr("Rewind"))
             self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionUndo.svg'))
+            self._action_bar.setPrimaryIndex(1)
             if not self._is_recovering:
                 self.recover_button.setEnabled(True)
             self._refresh_slider_bounds()
@@ -1662,6 +1687,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.restore_button.setVisible(True)
             self.recover_button.setText(self.tr("Recover"))
             self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
+            self._action_bar.setPrimaryIndex(2)
 
     def _version_layers_check_all(self) -> None:
         for i in range(self._version_layer_list.count()):
@@ -2016,6 +2042,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _on_review_toggle(self, checked: bool) -> None:
         """Handle Apple toggle ON/OFF for Review mode."""
+        self._log_review_state(f"toggle_before_checked={checked}")
         flog(
             f"review: toggle_called checked={checked} "
             f"snap_mode={self._review_snap_mode} "
@@ -2046,6 +2073,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _review_stop_from_statusbar(self) -> None:
         """Slot: user clicked OFF on the QGIS status bar widget."""
+        self._log_review_state("stop_from_statusbar")
         import traceback as _tb
         _stack = "".join(_tb.format_stack(limit=8))
         flog(f"review: stop_from_statusbar STACK={_stack!r}", "WARNING")
@@ -2057,6 +2085,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _review_stop_session(self) -> None:
         """Stop Review session, remove overlays, reset state."""
+        self._log_review_state("stop_session")
         flog(
             f"review: stop_session snap_mode={self._review_snap_mode} "
             f"wants_persist={self._review_wants_persist} "
@@ -2074,6 +2103,19 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_status_widget.deactivate()
         self._hide_review_status_bar()
         flog("review: session stopped", "INFO")
+
+    def _log_review_state(self, caller: str) -> None:
+        """Centralized snapshot of Review state for diagnostics."""
+        flog(
+            f"review_state caller={caller} "
+            f"snap_mode={self._review_snap_mode} "
+            f"wants_persist={self._review_wants_persist} "
+            f"bar={'yes' if self._review_date_bar is not None else 'none'} "
+            f"session={'yes' if self._review_snap_session is not None else 'none'} "
+            f"status_widget={'yes' if self._review_status_widget is not None else 'none'} "
+            f"active={self._review_active}",
+            "DEBUG",
+        )
 
     def _review_done(self, trace_id: str, reason: str) -> None:
         """Unlock UI and log after a Review early exit."""
@@ -2175,11 +2217,19 @@ class RecoverDialog(QDialog, LoggerMixin):
         first_iso, last_iso = query_snapshot_date_range(self._journal, layer_infos)
         bar.set_range(first_iso, last_iso)
         self._review_global_t0_iso = first_iso
+        self._review_global_t1_iso = last_iso
         flog(
             f"review: bar_range_updated first={first_iso} last={last_iso} "
-            f"global_t0={first_iso}",
+            f"global_t0={first_iso} global_t1={last_iso}",
             "DEBUG",
         )
+        # Now that the full temporal range is known, refresh markers for the
+        # current viewport (CHANGE C).
+        if self._review_snap_mode:
+            self._refresh_extent_markers(
+                self._compute_bbox_per_layer(),
+                uuid.uuid4().hex[:8],
+            )
 
     def _stop_snapshot_mode(self) -> None:
         """Cleanup worker + date bar + snapshot overlay. No-op if not active."""
@@ -2205,6 +2255,9 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_snap_ext_debounce = None
         self._cancel_snap_worker()
         flog("review: snap_worker cancelled", "DEBUG")
+        self._cancel_marker_worker()
+        self._review_marker_bbox_signature = ""
+        flog("review: marker_worker cancelled", "DEBUG")
         if self._review_date_bar is not None:
             try:
                 self.iface.mapCanvas().mapCanvasRefreshed.disconnect(
@@ -2361,8 +2414,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         """Re-apply the cached reconstruction to the current viewport (pan/zoom).
 
         Runs on the UI thread but never touches the journal — only the bbox
-        filter, the untracked-base merge (bounded by viewport + cap) and the
-        overlay repaint. Safe to call on every settled pan/zoom.
+        filter and the overlay repaint. Safe to call on every settled pan/zoom.
         """
         if self._review_snap_raw_result is None or not self._review_snap_mode:
             return
@@ -2370,12 +2422,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._apply_snapshot_to_extent(self._review_snap_raw_result, trace_id)
 
     def _apply_snapshot_to_extent(self, result, trace_id: str) -> None:
-        """Filter a reconstruction by the current extent, merge untracked base
-        features and repaint the overlays. No journal access (UI-thread safe)."""
-        from .widgets.snapshot_rebuild_worker import (
-            filter_snapshot_by_bbox,
-            merge_untracked_base,
-        )
+        """Filter a reconstruction by the current extent and repaint overlays.
+
+        Review shows only entities whose state at T differs from the live data
+        (changed-after-T, filtered in the worker); the unmodified source layers
+        are never duplicated. No journal access here (UI-thread safe). Extent
+        markers are refreshed separately (extent-scoped, background)."""
+        from .widgets.snapshot_rebuild_worker import filter_snapshot_by_bbox
         snap = self._review_snap_session
         bar = self._review_date_bar
         if snap is None or not self._review_snap_mode:
@@ -2394,31 +2447,12 @@ class RecoverDialog(QDialog, LoggerMixin):
                 "INFO",
             )
 
-        n_reconstructed = result.n_entities
-        result = merge_untracked_base(
-            result, self._review_layer_infos, bbox_per_layer, trace_id=trace_id,
-        )
-        flog(
-            f"[{trace_id}] review: base_merged "
-            f"reconstructed={n_reconstructed} total={result.n_entities} "
-            f"base_added={result.n_entities - n_reconstructed}",
-            "INFO",
-        )
-
         self._surface_snapshot_warnings(trace_id, result)
-
-        unique_dates = list(result.all_event_markers) if result.all_event_markers else sorted({
-            sf.last_created_at
-            for entity_map in result.features.values()
-            for sf in (entity_map.values() if isinstance(entity_map, dict) else [entity_map])
-            if hasattr(sf, 'last_created_at') and sf.last_created_at
-        })
 
         n_total_before_bbox = n_before if bbox_per_layer else result.n_entities
 
         def _on_update_done(stats: dict) -> None:
             if bar is not None and self._review_snap_mode:
-                bar.set_markers(unique_dates)
                 bar.set_stats(stats["n_entities"], n_total=n_total_before_bbox)
             flog(
                 f"[{trace_id}] review: snap_result_applied "
@@ -2428,51 +2462,14 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
 
         snap.update_async(result, _on_update_done)
+        self._refresh_extent_markers(bbox_per_layer, trace_id)
 
     def _surface_snapshot_warnings(self, trace_id: str, result) -> None:
-        """Surface degraded/at-risk snapshot conditions to the user (RL-E1-04/E1-02).
+        """Surface degraded/partial snapshot conditions to the user (RL-E1-02).
 
-        Pushed as persistent (duration=0) message-bar warnings so the user is
-        never left with a silently-wrong or silently-partial as-of-T view.
+        Pushed as a persistent (duration=0) message-bar warning so the user is
+        never left with a silently-partial as-of-T view.
         """
-        fid_only = getattr(result, "fid_only_layers", ()) or ()
-        if fid_only:
-            names = ", ".join(str(n) for n in fid_only)
-            flog(
-                f"[{trace_id}] review: warn_fid_only_identity layers=[{names}]",
-                "WARNING",
-            )
-            self.iface.messageBar().pushMessage(
-                self.tr("Identite instable (format a FID non stable)"),
-                self.tr(
-                    "Instantane a risque pour : {names}. Ces couches utilisent un "
-                    "format dont le FID n'est pas stable (CSV, KML, couche "
-                    "temporaire) et n'ont pas de cle primaire : une entite "
-                    "historique peut etre attribuee a la mauvaise entite. Utilisez "
-                    "un format a identifiant stable (GeoPackage, PostGIS) ou "
-                    "definissez une cle primaire pour fiabiliser la vue."
-                ).format(names=names),
-                QgisCompat.MSG_WARNING, 0,
-            )
-
-        baseline_missing = getattr(result, "baseline_missing_layers", ()) or ()
-        if baseline_missing:
-            names = ", ".join(str(n) for n in baseline_missing)
-            flog(
-                f"[{trace_id}] review: warn_before_baseline layers=[{names}]",
-                "WARNING",
-            )
-            self.iface.messageBar().pushMessage(
-                self.tr("Date anterieure au suivi"),
-                self.tr(
-                    "{n} couche(s) sans information a cette date : la date "
-                    "demandee precede le debut de leur suivi. Les entites non "
-                    "suivies ne sont PAS affichees (elles seraient presumees "
-                    "presentes a tort). Voir le journal pour le detail des couches."
-                ).format(n=len(baseline_missing)),
-                QgisCompat.MSG_WARNING, 0,
-            )
-
         if getattr(result, "partial", False):
             flog(
                 f"[{trace_id}] review: warn_partial reason={result.partial_reason}",
@@ -2558,6 +2555,108 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._review_snap_zombies = alive
         if reaped:
             flog(f"review: snap_zombies reaped={reaped} remaining={len(alive)}", "DEBUG")
+
+    def _cancel_marker_worker(self) -> None:
+        """Cancel current marker worker and park it for reaping."""
+        worker = self._review_marker_worker
+        if worker is None:
+            return
+        try:
+            worker.markers_ready.disconnect()
+            worker.error.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        worker.cancel()
+        self._review_marker_zombies.append(worker)
+        worker.finished.connect(self._reap_marker_zombies)
+        self._review_marker_worker = None
+
+    def _reap_marker_zombies(self) -> None:
+        """Remove finished marker workers from the zombie list."""
+        alive = [w for w in self._review_marker_zombies if w.isRunning()]
+        reaped = len(self._review_marker_zombies) - len(alive)
+        self._review_marker_zombies = alive
+        if reaped:
+            flog(f"review: marker_zombies reaped={reaped} remaining={len(alive)}", "DEBUG")
+
+    def _on_markers_ready(self, trace_id: str, markers: list) -> None:
+        """Slot: MarkerScanWorker found modification dates inside the viewport."""
+        self._review_marker_worker = None
+        if not self._review_snap_mode:
+            return
+        bar = self._review_date_bar
+        if bar is None:
+            return
+        bar.set_markers(markers, as_ticks=True)
+        first = markers[0][0] if markers else None
+        last = markers[-1][0] if markers else None
+        flog(
+            f"[{trace_id}] review: extent_markers_applied n={len(markers)} "
+            f"first={first} last={last} as_ticks=True",
+            "INFO",
+        )
+
+    def _on_marker_error(self, trace_id: str, message: str) -> None:
+        """Slot: MarkerScanWorker encountered a fatal error."""
+        self._review_marker_worker = None
+        flog(f"[{trace_id}] review: marker_worker_error msg={message}", "ERROR")
+
+    def _refresh_extent_markers(self, bbox_per_layer: dict, trace_id: str) -> None:
+        """Spawn a background scan of modification dates inside the viewport.
+
+        CHANGE C: markers are extent-scoped, so panning/zooming recomputes which
+        dates have events in the current view. Skipped if the viewport signature
+        is unchanged since the last scan.
+        """
+        if not self._review_snap_mode or self._journal is None:
+            return
+        t_min = self._review_global_t0_iso
+        t_max = self._review_global_t1_iso
+        if not t_min or not t_max:
+            flog(
+                f"[{trace_id}] review: extent_markers skipped "
+                f"reason=no_global_date_range",
+                "DEBUG",
+            )
+            return
+
+        sig_parts = []
+        for info in self._review_layer_infos:
+            fp = info["fingerprint"]
+            bbox = bbox_per_layer.get(fp)
+            if bbox is not None:
+                sig_parts.append(
+                    f"{fp}:{bbox.xMinimum():.3f}:{bbox.yMinimum():.3f}:"
+                    f"{bbox.xMaximum():.3f}:{bbox.yMaximum():.3f}"
+                )
+        signature = "|".join(sorted(sig_parts))
+        if signature == self._review_marker_bbox_signature:
+            flog(
+                f"[{trace_id}] review: extent_markers unchanged_signature skip",
+                "DEBUG",
+            )
+            return
+        self._review_marker_bbox_signature = signature
+
+        self._cancel_marker_worker()
+        from .widgets.marker_scan_worker import MarkerScanWorker
+        worker = MarkerScanWorker(
+            journal=self._journal,
+            layer_infos=self._review_layer_infos,
+            bbox_per_layer=bbox_per_layer,
+            t_min=t_min,
+            t_max=t_max,
+            trace_id=trace_id,
+        )
+        worker.markers_ready.connect(self._on_markers_ready)
+        worker.error.connect(self._on_marker_error)
+        self._review_marker_worker = worker
+        worker.start()
+        flog(
+            f"[{trace_id}] review: marker_worker_started "
+            f"t_min={t_min} t_max={t_max} n_layers={len(self._review_layer_infos)}",
+            "INFO",
+        )
 
     def _on_review_snap_extent_changed(self) -> None:
         """Slot: canvas extent changed — (re)start spatial debounce."""
@@ -2717,6 +2816,7 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _recover_version_mode(self) -> None:
         """Version/temporal mode: fetch events after cutoff in background thread."""
         from .core.restore_contracts import RestoreCutoff, CutoffType
+        from .core.event_stream_repository import has_active_restore_traces
 
         cutoff_dt = self.time_slider.cutoff_datetime()
         cutoff_iso = cutoff_dt.toUTC().toString("yyyy-MM-ddTHH:mm:ss")
@@ -2738,6 +2838,28 @@ class RecoverDialog(QDialog, LoggerMixin):
         undo_layers = len(self._last_restore_by_ds) if self._last_restore_by_ds else 0
         undo_events = (sum(len(v) for v in self._last_restore_by_ds.values())
                        if self._last_restore_by_ds else 0)
+
+        # BL-RW-P1-23-A2: if the in-memory undo state is gone (dialog closed /
+        # QGIS restarted) but the journal still contains active restore traces,
+        # a new rewind would replay compensation on top of an already restored
+        # layer.  For FID-only layers this can corrupt or skip features.  Block
+        # until the user explicitly undoes the previous restore via the UI.
+        if undo_layers == 0:
+            read_conn = self._get_dialog_read_conn()
+            if read_conn is not None and has_active_restore_traces(
+                read_conn, list(checked_fps), trace_id=trace_id
+            ):
+                flog(f"[{trace_id}] recover_version: BLOCKED active_restore_traces "
+                     f"datasource_count={len(checked_fps)}", "WARNING")
+                self._is_recovering = False
+                self.enable_controls(True)
+                self.recover_button.setEnabled(True)
+                qlog(self.tr(
+                    "Un rewind/restore actif existe pour une couche selectionnee. "
+                    "Annulez-le via 'Annuler le dernier restore' avant de rewinder."
+                ), "WARNING")
+                return
+
         include_traces = True
         flog(f"[{trace_id}] recover_version: start scope={len(checked_fps)} layer(s) "
              f"cutoff={cutoff_iso} undo_state=layers={undo_layers}/events={undo_events} "
@@ -4279,7 +4401,12 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_toggle.setChecked(True)
             self._review_toggle.blockSignals(False)
             self._review_toggle.setEnabled(True)
-            flog("showEvent: review_snap_mode restored on reopen", "INFO")
+            flog(
+                "showEvent: review_snap_mode restored on reopen "
+                f"bar={'yes' if self._review_date_bar is not None else 'none'} "
+                f"status_widget={'yes' if self._review_status_widget is not None else 'none'}",
+                "INFO",
+            )
             # The date bar lives on the canvas viewport, so it survives the
             # dialog hide — but its geometry/z-order can be stale after a
             # canvas resize while we were hidden, leaving it invisible. Force
@@ -4295,12 +4422,22 @@ class RecoverDialog(QDialog, LoggerMixin):
                     "(snap_mode=True, bar=None) — bar lost",
                     "WARNING",
                 )
+            # Defensive: ensure the status bar pill stays visible.
+            if self._review_status_widget is not None:
+                self._show_review_status_bar()
+                self._review_status_widget.activate()
         elif self._review_snap_mode and not self._review_wants_persist:
             flog("showEvent: snap_mode orphan detected — stopping", "WARNING")
             self._stop_snapshot_mode()
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        flog(
+            "RecoverDialog: hideEvent "
+            f"snap_mode={self._review_snap_mode} "
+            f"wants_persist={self._review_wants_persist}",
+            "DEBUG",
+        )
         if hasattr(self, '_layer_refresh_timer'):
             self._layer_refresh_timer.stop()
         if hasattr(self, '_stats_debounce_timer'):
@@ -4308,6 +4445,12 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def closeEvent(self, event):
         """Close event — data stays in its current state (rewound or not)."""
+        flog(
+            "RecoverDialog: closeEvent "
+            f"snap_mode={self._review_snap_mode} "
+            f"wants_persist={self._review_wants_persist}",
+            "INFO",
+        )
         if getattr(self, '_restore_in_progress', False):
             from qgis.PyQt.QtWidgets import QMessageBox
             reply = QMessageBox.question(
@@ -4378,10 +4521,19 @@ class RecoverDialog(QDialog, LoggerMixin):
             if hasattr(self, '_geom_preview'):
                 self._geom_preview.clear()
             snap_persist = self._review_snap_mode and self._review_wants_persist
+            flog(
+                f"cleanup_resources: persist_decision "
+                f"snap_mode={self._review_snap_mode} "
+                f"wants_persist={self._review_wants_persist} "
+                f"snap_persist={snap_persist} "
+                f"bar={'yes' if self._review_date_bar is not None else 'none'} "
+                f"session={'yes' if self._review_snap_session is not None else 'none'} "
+                f"status_widget={'yes' if self._review_status_widget is not None else 'none'}",
+                "INFO",
+            )
             if snap_persist:
                 flog(
-                    "cleanup_resources: Review snapshot persisting "
-                    f"review_snap_mode={self._review_snap_mode}",
+                    "cleanup_resources: Review snapshot persisting",
                     "INFO",
                 )
                 bar = self._review_date_bar
@@ -4404,6 +4556,10 @@ class RecoverDialog(QDialog, LoggerMixin):
                     "INFO",
                 )
             else:
+                flog(
+                    "cleanup_resources: Review not persisting, tearing down status bar",
+                    "INFO",
+                )
                 self._review_disconnect_auto_refresh()
                 self._teardown_review_status_bar()
         except Exception as e:

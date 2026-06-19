@@ -1,6 +1,9 @@
 """Core modules for RecoverLand plugin."""
 from .constants import PLUGIN_NAME
-from .logger import flog, qlog, LoggerMixin, generate_trace_id, timed_op
+from .logger import (
+    flog, qlog, LoggerMixin, generate_trace_id, timed_op,
+    set_project_log_path, remove_project_log_handler,
+)
 
 from .support_policy import (
     IdentityStrength, SupportLevel, ProviderPolicy,

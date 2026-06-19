@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from typing import Optional
 
 from qgis.core import QgsMessageLog
 
@@ -56,6 +57,70 @@ if not _file_logger.handlers:
         datefmt='%Y-%m-%dT%H:%M:%S'
     ))
     _file_logger.addHandler(_fh)
+
+# Optional project-scoped handler (populated when a journal is opened).
+_project_log_handler: Optional[logging.handlers.RotatingFileHandler] = None
+
+
+def set_project_log_path(journal_path: str) -> None:
+    """Add or replace a project-scoped log handler beside the journal.
+
+    The project log is written to ``<project_dir>/.recoverland/recoverland_debug.log``
+    so users can retrieve diagnostics directly from the project directory.
+    """
+    global _project_log_handler
+    if _project_log_handler is not None:
+        try:
+            _file_logger.removeHandler(_project_log_handler)
+            _project_log_handler.close()
+        except Exception as exc:  # noqa: BLE001
+            _file_logger.debug("log: failed to close previous project handler: %s", exc)
+        _project_log_handler = None
+
+    if not journal_path:
+        return
+    project_dir = os.path.dirname(os.path.dirname(journal_path))
+    if not project_dir or not os.path.isdir(project_dir):
+        return
+    log_dir = os.path.join(project_dir, ".recoverland")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as exc:
+        _file_logger.warning("log: cannot create project log dir %s: %s", log_dir, exc)
+        return
+    log_path = os.path.join(log_dir, "recoverland_debug.log")
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            log_path,
+            mode='a',
+            maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUP_COUNT,
+            encoding='utf-8',
+        )
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s.%(msecs)03d [%(levelname)-7s] [%(threadName)-15s] %(message)s',
+            datefmt='%Y-%m-%dT%H:%M:%S'
+        ))
+        _file_logger.addHandler(handler)
+        _project_log_handler = handler
+        _file_logger.info("log: project_log_ready path=%s", log_path)
+    except Exception as exc:  # noqa: BLE001
+        _file_logger.warning("log: cannot create project log %s: %s", log_path, exc)
+
+
+def remove_project_log_handler() -> None:
+    """Remove the project-scoped log handler (project switch / shutdown)."""
+    global _project_log_handler
+    if _project_log_handler is None:
+        return
+    try:
+        _file_logger.removeHandler(_project_log_handler)
+        _project_log_handler.close()
+        _file_logger.info("log: project_log_removed")
+    except Exception as exc:  # noqa: BLE001
+        _file_logger.debug("log: failed to remove project handler: %s", exc)
+    _project_log_handler = None
 
 _file_logger.info("=" * 80)
 _file_logger.info(f"RecoverLand module loaded - PID={os.getpid()} Thread={threading.current_thread().name}")
