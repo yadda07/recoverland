@@ -40,9 +40,18 @@ docs/support_policy.md
 .windsurf/
 .devin/
 
-# Internal tooling (orchestrator + validation toolkit)
+# Internal tooling (orchestrator only; validation toolkit is public for CI)
 scripts/orchestrator/
-scripts/validation/
+
+# Validation runtime artefacts (reports, generated fixtures, temp files)
+scripts/validation/reports/
+scripts/validation/fixtures/*.gpkg
+scripts/validation/fixtures/*.shp
+scripts/validation/fixtures/*.shx
+scripts/validation/fixtures/*.dbf
+scripts/validation/fixtures/*.sqlite
+scripts/validation/fixtures/*.db
+scripts/validation/tmp/
 
 # Internal session notes (if revived locally)
 scripts/SESSION_REWIND.md
