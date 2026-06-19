@@ -88,6 +88,7 @@ class SnapshotRebuildWorker(QThread):
         cutoff_iso: str,
         bbox_per_layer: dict = None,
         trace_id: str = "",
+        row_budget: int = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -97,6 +98,7 @@ class SnapshotRebuildWorker(QThread):
         self._bbox_per_layer = bbox_per_layer or {}
         self._cancelled = False
         self.trace_id = trace_id or uuid.uuid4().hex[:8]
+        self._row_budget = row_budget if row_budget is not None else _SNAPSHOT_ROW_BUDGET
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -179,7 +181,7 @@ class SnapshotRebuildWorker(QThread):
                 for row in cursor:
                     events.append(_row_to_event(row))
                     total_rows += 1
-                    if total_rows > _SNAPSHOT_ROW_BUDGET:
+                    if total_rows > self._row_budget:
                         partial = True
                         break
                 mini_cache[fp] = events
@@ -187,7 +189,8 @@ class SnapshotRebuildWorker(QThread):
                 flog(
                     f"[{tid}] snap_worker: layer={info['layer_name']} "
                     f"n_events={len(events)} cutoff={self._cutoff_iso}"
-                    f"{' PARTIAL_BUDGET_HIT' if partial else ''}",
+                    f"{' PARTIAL_BUDGET_HIT' if partial else ''}"
+                    f" row_budget={self._row_budget}",
                     "WARNING" if partial else "INFO",
                 )
                 if partial:
@@ -206,11 +209,11 @@ class SnapshotRebuildWorker(QThread):
             if partial:
                 result = result._replace(
                     partial=True,
-                    partial_reason=f"row_budget_exceeded:{_SNAPSHOT_ROW_BUDGET}",
+                    partial_reason=f"row_budget_exceeded:{self._row_budget}",
                 )
                 flog(
                     f"[{tid}] snap_worker: PARTIAL snapshot "
-                    f"total_rows>{_SNAPSHOT_ROW_BUDGET} "
+                    f"total_rows>{self._row_budget} "
                     f"reason=row_budget_exceeded degraded=True",
                     "WARNING",
                 )
@@ -495,6 +498,8 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
     n_seen_total = 0
     fid_only_layers = []
     baseline_missing_layers = []
+    partial = result.partial
+    partial_reason = result.partial_reason or ""
 
     for info in layer_infos:
         ds_fp = info["fingerprint"]
@@ -586,9 +591,15 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
                 n_added_total += n_added
 
             if capped:
+                partial = True
+                cap_reason = f"base_feature_cap_exceeded:{_BASE_FEATURE_CAP}"
+                partial_reason = (
+                    f"{partial_reason}; {cap_reason}"
+                    if partial_reason else cap_reason
+                )
                 flog(
                     f"[{trace_id}] base_merge: capped layer={layer_name} "
-                    f"cap={_BASE_FEATURE_CAP} overflow_dropped",
+                    f"cap={_BASE_FEATURE_CAP} overflow_dropped partial=True",
                     "WARNING",
                 )
             flog(
@@ -624,6 +635,8 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
         n_entities=new_n,
         fid_only_layers=tuple(fid_only_layers),
         baseline_missing_layers=tuple(baseline_missing_layers),
+        partial=partial,
+        partial_reason=partial_reason,
     )
 
 
