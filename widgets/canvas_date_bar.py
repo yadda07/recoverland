@@ -132,8 +132,16 @@ class CanvasDateBar(QWidget):
     # Public API                                                           #
     # ------------------------------------------------------------------ #
 
-    def set_range(self, first_iso: str, last_iso: str) -> None:
-        """Configure slider range. first_iso / last_iso are ISO date strings."""
+    def set_range(
+        self, first_iso: str, last_iso: str, preserve_cursor: bool = False
+    ) -> None:
+        """Configure slider range. first_iso / last_iso are ISO date strings.
+
+        Args:
+            preserve_cursor: when True, keep the current absolute date instead of
+                jumping to today. Used when the range is refitted to markers so
+                the user does not lose their position.
+        """
         try:
             self._base_date = parse_iso_date(first_iso)
             self._end_date = parse_iso_date(last_iso)
@@ -149,11 +157,22 @@ class CanvasDateBar(QWidget):
         self._date_edit.setMaximumDate(
             QDate(today.year, today.month, today.day)
         )
+
+        current_iso = self._timeline.current_date_iso() if preserve_cursor else None
         self._timeline.set_range(first_iso, last_iso)
-        self._go_today()
+        if preserve_cursor and current_iso:
+            self._syncing = True
+            try:
+                self._timeline.set_value_iso(current_iso)
+                self._on_timeline_date_changed(current_iso)
+            finally:
+                self._syncing = False
+        else:
+            self._go_today()
         flog(
             f"canvas_date_bar: range_set "
-            f"first={first_iso} last={last_iso} total_days={self._total_days}",
+            f"first={first_iso} last={last_iso} total_days={self._total_days} "
+            f"preserve_cursor={preserve_cursor}",
             "DEBUG",
         )
 
@@ -402,10 +421,58 @@ class CanvasDateBar(QWidget):
     def _raise_safe(self) -> None:
         self.raise_()
 
-    def set_markers(self, date_isos: list) -> None:
-        """Pass markers to timeline. Accepts plain ISO strings or (iso, op_type) tuples."""
+    def set_markers(self, date_isos: list, as_ticks: bool = False) -> None:
+        """Pass markers to timeline. Accepts plain ISO strings or (iso, op_type) tuples.
+
+        Args:
+            as_ticks: when True, the same dates are also rendered as major ruler
+                ticks (modification-centric mode). Default False preserves the
+                calendar ladder for other consumers.
+        """
         self._timeline.set_markers(date_isos)
-        flog(f"canvas_date_bar: markers_set n={len(date_isos)}", "DEBUG")
+        if as_ticks:
+            tick_dates = [
+                str(item[0]) if isinstance(item, (list, tuple)) else str(item)
+                for item in date_isos or []
+            ]
+            self._timeline.set_marker_ticks(tick_dates)
+            self._fit_range_to_marker_dates(tick_dates)
+        else:
+            self._timeline.set_marker_ticks(None)
+        flog(
+            f"canvas_date_bar: markers_set n={len(date_isos)} as_ticks={as_ticks}",
+            "DEBUG",
+        )
+
+    def _fit_range_to_marker_dates(self, tick_dates: list[str]) -> None:
+        """Set the visible date range to the marker span with padding.
+
+        In Review mode the bar must always contain the modification events in
+        the current viewport: start = first marker - padding, end = last marker
+        + padding. The cursor stays at the same absolute date so the user does
+        not lose control.
+        """
+        parsed: list[datetime] = []
+        for raw in tick_dates:
+            try:
+                parsed.append(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+            except (ValueError, TypeError):
+                pass
+        if not parsed:
+            return
+        min_dt = min(parsed)
+        max_dt = max(parsed)
+        span = max(timedelta(seconds=1), max_dt - min_dt)
+        padding = max(timedelta(hours=1), span * 0.02)
+        start = (min_dt - padding).isoformat()
+        end = (max_dt + padding).isoformat()
+        self.set_range(start, end, preserve_cursor=True)
+        flog(
+            f"canvas_date_bar: range_fitted_to_markers "
+            f"start={start} end={end} n={len(parsed)} "
+            f"padding_hours={padding.total_seconds() / 3600:.2f}",
+            "DEBUG",
+        )
 
     def _on_timeline_date_changed(self, iso: str) -> None:
         """Sync QDateEdit + QTimeEdit when user drags / zooms the timeline."""
@@ -445,6 +512,10 @@ class CanvasDateBar(QWidget):
         try:
             self._date_edit.setDate(qd)
             self._time_edit.setTime(QTime(now.hour, now.minute, 0))
+            # Reset the timeline view to the full range so the cursor at
+            # "today" is guaranteed to be visible, instead of vanishing when
+            # the user is zoomed elsewhere (e.g. Review mode on a past window).
+            self._timeline.reset_view()
             self._timeline.set_value_iso(
                 f"{today.year:04d}-{today.month:02d}-{today.day:02d}T00:00:00"
             )

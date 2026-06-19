@@ -7,6 +7,7 @@ from .restore_preflight_dialog import RestorePreflightDialog
 from .time_slider import TimeSliderWidget
 from .canvas_date_bar import CanvasDateBar
 from .temporal_timeline_widget import TemporalTimelineWidget
+from .action_button_bar import ActionButtonBar
 
 # Backward compat alias
 GeoGitSegmentedSwitch = ReviewSegmentedSwitch
@@ -21,4 +22,5 @@ __all__ = (
     "RestoreModeSelector",
     "RestorePreflightDialog",
     "TimeSliderWidget",
+    "ActionButtonBar",
 )

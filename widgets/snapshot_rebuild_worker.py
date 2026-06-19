@@ -46,28 +46,17 @@ _SQL_DATE_RANGE = (
     " AND invalidated_at IS NULL"
 )
 
-_SQL_ALL_EVENT_MARKERS = (
-    "SELECT DISTINCT created_at, operation_type FROM audit_event"
+# CHANGE B: entity_fingerprints with at least one event strictly AFTER the
+# cutoff. These are the ONLY entities whose state at T differs from the current
+# / live data, so Review reconstructs and shows only these (no duplication of
+# the unchanged source layers). feature_identity_json is fetched for the
+# NULL-fingerprint fallback so keys match the reconstruction exactly (see
+# temporal_snapshot_engine.compute_entity_key).
+_SQL_FPS_CHANGED_AFTER = (
+    "SELECT DISTINCT entity_fingerprint, feature_identity_json FROM audit_event"
     " WHERE datasource_fingerprint = ?"
+    " AND created_at > ?"
     " AND invalidated_at IS NULL"
-    " AND created_at IS NOT NULL"
-)
-
-_SQL_TRACKED_FPS = (
-    "SELECT DISTINCT entity_fingerprint FROM audit_event"
-    " WHERE datasource_fingerprint = ?"
-    " AND invalidated_at IS NULL"
-    " AND entity_fingerprint IS NOT NULL"
-)
-
-# RL-E1-03: tracking-start baseline T0 = earliest recorded event per datasource.
-# Cheap (indexed MIN). If the requested cutoff is < T0, the journal has no
-# information at that date and untracked features must NOT be assumed present.
-_SQL_MIN_CREATED = (
-    "SELECT MIN(created_at) FROM audit_event"
-    " WHERE datasource_fingerprint = ?"
-    " AND invalidated_at IS NULL"
-    " AND created_at IS NOT NULL"
 )
 
 # RL-E1-02 (Option A): volume guard. The reconstruction needs the FULL event
@@ -117,7 +106,10 @@ class SnapshotRebuildWorker(QThread):
         return self._cancelled
 
     def run(self) -> None:
-        from ..core.temporal_snapshot_engine import reconstruct_snapshot_at
+        from ..core.temporal_snapshot_engine import (
+            compute_entity_key,
+            reconstruct_snapshot_at,
+        )
 
         t0 = time.monotonic()
         tid = self.trace_id
@@ -131,6 +123,43 @@ class SnapshotRebuildWorker(QThread):
 
         try:
             conn = self._journal.create_read_connection()
+            cutoff_dt = datetime.fromisoformat(
+                self._cutoff_iso.replace("Z", "+00:00")
+            )
+
+            # CHANGE B: Review = "what was different back then". Only entities
+            # with >=1 event strictly AFTER the cutoff have a state at T that
+            # differs from the live data; everything else is identical to the
+            # source layers and must NOT be duplicated. Compute that set FIRST
+            # (cheap, indexed, no geometry/attr BLOBs) so an unchanged date
+            # (e.g. today) short-circuits with zero reconstruction.
+            changed_after: dict = {}
+            n_changed_total = 0
+            for info in self._layer_infos:
+                if self._cancelled:
+                    flog(f"[{tid}] snap_worker: cancelled", "INFO")
+                    return
+                fp = info["fingerprint"]
+                rows_c = conn.execute(
+                    _SQL_FPS_CHANGED_AFTER, (fp, self._cutoff_iso)
+                ).fetchall()
+                keys = {compute_entity_key(r[0], r[1]) for r in rows_c}
+                changed_after[fp] = keys
+                n_changed_total += len(keys)
+
+            if n_changed_total == 0:
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                flog(
+                    f"[{tid}] snap_worker: no_changes_after_cutoff "
+                    f"cutoff={self._cutoff_iso} n_entities=0 "
+                    f"short_circuit=True elapsed_ms={elapsed_ms}",
+                    "INFO",
+                )
+                empty = reconstruct_snapshot_at({}, cutoff_dt, trace_id=tid)
+                if not self._cancelled:
+                    self.result_ready.emit(tid, empty)
+                return
+
             mini_cache: dict = {}
             total_rows = 0
             partial = False
@@ -164,9 +193,6 @@ class SnapshotRebuildWorker(QThread):
                 if partial:
                     break
 
-            cutoff_dt = datetime.fromisoformat(
-                self._cutoff_iso.replace("Z", "+00:00")
-            )
             result = reconstruct_snapshot_at(
                 mini_cache, cutoff_dt, trace_id=tid,
                 should_cancel=lambda: self._cancelled,
@@ -174,6 +200,9 @@ class SnapshotRebuildWorker(QThread):
             if self._cancelled:
                 flog(f"[{tid}] snap_worker: cancelled post-reconstruct", "INFO")
                 return
+
+            result = self._filter_changed_after(result, changed_after, tid)
+
             if partial:
                 result = result._replace(
                     partial=True,
@@ -186,42 +215,11 @@ class SnapshotRebuildWorker(QThread):
                     "WARNING",
                 )
 
-            all_markers_set: set = set()
-            for info in self._layer_infos:
-                rows_m = conn.execute(
-                    _SQL_ALL_EVENT_MARKERS, (info["fingerprint"],)
-                ).fetchall()
-                all_markers_set.update(
-                    (r[0], (r[1] or "INSERT").upper())
-                    for r in rows_m if r[0]
-                )
-            all_event_markers = tuple(sorted(all_markers_set))
-            result = result._replace(all_event_markers=all_event_markers)
-
-            tracked_fps: dict = {}
-            n_tracked_total = 0
-            layer_baseline: dict = {}
-            for info in self._layer_infos:
-                fp = info["fingerprint"]
-                rows_t = conn.execute(
-                    _SQL_TRACKED_FPS, (fp,)
-                ).fetchall()
-                fps = {r[0] for r in rows_t if r[0]}
-                tracked_fps[fp] = fps
-                n_tracked_total += len(fps)
-                row_min = conn.execute(_SQL_MIN_CREATED, (fp,)).fetchone()
-                if row_min and row_min[0]:
-                    layer_baseline[fp] = row_min[0]
-            result = result._replace(
-                tracked_fps=tracked_fps, layer_baseline=layer_baseline,
-            )
-
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             flog(
                 f"[{tid}] snap_worker: done "
                 f"n_entities={result.n_entities} "
-                f"n_all_markers={len(all_event_markers)} "
-                f"n_tracked_fps={n_tracked_total} "
+                f"n_changed_after={n_changed_total} "
                 f"total_rows={total_rows} elapsed_ms={elapsed_ms}",
                 "INFO",
             )
@@ -240,6 +238,31 @@ class SnapshotRebuildWorker(QThread):
                     conn.close()
                 except Exception:  # noqa: BLE001
                     pass
+
+    @staticmethod
+    def _filter_changed_after(result, changed_after: dict, tid: str):
+        """Keep only entities modified/deleted AFTER the cutoff.
+
+        Their state at T differs from the current/live data, so they are the
+        only entities Review must paint. Entities present at T but unchanged
+        since (no event after T) are identical to the source layers and are
+        dropped to avoid duplicating the live data.
+        """
+        n_before = result.n_entities
+        filtered: dict = {}
+        n_kept = 0
+        for ds_fp, entity_map in result.features.items():
+            keep_keys = changed_after.get(ds_fp, set())
+            kept = {k: v for k, v in entity_map.items() if k in keep_keys}
+            if kept:
+                filtered[ds_fp] = kept
+                n_kept += len(kept)
+        flog(
+            f"[{tid}] snap_worker: changed_after_filter "
+            f"before={n_before} after={n_kept} dropped={n_before - n_kept}",
+            "INFO",
+        )
+        return result._replace(features=filtered, n_entities=n_kept)
 
 
 def _filter_by_bbox(events: list, bbox) -> list:
@@ -352,7 +375,48 @@ def filter_snapshot_by_bbox(result, bbox_per_layer: dict):
     return result._replace(features=filtered, n_entities=n_kept)
 
 
-_BASE_FEATURE_CAP = 50000  # per-layer, viewport-bounded volume guard (BL-RVF-P0-06)
+def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
+    """Return ``(first_iso, last_iso)`` from audit_event for given layers.
+
+    Runs on the calling thread (main thread acceptable — 1 row per layer).
+    """
+    import datetime as _dt
+
+    first_iso = ""
+    last_iso = ""
+    conn = None
+    try:
+        conn = journal.create_read_connection()
+        for info in layer_infos:
+            row = conn.execute(
+                _SQL_DATE_RANGE, (info["fingerprint"],)
+            ).fetchone()
+            if row:
+                if row[0] and (not first_iso or row[0] < first_iso):
+                    first_iso = row[0]
+                if row[1] and (not last_iso or row[1] > last_iso):
+                    last_iso = row[1]
+        flog(
+            f"snapshot_date_range: first={first_iso} last={last_iso}",
+            "DEBUG",
+        )
+    except Exception as exc:  # noqa: BLE001
+        flog(f"snapshot_date_range: error={exc!r}", "WARNING")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    today = _dt.date.today().isoformat()
+    return (
+        first_iso or "2020-01-01T00:00:00",
+        last_iso or (today + "T23:59:59"),
+    )
+
+
+_BASE_FEATURE_CAP = 50000
 
 
 def _parse_iso_utc(iso):
@@ -360,7 +424,7 @@ def _parse_iso_utc(iso):
     if not iso:
         return None
     try:
-        from datetime import timezone  # noqa: PLC0415
+        from datetime import timezone
         dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
@@ -373,7 +437,7 @@ def _resolve_pk_field(layer):
     """Return the layer's primary-key field name, or None (FID-only identity)."""
     try:
         pk_idx = layer.dataProvider().pkAttributeIndexes()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     if not pk_idx:
         return None
@@ -416,10 +480,10 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
 
     Returns a new SnapshotResult with untracked features appended.
     """
-    from qgis.core import QgsFeatureRequest, QgsProject  # noqa: PLC0415
-    from ..core.geometry_utils import geometry_to_wkb  # noqa: PLC0415
-    from ..core.serialization import serialize_attributes  # noqa: PLC0415
-    from ..core.temporal_snapshot_engine import SnapshotFeature  # noqa: PLC0415
+    from qgis.core import QgsFeatureRequest, QgsProject
+    from ..core.geometry_utils import geometry_to_wkb
+    from ..core.serialization import serialize_attributes
+    from ..core.temporal_snapshot_engine import SnapshotFeature
 
     t0 = time.monotonic()
     tracked = result.tracked_fps or {}
@@ -429,17 +493,13 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
     features = {ds: dict(em) for ds, em in result.features.items()}
     n_added_total = 0
     n_seen_total = 0
-    fid_only_layers: list = []
-    baseline_missing_layers: list = []
+    fid_only_layers = []
+    baseline_missing_layers = []
 
     for info in layer_infos:
         ds_fp = info["fingerprint"]
         layer_name = info.get("layer_name", "?")
 
-        # RL-E1-03: if the requested date is BEFORE the tracking-start baseline
-        # (earliest recorded event), the journal has no information at T. We
-        # must NOT assume untracked features were present at T — skip the merge
-        # for this layer and flag it so the UI can warn (no silent false-present).
         t0_iso = baseline.get(ds_fp)
         t0_dt = _parse_iso_utc(t0_iso)
         if t0_dt is not None and cutoff_dt is not None and cutoff_dt < t0_dt:
@@ -468,12 +528,6 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
             crs_authid = layer.crs().authid() if layer.crs().isValid() else None
 
             if pk_field is None:
-                # F-3: with no provider PK, identity falls back to fid:<id>.
-                # FID stability depends on the FORMAT, so we reuse RecoverLand's
-                # identity-strength model instead of warning on every keyless
-                # layer (RL-E1-04): GPKG/SpatiaLite/FlatGeobuf FIDs are STRONG
-                # (stable), Shapefile/GeoJSON are MEDIUM (stable unless packed),
-                # only CSV/KML/memory are WEAK/NONE (genuine renumber risk).
                 strength = get_identity_strength_for_layer(layer)
                 if strength in (IdentityStrength.WEAK, IdentityStrength.NONE):
                     fid_only_layers.append(layer_name)
@@ -543,7 +597,7 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
                 f"n_added={n_added}",
                 "INFO",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             flog(
                 f"[{trace_id}] base_merge: layer_error layer={layer_name} "
                 f"error={exc!r}",
@@ -560,11 +614,6 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
         "INFO",
     )
     if n_added_total:
-        # F-2: an untracked feature is assumed present at T (its current state
-        # is its state at T, since it was never edited). A feature created
-        # after T WITHOUT any tracked event is indistinguishable here and will
-        # appear at T. Documented limitation; correct handling would require a
-        # tracking-start baseline per layer.
         flog(
             f"[{trace_id}] base_merge: semantics untracked_assumed_present_at_T "
             f"n_added={n_added_total} caveat=created_after_T_untracked_shown",
@@ -578,45 +627,4 @@ def merge_untracked_base(result, layer_infos, bbox_per_layer, trace_id=""):
     )
 
 
-def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
-    """Return ``(first_iso, last_iso)`` from audit_event for given layers.
-
-    Runs on the calling thread (main thread acceptable — 1 row per layer).
-    """
-    import datetime as _dt
-
-    first_iso = ""
-    last_iso = ""
-    conn = None
-    try:
-        conn = journal.create_read_connection()
-        for info in layer_infos:
-            row = conn.execute(
-                _SQL_DATE_RANGE, (info["fingerprint"],)
-            ).fetchone()
-            if row:
-                if row[0] and (not first_iso or row[0] < first_iso):
-                    first_iso = row[0]
-                if row[1] and (not last_iso or row[1] > last_iso):
-                    last_iso = row[1]
-        flog(
-            f"snapshot_date_range: first={first_iso} last={last_iso}",
-            "DEBUG",
-        )
-    except Exception as exc:  # noqa: BLE001
-        flog(f"snapshot_date_range: error={exc!r}", "WARNING")
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-
-    today = _dt.date.today().isoformat()
-    return (
-        first_iso or "2020-01-01T00:00:00",
-        last_iso or (today + "T23:59:59"),
-    )
-
-
-__all__ = ["SnapshotRebuildWorker", "query_snapshot_date_range", "filter_snapshot_by_bbox"]
+__all__ = ["SnapshotRebuildWorker", "query_snapshot_date_range", "filter_snapshot_by_bbox", "merge_untracked_base"]

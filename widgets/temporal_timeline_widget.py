@@ -149,6 +149,10 @@ class TemporalTimelineWidget(QWidget):
         # Activity clusters [(start, end), ...] derived from markers.
         self._segments: List[Tuple[datetime, datetime]] = []
 
+        # Optional datetimes to render as major ruler ticks (modification-centric
+        # mode). None means "fall back to calendar ladder".
+        self._marker_ticks: Optional[List[datetime]] = None
+
         self._dragging = False
         self._panning = False
         self._pan_last_x: Optional[int] = None
@@ -200,6 +204,30 @@ class TemporalTimelineWidget(QWidget):
         self._rederive_segments()
         self.update()
         flog(f"timeline: markers_set n={len(markers)}", "DEBUG")
+
+    def set_marker_ticks(self, date_isos: Optional[list]) -> None:
+        """Set datetimes that should be rendered as major ruler ticks.
+
+        ``None`` or empty list disables marker-centric ticks and restores the
+        default calendar ladder. Used by Review mode to make the date bar
+        show the actual modification dates inside the current map extent.
+        """
+        ticks: List[datetime] = []
+        for item in date_isos or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 1:
+                iso = str(item[0])
+            else:
+                iso = str(item)
+            dt = _parse_dt(iso)
+            if dt is not None:
+                ticks.append(dt)
+        ticks.sort()
+        self._marker_ticks = ticks if ticks else None
+        self.update()
+        flog(
+            f"timeline: marker_ticks_set n={len(ticks)} enabled={self._marker_ticks is not None}",
+            "DEBUG",
+        )
 
     def current_date_iso(self) -> str:
         dt = self._current_dt or datetime.now()
@@ -373,7 +401,7 @@ class TemporalTimelineWidget(QWidget):
         major, minor = _select_steps(self._view_start, self._view_end, tw)
         top_y = cy + _TRACK_H // 2 + 2
 
-        # Minor ticks (short, unlabeled).
+        # Calendar ladder as minor ticks (short, unlabeled) for scale reference.
         if minor is not None:
             p.setPen(QPen(_COLOR_RULER_MINOR, 1))
             for tdt in _iter_ticks(self._view_start, self._view_end, minor):
@@ -382,29 +410,71 @@ class TemporalTimelineWidget(QWidget):
                     continue
                 p.drawLine(int(lx), top_y, int(lx), top_y + 3)
 
-        # Major ticks (long, labeled).
         font = QFont()
         font.setPointSize(7)
         p.setFont(font)
         fm = QFontMetrics(font)
-        last_label_right = -10000
         align = int(QtCompat.ALIGN_HCENTER) | int(QtCompat.ALIGN_TOP)
-        for tdt in _iter_ticks(self._view_start, self._view_end, major):
-            lx = self._dt_to_x(tdt)
-            if lx < x0 - 1 or lx > x0 + tw + 1:
-                continue
-            p.setPen(QPen(_COLOR_RULER_MAJOR, 1))
-            p.drawLine(int(lx), top_y, int(lx), top_y + 5)
-            label = tdt.strftime(major[3])
-            lw = fm.horizontalAdvance(label)
-            lleft = int(lx) - lw // 2
-            if lleft <= last_label_right + 4:
-                continue
-            last_label_right = lleft + lw
-            p.setPen(QPen(_COLOR_RULER_TEXT, 1))
-            p.drawText(
-                QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4),
-                align, label,
+        last_label_right = -10000
+        n_major_drawn = 0
+
+        # Marker dates as major ticks (long, labeled) when in modification-centric
+        # mode; otherwise fall back to the calendar ladder as major ticks.
+        if self._marker_ticks:
+            visible_ticks = self._deduplicate_marker_ticks([
+                dt for dt in self._marker_ticks
+                if self._view_start <= dt <= self._view_end
+            ])
+            for tdt in visible_ticks:
+                lx = self._dt_to_x(tdt)
+                if lx < x0 - 1 or lx > x0 + tw + 1:
+                    continue
+                label = _format_marker_tick_label(tdt, self._view_start, self._view_end)
+                lw = fm.horizontalAdvance(label)
+                lleft = int(lx) - lw // 2
+                if lleft <= last_label_right + 4:
+                    continue
+                p.setPen(QPen(_COLOR_RULER_MAJOR, 1))
+                p.drawLine(int(lx), top_y, int(lx), top_y + 5)
+                p.setPen(QPen(_COLOR_RULER_TEXT, 1))
+                p.drawText(
+                    QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4),
+                    align, label,
+                )
+                last_label_right = lleft + lw
+                n_major_drawn += 1
+            flog(
+                f"timeline: paint_ruler_marker_mode "
+                f"total_ticks={len(self._marker_ticks)} "
+                f"visible_ticks={len(visible_ticks)} "
+                f"drawn={n_major_drawn} "
+                f"view={self._view_start.isoformat()}..{self._view_end.isoformat()}",
+                "DEBUG",
+            )
+        else:
+            # Major ticks (long, labeled).
+            for tdt in _iter_ticks(self._view_start, self._view_end, major):
+                lx = self._dt_to_x(tdt)
+                if lx < x0 - 1 or lx > x0 + tw + 1:
+                    continue
+                label = tdt.strftime(major[3])
+                lw = fm.horizontalAdvance(label)
+                lleft = int(lx) - lw // 2
+                if lleft <= last_label_right + 4:
+                    continue
+                p.setPen(QPen(_COLOR_RULER_MAJOR, 1))
+                p.drawLine(int(lx), top_y, int(lx), top_y + 5)
+                p.setPen(QPen(_COLOR_RULER_TEXT, 1))
+                p.drawText(
+                    QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4),
+                    align, label,
+                )
+                last_label_right = lleft + lw
+                n_major_drawn += 1
+            flog(
+                f"timeline: paint_ruler_calendar_mode "
+                f"major={major[0]}-{major[1]} drawn={n_major_drawn}",
+                "DEBUG",
             )
 
     def _paint_crosshair(self, p: QPainter, x0: int, tw: int, ty: int, th: int) -> None:
@@ -655,6 +725,15 @@ class TemporalTimelineWidget(QWidget):
             self._view_start, self._view_end = self._full_start, self._full_end
             self.update()
 
+    def reset_view(self) -> None:
+        """Public alias: reset the visible window to the full data range."""
+        self._reset_view()
+        flog(
+            f"timeline: reset_view full={self._full_start}..{self._full_end} "
+            f"view={self._view_start}..{self._view_end}",
+            "DEBUG",
+        )
+
     # ------------------------------------------------------------------ #
     # Segment derivation                                                  #
     # ------------------------------------------------------------------ #
@@ -663,6 +742,28 @@ class TemporalTimelineWidget(QWidget):
         self._segments = _cluster_markers(
             [dt for dt, _ in self._markers], self._full_start, self._full_end,
         )
+
+    def _deduplicate_marker_ticks(self, ticks: List[datetime]) -> List[datetime]:
+        """Return representative marker ticks without day duplication.
+
+        When zoomed out (>3 days visible) keep one tick per day so labels do
+        not overlap. When zoomed in keep the exact timestamps.
+        """
+        if not ticks:
+            return []
+        span = 0.0
+        if self._view_start and self._view_end:
+            span = max(0.0, _to_secs(self._view_end) - _to_secs(self._view_start))
+        if 0 < span <= 3 * 86400:
+            return ticks
+        seen: set = set()
+        result: List[datetime] = []
+        for dt in ticks:
+            key = (dt.year, dt.month, dt.day)
+            if key not in seen:
+                seen.add(key)
+                result.append(dt)
+        return result
 
 
 # ---------------------------------------------------------------------- #
@@ -786,6 +887,13 @@ def _format_dt_label(
     if 0 < span <= 3 * 86400:
         return dt.strftime("%d/%m/%Y %H:%M")
     return dt.strftime("%d/%m/%Y")
+
+
+def _format_marker_tick_label(
+    dt: datetime, view_start: Optional[datetime], view_end: Optional[datetime],
+) -> str:
+    """Format a ruler tick label at a modification date."""
+    return _format_dt_label(dt, view_start, view_end)
 
 
 def _format_tooltip(iso: str) -> str:
