@@ -1,6 +1,6 @@
 [general]
 name=RecoverLand
-qgisMinimumVersion=3.40
+qgisMinimumVersion=3.30
 description=Local GIS data audit and recovery: automatic capture, search and restoration of modifications
 about=RecoverLand automatically captures every modification (attribute, geometry, deletion) in a local SQLite journal, then allows you to search, compare and restore previous states of features.
 version=5.0.0
