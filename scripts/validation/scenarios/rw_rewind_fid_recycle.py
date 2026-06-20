@@ -186,7 +186,6 @@ def _collapse_user_chain(events: List[AuditEvent]) -> List[AuditEvent]:
         if len(chain) == 1:
             result.append(chain[0])
             continue
-        chain_before = len(chain)
         chain = _cancel_internal_lifetimes(chain)
         if not chain:
             continue
@@ -334,7 +333,7 @@ def assertions(ctx):
     keys_after_rewrite = set()
     for e in ctx.data["events"]:
         if e.event_id >= 3:
-            keys_after_rewrite.add(_entity_key(e._replace(entity_fingerprint=f"fid:1@3")))
+            keys_after_rewrite.add(_entity_key(e._replace(entity_fingerprint="fid:1@3")))
         else:
             keys_after_rewrite.add(_entity_key(e))
     active_keys = {_entity_key(e) for e in active}

@@ -37,7 +37,6 @@ for mod_name in (
 from recoverland.core.lens_contracts import (
     EntityClassification, EntityState, EntityTimeline,
     LensFetchStats, LensRenderPlan, LensSelection, LensOpFilter,
-    LensVisualizationMode,
 )
 
 
@@ -94,7 +93,7 @@ plan = LensRenderPlan(
 )
 
 # --- Test 1: diff_table has 4 columns ---
-from qgis.utils import iface, plugins
+from qgis.utils import iface
 from recoverland.widgets.temporal_lens_dock import TemporalLensDock
 
 dock = TemporalLensDock(iface.mapCanvas(), None, iface.mainWindow())

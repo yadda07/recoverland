@@ -23,7 +23,6 @@ allowed) and as a standalone file (direct invocation).
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -326,7 +325,6 @@ def main(argv=None) -> int:
     _ensure_dir(SHAPEFILE_DIR)
     _ensure_dir(GPKG_DIR)
 
-    from osgeo import ogr
     print("[create_fixtures] writing shapefile/points5.shp ...")
     _write_shp(SHAPEFILE_DIR / "points5.shp",
                ogr.wkbPoint, "points5", POINTS_SPEC)

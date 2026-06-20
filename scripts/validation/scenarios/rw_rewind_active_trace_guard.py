@@ -106,8 +106,10 @@ def _cutoff_where(datasource_fp, cutoff, include_traces=True):
         clause = ds_cond + "restored_from_event_id IS NULL AND " + cutoff_col + " " + op + " ?"
         return clause, ds_params + [cutoff.value]
     user_clause = "(restored_from_event_id IS NULL AND " + cutoff_col + " " + op + " ?)"
-    trace_clause = ("(restored_from_event_id IS NOT NULL AND invalidated_at IS NULL AND restored_from_event_id IN ("
-                   "SELECT event_id FROM audit_event WHERE " + ds_cond + cutoff_col + " " + op + " ?))")
+    trace_clause = (
+        "(restored_from_event_id IS NOT NULL AND invalidated_at IS NULL AND restored_from_event_id IN ("
+        "SELECT event_id FROM audit_event WHERE " + ds_cond + cutoff_col + " " + op + " ?))"
+    )
     clause = ds_cond + "(" + user_clause + " OR " + trace_clause + ")"
     params = ds_params + [cutoff.value] + ds_params + [cutoff.value]
     return clause, params

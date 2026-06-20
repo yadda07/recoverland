@@ -5,7 +5,7 @@ from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPus
                                  QGraphicsDropShadowEffect, QWidget,
                                  QScrollArea, QFrame, QMenu, QShortcut,
                                  QStackedWidget, QListWidget, QListWidgetItem)
-from qgis.PyQt.QtCore import (QDateTime, QDate, QTime, QTimer,
+from qgis.PyQt.QtCore import (QDateTime, QDate, QTimer,
                               QVariantAnimation)
 from qgis.PyQt.QtGui import QIcon, QColor, QKeySequence
 from qgis.core import (
@@ -608,7 +608,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.layer_input.setEnabled(has_layers)
         self.operation_input.setEnabled(has_layers)
         self.recover_button.setEnabled(has_layers)
-
 
     def _on_tracking_toggled(self, enabled: bool) -> None:
         """Persist toggle state and activate/deactivate the edit tracker.
@@ -1783,7 +1782,12 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def set_period(self, period):
         """Set period from shortcut buttons."""
-        flog(f"set_period: called period={period} start_enabled={self.start_input.isEnabled()} end_enabled={self.end_input.isEnabled()}", "DEBUG")
+        flog(
+            f"set_period: called period={period} "
+            f"start_enabled={self.start_input.isEnabled()} "
+            f"end_enabled={self.end_input.isEnabled()}",
+            "DEBUG",
+        )
         today = QDateTime.currentDateTime()
         self.end_input.setMaximumDateTime(today)
         ms_today = today.time().msecsSinceStartOfDay()
@@ -2662,7 +2666,11 @@ class RecoverDialog(QDialog, LoggerMixin):
         """Slot: canvas extent changed — (re)start spatial debounce."""
         if not self._review_snap_mode:
             return
-        flog("review: snap_extent_signal_received debounce_alive=%s" % (self._review_snap_ext_debounce is not None), "DEBUG")
+        debounce_alive = self._review_snap_ext_debounce is not None
+        flog(
+            f"review: snap_extent_signal_received debounce_alive={debounce_alive}",
+            "DEBUG",
+        )
         if self._review_snap_ext_debounce is not None:
             self._review_snap_ext_debounce.start()
 
@@ -3276,8 +3284,8 @@ class RecoverDialog(QDialog, LoggerMixin):
                 flog(f"  stored_undo layer={layer_name!r} "
                      f"fp={fp[:16]}... n={len(evts)}")
         else:
-            flog(f"on_version_restore_done: ok=0 or no events "
-                 f"-> undo state NOT updated")
+            flog("on_version_restore_done: ok=0 or no events "
+                 "-> undo state NOT updated")
         self._version_restore_events = None
 
         detail_lines = self._build_restore_summary(result.by_ds)
@@ -3300,7 +3308,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.recover_button.setEnabled(True)
 
     def _rewind_count_snapshot(self, label: str, by_ds: dict,
-                                before: dict = None) -> dict:
+                               before: dict = None) -> dict:
         """Log feature counts per layer at a Rewind transition.
 
         Returns {fp: feat_count} for later comparison.

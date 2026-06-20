@@ -29,7 +29,7 @@ from qgis.PyQt.QtCore import Qt, QEvent, QEasingCurve, QAbstractAnimation
 from qgis.PyQt.QtGui import QPainter, QPalette
 from qgis.PyQt.QtWidgets import (
     QSizePolicy, QAbstractItemView, QMessageBox, QVBoxLayout,
-    QSlider, QFrame,
+    QSlider, QFrame, QDialogButtonBox, QDialog,
 )
 from qgis.core import Qgis, QgsFeatureRequest, QgsVectorDataProvider
 
@@ -93,6 +93,16 @@ class QtCompat:
     NO_EDIT_TRIGGERS = _resolve_enum(
         QAbstractItemView, 'EditTrigger', 'NoEditTriggers'
     )
+
+    # --- QDialogButtonBox.StandardButton ---
+    BUTTON_OK = _resolve_enum(QDialogButtonBox, 'StandardButton', 'Ok')
+    BUTTON_CANCEL = _resolve_enum(QDialogButtonBox, 'StandardButton', 'Cancel')
+    BUTTON_YES = _resolve_enum(QDialogButtonBox, 'StandardButton', 'Yes')
+    BUTTON_NO = _resolve_enum(QDialogButtonBox, 'StandardButton', 'No')
+
+    # --- QDialog.DialogCode ---
+    DIALOG_ACCEPTED = _resolve_enum(QDialog, 'DialogCode', 'Accepted')
+    DIALOG_REJECTED = _resolve_enum(QDialog, 'DialogCode', 'Rejected')
 
     # --- QEvent.Type ---
     EVENT_ENTER = _resolve_enum(QEvent, 'Type', 'Enter')

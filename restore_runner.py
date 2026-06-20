@@ -619,7 +619,7 @@ class StrictRestoreRunner(QObject):
                     if fid is not None:
                         upd_geom_state[fid] = feature_geom_short_repr(layer, fid)
                 except Exception as exc:
-                    flog(f"EDIT_START err eid={getattr(a,'event_id','?')} exc={exc}", "WARNING")
+                    flog(f"EDIT_START err eid={getattr(a, 'event_id', '?')} exc={exc}", "WARNING")
             flog(f"EDIT_START layer={layer_name} n_geom_upd={len(upd_geom_state)} geom_at_start={upd_geom_state}")
         else:
             flog(f"EDIT_START layer={layer_name} n_geom_upd={n_update_events} geom_at_start=diag_off")

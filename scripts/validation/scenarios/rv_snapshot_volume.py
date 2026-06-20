@@ -36,10 +36,7 @@ from recoverland.core.sqlite_schema import (
     AUDIT_EVENT_INSERT_COLUMNS,
     initialize_schema,
 )
-from recoverland.core.temporal_snapshot_engine import (
-    SnapshotFeature,
-    reconstruct_snapshot_at,
-)
+from recoverland.core.temporal_snapshot_engine import reconstruct_snapshot_at
 
 _DS_FP = "ds_rv_volume_test"
 _GEOM0 = b"\x01geo0"

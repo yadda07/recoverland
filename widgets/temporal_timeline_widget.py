@@ -19,10 +19,10 @@ Design principles:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
-from qgis.PyQt.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QPoint, QRect, QSize, pyqtSignal
 from qgis.PyQt.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen,
     QPolygon,

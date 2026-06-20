@@ -91,7 +91,7 @@ def assert_no_log_between(
     if end_idx is None:
         return (label, False, "marker_end not found after marker_start")
 
-    window = records[start_idx + 1 : end_idx]
+    window = records[start_idx + 1:end_idx]
     matches = [r for r in window if forbidden_re.search(r.raw)]
     ok = not matches
     extra = ""

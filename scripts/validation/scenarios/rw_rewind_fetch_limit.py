@@ -7,7 +7,7 @@ more. This breaks the promise "all events for a layer are recovered".
 import json
 import sqlite3
 from datetime import datetime, timezone, timedelta
-from typing import List, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 SCENARIO_ID = "rw_rewind_fetch_limit"
 INVARIANT = "BL-RW-P1-23"
@@ -109,8 +109,10 @@ def _cutoff_where(datasource_fp, cutoff, include_traces=True):
         clause = ds_cond + "restored_from_event_id IS NULL AND " + cutoff_col + " " + op + " ?"
         return clause, ds_params + [cutoff.value]
     user_clause = "(restored_from_event_id IS NULL AND " + cutoff_col + " " + op + " ?)"
-    trace_clause = ("(restored_from_event_id IS NOT NULL AND invalidated_at IS NULL AND restored_from_event_id IN ("
-                   "SELECT event_id FROM audit_event WHERE " + ds_cond + cutoff_col + " " + op + " ?))")
+    trace_clause = (
+        "(restored_from_event_id IS NOT NULL AND invalidated_at IS NULL AND restored_from_event_id IN ("
+        "SELECT event_id FROM audit_event WHERE " + ds_cond + cutoff_col + " " + op + " ?))"
+    )
     clause = ds_cond + "(" + user_clause + " OR " + trace_clause + ")"
     params = ds_params + [cutoff.value] + ds_params + [cutoff.value]
     return clause, params
@@ -437,7 +439,6 @@ def assertions(ctx):
     a2_synthetic_attrs = ctx.data.get("a2_synthetic_attrs", {})
     a2_synthetic_fp = ctx.data.get("a2_synthetic_fp", "")
     at1_len = ctx.data["at1_len"]
-    at1_ops = ctx.data["at1_ops"]
     at1_del_attrs = ctx.data.get("at1_del_attrs", {})
     at2_len = ctx.data["at2_len"]
     at2_ops = ctx.data["at2_ops"]

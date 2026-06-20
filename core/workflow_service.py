@@ -287,5 +287,3 @@ def purge_lens_overlays(context: str = "manual") -> int:
             "WARNING",
         )
         return 0
-
-

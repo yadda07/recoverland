@@ -59,7 +59,6 @@ def setup(ctx):
         e["operation_type"] = "INSERT"
         e["event_id"] = None
         insert(e)
-        last = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         e2 = dict(base_event)
         e2["entity_fingerprint"] = f"pair-{i}"
         e2["operation_type"] = "DELETE"
