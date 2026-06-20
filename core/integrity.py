@@ -74,6 +74,7 @@ def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult
             _check_sqlite_integrity(conn, issues)
             _check_wal_state(conn, issues)
             _check_schema_version(conn, issues)
+            _check_logical_integrity(conn, issues)
             recovered, rejected = _recover_pending_events(db_path, conn)
 
         except sqlite3.Error as e:
@@ -113,6 +114,57 @@ def _check_schema_version(conn: sqlite3.Connection, issues: List[str]) -> None:
             )
     except sqlite3.Error as e:
         issues.append(f"Schema version check error: {e}")
+
+
+def _check_logical_integrity(conn: sqlite3.Connection, issues: List[str]) -> None:
+    """Check semantic integrity: orphan traces, sessions, datasources."""
+    _check_orphan_restored_events(conn, issues)
+    _check_orphan_sessions(conn, issues)
+    _check_orphan_datasources(conn, issues)
+
+
+def _check_orphan_restored_events(conn: sqlite3.Connection, issues: List[str]) -> None:
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM audit_event"
+            " WHERE restored_from_event_id IS NOT NULL"
+            "   AND restored_from_event_id NOT IN"
+            "       (SELECT event_id FROM audit_event WHERE restored_from_event_id IS NULL)"
+        ).fetchone()
+        count = int(row[0] if row else 0)
+        if count:
+            issues.append(f"{count} trace event(s) reference a missing source event")
+    except sqlite3.Error as e:
+        issues.append(f"Orphan trace check error: {e}")
+
+
+def _check_orphan_sessions(conn: sqlite3.Connection, issues: List[str]) -> None:
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM audit_session s"
+            " WHERE NOT EXISTS (SELECT 1 FROM audit_event e WHERE e.session_id = s.session_id)"
+        ).fetchone()
+        count = int(row[0] if row else 0)
+        if count:
+            issues.append(f"{count} session(s) with no events")
+    except sqlite3.Error as e:
+        issues.append(f"Orphan session check error: {e}")
+
+
+def _check_orphan_datasources(conn: sqlite3.Connection, issues: List[str]) -> None:
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM datasource_registry r"
+            " WHERE NOT EXISTS ("
+            "   SELECT 1 FROM audit_event e"
+            "   WHERE e.datasource_fingerprint = r.datasource_fingerprint"
+            " )"
+        ).fetchone()
+        count = int(row[0] if row else 0)
+        if count:
+            issues.append(f"{count} datasource registry entry(ies) with no events")
+    except sqlite3.Error as e:
+        issues.append(f"Orphan datasource check error: {e}")
 
 
 def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> tuple:

@@ -6,7 +6,6 @@ than 30 days. No effect on `golden_logs/` (versioned reference).
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from collections import defaultdict
 from pathlib import Path

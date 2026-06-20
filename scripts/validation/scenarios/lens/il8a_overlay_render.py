@@ -171,8 +171,8 @@ else:
     # --- Test 3 : both layers actually exist in the project ---
     if result is not None and len(result.overlay_layer_ids) == 2:
         lyrs = [project.mapLayer(lid) for lid in result.overlay_layer_ids]
-        ok = all(l is not None for l in lyrs)
-        msg = f"layers={[l.name() if l else None for l in lyrs]}"
+        ok = all(layer is not None for layer in lyrs)
+        msg = f"layers={[layer.name() if layer else None for layer in lyrs]}"
     else:
         ok, msg = False, "no result"
     results.append(('layers_exist_in_project', ok, msg))

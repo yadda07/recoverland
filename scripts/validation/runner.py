@@ -18,13 +18,11 @@ ctx is a SimpleNamespace populated by the runner:
 from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable
 
 from .assert_log import AssertionSummary, summarize
 from .parse_log import LogRecord, log_file_size, read_records

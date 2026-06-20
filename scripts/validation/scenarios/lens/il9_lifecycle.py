@@ -104,9 +104,6 @@ results.append((
 
 # --- Build fixture for facade test ---
 from recoverland.core.lens_contracts import (
-    EntityClassification,
-    EntityState,
-    EntityTimeline,
     LensFetchStats,
     LensOpFilter,
     LensSelection,

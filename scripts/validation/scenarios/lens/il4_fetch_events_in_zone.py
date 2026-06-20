@@ -37,7 +37,6 @@ import sys
 import tempfile
 import types
 from pathlib import Path
-from typing import Tuple
 
 SCENARIO_ID = "il4_fetch_events_in_zone"
 INVARIANT = "BL-IL-P0-04"
@@ -49,6 +48,8 @@ _REPO_PATH = _PLUGIN_ROOT / "core" / "event_stream_repository.py"
 
 # Hardcoded little-endian WKB samples (validated against OGR / Shapely).
 # Format: 0x01 (LE), 4-byte type, then coordinates.
+
+
 def _le_double(value: float) -> bytes:
     return struct.pack("<d", value)
 

@@ -7,8 +7,6 @@ from typing import NamedTuple, Optional
 
 from qgis.PyQt.QtCore import QCoreApplication
 
-from .logger import flog
-
 
 def _tr(msg):
     return QCoreApplication.translate("HealthMonitor", msg)
@@ -232,6 +230,12 @@ def _humanize_integrity_issue(issue: str) -> str:
         return _tr("Le fichier journal est introuvable.")
     if "cannot open" in lower:
         return _tr("Impossible d'ouvrir le journal.")
+    if "trace event(s) reference a missing source event" in lower:
+        return _tr("Des traces pointent vers des evenements source manquants.")
+    if "session(s) with no events" in lower:
+        return _tr("Des sessions sans evenements sont presentes.")
+    if "datasource registry entry(ies) with no events" in lower:
+        return _tr("Des sources de donnees sont enregistrees sans evenements associes.")
     return _tr("Anomalie detectee : {issue}").format(issue=issue)
 
 

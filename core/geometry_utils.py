@@ -286,7 +286,6 @@ def reproject_geometry_for_render(
 
     cache_key = (src_crs_authid, dst_crs_authid)
     transform = transform_cache.get(cache_key)
-    cache_hit = transform is not None
 
     if transform is None:
         src_crs = QgsCoordinateReferenceSystem(src_crs_authid)

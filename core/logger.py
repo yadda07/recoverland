@@ -122,6 +122,7 @@ def remove_project_log_handler() -> None:
         _file_logger.debug("log: failed to remove project handler: %s", exc)
     _project_log_handler = None
 
+
 _file_logger.info("=" * 80)
 _file_logger.info(f"RecoverLand module loaded - PID={os.getpid()} Thread={threading.current_thread().name}")
 _file_logger.info(f"Plugin dir: {_PLUGIN_DIR}")

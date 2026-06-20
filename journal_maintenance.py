@@ -3,6 +3,10 @@
 Provides journal health overview, retention configuration,
 purge actions, vacuum, integrity check and export.
 """
+from typing import Optional
+import os
+import sqlite3
+
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QGroupBox, QMessageBox, QFileDialog,
@@ -16,17 +20,15 @@ from .compat import QtCompat
 from .core import (
     flog,
     get_journal_size_bytes,
-    get_journal_stats, count_purgeable_events,
-    purge_old_events, vacuum_async,
-    RetentionPolicy, check_journal_integrity,
+    get_journal_stats, count_purgeable_events, count_logical_garbage_events,
+    purge_old_events_with_options, vacuum_async,
+    RetentionPolicy, PurgeOptions, check_journal_integrity,
 )
 from .core.health_monitor import (
     evaluate_journal_health, HealthLevel, _format_size,
     format_integrity_message,
 )
 from .core.time_format import compute_history_span
-import os
-import sqlite3
 
 
 class JournalMaintenanceDialog(QDialog):
@@ -221,9 +223,23 @@ class JournalMaintenanceDialog(QDialog):
                 self._health_label.setStyleSheet("color: #db4437; font-weight: 600;")
 
             policy = self._load_retention_policy()
-            purgeable = count_purgeable_events(conn, policy)
-            if purgeable > 0:
-                self._purge_info.setText(self.tr("{count} evenement(s) purgeable(s)").format(count=purgeable))
+            old_purgeable = count_purgeable_events(conn, policy)
+            garbage = count_logical_garbage_events(conn)
+            total_purgeable = old_purgeable + garbage.total
+            if total_purgeable > 0:
+                parts = []
+                if old_purgeable:
+                    parts.append(self.tr("{count} ancien(s)").format(count=old_purgeable))
+                if garbage.invalidated_events:
+                    parts.append(self.tr("{count} trace(s) invalidee(s)").format(count=garbage.invalidated_events))
+                if garbage.insert_delete_pairs:
+                    parts.append(self.tr("{count} paire(s) INSERT/DELETE").format(count=garbage.insert_delete_pairs))
+                if garbage.orphan_traces:
+                    parts.append(self.tr("{count} orphelin(s)").format(count=garbage.orphan_traces))
+                text = self.tr("{count} evenement(s) purgeable(s)").format(count=total_purgeable)
+                if parts:
+                    text += " (" + ", ".join(parts) + ")"
+                self._purge_info.setText(text)
             else:
                 self._purge_info.setText(self.tr("Rien a purger"))
         except Exception as e:
@@ -284,32 +300,45 @@ class JournalMaintenanceDialog(QDialog):
         conn = None
         try:
             conn = self._journal.create_read_connection()
-            purgeable = count_purgeable_events(conn, policy)
+            old_purgeable = count_purgeable_events(conn, policy)
+            garbage = count_logical_garbage_events(conn)
+            total_purgeable = old_purgeable + garbage.total
         except Exception:
-            purgeable = 0
+            old_purgeable = 0
+            garbage = None
+            total_purgeable = 0
         finally:
             if conn:
                 try:
                     conn.close()
                 except Exception:
                     pass
-        if purgeable == 0:
+        if total_purgeable == 0:
             QMessageBox.information(self, self.tr("Purge"), self.tr("Aucun evenement a purger."))
             return
-        reply = QMessageBox.question(
-            self, self.tr("Confirmer la purge"),
-            self.tr("Supprimer {count} evenement(s) anciens ?\n"
-                    "Cette action est irreversible.").format(count=purgeable),
-            QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_NO)
-        if reply != QtCompat.MSG_YES:
+        options = self._ask_purge_options(old_purgeable, garbage)
+        if options is None:
             return
         conn = None
         try:
             conn = self._journal.get_connection()
-            result = purge_old_events(conn, policy)
-            QMessageBox.information(
-                self, self.tr("Purge terminee"),
-                self.tr("{count} evenement(s) supprime(s).").format(count=result.deleted_count))
+            result = purge_old_events_with_options(conn, policy, options)
+            msg = self.tr("{count} evenement(s) supprime(s).").format(count=result.deleted_count)
+            if result.deleted_count > 0:
+                parts = []
+                if result.retention_deleted:
+                    parts.append(self.tr("{count} ancien(s)").format(count=result.retention_deleted))
+                if result.excess_deleted:
+                    parts.append(self.tr("{count} exces").format(count=result.excess_deleted))
+                if result.invalidated_deleted:
+                    parts.append(self.tr("{count} invalide(s)").format(count=result.invalidated_deleted))
+                if result.pair_deleted:
+                    parts.append(self.tr("{count} paire(s)").format(count=result.pair_deleted))
+                if result.orphan_trace_deleted:
+                    parts.append(self.tr("{count} orphelin(s)").format(count=result.orphan_trace_deleted))
+                if parts:
+                    msg += "\n" + self.tr("Details : ") + ", ".join(parts)
+            QMessageBox.information(self, self.tr("Purge terminee"), msg)
         except Exception as e:
             flog(f"purge error: {e}", "ERROR")
             QMessageBox.warning(
@@ -317,6 +346,45 @@ class JournalMaintenanceDialog(QDialog):
                 self.tr("Une erreur est survenue lors de la purge. "
                         "Consultez le journal de logs."))
         self._refresh_stats()
+
+    def _ask_purge_options(self, old_purgeable: int, garbage) -> Optional[PurgeOptions]:
+        """Show a dialog to choose purge scope. Returns None if cancelled."""
+        from qgis.PyQt.QtWidgets import QDialog, QVBoxLayout, QCheckBox, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle(self.tr("Options de purge"))
+        dlg.setMinimumWidth(360)
+        lay = QVBoxLayout(dlg)
+        checks = []
+        if old_purgeable:
+            chk = QCheckBox(self.tr("Evenements anciens ({count})").format(count=old_purgeable))
+            chk.setChecked(True)
+            lay.addWidget(chk)
+            checks.append(("retention", chk))
+        if garbage and garbage.invalidated_events:
+            chk = QCheckBox(self.tr("Traces invalidées ({count})").format(count=garbage.invalidated_events))
+            chk.setChecked(True)
+            lay.addWidget(chk)
+            checks.append(("invalidated", chk))
+        if garbage and garbage.insert_delete_pairs:
+            chk = QCheckBox(self.tr("Paires INSERT/DELETE ({count})").format(count=garbage.insert_delete_pairs))
+            chk.setChecked(True)
+            lay.addWidget(chk)
+            checks.append(("insert_delete_pairs", chk))
+        if garbage and garbage.orphan_traces:
+            chk = QCheckBox(self.tr("Traces orphelines ({count})").format(count=garbage.orphan_traces))
+            chk.setChecked(True)
+            lay.addWidget(chk)
+            checks.append(("orphan_traces", chk))
+        if not checks:
+            return None
+        bbox = QDialogButtonBox(QtCompat.BUTTON_OK | QtCompat.BUTTON_CANCEL, dlg)
+        bbox.accepted.connect(dlg.accept)
+        bbox.rejected.connect(dlg.reject)
+        lay.addWidget(bbox)
+        if dlg.exec() != QtCompat.DIALOG_ACCEPTED:
+            return None
+        kw = {name: chk.isChecked() for name, chk in checks}
+        return PurgeOptions(**kw)
 
     def _vacuum_journal(self) -> None:
         if not self._journal or not self._journal.path:
@@ -334,6 +402,21 @@ class JournalMaintenanceDialog(QDialog):
         free_pages, page_size = self._get_freelist_info(path)
         reclaimable = free_pages * page_size
         if free_pages == 0:
+            garbage = self._count_logical_garbage()
+            if garbage and garbage.total > 0:
+                self._vacuum_status.setText(
+                    self.tr("{count} donnees mortes — purger d'abord").format(count=garbage.total))
+                self._vacuum_status.setStyleSheet("color: #ff9800; font-weight: 600;")
+                QMessageBox.information(
+                    self, self.tr("Compactage inutile"),
+                    self.tr(
+                        "Le journal n'a pas de pages libres, mais il contient\n"
+                        "{count} evenement(s) logiquement mort(s) "
+                        "(traces invalidées, paires INSERT/DELETE, orphelins).\n\n"
+                        "Utilisez d'abord 'Purger' pour les supprimer, puis compactez."
+                    ).format(count=garbage.total))
+                flog(f"vacuum: skipped, freelist_count=0 logical_garbage={garbage.total}", "INFO")
+                return
             self._vacuum_status.setText(self.tr("Deja compacte"))
             self._vacuum_status.setStyleSheet("color: #4285f4; font-weight: 600;")
             QMessageBox.information(
@@ -436,6 +519,24 @@ class JournalMaintenanceDialog(QDialog):
             return (free, psize)
         except (sqlite3.Error, TypeError):
             return (0, 4096)
+
+    def _count_logical_garbage(self):
+        """Return LogicalGarbageCount for the active journal, or None on error."""
+        if not self._journal or not self._journal.is_open:
+            return None
+        conn = None
+        try:
+            conn = self._journal.create_read_connection()
+            return count_logical_garbage_events(conn)
+        except Exception as e:
+            flog(f"JournalMaintenanceDialog: logical garbage count error: {e}", "WARNING")
+            return None
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _flash_size_change(self, before_str: str, after_str: str) -> None:
         """Animate the size label to show the before→after transition."""

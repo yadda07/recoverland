@@ -53,9 +53,10 @@ from .restore_service import (
 )
 from .sqlite_backend import SQLiteAuditBackend
 from .retention import (
-    purge_old_events, count_purgeable_events, get_journal_stats,
+    purge_old_events, purge_old_events_with_options, count_purgeable_events,
+    count_logical_garbage_events, get_journal_stats,
     purge_excess_events, vacuum_async,
-    RetentionPolicy, DEFAULT_POLICY,
+    RetentionPolicy, DEFAULT_POLICY, PurgeOptions, LogicalGarbageCount,
 )
 from .integrity import check_journal_integrity, save_pending_events
 from .local_settings import LocalSettings
@@ -132,6 +133,7 @@ from .snapshot_overlay_session import SnapshotOverlaySession
 __all__ = (
     "PLUGIN_NAME",
     "flog", "qlog", "LoggerMixin", "generate_trace_id", "timed_op",
+    "set_project_log_path", "remove_project_log_handler",
     "IdentityStrength", "SupportLevel", "ProviderPolicy",
     "evaluate_layer_support", "is_capture_supported", "is_restore_supported",
     "format_support_message",
@@ -162,9 +164,10 @@ __all__ = (
     "restore_updated_feature", "restore_batch", "PreCheckResult",
     "build_restore_trace_event", "undo_restore_batch",
     "SQLiteAuditBackend",
-    "purge_old_events", "count_purgeable_events", "get_journal_stats",
+    "purge_old_events", "purge_old_events_with_options", "count_purgeable_events",
+    "count_logical_garbage_events", "get_journal_stats",
     "purge_excess_events", "vacuum_async",
-    "RetentionPolicy", "DEFAULT_POLICY",
+    "RetentionPolicy", "DEFAULT_POLICY", "PurgeOptions", "LogicalGarbageCount",
     "check_journal_integrity", "save_pending_events",
     "LocalSettings",
     "is_layer_audit_field",

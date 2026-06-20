@@ -7,13 +7,6 @@ No QGIS dependency.
 import sqlite3
 from typing import List, NamedTuple, Optional
 
-
-class FetchStats(NamedTuple):
-    n_events_total: int
-    n_events_returned: int
-    n_events_truncated: int
-    elapsed_ms: int
-
 from .audit_backend import AuditEvent
 from .search_service import _row_to_event
 from .restore_contracts import (
@@ -23,6 +16,14 @@ from .logger import flog, timed_op
 from .sql_safety import assert_safe_fragment
 from .sqlite_schema import AUDIT_EVENT_SELECT_SQL
 from .wkb_envelope import envelope_intersects, parse_envelope
+
+
+class FetchStats(NamedTuple):
+    n_events_total: int
+    n_events_returned: int
+    n_events_truncated: int
+    elapsed_ms: int
+
 
 _EVENT_COLUMNS = AUDIT_EVENT_SELECT_SQL
 

@@ -15,7 +15,7 @@ Thèse (phase A) : un Shapefile normal, connecté à un tracker actif,
 produit au moins un event INSERT après commitChanges Qt.
 
 Antithèse brutale (phase B) :
-  * A6-bis : `tracker.activate()` -> `connect_layer(shp)` -> 
+  * A6-bis : `tracker.activate()` -> `connect_layer(shp)` ->
     `tracker.deactivate()` -> commit Qt. Le tracker DOIT cesser de
     capturer même si le layer reste techniquement connecté. Verifie
     le guard `if not self._active` sur tous les handlers de signaux.

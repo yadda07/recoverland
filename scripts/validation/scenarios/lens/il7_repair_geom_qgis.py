@@ -96,7 +96,7 @@ else:
         from qgis.utils import plugins
         log_path = Path(plugins['recoverland'].api_log_path())
         log_content = log_path.read_text(encoding='utf-8', errors='ignore')
-        signature = f"lens_geom_repair event=repaired"
+        signature = "lens_geom_repair event=repaired"
         ok = signature in log_content and trace_id in log_content
         msg = f"signature='{signature}' trace_id={trace_id} found={ok}"
     except Exception as exc:

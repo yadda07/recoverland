@@ -107,7 +107,7 @@ else:
         log_path = Path(plugins['recoverland'].api_log_path())
         log_content = log_path.read_text(encoding='utf-8', errors='ignore')
 
-        sig_reproj = f"lens_geom_reproject event=reprojected"
+        sig_reproj = "lens_geom_reproject event=reprojected"
         ok_r = sig_reproj in log_content and trace_id in log_content
         results.append((
             'log_signature_reprojected',
@@ -115,7 +115,7 @@ else:
             f"signature='{sig_reproj}' trace_id={trace_id} found={ok_r}",
         ))
 
-        sig_skip = f"lens_geom_reproject event=skipped"
+        sig_skip = "lens_geom_reproject event=skipped"
         ok_s = sig_skip in log_content and trace_id in log_content
         results.append((
             'log_signature_skipped',
