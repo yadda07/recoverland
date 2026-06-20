@@ -269,7 +269,7 @@
       "effort": "L",
       "root_cause": "CI limitee a flake8; scenarios runtime non cables (.github/workflows/ci.yml).",
       "state": "PROVEN",
-      "blocked_by": ["ci_push"],
+      "blocked_by": ["ci_push", "ci_not_triggered"],
       "scenario_path": "scripts/validation/ci_run.py",
       "scenario_status": "passing",
       "last_report": "local_runtime_scenarios_pass_ci_pending_push",
@@ -308,6 +308,13 @@
           "to": "PROVEN",
           "by": "/qgis-compat + /corrector",
           "evidence": "Audit /qgis-compat GO: aucune API incompatible 3.30-4.0.3 dans les 6 fichiers cibles; enums via QtCompat/QgisCompat. Correctifs: (a) compat(qgis) commit 5d4a903 metadata 3.30 + CI matrix release-3_30/latest; (b) fix(snapshot) commit e327a0c partial=True sur _BASE_FEATURE_CAP + row_budget sans reload; (c) ci commit db5e976 validation toolkit public + .gitattributes LF. Reste bloqueur ci_push: preuve finale = run GitHub Actions vert apres push."
+        },
+        {
+          "ts": "2026-06-20T08:30:00Z",
+          "from": "PROVEN",
+          "to": "PROVEN",
+          "by": "/orchestrator",
+          "evidence": "Push main OK: remote HEAD=638d4e5b8b563d8f8f898ffc6962774bf7606e8a. Cependant GitHub Actions n'a pas declenche de run CI pour ce commit (API /actions/workflows/260680717/runs?head_sha=638d4e5... retourne 0 run). Dernier run CI connu: #30 (commit 090a066, 2026-05-19, conclusion=failure). Bloqueur ci_not_triggered ajoute. Action requise: verifier settings Actions du repo ou declencher manuellement."
         }
       ]
     },
@@ -4011,6 +4018,7 @@
         "core/health_monitor.py",
         "core/__init__.py",
         "journal_maintenance.py",
+        "compat.py",
         "scripts/validation/scenarios/maint_inert_buttons.py"
       ],
       "history": [
@@ -4034,6 +4042,13 @@
           "to": "PATCHED",
           "by": "/corrector",
           "evidence": "core/retention.py: purge logique (invalidated, INSERT/DELETE pairs, orphan traces) + PurgeOptions; core/integrity.py: checks semantiques orphan traces/sessions/datasources; journal_maintenance.py: UI affiche compteurs et options; scenario maint_inert_buttons.py; py_compile OK; test SQL valide purge de 2 events pair + 1 invalidated + 1 orphan."
+        },
+        {
+          "ts": "2026-06-20T07:58:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "Hotfix compatibilité Qt5/Qt6: remplacer QDialogButtonBox.Ok/Cancel et QDialog.Accepted par QtCompat.BUTTON_OK/CANCEL et DIALOG_ACCEPTED. compat.py ajoute QDialogButtonBox et QDialog."
         }
       ],
       "commit_hash": "",
