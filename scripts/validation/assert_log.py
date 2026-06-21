@@ -9,8 +9,9 @@ plug directly into the assertions list of a scenario.
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Pattern, Tuple
+from typing import Callable, Iterable, List, Optional, Pattern, Sequence, Tuple
 
 from .parse_log import LogRecord
 
@@ -142,6 +143,41 @@ def assert_counter(
     return (label, ok, f"n={n} expected={expected}")
 
 
+def assert_sequence_in_order(
+    records: Iterable[LogRecord],
+    patterns: Sequence[str | Pattern],
+    name: Optional[str] = None,
+) -> Assertion:
+    """Assert each pattern matches a record, matches occurring in increasing order.
+
+    This is the primary God Object move-only non-regression primitive (decision
+    D-GOD-01): per mode, a short ordered list of milestone patterns. Records
+    between milestones are ignored, so high-frequency noise (paint logs), worker
+    interleaving and log rotation do not cause false failures. Only the relative
+    order of the named milestones is enforced.
+    """
+    rec_list = list(records)
+    label = name or f"in_order:{len(patterns)}_milestones"
+    search_from = 0
+    matched_at: List[int] = []
+    for i, pattern in enumerate(patterns):
+        regex = _compile(pattern)
+        found = None
+        for j in range(search_from, len(rec_list)):
+            if regex.search(rec_list[j].raw):
+                found = j
+                break
+        if found is None:
+            return (
+                label, False,
+                f"milestone[{i}] /{regex.pattern[:60]}/ not found after idx "
+                f"{search_from} (matched_so_far={matched_at})",
+            )
+        matched_at.append(found)
+        search_from = found + 1
+    return (label, True, f"{len(patterns)} milestones in order at idx={matched_at}")
+
+
 def diff_against_golden(
     records: Iterable[LogRecord],
     golden_id: str,
@@ -189,6 +225,56 @@ __all__ = [
     "assert_no_log_between",
     "assert_field_value",
     "assert_counter",
+    "assert_sequence_in_order",
     "diff_against_golden",
     "summarize",
 ]
+
+
+def _selftest() -> int:
+    """Prove assert_sequence_in_order detects order, gaps tolerance, and misses."""
+    from .parse_log import parse_line
+
+    def mk(msgs):
+        out = []
+        for i, m in enumerate(msgs):
+            r = parse_line(
+                f"2026-06-21T17:00:0{i % 10}.000 [INFO   ] [MainThread     ] {m}")
+            if r is not None:
+                out.append(r)
+        return out
+
+    recs = mk([
+        "recover_and_load: START",
+        "timeline: paint noise",          # noise between milestones
+        "_on_search_complete: 3 events",
+        "restore_selected_data: applied",
+        "_on_event_restore_done: ok",
+    ])
+    milestones = [
+        r"recover_and_load: START",
+        r"_on_search_complete",
+        r"restore_selected_data",
+        r"_on_event_restore_done",
+    ]
+    cases = []
+    _, ok, _ = assert_sequence_in_order(recs, milestones)
+    cases.append(("in_order_with_noise_passes", ok is True))
+    # missing milestone -> FAIL
+    _, ok, _ = assert_sequence_in_order(mk(["recover_and_load: START", "_on_event_restore_done: ok"]), milestones)
+    cases.append(("missing_milestone_fails", ok is False))
+    # out of order -> FAIL (expect restore before search, but log has search first)
+    _, ok, _ = assert_sequence_in_order(recs, [r"restore_selected_data", r"recover_and_load: START"])
+    cases.append(("out_of_order_fails", ok is False))
+
+    all_ok = all(p for _, p in cases)
+    for n, p in cases:
+        print(f"[assert_log-selftest] {'PASS' if p else 'FAIL'} {n}")
+    print(f"[assert_log-selftest] VERDICT={'PASS' if all_ok else 'FAIL'} "
+          f"note={'assertion_can_fail' if all_ok else 'BROKEN'}")
+    return 0 if all_ok else 1
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        raise SystemExit(_selftest())

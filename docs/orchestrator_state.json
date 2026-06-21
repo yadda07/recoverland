@@ -525,14 +525,15 @@
       "state": "PATCHED",
       "blocked_by": [],
       "scenario_path": "scripts/validation/god_object_surface_guard.py",
-      "scenario_status": "static_guard_passing",
+      "scenario_status": "ast_guard_proven_offline; milestone_checks_4modes_proven_offline; runtime_NOT_proven_pending_user_qgis",
       "patch_files": [
         "controllers/__init__.py",
         "scripts/validation/god_object_surface_guard.py",
         "scripts/validation/god_object_baseline.json",
         "scripts/validation/golden.py",
         "scripts/validation/assert_log.py",
-        "scripts/validation/golden_logs/README.md"
+        "scripts/validation/golden_logs/README.md",
+        "scripts/validation/god_object_check.py"
       ],
       "history": [
         {
@@ -562,11 +563,60 @@
           "to": "PATCHED",
           "by": "/corrector",
           "evidence": "Infra golden log implementee (etait documentee dans README sans code): scripts/validation/golden.py (normalize_message masque trace_id/uuid/durees/addr, extract_sequence filtre main-thread, compare_sequences via difflib, capture_start/capture_finish pour la console QGIS) + diff_against_golden ajoute a assert_log.py (+__all__) + dossier golden_logs/ avec README (5 baselines: dashboard, event_search, version_rewind, review_snapshot, undo). PREUVE antithese hors QGIS (--selftest): 'identical_after_mask PASS' (trace_id+duree differents -> egal apres masque), 'missing_milestone_detected PASS', 'extra_milestone_detected PASS', 'reorder_detected PASS', 'worker_noise_ignored PASS' -> 'VERDICT=PASS note=comparator_can_fail'. py_compile OK sur golden.py + assert_log.py."
+        },
+        {
+          "ts": "2026-06-21T16:50:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/critiker",
+          "evidence": "ECHEC RUNTIME capte en QGIS: 'capture_finish' a ecrit un golden VIDE 'event_search.golden n_events=0' sans aucune validation. Diagnostic confirme (log reel): aucun jalon INFO main-thread entre capture_start et capture_finish (queue = paint timeline DEBUG). Causes racines: (R-CRIT) tooling declare 'prouve' alors que seul le comparateur synthetique l'etait, jamais le chemin de capture (viole charte: preuve=runtime, pas mock); (R-HIGH) modele de capture non interactif inutilisable (impossible d'intercaler actions GUI dans un exec unique); (R-HIGH) capture par offset fragile vs RotatingFileHandler (25 Mo de churn observe); (R-MED) determinisme non garanti (logs paint haute-frequence). Verdict: garde AST = solide; infra golden = a fiabiliser, NON prouvee runtime."
+        },
+        {
+          "ts": "2026-06-21T16:55:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "Correctif garde-fou anti-degenere dans golden.py: write_golden refuse une sequence vide AVANT tout effet de bord; capture_finish refuse (1) fenetre < min_events et (2) rotation (end_size < start_offset), avec erreur bruyante et AUCUN fichier ecrit. PREUVE antithese hors QGIS (--selftest, 9 cas): + 'write_golden_refuses_empty PASS', 'no_file_on_refusal PASS', 'capture_refuses_degenerate PASS', 'capture_refuses_rotation PASS' -> 'VERDICT=PASS note=comparator_can_fail'. py_compile OK. NB: ceci empeche la mine (golden vide) mais ne PROUVE toujours pas la capture en runtime QGIS - decision en attente sur modele de capture (pilotage programmatique vs GUI)."
+        },
+        {
+          "ts": "2026-06-21T17:05:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/orchestrator",
+          "evidence": "DECISION D-GOD-01: modele de verification de non-regression = JALONS ORDONNES PAR MODE (option 1), pas golden full-sequence. Motif: le golden gele fige la fragilite exposee par /critiker (capture offset/rotation, bruit paint, interaction manuelle). On prouve que les comportements clefs se declenchent dans le bon ordre via assert_sequence_in_order, en ignorant tout log non-jalon. Le marqueur sentinelle (option 2) est conserve comme primitive de fenetrage; diff_against_golden reste dispo en secondaire."
+        },
+        {
+          "ts": "2026-06-21T17:10:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "Primitive D-GOD-01 livree: assert_sequence_in_order(records, patterns) dans assert_log.py (+__all__), tolerante au bruit entre jalons (scan forward, ordre relatif seul). PREUVE antithese hors QGIS (--selftest): 'in_order_with_noise_passes PASS', 'missing_milestone_fails PASS', 'out_of_order_fails PASS' -> 'VERDICT=PASS note=assertion_can_fail'. py_compile OK. RESTE: deriver les specs de jalons par mode depuis le CODE REEL de recover_dialog.py (ne pas inventer), puis prouver en runtime QGIS."
+        },
+        {
+          "ts": "2026-06-21T17:20:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "Mecanisme de check assemble: scripts/validation/god_object_check.py. MILESTONES['event_search'] DERIVE du code reel recover_dialog.py (recover_and_load:START L1918, recover_event:start L2805, _display_search_result:total_count= L3418, restore_event:start L3884, restore_event:done L3906 - chaines verifiees par lecture, pas inventees). Fenetrage par marqueur sentinelle flog 'GOLDEN_MARK id=<mode>' (robuste rotation, vs offset). API runtime: mark(mode) -> exercer GUI -> check_mode(mode). PREUVE antithese hors QGIS (--selftest, log synthetique): 'full_flow_after_last_mark_passes PASS' (ignore marqueur perime+bruit), 'missing_restore_milestone_fails PASS', 'no_mark_fails PASS' (echec bruyant, pas de faux PASS silencieux) -> 'VERDICT=PASS note=check_can_fail'. py_compile OK. NON encore prouve en runtime QGIS."
+        },
+        {
+          "ts": "2026-06-21T17:25:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "BUGFIX trouve lors du 1er essai runtime QGIS. Diagnostic (lecture seule en console): marqueur present (marker_count=2, parse_line OK, records_with_marker=2), chemin read==flog (faux 'match=False' du a / vs \\). Vrai defaut: read_since_mark retournait [] a la fois pour 'pas de marqueur' ET 'marqueur=derniere ligne' -> check_mode affichait 'no_mark_found' alors que l'user n'avait pas exerce la GUI entre mark et check (fenetre vide). FIX: read_since_mark renvoie None ssi marqueur absent, sinon une liste (eventuellement vide) -> fenetre vide donne un FAIL clair 'milestone[0] not found'. PREUVE antithese hors QGIS (--selftest, 4 cas): + 'empty_window_is_not_no_mark PASS' (n_records=0 verdict=FAIL milestone[0]) -> 'VERDICT=PASS note=check_can_fail'. py_compile OK."
+        },
+        {
+          "ts": "2026-06-21T17:35:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "3 specs de jalons restantes DERIVEES du code reel recover_dialog.py: version_rewind (recover_version:start L2872, on_version_fetch_done:raw= L2925, recover_version:done L3266), review_snapshot (snapshot_mode_start L2008, snapshot_init_direct L2148, snapshot_bar_shown L2195, snapshot_ready L2207), undo (undo_last:requested L4200, undo_done:trace invalidation L4278). CONSTAT honnete: 'dashboard' EXCLU - _request_stats_refresh L535 / _on_stats_ready L550 n'emettent AUCUN flog (flux silencieux), spec non inventee. Auto-test pilote par les donnees etendu aux 4 modes. PREUVE antithese hors QGIS (--selftest, 10 cas): {event_search,version_rewind,review_snapshot,undo} x {full_flow_passes, missing_last_milestone_fails} + no_mark_fails + empty_window_is_not_no_mark -> 'VERDICT=PASS note=check_can_fail'. py_compile OK. README golden_logs reecrit (D-GOD-01 primaire, procedure runtime, golden secondaire)."
         }
       ],
-      "commit_hash": "",
-      "log_evidence_excerpt": "event=VERDICT verdict=PASS passed=8 failed=0 total=8 ; event=SELFTEST_VERDICT verdict=PASS note=guard_can_fail",
-      "remaining_for_done": "Tooling buildable hors QGIS = FAIT et auto-teste (garde AST + infra golden). Reste pour PROVEN/DONE: (1) capturer les 5 baselines golden (dashboard, event_search, version_rewind, review_snapshot, undo) via run QGIS par l'utilisateur - bloque sur QGIS, je ne peux pas l'executer; (2) commit /git (en cours)."
+      "commit_hash": "9dfa42e",
+      "log_evidence_excerpt": "OFFLINE PROUVE: AST 'verdict=PASS passed=8' + 'SELFTEST_VERDICT verdict=PASS note=guard_can_fail'; assert_log 'VERDICT=PASS note=assertion_can_fail'; golden 9 cas 'note=comparator_can_fail'; god_object_check 10 cas (4 modes x full_flow_passes/missing_last_milestone_fails + no_mark_fails + empty_window_is_not_no_mark) 'VERDICT=PASS note=check_can_fail'. RUNTIME QGIS: NON prouve - requiert l'utilisateur (mark/check_mode par mode).",
+      "remaining_for_done": "TOUT le faisable hors QGIS est FAIT et prouve offline + commite: garde AST, garde-fous golden anti-vide/rotation, assert_sequence_in_order, god_object_check avec 4 specs de jalons (event_search, version_rewind, review_snapshot, undo) derivees du code, dashboard exclu (silencieux). SEUL RESTE, et NE PEUT PAS etre fait par l'agent (requiert session QGIS de l'utilisateur): prouver en runtime chaque mode via mark(mode) -> exercer GUI -> check_mode(mode)=PASS. Procedure dans scripts/validation/golden_logs/README.md. Une fois >=1 mode PASS runtime cite -> advance PATCHED->PROVEN; les 5 modes -> base solide pour demarrer les phases d'extraction. NE PAS marquer PROVEN sans log runtime (charte)."
     }
   ]
 }
