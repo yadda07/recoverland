@@ -142,6 +142,29 @@ def assert_counter(
     return (label, ok, f"n={n} expected={expected}")
 
 
+def diff_against_golden(
+    records: Iterable[LogRecord],
+    golden_id: str,
+    name: Optional[str] = None,
+    **extract_opts,
+) -> Assertion:
+    """Assert the main-thread milestone sequence matches golden_logs/<id>.golden.
+
+    Proves behaviour preservation across a God Object extraction phase: any
+    lost, extra or reordered milestone fails the assertion. `extract_opts` are
+    forwarded to `golden.extract_sequence` (main_thread_only, levels, include).
+    """
+    from .golden import extract_sequence, read_golden, compare_sequences
+    label = name or f"golden:{golden_id}"
+    try:
+        golden = read_golden(golden_id)
+    except FileNotFoundError:
+        return (label, False, f"golden missing: run capture for {golden_id}")
+    current = extract_sequence(records, **extract_opts)
+    ok, detail = compare_sequences(current, golden)
+    return (label, ok, detail)
+
+
 @dataclass
 class AssertionSummary:
     total: int
@@ -166,5 +189,6 @@ __all__ = [
     "assert_no_log_between",
     "assert_field_value",
     "assert_counter",
+    "diff_against_golden",
     "summarize",
 ]
