@@ -1,44 +1,60 @@
-# golden_logs/
+# God Object non-regression checks (golden_logs/)
 
-References verrouillees pour la non-regression de comportement du chantier
-God Object (`BL-DIAG-P2-14`). Voir
-`docs/backlog_god_object_recover_dialog_2026-06-21.md` section 7.
+Filet de non-regression **move-only** du chantier God Object (`BL-DIAG-P2-14`).
+Voir `docs/backlog_god_object_recover_dialog_2026-06-21.md`.
 
-Un fichier `<golden_id>.golden` contient la **sequence ordonnee des jalons de log
-main-thread** d'un scenario de reference, tokens volatils masques (trace id,
-uuid, durees, adresses). Apres chaque phase d'extraction, on rejoue le scenario
-et `diff_against_golden` exige une sequence identique.
+## Modele retenu (decision D-GOD-01) : jalons ordonnes par mode
 
-## Baselines attendues (5 modes)
+Plutot que geler une sequence de log complete (fragile : rotation, bruit paint,
+capture manuelle), on verifie que les **jalons clefs de chaque mode** apparaissent
+**dans le bon ordre**, en ignorant tout log non-jalon. Les jalons sont **derives
+du code reel** de `recover_dialog.py` et vivent dans
+`scripts/validation/god_object_check.py` (dict `MILESTONES`).
 
-| golden_id | Mode | Actions a executer dans QGIS |
-|---|---|---|
-| `dashboard` | Dashboard | ouvrir le dialog, changer la couche puis l'operation |
-| `event_search` | Event search | rechercher des events, en restaurer un |
-| `version_rewind` | Version rewind | rewind avec auto-undo, attendre le resume |
-| `review_snapshot` | Review snapshot | toggle review, changer la date, pan/zoom |
-| `undo` | Undo | undo last restore, puis undo session |
+Avant ET apres chaque phase d'extraction, on exerce le mode et on verifie que la
+meme sequence de jalons tient. Toute perte/inversion d'un jalon = FAIL.
 
-## Capture (depuis la console Python QGIS, plugin charge)
+### Modes couverts
+
+| mode | jalons (dans l'ordre) |
+|---|---|
+| `event_search` | `recover_and_load: START` -> `recover_event: start` -> `_display_search_result: total_count=` -> `restore_event: start` -> `restore_event: done` |
+| `version_rewind` | `recover_version: start` -> `on_version_fetch_done: raw=` -> `recover_version: done` |
+| `review_snapshot` | `review: snapshot_mode_start` -> `snapshot_init_direct` -> `snapshot_bar_shown` -> `snapshot_ready` |
+| `undo` | `undo_last: requested` -> `undo_done: trace invalidation` |
+
+`dashboard` n'est **pas** couvert : le flux stats (`_request_stats_refresh`,
+`_on_stats_ready`) n'emet aucun jalon `flog`. Le couvrir exigerait d'ajouter de
+l'instrumentation d'abord (item separe), pas d'inventer une spec.
+
+## Procedure (console Python QGIS, plugin charge)
 
 ```python
 import sys
-from pathlib import Path
-SCRIPTS = Path(r'C:\Users\yadda\AppData\Roaming\QGIS\QGIS4\profiles\default\python\plugins\recoverland')
-sys.path.insert(0, str(SCRIPTS))
-from scripts.validation import golden
+for m in [k for k in list(sys.modules) if k.startswith('scripts.validation')]:
+    del sys.modules[m]                       # purge le cache QGIS (modules a jour)
+sys.path.insert(0, r'C:\Users\yadda\AppData\Roaming\QGIS\QGIS4\profiles\default\python\plugins\recoverland')
+from scripts.validation import god_object_check as gc
 
-off = golden.capture_start()          # 1) marque le debut
-# 2) executer manuellement les actions du mode (cf. tableau)
-golden.capture_finish('event_search', off)   # 3) ecrit golden_logs/event_search.golden
+gc.mark('event_search')        # 1) pose un marqueur sentinelle dans le log
+# 2) exercer le mode dans la GUI (cf. tableau ci-dessus)
+gc.check_mode('event_search')  # 3) -> verdict=PASS si les jalons tiennent dans l'ordre
 ```
 
-Recommencer pour chaque `golden_id`. Les `.golden` sont **versionnes** (reference
-verrouillee), contrairement a `reports/` qui est gitignore.
+Le fenetrage utilise un marqueur (`GOLDEN_MARK id=<mode>` flogue par `mark()`),
+robuste a la rotation du log (contrairement a une capture par offset). Si un
+jalon manque, le message indique lequel : `milestone[i] /.../ not found`.
 
-## Verification (apres une phase d'extraction)
+## Auto-test hors QGIS
 
-`diff_against_golden(records, '<golden_id>')` dans les assertions d'un scenario,
-ou comparaison directe via `golden.compare_sequences(...)`.
+```
+python -m scripts.validation.god_object_check --selftest   # 10 cas: PASS/FAIL par mode
+python -m scripts.validation.assert_log --selftest         # primitive assert_sequence_in_order
+```
 
-Tooling auto-teste hors QGIS : `python -m scripts.validation.golden --selftest`.
+## Golden full-sequence (secondaire, optionnel)
+
+`golden.py` + `diff_against_golden` conservent la comparaison de sequence complete
+(avec garde-fous anti-vide / anti-rotation, `python -m scripts.validation.golden
+--selftest`) pour un usage cible. Les `.golden` eventuels sont versionnes ; ils ne
+sont **pas requis** par le modele D-GOD-01.

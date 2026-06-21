@@ -18,6 +18,7 @@ from __future__ import annotations
 import difflib
 import re
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -78,8 +79,18 @@ def golden_path(golden_id: str) -> Path:
     return _GOLDEN_DIR / f"{golden_id}.golden"
 
 
-def write_golden(golden_id: str, sequence: Sequence[str]) -> Path:
-    """Persist a captured sequence as the versioned reference."""
+def write_golden(golden_id: str, sequence: Sequence[str], *, min_events: int = 1) -> Path:
+    """Persist a captured sequence as the versioned reference.
+
+    Refuses a degenerate (empty/too-short) golden BEFORE any filesystem side
+    effect: such a baseline is worse than none, since diff_against_golden would
+    then pass against noise or an empty run.
+    """
+    if len(sequence) < min_events:
+        raise ValueError(
+            f"refusing degenerate golden id={golden_id} n_events={len(sequence)} "
+            f"min={min_events}: nothing written"
+        )
     _GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     path = golden_path(golden_id)
     header = [
@@ -141,14 +152,36 @@ def capture_finish(
     golden_id: str,
     start_offset: int,
     log_path: Optional[Path] = None,
-    **opts,
+    *,
+    min_events: int = 1,
+    **extract_opts,
 ) -> Path:
-    """Read the log window since start_offset and write the golden reference."""
+    """Read the log window since start_offset and write the golden reference.
+
+    Loud failure (no file written) on two real-world traps observed in QGIS:
+      - degenerate window: fewer than `min_events` milestones (e.g. captured
+        with no interaction between start and finish);
+      - rotation: the RotatingFileHandler rolled the 5 MB file mid-capture, so
+        the byte offset now points past EOF of a fresh file.
+    """
     from .runner import _resolve_log_path
     path = log_path or _resolve_log_path()
+    end_size = log_file_size(path)
+    if end_size < start_offset:
+        raise ValueError(
+            f"[golden] REFUSED id={golden_id}: log rotated during capture "
+            f"(end_size={end_size} < start_offset={start_offset}). "
+            f"Offset capture unreliable here; nothing written."
+        )
     records = read_records(path, start_offset=start_offset)
-    sequence = extract_sequence(records, **opts)
-    out = write_golden(golden_id, sequence)
+    sequence = extract_sequence(records, **extract_opts)
+    if len(sequence) < min_events:
+        raise ValueError(
+            f"[golden] REFUSED id={golden_id}: degenerate capture "
+            f"n_milestones={len(sequence)} min={min_events} n_raw={len(records)}. "
+            f"Exercise the mode between capture_start and capture_finish. Nothing written."
+        )
+    out = write_golden(golden_id, sequence, min_events=min_events)
     print(f"[golden] captured id={golden_id} n_events={len(sequence)} path={out}")
     return out
 
@@ -204,6 +237,40 @@ def _selftest() -> int:
         noisy.insert(2, extra_worker)
     ok, _ = compare_sequences(extract_sequence(noisy), golden)
     cases.append(("worker_noise_ignored", ok is True))
+
+    # 6. write_golden refuses an empty sequence (no filesystem side effect)
+    _tid = "selftest_never_written"
+    try:
+        write_golden(_tid, [])
+        refused = False
+    except ValueError:
+        refused = True
+    cases.append(("write_golden_refuses_empty", refused))
+    cases.append(("no_file_on_refusal", not golden_path(_tid).exists()))
+
+    # 7+8. capture_finish refuses degenerate window and rotation (real temp log,
+    # no QGIS): explicit log_path bypasses _resolve_log_path.
+    tmp = Path(tempfile.gettempdir()) / "golden_selftest_capture.log"
+    tmp.write_text(
+        "2026-06-21T16:00:00.000 [DEBUG  ] [MainThread     ] timeline: paint noise\n",
+        encoding="utf-8",
+    )
+    try:
+        capture_finish(_tid, start_offset=0, log_path=tmp, min_events=1)
+        refused_degenerate = False
+    except ValueError:
+        refused_degenerate = True
+    cases.append(("capture_refuses_degenerate", refused_degenerate))
+    try:
+        capture_finish(_tid, start_offset=10**9, log_path=tmp, min_events=1)
+        refused_rotation = False
+    except ValueError:
+        refused_rotation = True
+    cases.append(("capture_refuses_rotation", refused_rotation))
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
 
     all_ok = all(passed for _, passed in cases)
     for name, passed in cases:
