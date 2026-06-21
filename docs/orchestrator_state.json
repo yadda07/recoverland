@@ -612,9 +612,17 @@
           "to": "PATCHED",
           "by": "/corrector",
           "evidence": "3 specs de jalons restantes DERIVEES du code reel recover_dialog.py: version_rewind (recover_version:start L2872, on_version_fetch_done:raw= L2925, recover_version:done L3266), review_snapshot (snapshot_mode_start L2008, snapshot_init_direct L2148, snapshot_bar_shown L2195, snapshot_ready L2207), undo (undo_last:requested L4200, undo_done:trace invalidation L4278). CONSTAT honnete: 'dashboard' EXCLU - _request_stats_refresh L535 / _on_stats_ready L550 n'emettent AUCUN flog (flux silencieux), spec non inventee. Auto-test pilote par les donnees etendu aux 4 modes. PREUVE antithese hors QGIS (--selftest, 10 cas): {event_search,version_rewind,review_snapshot,undo} x {full_flow_passes, missing_last_milestone_fails} + no_mark_fails + empty_window_is_not_no_mark -> 'VERDICT=PASS note=check_can_fail'. py_compile OK. README golden_logs reecrit (D-GOD-01 primaire, procedure runtime, golden secondaire)."
+        },
+        {
+          "ts": "2026-06-21T17:40:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/git",
+          "evidence": "Commit e89ecf9 pousse sur main (acdf6ac..e89ecf9): 5 fichiers, +455/-43, scripts/validation/god_object_check.py cree. Checkpoint de l'outil prouve OFFLINE - ce N'EST PAS une transition vers DONE: la charte exige PROVEN (run QGIS + log cite) avant DONE, et le runtime n'est pas encore fait. Item reste PATCHED. Increment Phase 0 precedent = 9dfa42e."
         }
       ],
-      "commit_hash": "9dfa42e",
+      "commit_hash": "e89ecf9",
+      "commit_hash_phase0": "9dfa42e",
       "log_evidence_excerpt": "OFFLINE PROUVE: AST 'verdict=PASS passed=8' + 'SELFTEST_VERDICT verdict=PASS note=guard_can_fail'; assert_log 'VERDICT=PASS note=assertion_can_fail'; golden 9 cas 'note=comparator_can_fail'; god_object_check 10 cas (4 modes x full_flow_passes/missing_last_milestone_fails + no_mark_fails + empty_window_is_not_no_mark) 'VERDICT=PASS note=check_can_fail'. RUNTIME QGIS: NON prouve - requiert l'utilisateur (mark/check_mode par mode).",
       "remaining_for_done": "TOUT le faisable hors QGIS est FAIT et prouve offline + commite: garde AST, garde-fous golden anti-vide/rotation, assert_sequence_in_order, god_object_check avec 4 specs de jalons (event_search, version_rewind, review_snapshot, undo) derivees du code, dashboard exclu (silencieux). SEUL RESTE, et NE PEUT PAS etre fait par l'agent (requiert session QGIS de l'utilisateur): prouver en runtime chaque mode via mark(mode) -> exercer GUI -> check_mode(mode)=PASS. Procedure dans scripts/validation/golden_logs/README.md. Une fois >=1 mode PASS runtime cite -> advance PATCHED->PROVEN; les 5 modes -> base solide pour demarrer les phases d'extraction. NE PAS marquer PROVEN sans log runtime (charte)."
     }
