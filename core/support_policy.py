@@ -78,12 +78,11 @@ _DEFAULT_POLICY = ProviderPolicy(
 
 def _edit_capabilities_mask():
     from ..compat import QgisCompat
-    return (
-        QgisCompat.CAP_ADD_FEATURES |
-        QgisCompat.CAP_DELETE_FEATURES |
-        QgisCompat.CAP_CHANGE_ATTRIBUTE_VALUES |
-        QgisCompat.CAP_CHANGE_GEOMETRIES
-    )
+    mask = QgisCompat.CAP_ADD_FEATURES
+    mask |= QgisCompat.CAP_DELETE_FEATURES
+    mask |= QgisCompat.CAP_CHANGE_ATTRIBUTE_VALUES
+    mask |= QgisCompat.CAP_CHANGE_GEOMETRIES
+    return mask
 
 
 def get_provider_policy(provider_name: str) -> ProviderPolicy:

@@ -170,8 +170,7 @@ def purge_old_events_with_options(conn: sqlite3.Connection,
                 orphan_trace_deleted = _purge_orphan_traces(conn)
 
             total_deleted = (
-                retention_deleted + excess_deleted + invalidated_deleted
-                + pair_deleted + orphan_trace_deleted
+                retention_deleted + excess_deleted + invalidated_deleted + pair_deleted + orphan_trace_deleted
             )
 
             if total_deleted > 0:
@@ -193,8 +192,7 @@ def purge_old_events_with_options(conn: sqlite3.Connection,
     except sqlite3.Error as e:
         flog(f"retention: purge error: {e}", "ERROR")
         total = (
-            retention_deleted + excess_deleted + invalidated_deleted
-            + pair_deleted + orphan_trace_deleted
+            retention_deleted + excess_deleted + invalidated_deleted + pair_deleted + orphan_trace_deleted
         )
         return PurgeResult(
             deleted_count=total,

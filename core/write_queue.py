@@ -26,11 +26,13 @@ _BATCH_RETRY_COUNT = 3
 _BATCH_RETRY_BASE_SEC = 0.2
 _WAL_CHECKPOINT_INTERVAL_SEC = 60
 
-_INSERT_SQL = (
-    "INSERT INTO audit_event (" +  # nosec B608: column list is a module constant
-    AUDIT_EVENT_INSERT_SQL +
-    ") VALUES (" + AUDIT_EVENT_INSERT_PLACEHOLDERS + ")"
-)
+_INSERT_SQL = "".join((
+    "INSERT INTO audit_event (",  # nosec B608: column list is a module constant
+    AUDIT_EVENT_INSERT_SQL,
+    ") VALUES (",
+    AUDIT_EVENT_INSERT_PLACEHOLDERS,
+    ")",
+))
 
 
 class WriteQueue:

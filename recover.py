@@ -239,10 +239,7 @@ class RecoverPlugin:
                 raw = settings.value("RecoverLand/tracked_layers", "[]")
             try:
                 ids = json.loads(raw if isinstance(raw, str) else "[]")
-                if (
-                    isinstance(ids, list) and ids
-                    and all(isinstance(val, str) and "::" in val for val in ids)
-                ):
+                if (isinstance(ids, list) and ids and all(isinstance(val, str) and "::" in val for val in ids)):
                     self._tracker.set_filter(set(ids))
             except (ValueError, TypeError) as exc:
                 flog(f"RecoverPlugin: cannot parse tracked_layer_fingerprints: {exc}", "WARNING")
