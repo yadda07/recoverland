@@ -62,12 +62,13 @@ def has_active_restore_traces(
     if not datasource_fps:
         return False
     placeholders = ",".join("?" for _ in datasource_fps)
-    query = (
-        "SELECT 1 FROM audit_event WHERE "
-        "restored_from_event_id IS NOT NULL AND invalidated_at IS NULL "
-        f"AND datasource_fingerprint IN ({placeholders})"
-        " LIMIT 1"
-    )
+    query = "".join((
+        "SELECT 1 FROM audit_event WHERE ",
+        "restored_from_event_id IS NOT NULL AND invalidated_at IS NULL ",
+        "AND datasource_fingerprint IN (",
+        placeholders,
+        ") LIMIT 1",
+    ))
     row = conn.execute(query, list(datasource_fps)).fetchone()
     result = row is not None
     flog(
