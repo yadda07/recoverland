@@ -3,7 +3,7 @@
   "generated_at": "2026-06-22T06:00:00Z",
   "session_active": {
     "current_item": "BL-I18N-P0-01",
-    "current_state": "PROVEN",
+    "current_state": "DONE",
     "current_pilot": "/corrector",
     "started_at": "2026-06-22T09:26:00Z",
     "notes": "BL-I18N-P0-01 PROVEN. G4 runtime PASS 36/36 trace_id=96f3e4b1 dans QGIS console Python (locale non modifiee). Precedentes tentatives FAIL prouvent le test discrimine: trace_id=47bdde1c (6/36 avec .qm custom malforme), trace_id=18640186 (path __file__), crash (sys.exit). .qm final compile avec lrelease 5.15.2 (337 traductions). BL-REL-P0-01 peut avancer vers DONE quand qm frais est inclus dans le ZIP release."
@@ -181,10 +181,17 @@
           "to": "PROVEN",
           "by": "/corrector",
           "evidence": "G4 PROVEN runtime QGIS: i18n_runtime_qgis.py verdict=PASS passed=36/36 trace_id=96f3e4b1. Toutes les traductions ReviewStatusWidget/ReviewSegmentedSwitch/AppleToggleSwitch/CanvasDateBar retournent bien l'anglais via QCoreApplication.translate avec recoverland_en.qm charge manuellement. Locale QGIS non modifiee. 4 tentatives precedentes (crash, path, unicode/ascii, .qm custom malforme) prouvent que le scenario discrimine correctement."
+        },
+        {
+          "ts": "2026-06-22T18:07:00Z",
+          "from": "PROVEN",
+          "to": "DONE",
+          "by": "/git",
+          "evidence": "Commit BL-I18N-P0-01: 8 fichiers (2 nouveaux scenarios i18n, 2 widgets, 3 i18n, 1 ledger). Message: BL-I18N-P0-01: i18n FR->EN Review/Snapshot widgets + G4 PROVEN (36/36). Hash: 2ae4ed83b04e4f21f8aff8a0e45d1fadb1ab415a. Push: origin/main a jour."
         }
       ],
-      "commit_hash": "",
-      "log_evidence_excerpt": "G2 FAIL trace_id=558308aa (1/4); G3 PASS trace_id=b18c83c9 (4/4); G3.5 antithese PASS trace_id=9c70ad70 (5/5); G4 PROVEN PASS trace_id=96f3e4b1 (36/36)."
+      "commit_hash": "2ae4ed83b04e4f21f8aff8a0e45d1fadb1ab415a",
+      "log_evidence_excerpt": "G2 FAIL trace_id=558308aa (1/4); G3 PASS trace_id=b18c83c9 (4/4); G3.5 antithese PASS trace_id=9c70ad70 (5/5); G4 PROVEN PASS trace_id=96f3e4b1 (36/36); commit 2ae4ed83."
     },
     {
       "id": "RL-E1-01",
