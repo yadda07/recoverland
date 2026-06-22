@@ -24,7 +24,7 @@ class AppleToggleSwitch(QWidget):
         self._anim.valueChanged.connect(self._update_pos)
         self.setFixedSize(50, 28)
         self.setCursor(QtCompat.POINTING_HAND_CURSOR)
-        self.setToolTip("Enregistrement des modifications : actif")
+        self.setToolTip(self.tr("Enregistrement des modifications : actif"))
 
     def isChecked(self) -> bool:
         return self._checked
@@ -42,7 +42,7 @@ class AppleToggleSwitch(QWidget):
         else:
             self._anim_pos = target
             self.update()
-        tip = "Enregistrement actif" if value else "Enregistrement desactive"
+        tip = self.tr("Enregistrement actif") if value else self.tr("Enregistrement desactive")
         self.setToolTip(tip)
 
     def _update_pos(self, pos):

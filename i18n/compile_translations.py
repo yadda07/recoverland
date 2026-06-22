@@ -1,14 +1,17 @@
-"""Pure-Python .ts -> .qm compiler for RecoverLand.
+""".ts -> .qm compiler for RecoverLand.
 
-No external tool required.  Produces a binary .qm file that
-QTranslator.load() can read.
+Prefers the Qt lrelease tool when available (produces a standard .qm
+that QTranslator reads reliably). Falls back to a pure-Python compiler
+for environments without lrelease.
 
 Usage (QGIS Python console or standalone):
     from recoverland.i18n.compile_translations import compile_ts_files
     compile_ts_files()
 """
 import os
+import shutil
 import struct
+import subprocess
 import xml.etree.ElementTree as ET
 
 try:
@@ -70,10 +73,16 @@ def _pack_field(tag: int, data: bytes) -> bytes:
 
 
 def _build_message_entry(context: str, source: str, translation: str) -> bytes:
+    """Build a standard Qt .qm message entry.
+
+    Format: [Context16][SourceText16][Translation][End].
+    The hash is stored only in the separate hash table block; it must NOT be
+    written inside the message entry because Qt's QTranslator expects the
+    message block to contain only context/source/translation tags.
+    """
     buf = bytearray()
     key = (context + "\n" + source + "\n").encode("utf-8")
     h = _elf_hash(key)
-    buf += struct.pack(">BI", _TAG_HASH, h)
     buf += _pack_field(_TAG_CONTEXT16, _encode_utf16be(context))
     buf += _pack_field(_TAG_SOURCE16, _encode_utf16be(source))
     buf += _pack_field(_TAG_TRANSLATION, _encode_utf16be(translation))
@@ -101,8 +110,40 @@ def _parse_ts(ts_path: str):
             yield context, source, translation
 
 
-def compile_ts_to_qm(ts_path: str, qm_path: str) -> int:
-    """Compile a single .ts file to .qm.  Returns message count."""
+def _find_lrelease() -> str | None:
+    """Return the path to the Qt lrelease tool, or None if not found."""
+    return shutil.which("lrelease")
+
+
+def _compile_with_lrelease(ts_path: str, qm_path: str) -> int | None:
+    """Try to compile with Qt lrelease. Return message count or None on failure."""
+    lrelease = _find_lrelease()
+    if lrelease is None:
+        return None
+    try:
+        result = subprocess.run(
+            [lrelease, ts_path, "-qm", qm_path],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        # lrelease prints summary like "Generated 337 translation(s) ..."
+        for line in result.stdout.splitlines() + result.stderr.splitlines():
+            if "Generated" in line and "translation" in line:
+                try:
+                    return int(line.strip().split()[1])
+                except (ValueError, IndexError):
+                    pass
+        if result.returncode == 0 and os.path.isfile(qm_path):
+            return 0
+        return None
+    except Exception:
+        return None
+
+
+def _compile_with_custom(ts_path: str, qm_path: str) -> int:
+    """Compile a single .ts file to .qm using the pure-Python compiler."""
     messages_buf = bytearray()
     hash_entries = []
 
@@ -129,10 +170,24 @@ def compile_ts_to_qm(ts_path: str, qm_path: str) -> int:
     return len(hash_entries)
 
 
+def compile_ts_to_qm(ts_path: str, qm_path: str) -> int:
+    """Compile a single .ts file to .qm.
+
+    Prefers Qt lrelease for a standard .qm; falls back to the custom compiler.
+    """
+    count = _compile_with_lrelease(ts_path, qm_path)
+    if count is not None:
+        return count
+    return _compile_with_custom(ts_path, qm_path)
+
+
 def compile_ts_files(directory=None):
     """Compile all .ts files in directory to .qm."""
     if directory is None:
         directory = os.path.dirname(os.path.abspath(__file__))
+    lrelease = _find_lrelease()
+    if lrelease is None:
+        print("lrelease not found; using pure-Python fallback compiler")
     for filename in sorted(os.listdir(directory)):
         if not filename.endswith(".ts"):
             continue

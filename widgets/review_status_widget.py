@@ -62,7 +62,7 @@ class ReviewStatusWidget(QWidget):
         self._dot.setStyleSheet(self._dot_css("#95a5a6"))
         layout.addWidget(self._dot)
 
-        self._text_label = QLabel("Review", self)
+        self._text_label = QLabel(self.tr("Review"), self)
         self._text_label.setStyleSheet(
             "font-size: 11px; font-weight: 600; letter-spacing: 0.5px;"
         )
@@ -78,7 +78,7 @@ class ReviewStatusWidget(QWidget):
             "padding: 0; margin: 0; }"
             "QPushButton:hover { background: #c0392b; }"
         )
-        self._stop_btn.setToolTip("Desactiver Review")
+        self._stop_btn.setToolTip(self.tr("Desactiver Review"))
         self._stop_btn.clicked.connect(self.stop_requested.emit)
         self._stop_btn.setVisible(False)
         layout.addWidget(self._stop_btn)
@@ -147,19 +147,19 @@ class ReviewStatusWidget(QWidget):
         """Visual feedback: fetch phase starting."""
         self._dot.setStyleSheet(self._dot_css("#f39c12"))
         self.setStyleSheet(_PILL_WORKING)
-        self._text_label.setText("Review · Recherche...")
-        self.setToolTip("Review — Recherche des modifications")
+        self._text_label.setText(self.tr("Review · Recherche..."))
+        self.setToolTip(self.tr("Review — Recherche des modifications"))
 
     def set_phase(self, phase: str, detail: str = "") -> None:
         """Update to reflect current processing phase."""
         if phase == "fetch":
             self._dot.setStyleSheet(self._dot_css("#f39c12"))
             self.setStyleSheet(_PILL_WORKING)
-            self._text_label.setText("Review · Recherche...")
+            self._text_label.setText(self.tr("Review · Recherche..."))
         elif phase == "render":
             self._dot.setStyleSheet(self._dot_css("#3498db"))
             self.setStyleSheet(_PILL_WORKING)
-            txt = f"Review · Rendu {detail}" if detail else "Review · Rendu..."
+            txt = self.tr("Review · Rendu {detail}").format(detail=detail) if detail else self.tr("Review · Rendu...")
             self._text_label.setText(txt)
         else:
             self._dot.setStyleSheet(self._dot_css("#2ecc71"))
@@ -185,40 +185,41 @@ class ReviewStatusWidget(QWidget):
 
     def _update_text(self) -> None:
         if not self._active:
-            self._text_label.setText("Review")
+            self._text_label.setText(self.tr("Review"))
             return
         if self._n_entities == 0:
-            self._text_label.setText("Review · actif")
+            self._text_label.setText(self.tr("Review · actif"))
         else:
-            self._text_label.setText(f"Review · {self._n_entities}")
+            self._text_label.setText(self.tr("Review · {n}").format(n=self._n_entities))
 
     def _build_tooltip(self) -> str:
-        lines = ["Review — Visualisation temps reel"]
+        lines = [self.tr("Review — Visualisation temps reel")]
         if self._active:
             lines.append(
-                f"{self._n_layers} couche(s) · "
-                f"{self._n_entities} entite(s)"
+                self.tr("{n_layers} couche(s) · {n_entities} entite(s)").format(
+                    n_layers=self._n_layers, n_entities=self._n_entities,
+                )
             )
             if self._last_refresh_ts is not None:
                 ago = int(time.time() - self._last_refresh_ts)
                 if ago < 5:
-                    lines.append("MAJ : a l'instant")
+                    lines.append(self.tr("MAJ : a l'instant"))
                 elif ago < 60:
-                    lines.append(f"MAJ : il y a {ago}s")
+                    lines.append(self.tr("MAJ : il y a {ago}s").format(ago=ago))
                 else:
-                    lines.append(f"MAJ : il y a {ago // 60}min")
+                    lines.append(self.tr("MAJ : il y a {m}min").format(m=ago // 60))
             lines.append("")
-            lines.append("Deplacez la carte pour rafraichir")
-            lines.append("Clic X : desactiver")
+            lines.append(self.tr("Deplacez la carte pour rafraichir"))
+            lines.append(self.tr("Clic X : desactiver"))
         else:
-            lines.append("Inactif")
+            lines.append(self.tr("Inactif"))
         return "\n".join(lines)
 
     def _set_idle(self) -> None:
         self._dot.setStyleSheet(self._dot_css("#95a5a6"))
         self.setStyleSheet(_PILL_IDLE)
-        self._text_label.setText("Review")
-        self.setToolTip("Review — Inactif")
+        self._text_label.setText(self.tr("Review"))
+        self.setToolTip(self.tr("Review — Inactif"))
         self.hide()
 
     @staticmethod
