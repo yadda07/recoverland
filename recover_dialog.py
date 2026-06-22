@@ -2711,8 +2711,18 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_status_widget = None
 
     def _show_review_status_bar(self) -> None:
-        """Insert the Review pill into the QGIS status bar (visible)."""
+        """Insert the Review pill into the QGIS status bar (visible).
+
+        Self-heals if the pill was torn down on a previous dialog close: the
+        dialog instance is reused across reopen (recover.py caches self.dlg),
+        so __init__ does not run again and _review_status_widget would stay
+        None forever, leaving Review with no status indicator nor stop control.
+        """
         if self._review_status_widget is None:
+            flog("review: status_bar widget missing on show — recreating", "INFO")
+            self._setup_review_status_bar()
+        if self._review_status_widget is None:
+            flog("review: status_bar show skipped (widget unavailable)", "WARNING")
             return
         try:
             status_bar = self.iface.mainWindow().statusBar()
@@ -4430,9 +4440,11 @@ class RecoverDialog(QDialog, LoggerMixin):
                     "(snap_mode=True, bar=None) — bar lost",
                     "WARNING",
                 )
-            # Defensive: ensure the status bar pill stays visible.
+            # Defensive: ensure the status bar pill stays visible. Calling
+            # _show_review_status_bar unconditionally lets it self-heal the
+            # widget if a prior dialog close tore it down.
+            self._show_review_status_bar()
             if self._review_status_widget is not None:
-                self._show_review_status_bar()
                 self._review_status_widget.activate()
         elif self._review_snap_mode and not self._review_wants_persist:
             flog("showEvent: snap_mode orphan detected — stopping", "WARNING")
