@@ -5,20 +5,26 @@ Per mode, an ordered list of MILESTONE log patterns derived from the REAL
 the user exercises a mode in QGIS; this asserts the milestones still fire in the
 same relative order, ignoring all non-milestone noise.
 
-Windowing uses a sentinel MARKER flog'd into the log (robust to byte-offset and
-to RotatingFileHandler rotation, unlike the abandoned golden offset capture).
+Two ways to check (both assert the SAME milestone order):
+
+  * RETROSPECTIVE (recommended, no timing): exercise the mode in the GUI, THEN
+    call check_recent(mode). It anchors on the LAST occurrence of the mode's
+    entry milestone, so action order / timing / plugin reload never matter.
+
+  * MARKER (for scripted runs): mark(mode) BEFORE exercising, check_mode(mode)
+    AFTER. The window is everything after the sentinel (needs correct ordering).
 
 Usage (QGIS Python console, plugin loaded):
     from scripts.validation import god_object_check as gc
-    gc.mark('event_search')          # 1) drop a sentinel in the log
-    # 2) exercise the mode in the GUI (search some events, restore one)
-    gc.check_mode('event_search')    # 3) -> PASS/FAIL on milestone order
+    # ... exercise the review / version / event flow in the dialog ...
+    gc.check_recent('review_snapshot')   # -> PASS/FAIL on milestone order
 
 Offline self-test (no QGIS):
     python -m scripts.validation.god_object_check --selftest
 """
 from __future__ import annotations
 
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -32,9 +38,12 @@ from .parse_log import LogRecord, parse_line, read_records
 # values are irrelevant to the match).
 MILESTONES = {
     # Full event search + restore of one event.
+    # Anchored on recover_event:start (the EVENT-mode entry, post-validation),
+    # NOT recover_and_load:START which fires pre-validation in ALL modes and is
+    # therefore not event-specific (confirmed in runtime: 5x recover_and_load
+    # START split across 2 temporal + 3 review, 0 event).
     "event_search": [
-        r"recover_and_load: START",                 # recover_dialog.py:1918
-        r"recover_event: start",                    # :2805
+        r"recover_event: start",                    # recover_dialog.py:2806
         r"_display_search_result: total_count=",    # :3418
         r"restore_event: start",                    # :3884
         r"restore_event: done",                     # :3906
@@ -118,6 +127,43 @@ def check_mode(mode: str, log_path: Optional[Path] = None) -> bool:
     return ok
 
 
+def find_last_run(mode: str, records: List[LogRecord]) -> Optional[List[LogRecord]]:
+    """Return records from the LAST occurrence of the mode's entry milestone.
+
+    Anchors on the mode's own first milestone instead of a manual marker, so the
+    user can exercise the mode at any time and check afterwards. Returns None if
+    the entry milestone never appears in the log.
+    """
+    if mode not in MILESTONES:
+        raise KeyError(f"unknown mode {mode!r}; known={sorted(MILESTONES)}")
+    entry = re.compile(MILESTONES[mode][0])
+    last = -1
+    for i, rec in enumerate(records):
+        if entry.search(rec.raw):
+            last = i
+    if last < 0:
+        return None
+    return records[last:]
+
+
+def check_recent(mode: str, log_path: Optional[Path] = None) -> bool:
+    """Retrospective check (no marker): find the LAST run of `mode` and assert
+    milestone order. Exercise the mode in the GUI first, then call this.
+    """
+    from .runner import _resolve_log_path
+    path = log_path or _resolve_log_path()
+    records = read_records(path)
+    window = find_last_run(mode, records)
+    if window is None:
+        print(f"[god-check] mode={mode} verdict=FAIL entry_never_logged "
+              f"/{MILESTONES[mode][0]}/ (exercise the {mode} flow in the GUI first)")
+        return False
+    name, ok, msg = check_records(mode, window)
+    print(f"[god-check] mode={mode} n_records={len(window)} since=last_entry "
+          f"verdict={'PASS' if ok else 'FAIL'} {msg}")
+    return ok
+
+
 # --- Antithese offline: prove the check detects regressions for every mode ---
 
 def _synth_log(mode: str, patterns, *, stale_mark: bool = False) -> str:
@@ -146,15 +192,26 @@ def _selftest() -> int:
     tmp = Path(tempfile.gettempdir()) / "god_check_selftest.log"
     cases = []
 
-    # Per mode: full flow in order (with noise + stale mark) -> PASS;
-    # drop the last milestone -> FAIL.
+    # Per mode, for BOTH checkers: full flow in order -> PASS;
+    # last run missing its final milestone -> FAIL.
     for mode, patterns in MILESTONES.items():
         tmp.write_text(_synth_log(mode, patterns, stale_mark=True), encoding="utf-8")
-        cases.append((f"{mode}_full_flow_passes",
+        cases.append((f"{mode}_check_mode_passes",
                       check_mode(mode, log_path=tmp) is True))
+        cases.append((f"{mode}_check_recent_passes",
+                      check_recent(mode, log_path=tmp) is True))
         tmp.write_text(_synth_log(mode, patterns[:-1]), encoding="utf-8")
-        cases.append((f"{mode}_missing_last_milestone_fails",
+        cases.append((f"{mode}_check_mode_missing_fails",
                       check_mode(mode, log_path=tmp) is False))
+        cases.append((f"{mode}_check_recent_missing_fails",
+                      check_recent(mode, log_path=tmp) is False))
+
+    # check_recent with the entry milestone never logged -> FAIL (loud)
+    tmp.write_text(
+        "2026-06-21T18:30:00.000 [INFO   ] [MainThread     ] unrelated noise only\n",
+        encoding="utf-8")
+    cases.append(("check_recent_entry_never_logged_fails",
+                  check_recent("event_search", log_path=tmp) is False))
 
     # no mark at all -> FAIL (loud, not silent pass)
     tmp.write_text(
@@ -189,5 +246,5 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
     print("usage: python -m scripts.validation.god_object_check --selftest")
-    print("runtime: gc.mark(mode) -> exercise GUI -> gc.check_mode(mode)")
+    print("runtime: exercise the mode in the GUI -> gc.check_recent(mode)")
     raise SystemExit(0)
