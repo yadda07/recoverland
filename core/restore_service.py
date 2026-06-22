@@ -274,9 +274,11 @@ def _find_by_snapshot(
     relevant = [
         (hist_name, fields.indexOf(hist_name))
         for hist_name in expected_attrs.keys()
-        if not is_layer_audit_field(hist_name) and
-        fields.indexOf(hist_name) >= 0 and
-        fields.indexOf(hist_name) not in pk_field_indices
+        if all((
+            not is_layer_audit_field(hist_name),
+            fields.indexOf(hist_name) >= 0,
+            fields.indexOf(hist_name) not in pk_field_indices,
+        ))
     ]
     pk_skipped = [
         hist_name for hist_name in expected_attrs.keys()
@@ -285,9 +287,11 @@ def _find_by_snapshot(
 
     matches: List[int] = []
     request = QgsFeatureRequest()
-    has_geom_filter = (expected_geom is not None and
-                       hasattr(request, "setFilterRect") and
-                       hasattr(expected_geom, "boundingBox"))
+    has_geom_filter = all((
+        expected_geom is not None,
+        hasattr(request, "setFilterRect"),
+        hasattr(expected_geom, "boundingBox"),
+    ))
     if has_geom_filter:
         request.setFilterRect(expected_geom.boundingBox())
     source = get_feature_source(layer)
@@ -444,13 +448,11 @@ def _diagnose_snapshot_miss(layer, event: AuditEvent) -> None:
     relevant = [
         (hist_name, fields.indexOf(hist_name))
         for hist_name in expected_attrs.keys()
-        if not is_layer_audit_field(hist_name) and
-        fields.indexOf(hist_name) >= 0
+        if not is_layer_audit_field(hist_name) and fields.indexOf(hist_name) >= 0
     ]
 
     request = QgsFeatureRequest()
-    if (hasattr(request, "setFilterRect") and
-            hasattr(expected_geom, "boundingBox")):
+    if (hasattr(request, "setFilterRect") and hasattr(expected_geom, "boundingBox")):
         request.setFilterRect(expected_geom.boundingBox())
     source = get_feature_source(layer)
 
@@ -698,11 +700,11 @@ def _classify_restore_result(result: Dict[str, Any]) -> str:
         "drift" in msg and "tolerance" in msg
     ):
         return "geometry_drift"
-    if (
-        "target feature absent" in msg or
-        "feature already absent" in msg or
-        "identity mismatch" in msg
-    ):
+    if any((
+        "target feature absent" in msg,
+        "feature already absent" in msg,
+        "identity mismatch" in msg,
+    )):
         return "target_absent"
     if success and skipped:
         return "skipped_idempotent"

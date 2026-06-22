@@ -183,8 +183,7 @@ class EditSessionTracker:
         # full identity/support evaluation on each was pure overhead. Marked
         # via custom property before they ever reach the project registry.
         try:
-            if (layer.customProperty("_rl_snap_managed") == "1" or
-                    layer.customProperty("_rl_lens_managed") == "1"):
+            if (layer.customProperty("_rl_snap_managed") == "1" or layer.customProperty("_rl_lens_managed") == "1"):
                 return
         except (RuntimeError, AttributeError):
             pass
@@ -632,8 +631,7 @@ class EditSessionTracker:
         added_set = set(edit_buf.addedFeatures().keys())
 
         geom_fids = set(changed_geoms.keys()) - deleted_set - added_set
-        attr_only_fids = (set(changed_attrs.keys()) - deleted_set - added_set -
-                          geom_fids)
+        attr_only_fids = (set(changed_attrs.keys()) - deleted_set - added_set - geom_fids)
 
         excluded_added = (set(changed_geoms) | set(changed_attrs)) & added_set
         excluded_deleted = (set(changed_geoms) | set(changed_attrs)) & deleted_set

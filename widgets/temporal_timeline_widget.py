@@ -517,10 +517,7 @@ class TemporalTimelineWidget(QWidget):
         p.setPen(QPen(_COLOR_HANDLE_RING, 2))
         p.drawLine(hx_i, ty - 4, hx_i, ty + _TRACK_H + 4)
 
-        hovering = (
-            self._hover_pos is not None
-            and abs(self._hover_pos - hx_i) < _HANDLE_R + 4
-        )
+        hovering = (self._hover_pos is not None and abs(self._hover_pos - hx_i) < _HANDLE_R + 4)
         fill = _COLOR_HANDLE_HOVER if hovering else _COLOR_HANDLE
         p.setBrush(fill)
         p.setPen(QPen(_COLOR_HANDLE_RING, 2))

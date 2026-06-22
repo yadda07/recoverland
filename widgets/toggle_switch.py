@@ -11,7 +11,7 @@ class AppleToggleSwitch(QWidget):
 
     toggled = pyqtSignal(bool)
 
-    _COLOR_ON  = QColor(52, 199, 89)    # Apple system green
+    _COLOR_ON = QColor(52, 199, 89)     # Apple system green
     _COLOR_OFF = QColor(142, 142, 147)  # Apple system gray
 
     def __init__(self, parent=None):
@@ -60,9 +60,9 @@ class AppleToggleSwitch(QWidget):
         radius = h / 2.0
         t = self._anim_pos
 
-        r = int(self._COLOR_OFF.red()   + (self._COLOR_ON.red()   - self._COLOR_OFF.red())   * t)
+        r = int(self._COLOR_OFF.red() + (self._COLOR_ON.red() - self._COLOR_OFF.red()) * t)
         g = int(self._COLOR_OFF.green() + (self._COLOR_ON.green() - self._COLOR_OFF.green()) * t)
-        b = int(self._COLOR_OFF.blue()  + (self._COLOR_ON.blue()  - self._COLOR_OFF.blue())  * t)
+        b = int(self._COLOR_OFF.blue() + (self._COLOR_ON.blue() - self._COLOR_OFF.blue()) * t)
         p.setPen(QtCompat.NO_PEN)
         p.setBrush(QColor(r, g, b))
         p.drawRoundedRect(QRectF(0, 0, w, h), radius, radius)

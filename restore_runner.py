@@ -94,8 +94,7 @@ def _finish_runner(
     # Any drift between total_ok+total_fail and the 5-bucket sum exposes
     # a classification bug. We log a WARNING but do not raise; the user
     # gets correct restore results, just without trustworthy metrics.
-    bucket_sum = (applied + skipped_idempotent + failed_other
-                  + failed_target_absent + failed_geometry_drift)
+    bucket_sum = (applied + skipped_idempotent + failed_other + failed_target_absent + failed_geometry_drift)
     expected = total_ok + total_fail
     if breakdown is not None and bucket_sum != expected:
         flog(

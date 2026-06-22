@@ -103,8 +103,7 @@ class ThemedLogoWidget(QWidget):
             self._smoke_opacity = min(1.0, self._smoke_opacity + self._OPACITY_STEP)
         else:
             self._smoke_opacity = max(0.0, self._smoke_opacity - self._OPACITY_STEP)
-            if (self._smoke_opacity <= 0.0
-                    and self._anim.state() == QtCompat.ANIM_STATE_RUNNING):
+            if (self._smoke_opacity <= 0.0 and self._anim.state() == QtCompat.ANIM_STATE_RUNNING):
                 self._anim.stop()
                 self._cycle_phase = 0.0
         self.update()

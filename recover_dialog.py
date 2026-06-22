@@ -49,10 +49,10 @@ import time
 import uuid
 
 CHANGE_TYPE_COLORS = {
-    "modified":  QColor(66, 133, 244, 60),
-    "emptied":   QColor(219, 68, 55, 55),
+    "modified": QColor(66, 133, 244, 60),
+    "emptied": QColor(219, 68, 55, 55),
     "populated": QColor(52, 168, 83, 55),
-    "geometry":  QColor(255, 152, 0, 60),
+    "geometry": QColor(255, 152, 0, 60),
 }
 
 
@@ -62,10 +62,10 @@ def _change_type_labels():
     def _tr(msg):
         return QCoreApplication.translate("RecoverDialog", msg)
     return {
-        "modified":  _tr("Valeur modifiee"),
-        "emptied":   _tr("Valeur videe"),
+        "modified": _tr("Valeur modifiee"),
+        "emptied": _tr("Valeur videe"),
         "populated": _tr("Valeur ajoutee"),
-        "geometry":  _tr("Geometrie modifiee"),
+        "geometry": _tr("Geometrie modifiee"),
     }
 
 
@@ -1878,8 +1878,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         current = self.progress_bar.value()
         if target_value == current:
             return
-        running = (self._progress_smoother.state()
-                   == QtCompat.ANIM_STATE_RUNNING)
+        running = (self._progress_smoother.state() == QtCompat.ANIM_STATE_RUNNING)
         if target_value <= 0 or target_value >= 100:
             if running:
                 self._progress_smoother.stop()
@@ -2155,8 +2154,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._review_snap_mode = True
 
         today = _dt.date.today().isoformat()
-        first_iso = ((_dt.date.today() - _dt.timedelta(days=5 * 365)).isoformat()
-                     + "T00:00:00")
+        first_iso = ((_dt.date.today() - _dt.timedelta(days=5 * 365)).isoformat() + "T00:00:00")
         last_iso = today + "T23:59:59"
 
         canvas = self.iface.mapCanvas()
@@ -2373,8 +2371,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         # Same cutoff already reconstructed → no journal re-read, just re-apply
         # the cached result to the current viewport.
-        if (self._review_snap_raw_result is not None
-                and self._review_snap_raw_iso == iso):
+        if (self._review_snap_raw_result is not None and self._review_snap_raw_iso == iso):
             flog(f"review: snapshot_reuse_cached iso={iso}", "DEBUG")
             self._refresh_snapshot_for_extent()
             return
@@ -2683,8 +2680,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         """
         if not self._review_snap_mode or not self._review_snap_pending_iso:
             return
-        if (self._review_snap_raw_result is not None
-                and self._review_snap_raw_iso == self._review_snap_pending_iso):
+        if (self._review_snap_raw_result is not None and self._review_snap_raw_iso == self._review_snap_pending_iso):
             flog(
                 f"review: snap_extent_reapply iso={self._review_snap_pending_iso}",
                 "DEBUG",
@@ -2990,9 +2986,11 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.recover_button.setEnabled(True)
             if trace_id:
                 self._active_restore_trace_id = ""
-            qlog(self.tr("{count} evenements depassent la limite ({limit}). "
-                         "Choisissez une date plus recente.").format(
-                     count=total_count, limit=MAX_EVENTS_PER_RESTORE), "WARNING")
+            msg = self.tr(
+                "{count} evenements depassent la limite ({limit}). "
+                "Choisissez une date plus recente."
+            ).format(count=total_count, limit=MAX_EVENTS_PER_RESTORE)
+            qlog(msg, "WARNING")
             return
 
         if total_count > WARN_EVENTS_THRESHOLD:
@@ -3165,8 +3163,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         flog(f"[{trace_id}] refetch_after_auto_undo: "
              f"scope={len(checked_fps)} layer(s) cutoff_reuse=True")
 
-        if (self._version_fetch_thread
-                and self._version_fetch_thread.isRunning()):
+        if (self._version_fetch_thread and self._version_fetch_thread.isRunning()):
             self._version_fetch_thread.stop()
             self._version_fetch_thread.wait(500)
 
@@ -3528,9 +3525,12 @@ class RecoverDialog(QDialog, LoggerMixin):
             ]
             geom_changed = False
             if has_geom_change:
-                is_geom_only = (is_update and parsed_data is not None
-                                and "changed_only" in parsed_data
-                                and all(is_layer_audit_field(k) for k in parsed_data["changed_only"]))
+                is_geom_only = all((
+                    is_update,
+                    parsed_data is not None,
+                    "changed_only" in parsed_data,
+                    all(is_layer_audit_field(k) for k in parsed_data["changed_only"]),
+                ))
                 geom_changed = is_geom_only or (is_update and event.geometry_wkb is not None)
                 row_values.append(self.tr("Modifiée") if geom_changed else "")
             diff_tooltip = self._build_event_diff_tooltip(
@@ -3660,8 +3660,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             trace_id = self._active_restore_trace_id
             self._active_restore_trace_id = ""
             if applied > 0:
-                events = getattr(self, '_version_restore_events', None) or \
-                         getattr(self, '_event_restore_events', None)
+                events = getattr(self, '_version_restore_events', None) or getattr(self, '_event_restore_events', None)
                 if events and by_ds:
                     self._last_restore_events = events
                     self._last_restore_by_ds = by_ds

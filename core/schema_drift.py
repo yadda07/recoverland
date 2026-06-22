@@ -82,8 +82,7 @@ def compare_schemas(historical: List[FieldInfo], current: List[FieldInfo]) -> Dr
     added_in_current = [n for n in curr_by_name if n not in hist_by_name]
 
     is_compatible = (
-        len(missing_in_current) == 0 and
-        len(type_changed) == 0
+        len(missing_in_current) == 0 and len(type_changed) == 0
     )
 
     return DriftReport(

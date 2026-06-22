@@ -219,11 +219,13 @@ def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
     Uses the shared AUDIT_EVENT_INSERT_* constants so the column list
     stays in lockstep with WriteQueue and the schema definition.
     """
-    sql = (
-        "INSERT INTO audit_event (" +  # nosec B608: column list is a module constant
-        AUDIT_EVENT_INSERT_SQL +
-        ") VALUES (" + AUDIT_EVENT_INSERT_PLACEHOLDERS + ")"
-    )
+    sql = "".join((
+        "INSERT INTO audit_event (",  # nosec B608: column list is a module constant
+        AUDIT_EVENT_INSERT_SQL,
+        ") VALUES (",
+        AUDIT_EVENT_INSERT_PLACEHOLDERS,
+        ")",
+    ))
     count = 0
     remaining = []
     with conn:
