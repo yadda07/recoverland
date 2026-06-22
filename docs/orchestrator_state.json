@@ -777,10 +777,28 @@
         "metadata.txt",
         ".github/workflows/ci.yml",
         "scripts/build_release.py",
-        "core/event_stream_repository.py"
+        "core/event_stream_repository.py",
+        "core/edit_tracker.py",
+        "core/integrity.py",
+        "core/observability.py",
+        "core/restore_service.py",
+        "core/retention.py",
+        "core/rewind_dedup.py",
+        "core/schema_drift.py",
+        "core/search_service.py",
+        "core/support_policy.py",
+        "core/workflow_service.py",
+        "core/write_queue.py",
+        "qgs_task_support.py",
+        "recover.py",
+        "restore_runner.py",
+        "widgets/temporal_timeline_widget.py",
+        "widgets/themed_logo.py",
+        "widgets/toggle_switch.py",
+        "recover_dialog.py"
       ],
-      "commit_hash": "86ec193",
-      "log_evidence_excerpt": "Build: level=INFO event=release_done version=5.0.0 n_entries=95 size_kb=415. Verif ZIP: TOP_ROOTS=['RecoverLand'] (single top-level), MD_FILES=[], JSON=[], AGENTS_PRESENT=False, REQUIRED_OK=True, VER=['qgisMinimumVersion=3.40','version=5.0.0','qgisMaximumVersion=4.99']. Bandit B608 fix: core/event_stream_repository.py f-string SQL remplace par str.join(); py_compile=0. RESTE: validation scanner plugins.qgis.org (runtime).",
+      "commit_hash": "dfc64f9",
+      "log_evidence_excerpt": "Build: level=INFO event=release_done version=5.0.0 n_entries=95 size_kb=415. Verif ZIP: TOP_ROOTS=['RecoverLand'], MD_FILES=[], AGENTS_PRESENT=False, REQUIRED_OK=True, VER=['qgisMinimumVersion=3.40','version=5.0.0','qgisMaximumVersion=4.99']. flake8 --select=W503,W504,E126,E241,E221 sur core/widgets/*.py = 0. py_compile=0. RESTE: validation scanner plugins.qgis.org (runtime QGIS load + smoke).",
       "history": [
         {
           "ts": "2026-06-22T05:55:00Z",
@@ -837,6 +855,13 @@
           "to": "PATCHED",
           "by": "/corrector",
           "evidence": "Bandit scanner plugins.qgis.org remonte B608 sur event_stream_repository.py:66 (f-string SQL IN clause). Fix: remplacer f-string par str.join() (placeholders restent des '?' parametres). Commit 86ec193. Rebuild --clean: n_entries=95, size_kb=415, TOP_ROOTS=['RecoverLand'], AGENTS absent. py_compile=0."
+        },
+        {
+          "ts": "2026-06-22T18:30:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "Scanner plugins.qgis.org remonte 42+ W503/W504/E126/E241/E221 dans le code embarque. Fix: 19 fichiers (core*12, widgets*3, recover.py, restore_runner.py, qgs_task_support.py, recover_dialog.py). Tous les operateurs binaires et concatenations SQL restructurees (str.join, all/any, one-liners). Commit dfc64f9. flake8 --select=W503,W504,E126,E241,E221 sur core/widgets/*.py = 0. py_compile=0. Rebuild --clean: n_entries=95, size_kb=415."
         }
       ],
       "remaining_for_done": "G3.5/G4 PROVEN (user, runtime QGIS): installer dist/RecoverLand.zip dans QGIS 3.40 (Qt5) ET un build QGIS 4.x (Qt6, image questing/trixie), confirmer le load sans erreur + un smoke de chaque mode (Restore, Rewind, ReView), citer >=1 ligne de log par check. Antitheses statiques deja refutees: (A1) bypass enum Qt6 -> grep ne trouve aucun QMessageBox.Yes/.No ni Qt. scope hors compat; (A2) syntaxe new-Python casse 3.9 -> aucun match/case, aucune union X|Y runtime, future-annotations present; (A3) fuite interne dans le ZIP -> enumere, seul AGENTS.md fuyait, corrige a la racine; (A4) edit non packagee (git ls-files) -> VER du ZIP confirme 3.40. Code COMMITTE+PUSH (255ce5b sur main, inclut le self-heal pill Review). RESTE runtime-unverified: (1) load + smoke par mode (Restore/Rewind/ReView) avec log cite; (2) verifier le self-heal: fermer puis rouvrir le dialog en mode Review, confirmer le retour de la pill + le log INFO 'review: status_bar widget missing on show ... recreating'. Puis advance PROVEN, puis DONE."
