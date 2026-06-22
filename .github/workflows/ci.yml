@@ -43,8 +43,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Minimum supported (3.30) + latest (4.0.x target), per RL-E3-02.
-        qgis_tag: [release-3_30, latest]
+        # Minimum supported (3.40 LTR) + latest stable 3.x, per RL-E3-02.
+        # QGIS 4.0 images use distribution-suffixed tags (questing/trixie);
+        # pin one here for explicit Qt6 coverage. "3.40" is quoted so YAML
+        # keeps it a string (unquoted 3.40 -> float 3.4 -> wrong image tag).
+        qgis_tag: ["3.40", latest]
     steps:
       # Check out into a `recoverland` directory so the plugin is importable
       # as the `recoverland` package by the runtime scenarios.

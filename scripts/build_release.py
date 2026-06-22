@@ -59,6 +59,10 @@ EXCLUDE_FILES = frozenset({
     "conftest.py",
     "COMMIT_MSG",
     "COMMIT_EDITMSG",
+    # Internal team charter (gates, orchestrator, profiles): dev-only,
+    # not part of the user-facing plugin. Root-level .md, so not caught
+    # by the docs/*.md glob below.
+    "AGENTS.md",
 })
 
 # Glob patterns matched against the full relative POSIX path.
