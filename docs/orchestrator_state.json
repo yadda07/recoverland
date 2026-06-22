@@ -2,11 +2,11 @@
   "schema_version": 1,
   "generated_at": "2026-06-22T06:00:00Z",
   "session_active": {
-    "current_item": "BL-I18N-P0-01",
-    "current_state": "DONE",
-    "current_pilot": "/corrector",
-    "started_at": "2026-06-22T09:26:00Z",
-    "notes": "BL-I18N-P0-01 PROVEN. G4 runtime PASS 36/36 trace_id=96f3e4b1 dans QGIS console Python (locale non modifiee). Precedentes tentatives FAIL prouvent le test discrimine: trace_id=47bdde1c (6/36 avec .qm custom malforme), trace_id=18640186 (path __file__), crash (sys.exit). .qm final compile avec lrelease 5.15.2 (337 traductions). BL-REL-P0-01 peut avancer vers DONE quand qm frais est inclus dans le ZIP release."
+    "current_item": "BL-REL-P0-01",
+    "current_state": "PATCHED",
+    "current_pilot": "/orchestrator",
+    "started_at": "2026-06-22T18:11:00Z",
+    "notes": "BL-REL-P0-01: livrable dist/RecoverLand.zip re-genere avec scripts/build_release.py --clean apres BL-I18N-P0-01 DONE. ZIP contient i18n/recoverland_en.qm (lrelease, 337 traductions). Single top-level RecoverLand/, AGENTS.md absent, metadata 3.40/5.0.0/4.99. RESTE G3.5/G4 PROVEN: installer le ZIP dans QGIS 3.40 (Qt5) et QGIS 4.x (Qt6), smoke test Restore/Rewind/ReView avec log cite. Decharge a /corrector+user pour le runtime QGIS."
   },
   "session_history": [
     {
@@ -822,6 +822,13 @@
           "to": "PATCHED",
           "by": "/corrector+/git",
           "evidence": "Fix runtime ajoute au livrable (demande user): recover_dialog.py self-heal de la pill Review en status bar quand le dialog est reutilise au reopen (recover.py cache self.dlg -> __init__/setup non rejoues). _show_review_status_bar recree le widget via _setup_review_status_bar si None (flog INFO 'recreating'), WARNING si indispo; showEvent l'appelle inconditionnellement avant activate(). py_compile=0, flake8=0 sur recover_dialog.py. Rebuild --clean: n_entries=95, SELFHEAL_IN_ZIP=True, MD=[], VER 3.40/5.0.0/4.99. Commit 255ce5b sur main (c2c380d..255ce5b): 1 fichier, +15/-3. STATIC seulement: le chemin self-heal n'est PAS prouve runtime."
+        },
+        {
+          "ts": "2026-06-22T18:11:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/orchestrator",
+          "evidence": "BL-I18N-P0-01 DONE (commit 2ae4ed83 + 77300ca). Livrable dist/RecoverLand.zip re-genere avec scripts/build_release.py --clean. ZIP contient i18n/recoverland_en.qm (lrelease, 337 traductions), i18n/compile_translations.py, i18n/recoverland_en.ts. Single top-level RecoverLand/, AGENTS.md absent, metadata 3.40/5.0.0/4.99, n_entries=95, size_kb=415. RESTE: G3.5/G4 PROVEN runtime QGIS (install ZIP + smoke Restore/Rewind/ReView)."
         }
       ],
       "remaining_for_done": "G3.5/G4 PROVEN (user, runtime QGIS): installer dist/RecoverLand.zip dans QGIS 3.40 (Qt5) ET un build QGIS 4.x (Qt6, image questing/trixie), confirmer le load sans erreur + un smoke de chaque mode (Restore, Rewind, ReView), citer >=1 ligne de log par check. Antitheses statiques deja refutees: (A1) bypass enum Qt6 -> grep ne trouve aucun QMessageBox.Yes/.No ni Qt. scope hors compat; (A2) syntaxe new-Python casse 3.9 -> aucun match/case, aucune union X|Y runtime, future-annotations present; (A3) fuite interne dans le ZIP -> enumere, seul AGENTS.md fuyait, corrige a la racine; (A4) edit non packagee (git ls-files) -> VER du ZIP confirme 3.40. Code COMMITTE+PUSH (255ce5b sur main, inclut le self-heal pill Review). RESTE runtime-unverified: (1) load + smoke par mode (Restore/Rewind/ReView) avec log cite; (2) verifier le self-heal: fermer puis rouvrir le dialog en mode Review, confirmer le retour de la pill + le log INFO 'review: status_bar widget missing on show ... recreating'. Puis advance PROVEN, puis DONE."
