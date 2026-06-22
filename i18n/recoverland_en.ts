@@ -312,8 +312,8 @@ This action is irreversible.</translation>
         <translation>Today</translation>
     </message>
     <message>
-        <source>Reconstruction…</source>
-        <translation>Reconstruction…</translation>
+        <source>Reconstruction en cours…</source>
+        <translation>Reconstruction in progress…</translation>
     </message>
     <message>
         <source>Aucune entité à cette date</source>
@@ -324,12 +324,117 @@ This action is irreversible.</translation>
         <translation>{n} entity(ies) reconstructed</translation>
     </message>
     <message>
+        <source>{n} entité(s) hors de l&apos;emprise actuelle</source>
+        <translation>{n} entity(ies) outside current extent</translation>
+    </message>
+    <message>
         <source>Export</source>
         <translation>Export</translation>
     </message>
     <message>
         <source>Exporter le snapshot vers GeoPackage</source>
         <translation>Export snapshot to GeoPackage</translation>
+    </message>
+    <message>
+        <source>Molette : zoomer/dezoomer • Clic droit glisser : se deplacer • Double-clic : reinitialiser le zoom</source>
+        <translation>Wheel: zoom in/out • Right-click drag: pan • Double-click: reset zoom</translation>
+    </message>
+</context>
+<context>
+    <name>ReviewStatusWidget</name>
+    <message>
+        <source>Review</source>
+        <translation>Review</translation>
+    </message>
+    <message>
+        <source>Desactiver Review</source>
+        <translation>Disable Review</translation>
+    </message>
+    <message>
+        <source>Review · Recherche...</source>
+        <translation>Review · Searching...</translation>
+    </message>
+    <message>
+        <source>Review — Recherche des modifications</source>
+        <translation>Review — Searching for modifications</translation>
+    </message>
+    <message>
+        <source>Review · Rendu {detail}</source>
+        <translation>Review · Rendering {detail}</translation>
+    </message>
+    <message>
+        <source>Review · Rendu...</source>
+        <translation>Review · Rendering...</translation>
+    </message>
+    <message>
+        <source>Review · actif</source>
+        <translation>Review · active</translation>
+    </message>
+    <message>
+        <source>Review · {n}</source>
+        <translation>Review · {n}</translation>
+    </message>
+    <message>
+        <source>Review — Visualisation temps reel</source>
+        <translation>Review — Real-time visualization</translation>
+    </message>
+    <message>
+        <source>{n_layers} couche(s) · {n_entities} entite(s)</source>
+        <translation>{n_layers} layer(s) · {n_entities} entity(ies)</translation>
+    </message>
+    <message>
+        <source>MAJ : a l&apos;instant</source>
+        <translation>Updated: just now</translation>
+    </message>
+    <message>
+        <source>MAJ : il y a {ago}s</source>
+        <translation>Updated: {ago}s ago</translation>
+    </message>
+    <message>
+        <source>MAJ : il y a {m}min</source>
+        <translation>Updated: {m}min ago</translation>
+    </message>
+    <message>
+        <source>Deplacez la carte pour rafraichir</source>
+        <translation>Move the map to refresh</translation>
+    </message>
+    <message>
+        <source>Clic X : desactiver</source>
+        <translation>Click X: disable</translation>
+    </message>
+    <message>
+        <source>Inactif</source>
+        <translation>Inactive</translation>
+    </message>
+    <message>
+        <source>Review — Inactif</source>
+        <translation>Review — Inactive</translation>
+    </message>
+</context>
+<context>
+    <name>ReviewSegmentedSwitch</name>
+    <message>
+        <source>Présent</source>
+        <translation>Present</translation>
+    </message>
+    <message>
+        <source>Basculer entre l&apos;etat present et Review</source>
+        <translation>Toggle between present state and Review</translation>
+    </message>
+</context>
+<context>
+    <name>AppleToggleSwitch</name>
+    <message>
+        <source>Enregistrement des modifications : actif</source>
+        <translation>Change recording: active</translation>
+    </message>
+    <message>
+        <source>Enregistrement actif</source>
+        <translation>Recording active</translation>
+    </message>
+    <message>
+        <source>Enregistrement desactive</source>
+        <translation>Recording disabled</translation>
     </message>
 </context>
 <context>
@@ -1324,233 +1429,6 @@ Warnings ({count}):</translation>
     <message>
         <source>Continuer ?</source>
         <translation>Continue?</translation>
-    </message>
-</context>
-<context>
-    <name>TemporalLensDock</name>
-    <message>
-        <source>Couche audited :</source>
-        <translation>Audited layer:</translation>
-    </message>
-    <message>
-        <source>Rectangle</source>
-        <translation>Rectangle</translation>
-    </message>
-    <message>
-        <source>Polygone</source>
-        <translation>Polygon</translation>
-    </message>
-    <message>
-        <source>Plage temporelle :</source>
-        <translation>Time range:</translation>
-    </message>
-    <message>
-        <source>Aujourd&apos;hui</source>
-        <translation>Today</translation>
-    </message>
-    <message>
-        <source>7 derniers jours</source>
-        <translation>Last 7 days</translation>
-    </message>
-    <message>
-        <source>30 derniers jours</source>
-        <translation>Last 30 days</translation>
-    </message>
-    <message>
-        <source>Personnalise</source>
-        <translation>Custom</translation>
-    </message>
-    <message>
-        <source>De :</source>
-        <translation>From:</translation>
-    </message>
-    <message>
-        <source>A :</source>
-        <translation>To:</translation>
-    </message>
-    <message>
-        <source>Filtre operation :</source>
-        <translation>Operation filter:</translation>
-    </message>
-    <message>
-        <source>Tout</source>
-        <translation>All</translation>
-    </message>
-    <message>
-        <source>Insertions uniquement</source>
-        <translation>Inserts only</translation>
-    </message>
-    <message>
-        <source>Mises a jour uniquement</source>
-        <translation>Updates only</translation>
-    </message>
-    <message>
-        <source>Suppressions uniquement</source>
-        <translation>Deletes only</translation>
-    </message>
-    <message>
-        <source>Attributs seuls</source>
-        <translation>Attributes only</translation>
-    </message>
-    <message>
-        <source>Geometrie seule</source>
-        <translation>Geometry only</translation>
-    </message>
-    <message>
-        <source>Rafraichir</source>
-        <translation>Refresh</translation>
-    </message>
-    <message>
-        <source>Aucune selection.</source>
-        <translation>No selection.</translation>
-    </message>
-    <message>
-        <source>Legende :</source>
-        <translation>Legend:</translation>
-    </message>
-    <message>
-        <source>Plage non definie.</source>
-        <translation>Time range not set.</translation>
-    </message>
-    <message>
-        <source>Entites :</source>
-        <translation>Entities:</translation>
-    </message>
-    <message>
-        <source>Selectionnez une entite pour voir le diff.</source>
-        <translation>Select an entity to view the diff.</translation>
-    </message>
-    <message>
-        <source>Date</source>
-        <translation>Date</translation>
-    </message>
-    <message>
-        <source>Op</source>
-        <translation>Op</translation>
-    </message>
-    <message>
-        <source>Champ</source>
-        <translation>Field</translation>
-    </message>
-    <message>
-        <source>Ancien</source>
-        <translation>Old</translation>
-    </message>
-    <message>
-        <source>Nouveau</source>
-        <translation>New</translation>
-    </message>
-    <message>
-        <source>Desactiver Lens</source>
-        <translation>Disable Lens</translation>
-    </message>
-    <message>
-        <source>creations</source>
-        <translation>creations</translation>
-    </message>
-    <message>
-        <source>modifications</source>
-        <translation>modifications</translation>
-    </message>
-    <message>
-        <source>suppressions</source>
-        <translation>deletions</translation>
-    </message>
-    <message>
-        <source>attributs seuls</source>
-        <translation>attributes only</translation>
-    </message>
-    <message>
-        <source>geometrie seule</source>
-        <translation>geometry only</translation>
-    </message>
-    <message>
-        <source>(Journal non ouvert)</source>
-        <translation>(Journal not open)</translation>
-    </message>
-    <message>
-        <source>(Erreur d&apos;ouverture du journal)</source>
-        <translation>(Journal open error)</translation>
-    </message>
-    <message>
-        <source>(Aucune couche audited dans le projet)</source>
-        <translation>(No audited layer in project)</translation>
-    </message>
-    <message>
-        <source>Tracez un rectangle sur la carte (clic-glisser-relacher).</source>
-        <translation>Draw a rectangle on the map (click-drag-release).</translation>
-    </message>
-    <message>
-        <source>Tracez un polygone (clic = sommet, double-clic = valider, Esc = annuler).</source>
-        <translation>Draw a polygon (click = vertex, double-click = validate, Esc = cancel).</translation>
-    </message>
-    <message>
-        <source>Zone selectionnee: x=[{xmin}, {xmax}], y=[{ymin}, {ymax}]. Cliquez Rafraichir.</source>
-        <translation>Zone selected: x=[{xmin}, {xmax}], y=[{ymin}, {ymax}]. Click Refresh.</translation>
-    </message>
-    <message>
-        <source>Selection annulee.</source>
-        <translation>Selection cancelled.</translation>
-    </message>
-    <message>
-        <source>Choisissez d&apos;abord une couche auditee.</source>
-        <translation>Choose an audited layer first.</translation>
-    </message>
-    <message>
-        <source>Canvas QGIS indisponible.</source>
-        <translation>QGIS canvas unavailable.</translation>
-    </message>
-    <message>
-        <source>Selection incomplete.</source>
-        <translation>Incomplete selection.</translation>
-    </message>
-    <message>
-        <source>Journal non ouvert.</source>
-        <translation>Journal not open.</translation>
-    </message>
-    <message>
-        <source>Couche disparue du projet.</source>
-        <translation>Layer removed from project.</translation>
-    </message>
-    <message>
-        <source>Reprojection bbox echec: {error_type}</source>
-        <translation>BBox reprojection failed: {error_type}</translation>
-    </message>
-    <message>
-        <source>Connexion lecture echec: {error_type}</source>
-        <translation>Read connection failed: {error_type}</translation>
-    </message>
-    <message>
-        <source>Lecture journal echec: {error_type}</source>
-        <translation>Journal read failed: {error_type}</translation>
-    </message>
-    <message>
-        <source>Aucune modification trouvee dans cette zone et cette fenetre.</source>
-        <translation>No modifications found in this zone and time window.</translation>
-    </message>
-    <message>
-        <source> ({n} tronques)</source>
-        <translation> ({n} truncated)</translation>
-    </message>
-    <message>
-        <source>{n_entities} entites - {n_events} events affiches{truncated} ({elapsed} ms, trace={trace})</source>
-        <translation>{n_entities} entities - {n_events} events displayed{truncated} ({elapsed} ms, trace={trace})</translation>
-    </message>
-    <message>
-        <source>Depuis : {rel} ({absolute})</source>
-        <translation>Since: {rel} ({absolute})</translation>
-    </message>
-    <message>
-        <source>{fp} - {cls} - {n} states</source>
-        <translation>{fp} - {cls} - {n} states</translation>
-    </message>
-    <message>
-        <source>Diff entite {fp} - {n_states} states - {n_changes} changements</source>
-        <translation>Diff entity {fp} - {n_states} states - {n_changes} changes</translation>
-    </message>
-    <message>
-        <source>(vide)</source>
-        <translation>(empty)</translation>
     </message>
 </context>
 </TS>
