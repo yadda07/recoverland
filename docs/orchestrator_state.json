@@ -522,10 +522,10 @@
       "priority": "P2",
       "effort": "M",
       "root_cause": "N1 du verdict GO_WITH_NOTES (BL-DIAG-P2-14): aucune phase de deplacement ne demarre sans filet. Le mecanisme golden log est documente dans scripts/validation/README.md mais NON implemente (pas de dossier golden_logs/, pas de diff_against_golden dans assert_log.py). La surface publique consommee par recover.py doit etre verrouillee avant tout refactor (risque R-2).",
-      "state": "PATCHED",
+      "state": "PROVEN",
       "blocked_by": [],
       "scenario_path": "scripts/validation/god_object_surface_guard.py",
-      "scenario_status": "ast_guard_proven_offline; milestone_checks_4modes_proven_offline; runtime_NOT_proven_pending_user_qgis",
+      "scenario_status": "ast_guard_proven_offline; milestone_checks_4modes_proven_offline; runtime_PROVEN_2modes(review_snapshot,version_rewind); event_search+undo_offline_only_pending_exercise",
       "patch_files": [
         "controllers/__init__.py",
         "scripts/validation/god_object_surface_guard.py",
@@ -619,12 +619,34 @@
           "to": "PATCHED",
           "by": "/git",
           "evidence": "Commit e89ecf9 pousse sur main (acdf6ac..e89ecf9): 5 fichiers, +455/-43, scripts/validation/god_object_check.py cree. Checkpoint de l'outil prouve OFFLINE - ce N'EST PAS une transition vers DONE: la charte exige PROVEN (run QGIS + log cite) avant DONE, et le runtime n'est pas encore fait. Item reste PATCHED. Increment Phase 0 precedent = 9dfa42e."
+        },
+        {
+          "ts": "2026-06-22T05:30:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "DIAGNOSTIC runtime (lecture log user, lecture seule): le workflow marqueur (mark -> alt-tab -> exercer -> check) a echoue 5x cote user (n_records=0). Cause = entrelacement manuel impraticable + reload plugin remettant le marqueur en fin de fichier alors que l'activite etait avant. Analyse log: recover_and_load:START x5 = 2 temporal + 3 review + 0 event (le jalon event n'est jamais atteint car START tire AVANT validation/dispatch de mode). FIX: (1) check_recent(mode) SANS marqueur, ancre sur la DERNIERE occurrence du jalon d'entree du mode -> ordre/timing/reload sans effet; (2) event_search ancre desormais sur recover_event:start (specifique event, post-validation) au lieu de recover_and_load:START (generique tous modes). god_object_check.py edite, commit 3d4161a. py_compile OK."
+        },
+        {
+          "ts": "2026-06-22T05:40:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/antithese",
+          "evidence": "G3.5 - 19 cas offline dont negatifs implementes et capables d'echouer: 4 modes x {check_mode_passes, check_recent_passes, check_mode_missing_fails, check_recent_missing_fails} + check_recent_entry_never_logged_fails + no_mark_fails + empty_window_is_not_no_mark. Antitheses refutees: (A1) 'check_recent passe sur un run casse' -> FAUX (check_recent_missing_fails PASS x4); (A2) 'passe si le mode n'a jamais tourne' -> FAUX (entry_never_logged_fails PASS); (A3) 'le PASS vient d'historique perime' -> FAUX (ancrage sur la DERNIERE entree; fenetres runtime n=896/8089 et idx etales [0,1,15,86]/[0,194,3614] = vrai bruit, pas d'adjacence factice); (A4) 'les chaines ne matchent pas le runtime' -> FAUX (PASS sur vrai log + chaines verifiees dans recover_dialog.py L2806/3418/3884/3906). VERDICT=PASS note=check_can_fail."
+        },
+        {
+          "ts": "2026-06-22T05:45:00Z",
+          "from": "PATCHED",
+          "to": "PROVEN",
+          "by": "/orchestrator",
+          "evidence": "G4 PROVEN sur run QGIS REEL de l'utilisateur (modules recharges, check_recent sur le log existant, aucune mine). PREUVE CITEE: '[god-check] mode=review_snapshot n_records=896 since=last_entry verdict=PASS 4 milestones in order at idx=[0, 1, 15, 86]' ET '[god-check] mode=version_rewind n_records=8089 since=last_entry verdict=PASS 3 milestones in order at idx=[0, 194, 3614]'. 2 modes PROVEN runtime (les 2 plus lourds). event_search + undo restent prouves OFFLINE seulement (user ne les a pas exerces; mecanisme identique donc confiance haute, mais AUCUN claim PROVEN sans log par mode - charte respectee). Code = commit 3d4161a."
         }
       ],
-      "commit_hash": "e89ecf9",
+      "commit_hash": "3d4161a",
       "commit_hash_phase0": "9dfa42e",
-      "log_evidence_excerpt": "OFFLINE PROUVE: AST 'verdict=PASS passed=8' + 'SELFTEST_VERDICT verdict=PASS note=guard_can_fail'; assert_log 'VERDICT=PASS note=assertion_can_fail'; golden 9 cas 'note=comparator_can_fail'; god_object_check 10 cas (4 modes x full_flow_passes/missing_last_milestone_fails + no_mark_fails + empty_window_is_not_no_mark) 'VERDICT=PASS note=check_can_fail'. RUNTIME QGIS: NON prouve - requiert l'utilisateur (mark/check_mode par mode).",
-      "remaining_for_done": "TOUT le faisable hors QGIS est FAIT et prouve offline + commite: garde AST, garde-fous golden anti-vide/rotation, assert_sequence_in_order, god_object_check avec 4 specs de jalons (event_search, version_rewind, review_snapshot, undo) derivees du code, dashboard exclu (silencieux). SEUL RESTE, et NE PEUT PAS etre fait par l'agent (requiert session QGIS de l'utilisateur): prouver en runtime chaque mode via mark(mode) -> exercer GUI -> check_mode(mode)=PASS. Procedure dans scripts/validation/golden_logs/README.md. Une fois >=1 mode PASS runtime cite -> advance PATCHED->PROVEN; les 5 modes -> base solide pour demarrer les phases d'extraction. NE PAS marquer PROVEN sans log runtime (charte)."
+      "commit_hash_checkpoints": ["e89ecf9", "1473e7a"],
+      "log_evidence_excerpt": "RUNTIME QGIS PROUVE (run user, check_recent sur log reel): '[god-check] mode=review_snapshot n_records=896 since=last_entry verdict=PASS 4 milestones in order at idx=[0, 1, 15, 86]' ET '[god-check] mode=version_rewind n_records=8089 since=last_entry verdict=PASS 3 milestones in order at idx=[0, 194, 3614]'. OFFLINE: AST 'verdict=PASS passed=8'/'guard_can_fail'; assert_log 'assertion_can_fail'; golden 9 cas 'comparator_can_fail'; god_object_check 19 cas (2 checkers x4 modes + negatifs) 'VERDICT=PASS note=check_can_fail'.",
+      "remaining_for_done": "FILET DE SECURITE OPERATIONNEL ET PROUVE RUNTIME. check_recent valide sur vrais logs QGIS: review_snapshot (PASS 4 jalons) et version_rewind (PASS 3 jalons), les 2 modes les plus lourds. RESTE optionnel et NON bloquant pour demarrer l'extraction: exercer une fois event_search (basculer mode event -> rechercher -> restaurer) et undo dans QGIS, puis gc.check_recent(mode), pour les passer de offline-only a runtime-proven. G5 DONE: code committe 3d4161a + ce ledger; il reste a push. Ensuite: demarrer la 1ere phase de deplacement God Object sous garde AST + check_recent comme filet."
     }
   ]
 }
