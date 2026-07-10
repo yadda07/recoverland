@@ -375,7 +375,7 @@ def _buffer_delete(layer, event: AuditEvent,
     """
     from .restore_service import (
         _parse_identity, _find_target_feature, _find_by_snapshot,
-        _diagnose_snapshot_miss,
+        _find_by_attrs_only, _diagnose_snapshot_miss,
     )
 
     identity = _parse_identity(event.feature_identity_json)
@@ -415,33 +415,48 @@ def _buffer_delete(layer, event: AuditEvent,
             # the feature is gone => undo already applied. For any other
             # source op, target absence is a hard failure: we cannot
             # prove the user state matches the desired one.
+            rescued_fid = None
             if event.operation_type == 'INSERT':
+                # BL-RW-P1-25: before declaring the insert already undone,
+                # rescue by strict attribute match (geometry WKB may have
+                # drifted through provider write cycles while the inserted
+                # feature still exists under another FID).
+                rescued_fid = _find_by_attrs_only(
+                    layer, event, exclude_fids=exclude_remap_fids,
+                )
+                if rescued_fid is not None:
+                    flog(f"BUF_DEL eid={event.event_id} fp={fp} "
+                         f"target=none snap=none→attr_rescue={rescued_fid} "
+                         f"(BL-RW-P1-25)", "WARNING")
+                    target_fid = rescued_fid
+                else:
+                    flog(
+                        f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
+                        f"target=none snap=none status=SKIPPED_IDEMPOTENT "
+                        f"reason_code=absent_vs_insert_comp "
+                        f"(undo of user INSERT already applied)",
+                        "INFO",
+                    )
+                    return {
+                        "success": True, "skipped": True,
+                        "status": "SKIPPED_IDEMPOTENT",
+                        "reason_code": "absent_vs_insert_comp",
+                        "message": "Skipped (idempotent): feature already absent",
+                    }
+            if rescued_fid is None:
                 flog(
                     f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
-                    f"target=none snap=none status=SKIPPED_IDEMPOTENT "
-                    f"reason_code=absent_vs_insert_comp "
-                    f"(undo of user INSERT already applied)",
-                    "INFO",
+                    f"target=none snap=none status=FAILED "
+                    f"reason_code=target_absent op={event.operation_type}",
+                    "WARNING",
                 )
+                _diagnose_snapshot_miss(layer, event)
                 return {
-                    "success": True, "skipped": True,
-                    "status": "SKIPPED_IDEMPOTENT",
-                    "reason_code": "absent_vs_insert_comp",
-                    "message": "Skipped (idempotent): feature already absent",
+                    "success": False,
+                    "status": "FAILED",
+                    "reason_code": "target_absent",
+                    "message": "Failed: target feature absent",
                 }
-            flog(
-                f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} "
-                f"target=none snap=none status=FAILED "
-                f"reason_code=target_absent op={event.operation_type}",
-                "WARNING",
-            )
-            _diagnose_snapshot_miss(layer, event)
-            return {
-                "success": False,
-                "status": "FAILED",
-                "reason_code": "target_absent",
-                "message": "Failed: target feature absent",
-            }
     else:
         flog(f"BUF_DEL eid={event.event_id} fp={fp} remap={remapped} target={target_fid}", "DEBUG")
 
@@ -458,12 +473,49 @@ def _buffer_delete(layer, event: AuditEvent,
                 if layer.dataProvider() else ''
             )
             if event.operation_type == 'INSERT':
-                flog(
-                    f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
-                    f"snap_mismatch→direct_fid prov={provider_key} "
-                    f"(INSERT FID trustworthy: subsequent rounds modified attrs RW-11)",
-                    "WARNING"
+                # BL-RW-P1-25: the FID occupant does not match the snapshot
+                # and no geometry-based candidate exists. Try the strict
+                # attribute rescue first: after a FID drift (deletes + OGR
+                # repack) the real inserted feature lives at another FID
+                # while the occupant is an unrelated feature.
+                rescue_fid = _find_by_attrs_only(
+                    layer, event, exclude_fids=exclude_remap_fids,
                 )
+                if rescue_fid is not None and rescue_fid != target_fid:
+                    flog(f"BUF_DEL eid={event.event_id} fp={fp} "
+                         f"fid={target_fid}→attr_rescue={rescue_fid} "
+                         f"(BL-RW-P1-25: FID drift, occupant spared)",
+                         "WARNING")
+                    target_fid = rescue_fid
+                elif _occupant_shares_evidence(layer, target_fid, event):
+                    # RW-11 narrowed: trust the direct FID only when the
+                    # occupant shares at least one piece of evidence with
+                    # the event (geometry or one captured attribute), i.e.
+                    # it plausibly IS the inserted feature with attrs
+                    # modified by subsequent rounds.
+                    flog(
+                        f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
+                        f"snap_mismatch→direct_fid prov={provider_key} "
+                        f"(RW-11 narrowed: occupant shares evidence)",
+                        "WARNING"
+                    )
+                else:
+                    # BL-RW-P1-25: occupant shares NOTHING with the event
+                    # and no other candidate exists. Deleting it would
+                    # destroy an unrelated feature (proven on project
+                    # 63398, trace d8933d22). Refuse loudly.
+                    flog(
+                        f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
+                        f"status=FAILED reason_code=target_unverifiable "
+                        f"(occupant shares no evidence, attr_rescue=none)",
+                        "WARNING",
+                    )
+                    return {
+                        "success": False,
+                        "status": "FAILED",
+                        "reason_code": "target_unverifiable",
+                        "message": "Failed: FID occupant unverifiable",
+                    }
             else:
                 # BL-RW-P0-02: identity mismatch is unprovable -> FAILED.
                 # We cannot demonstrate idempotence; aborting prevents
@@ -530,6 +582,53 @@ def _buffer_delete(layer, event: AuditEvent,
         "reason_code": "applied",
         "message": "Deleted via buffer",
     }
+
+
+def _occupant_shares_evidence(layer, fid: int, event: AuditEvent) -> bool:
+    """True when the feature at *fid* shares at least one piece of evidence
+    with *event*: matching geometry OR one non-null captured attribute.
+
+    BL-RW-P1-25: gate for the narrowed RW-11 direct-FID trust. An occupant
+    sharing nothing with the INSERT snapshot is an unrelated feature that
+    took over a recycled FID; deleting it would destroy user data.
+    """
+    from qgis.core import QgsFeatureRequest
+    from .restore_service import _qgis_vals_equal
+    from .audit_field_policy import is_layer_audit_field
+
+    attrs = reconstruct_attributes(event)
+    geom = rebuild_geometry(event.geometry_wkb) if event.geometry_wkb else None
+    try:
+        fields = layer.fields()
+        pk_field_indices = set(layer.dataProvider().pkAttributeIndexes())
+        source = get_feature_source(layer)
+        for feature in source(QgsFeatureRequest(fid)):
+            if geom is not None and feature_matches_geometry(feature, geom):
+                flog(f"_occupant_shares_evidence: fid={fid} "
+                     f"eid={event.event_id} evidence=geometry", "DEBUG")
+                return True
+            for hist_name, expected_val in attrs.items():
+                idx = fields.indexOf(hist_name)
+                if any((
+                    expected_val is None,
+                    is_layer_audit_field(hist_name),
+                    idx < 0,
+                    idx in pk_field_indices,
+                )):
+                    continue
+                actual_val = feature[idx]
+                if actual_val is not None and _qgis_vals_equal(
+                        actual_val, expected_val):
+                    flog(f"_occupant_shares_evidence: fid={fid} "
+                         f"eid={event.event_id} evidence=attr:{hist_name}",
+                         "DEBUG")
+                    return True
+            return False
+    except Exception as exc:
+        flog(f"_occupant_shares_evidence: check failed fid={fid}: {exc}",
+             "WARNING")
+        return False
+    return False
 
 
 def _target_matches_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:

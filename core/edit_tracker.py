@@ -11,6 +11,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional, List
 
+from qgis.PyQt.QtCore import QObject, pyqtSignal
+
 from .audit_backend import AuditEvent
 from .edit_buffer import (
     EditSessionBuffer, FeatureSnapshot, create_snapshot_from_feature,
@@ -39,6 +41,19 @@ from .logger import flog
 _SENTINEL = object()
 
 
+class _CommitSignalBridge(QObject):
+    """QObject bridge for Qt signals from EditSessionTracker.
+
+    EditSessionTracker remains a pure Python class (no Qt dependency in its core logic).
+    This bridge is owned by the tracker and lives on the main thread (created in __init__).
+    It emits committed_features(n_events) when the WriteQueue flush callback fires.
+    """
+    committed_features = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+
 class EditSessionTracker:
     """Tracks editing sessions across all layers in a QGIS project.
 
@@ -61,6 +76,7 @@ class EditSessionTracker:
         self._session_event_count = 0
         self._on_commit_callback = None
         self._on_overflow_callback = None
+        self._commit_bridge = _CommitSignalBridge()
 
     @property
     def is_active(self) -> bool:
@@ -116,6 +132,16 @@ class EditSessionTracker:
     def session_event_count(self) -> int:
         return self._session_event_count
 
+    @property
+    def committed_features(self):
+        """Qt signal emitted after WriteQueue flush (n_events persisted).
+
+        Returns the bound pyqtSignal from the internal QObject bridge.
+        This property exists so existing connect/disconnect code in recover_dialog.py
+        works without modification.
+        """
+        return self._commit_bridge.committed_features
+
     def set_commit_callback(self, callback) -> None:
         """Set callback(event_count, layer_name, is_mass_delete, delete_count)."""
         self._on_commit_callback = callback
@@ -128,12 +154,29 @@ class EditSessionTracker:
         """
         self._on_overflow_callback = callback
 
+    def _on_flush_callback(self, n_events: int) -> None:
+        """Internal callback from WriteQueue after successful batch write.
+
+        Emits the Qt signal to notify that events have been persisted.
+        Race-free by construction: emission happens after persistence,
+        and the signal has no shared state (simple notification).
+        """
+        flog(
+            f"EditSessionTracker: flush_callback n_events={n_events} emitting_signal",
+            "DEBUG",
+        )
+        self._commit_bridge.committed_features.emit(n_events)
+
     def reset_session_count(self) -> None:
         self._session_event_count = 0
 
     def activate(self) -> None:
         self._active = True
-        flog("EditSessionTracker: activated")
+        if hasattr(self._write_queue, 'set_flush_callback'):
+            self._write_queue.set_flush_callback(self._on_flush_callback)
+            flog("EditSessionTracker: activated flush_callback=registered")
+        else:
+            flog("EditSessionTracker: activated flush_callback=unavailable", "WARNING")
 
     def deactivate(self) -> None:
         self._active = False

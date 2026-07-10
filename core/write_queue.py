@@ -46,6 +46,7 @@ class WriteQueue:
         self._running = False
         self._early_warning_emitted = False
         self._on_early_warning = None
+        self._on_flush_callback = None
         self._pending_lock = threading.Lock()
 
     def start(self, db_path: str) -> None:
@@ -126,6 +127,15 @@ class WriteQueue:
         """Set callback() invoked once when queue reaches 80% of hard limit."""
         self._on_early_warning = callback
 
+    def set_flush_callback(self, callback) -> None:
+        """Set callback(n_events) invoked after successful batch write.
+
+        The callback is called by the writer thread after each successful
+        batch write (executemany + commit). The argument n_events is the
+        number of events in the batch that was just persisted.
+        """
+        self._on_flush_callback = callback
+
     @property
     def pending_count(self) -> int:
         return self._queue.qsize()
@@ -201,6 +211,8 @@ class WriteQueue:
                 with conn:
                     conn.executemany(_INSERT_SQL, params)
                 flog(f"WriteQueue: wrote {len(batch)} events")
+                if self._on_flush_callback is not None:
+                    self._on_flush_callback(len(batch))
                 return
             except sqlite3.OperationalError as e:
                 last_err = e

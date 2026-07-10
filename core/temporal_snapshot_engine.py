@@ -9,9 +9,14 @@ mapping entity_fp → SnapshotFeature for every entity that existed at T.
 Algorithm (forward replay until T):
     For each fingerprint in event_cache:
         1. Group events by entity_fp (same key logic as lens_planner).
-        2. Filter each entity's events to created_at <= cutoff_dt.
-        3. Sort ASC by (created_at, event_id).
-        4. Inspect the last visible event:
+        2. Materialize rewind traces: an event with restored_from_event_id
+           carries a marker payload ({"_restore_ref": eid}, no geometry),
+           NOT the state it applied. Its effective state is resolved from
+           the referenced source event (BL-RVW-01); unresolvable refs
+           degrade with a WARNING, never silently.
+        3. Filter each entity's events to created_at <= cutoff_dt.
+        4. Sort ASC by (created_at, event_id).
+        5. Inspect the last visible event:
            - INSERT | UPDATE  → entity exists at T, record geom + attrs.
            - DELETE           → entity was absent at T (n_absent).
            - No events <= T   → entity not yet created at T (n_unknown).
@@ -126,6 +131,8 @@ def reconstruct_snapshot_at(
     n_unknown = 0
     n_entities = 0
 
+    trace_counters = {"resolved": 0, "missing": 0}
+
     for ds_fp, events in event_cache.items():
         if should_cancel is not None and should_cancel():
             flog(f"[{trace_id}] review_snapshot: reconstruct cancelled", "DEBUG")
@@ -133,6 +140,7 @@ def reconstruct_snapshot_at(
         entity_groups = _group_by_entity(events)
         ds_feats: Dict[str, SnapshotFeature] = {}
         for entity_fp, ev_list in entity_groups.items():
+            ev_list = _materialize_traces(ev_list, trace_counters)
             visible = [e for e in ev_list if _before_cutoff(e, cutoff_utc)]
             if not visible:
                 n_unknown += 1
@@ -152,9 +160,18 @@ def reconstruct_snapshot_at(
         f"cutoff={cutoff_utc.isoformat()} "
         f"n_fps={len(event_cache)} n_entities={n_entities} "
         f"n_absent={n_absent} n_unknown={n_unknown} "
+        f"n_traces_resolved={trace_counters['resolved']} "
+        f"n_trace_ref_missing={trace_counters['missing']} "
         f"elapsed_ms={elapsed_ms}",
         "INFO",
     )
+    if trace_counters["missing"]:
+        flog(
+            f"[{trace_id}] review_snapshot: trace_ref_missing "
+            f"n={trace_counters['missing']} degraded=True "
+            f"reason=source_event_purged_or_foreign",
+            "WARNING",
+        )
     return SnapshotResult(
         features=features,
         cutoff_dt=cutoff_utc,
@@ -233,6 +250,102 @@ def _group_by_entity(events: list) -> Dict[str, list]:
     for ev_list in grouped.values():
         ev_list.sort(key=lambda e: (e.created_at or "", e.event_id or 0))
     return grouped
+
+
+# ------------------------------------------------------------------ #
+# Rewind trace materialization (BL-RVW-01)                             #
+# ------------------------------------------------------------------ #
+
+
+def _invert_delta(changed: dict) -> dict:
+    """Swap old/new of a changed_only delta (compensation = reverse apply)."""
+    inverted: Dict[str, dict] = {}
+    for field, val in changed.items():
+        inverted[field] = {
+            "old": extract_delta_new(val),
+            "new": extract_delta_old(val),
+        }
+    return inverted
+
+
+def _parsed_attrs(event) -> dict:
+    """attributes_json as dict, {} on absent/invalid payload."""
+    if not event.attributes_json:
+        return {}
+    try:
+        parsed = json.loads(event.attributes_json)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _effective_trace(trace, src):
+    """Return the trace event rewritten with the state it actually applied.
+
+    build_restore_trace_event writes marker payloads only; the applied state
+    lives in the referenced source event:
+    - trace INSERT (compensated a DELETE): re-inserted state = the captured
+      state of the source (geometry_wkb + all_attributes).
+    - trace UPDATE (compensated an UPDATE): reverse delta of the source
+      changed_only; restored geometry = source geometry_wkb (old side).
+    - trace DELETE (compensated an INSERT): carries the removed state so
+      chained traces can resolve through it; replay outcome stays absent.
+
+    Returns None when the source is unusable (purged, foreign, corrupt or
+    younger than the trace) — caller degrades loudly.
+    """
+    if src is None:
+        return None
+    if (src.created_at or "") > (trace.created_at or ""):
+        return None
+    op = trace.operation_type
+    if op == "INSERT" or op == "DELETE":
+        src_attrs = _parsed_attrs(src)
+        if "all_attributes" not in src_attrs and src.geometry_wkb is None:
+            return None
+        return trace._replace(
+            geometry_wkb=src.geometry_wkb,
+            attributes_json=src.attributes_json,
+        )
+    if op == "UPDATE":
+        changed = _parsed_attrs(src).get("changed_only", {})
+        if not isinstance(changed, dict):
+            changed = {}
+        return trace._replace(
+            attributes_json=json.dumps(
+                {"changed_only": _invert_delta(changed)}, ensure_ascii=False,
+            ),
+            new_geometry_wkb=src.geometry_wkb,
+        )
+    return None
+
+
+def _materialize_traces(ev_list: list, counters: dict) -> list:
+    """Rewrite rewind traces of one entity chain into effective events.
+
+    Single chronological pass (ev_list is sorted ASC): a trace always
+    references an OLDER event of the same entity, so its source is already
+    materialized when reached — chained traces (trace referencing a trace)
+    resolve without recursion. Unresolvable traces are kept as-is and
+    counted in counters['missing'] (degraded, never silent).
+    """
+    if not any(e.restored_from_event_id is not None for e in ev_list):
+        return ev_list
+    by_eid: Dict[int, object] = {}
+    out = []
+    for ev in ev_list:
+        if ev.restored_from_event_id is not None:
+            eff = _effective_trace(ev, by_eid.get(ev.restored_from_event_id))
+            if eff is None:
+                counters["missing"] += 1
+                eff = ev
+            else:
+                counters["resolved"] += 1
+            ev = eff
+        out.append(ev)
+        if ev.event_id is not None:
+            by_eid[ev.event_id] = ev
+    return out
 
 
 # ------------------------------------------------------------------ #

@@ -137,14 +137,69 @@ class SnapshotOverlaySession:
         except Exception:  # noqa: BLE001
             canvas = None
 
+        # Defer legend construction by disabling ShowLegend flag on the
+        # layer tree model. This prevents QgsLayerTreeModel from building
+        # legend icons synchronously on layer insertion (which triggers
+        # network probes for SVG styles, causing 9-11s gaps per layer).
+        # The flag is restored after creation, then legends are rebuilt
+        # chunked via refreshLayerLegend() to measure the actual cost.
+        model = None
+        original_flags = None
+        try:
+            from qgis.utils import iface  # noqa: PLC0415
+            from qgis.core import QgsLayerTreeModel  # noqa: PLC0415
+            if iface is not None:
+                model = iface.layerTreeView().layerTreeModel()
+                if model is not None:
+                    original_flags = model.flags()
+                    # Resolve ShowLegend enum safely across QGIS versions
+                    flag_ns = getattr(QgsLayerTreeModel, "Flag", QgsLayerTreeModel)
+                    show_legend = getattr(flag_ns, "ShowLegend", None)
+                    if show_legend is not None:
+                        model.setFlags(original_flags & ~show_legend)
+                        flog(
+                            f"[{trace_id}] snapshot_overlay: legend_defer applied "
+                            f"n_layers={total} mode=show_legend_flag",
+                            "INFO",
+                        )
+                    else:
+                        flog(
+                            f"[{trace_id}] snapshot_overlay: legend_defer_unavailable "
+                            f"reason=show_legend_enum_not_found",
+                            "WARNING",
+                        )
+                        model = None
+                        original_flags = None
+        except Exception as exc:  # noqa: BLE001
+            flog(
+                f"[{trace_id}] snapshot_overlay: legend_defer_unavailable "
+                f"reason={type(exc).__name__} msg={exc}",
+                "WARNING",
+            )
+            model = None
+            original_flags = None
+
         def _thaw() -> None:
             if canvas is not None:
                 try:
                     canvas.freeze(False)
                 except Exception:  # noqa: BLE001
                     pass
+            if model is not None and original_flags is not None:
+                try:
+                    model.setFlags(original_flags)
+                    flog(
+                        f"[{self.trace_id}] snapshot_overlay: legend_defer restored",
+                        "DEBUG",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+        last_end = [time.monotonic()]
 
         def _step() -> None:
+            t_begin = time.monotonic()
+            queue_gap_ms = int((t_begin - last_end[0]) * 1000)
             if not self._active:
                 _thaw()
                 flog(
@@ -152,6 +207,7 @@ class SnapshotOverlaySession:
                     f"aborted (inactive) created={created[0]}/{total}",
                     "WARNING",
                 )
+                on_done()
                 return
             if not pending:
                 _thaw()
@@ -160,18 +216,120 @@ class SnapshotOverlaySession:
                     f"created={created[0]}/{total}",
                     "INFO",
                 )
+                # Call on_done immediately to allow snapshot data population
                 on_done()
+                # Start chunked legend refresh independently (does not call on_done)
+                if model is not None and original_flags is not None:
+                    self._refresh_legends_chunked(trace_id)
                 return
             info = pending.pop(0)
             try:
                 self._create_overlay(info)
                 created[0] += 1
-            except (RuntimeError, Exception) as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 flog(
                     f"[{self.trace_id}] snapshot_overlay: create_overlay_error "
                     f"layer={info.get('layer_name', '?')} error={exc!r}",
                     "ERROR",
                 )
+                # Continue with remaining layers even if one fails
+                # Flag will be restored when pending is empty or on abort
+            step_ms = int((time.monotonic() - t_begin) * 1000)
+            if step_ms > 500 or queue_gap_ms > 500:
+                flog(
+                    f"[{self.trace_id}] snapshot_overlay: async_create_step_slow "
+                    f"layer={info.get('layer_name', '?')} "
+                    f"step_elapsed_ms={step_ms} queue_gap_ms={queue_gap_ms} "
+                    f"progress={created[0]}/{total}",
+                    "WARNING",
+                )
+            last_end[0] = time.monotonic()
+            QTimer.singleShot(0, _step)
+
+        QTimer.singleShot(0, _step)
+
+    def _refresh_legends_chunked(self, trace_id: str) -> None:
+        """Refresh legend nodes for all created overlays, one per tick.
+
+        This measures the actual cost of legend construction (SVG network
+        probes) by timing each refreshLayerLegend() call. If the cost is
+        high (~10s per layer), it confirms the legend hypothesis; if low,
+        the gaps originate elsewhere.
+        """
+        from qgis.PyQt.QtCore import QTimer  # noqa: PLC0415
+        from qgis.core import QgsProject  # noqa: PLC0415
+
+        # Resolve model/root/group once before the loop
+        model = None
+        root = None
+        group = None
+        try:
+            from qgis.utils import iface  # noqa: PLC0415
+            if iface is not None:
+                model = iface.layerTreeView().layerTreeModel()
+                if model is not None:
+                    root = QgsProject.instance().layerTreeRoot()
+                    if root is not None:
+                        group = root.findGroup(_GROUP_NAME)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Build layer_id->name dict once
+        layer_id_to_name = {ovl.layer_id: ovl.layer_name for ovl in self._overlays.values()}
+
+        # Collect overlay layer IDs in creation order
+        overlay_ids = [ovl.layer_id for ovl in self._overlays.values()]
+        pending = list(overlay_ids)
+        total = len(pending)
+        refreshed = [0]
+        last_end = [time.monotonic()]
+
+        def _step() -> None:
+            t_begin = time.monotonic()
+            queue_gap_ms = int((t_begin - last_end[0]) * 1000)
+            if not self._active:
+                flog(
+                    f"[{trace_id}] snapshot_overlay: legend_refresh aborted "
+                    f"refreshed={refreshed[0]}/{total}",
+                    "WARNING",
+                )
+                return
+            if not pending:
+                flog(
+                    f"[{trace_id}] snapshot_overlay: legend_refresh done "
+                    f"refreshed={refreshed[0]}/{total}",
+                    "INFO",
+                )
+                return
+            layer_id = pending.pop(0)
+            try:
+                if model is not None and group is not None:
+                    node = group.findLayer(layer_id)
+                    if node is not None:
+                        t0 = time.monotonic()
+                        model.refreshLayerLegend(node)
+                        elapsed_ms = int((time.monotonic() - t0) * 1000)
+                        ovl_name = layer_id_to_name.get(layer_id, "unknown")
+                        flog(
+                            f"[{trace_id}] snapshot_overlay: legend_refresh "
+                            f"layer={ovl_name} elapsed_ms={elapsed_ms}",
+                            "DEBUG",
+                        )
+                        if elapsed_ms > 500 or queue_gap_ms > 500:
+                            flog(
+                                f"[{trace_id}] snapshot_overlay: legend_refresh_slow "
+                                f"layer={ovl_name} elapsed_ms={elapsed_ms} "
+                                f"queue_gap_ms={queue_gap_ms} progress={refreshed[0]}/{total}",
+                                "WARNING",
+                            )
+                refreshed[0] += 1
+            except Exception as exc:  # noqa: BLE001
+                flog(
+                    f"[{trace_id}] snapshot_overlay: legend_refresh_error "
+                    f"layer_id={layer_id[:8]} error={exc!r}",
+                    "ERROR",
+                )
+            last_end[0] = time.monotonic()
             QTimer.singleShot(0, _step)
 
         QTimer.singleShot(0, _step)
@@ -332,6 +490,7 @@ class SnapshotOverlaySession:
     def _create_overlay(self, info: dict) -> None:
         from qgis.core import QgsProject  # noqa: PLC0415
 
+        t0 = time.monotonic()
         project = QgsProject.instance()
         fp = info["fingerprint"]
         uid = uuid.uuid4().hex[:8]
@@ -345,19 +504,29 @@ class SnapshotOverlaySession:
             return
 
         geom_family = self._detect_geom_family(source_layer) or "Polygon"
-        overlay_crs = info.get("storage_crs", self._dst_crs)
+        overlay_crs = info.get("storage_crs") or self._dst_crs
+        if overlay_crs != info.get("storage_crs", self._dst_crs):
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: crs_fallback "
+                f"layer={info['layer_name']} used={overlay_crs} "
+                f"reason=storage_crs_empty",
+                "DEBUG",
+            )
         snap_lyr = self._build_snap_layer(
             uid, geom_family, overlay_crs, source_layer,
         )
         snap_lyr.setName(f"{info['layer_name']} (snapshot)")
         snap_lyr.setCustomProperty("_rl_snap_managed", "1")
+        t_build = time.monotonic()
         self._clone_style_only(snap_lyr, source_layer)
+        t_clone = time.monotonic()
 
         root = project.layerTreeRoot()
         group = root.findGroup(_GROUP_NAME) or root.insertGroup(0, _GROUP_NAME)
         project.addMapLayer(snap_lyr, False)
         idx = self._group_insert_index(group, info["layer_id"])
         group.insertLayer(idx, snap_lyr)
+        t_insert = time.monotonic()
         flog(
             f"[{self.trace_id}] snapshot_overlay: insert_at "
             f"idx={idx}/{len(group.children())} layer={info['layer_name']}",
@@ -369,14 +538,17 @@ class SnapshotOverlaySession:
         ovl.source_layer_id = info["layer_id"]
         ovl.layer_name = info["layer_name"]
         ovl.fingerprint = fp
-        ovl.storage_crs = info.get("storage_crs", self._dst_crs)
+        ovl.storage_crs = info.get("storage_crs") or self._dst_crs
         self._overlays[fp] = ovl
 
         flog(
             f"[{self.trace_id}] snapshot_overlay: created "
             f"layer={info['layer_name']} "
             f"geom={geom_family} uid={uid} "
-            f"overlay_crs={overlay_crs} dst_crs={self._dst_crs}",
+            f"overlay_crs={overlay_crs} dst_crs={self._dst_crs} "
+            f"build_ms={int((t_build - t0) * 1000)} "
+            f"clone_ms={int((t_clone - t_build) * 1000)} "
+            f"insert_ms={int((t_insert - t_clone) * 1000)}",
             "DEBUG",
         )
 
@@ -408,6 +580,7 @@ class SnapshotOverlaySession:
         from qgis.core import QgsFeature, QgsProject  # noqa: PLC0415
         from .geometry_utils import rebuild_geometry  # noqa: PLC0415
 
+        t0 = time.monotonic()
         project = QgsProject.instance()
         lyr = project.mapLayer(ovl.layer_id)
         if lyr is None:
@@ -457,7 +630,8 @@ class SnapshotOverlaySession:
             f"n_null_geom={n_null_geom} n_type_skip={n_skipped} "
             f"n_feats_built={len(feats)} "
             f"lyr_crs={lyr.crs().authid() if lyr.crs().isValid() else '?'} "
-            f"storage_crs={ovl.storage_crs}",
+            f"storage_crs={ovl.storage_crs} "
+            f"build_elapsed_ms={int((time.monotonic() - t0) * 1000)}",
             "INFO",
         )
         fc = 0
@@ -623,6 +797,7 @@ class SnapshotOverlaySession:
         ``QgsMapLayerStyle.writeToLayer()`` causes on certain renderer types.
         Falls back to default renderer if clone fails.
         """
+        t0 = time.monotonic()
         cloned = False
         try:
             renderer = source_layer.renderer()
@@ -647,7 +822,8 @@ class SnapshotOverlaySession:
         flog(
             f"[{self.trace_id}] snapshot_overlay: style_applied "
             f"source={source_layer.name()} opacity={self._SNAP_OPACITY} "
-            f"renderer_cloned={cloned}",
+            f"renderer_cloned={cloned} "
+            f"elapsed_ms={int((time.monotonic() - t0) * 1000)}",
             "DEBUG",
         )
 
