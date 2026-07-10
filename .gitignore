@@ -53,6 +53,13 @@ scripts/validation/fixtures/*.dbf
 scripts/validation/fixtures/*.sqlite
 scripts/validation/fixtures/*.db
 scripts/validation/tmp/
+scripts/validation/_tmp_*
+scripts/validation/*.txt
+scripts/validation/scrub_*.py
+scripts/validation/scenarios/run_*.py
+scripts/validation/scenarios/rvw_*.py
+scripts/validation/scenarios/rw_*.py
+scripts/validation/scenarios/test_*.py
 
 # Internal session notes (if revived locally)
 scripts/SESSION_REWIND.md
@@ -67,3 +74,4 @@ _vendor/
 # Release build artefacts (produced by scripts/build_release.py).
 build/
 dist/
+build_log.txt

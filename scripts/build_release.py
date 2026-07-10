@@ -63,6 +63,9 @@ EXCLUDE_FILES = frozenset({
     # not part of the user-facing plugin. Root-level .md, so not caught
     # by the docs/*.md glob below.
     "AGENTS.md",
+    # Validation/QA helper script moved to scripts/validation/; excluded
+    # here as defense-in-depth in case it was ever tracked at root.
+    "validate_zip.py",
 })
 
 # Glob patterns matched against the full relative POSIX path.
