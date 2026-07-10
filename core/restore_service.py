@@ -294,6 +294,15 @@ def _find_by_snapshot(
     ))
     if has_geom_filter:
         request.setFilterRect(expected_geom.boundingBox())
+    # BL-RW-P1-26: serialise the expected geometry once per scan, not
+    # once per scanned feature (heavy polygons made this dominate the
+    # rewind apply phase).
+    expected_wkb = None
+    if expected_geom is not None and hasattr(expected_geom, "asWkb"):
+        try:
+            expected_wkb = bytes(expected_geom.asWkb())
+        except (TypeError, ValueError):
+            expected_wkb = None
     source = get_feature_source(layer)
     scanned = 0
     _diffs: List[str] = []
@@ -307,7 +316,7 @@ def _find_by_snapshot(
                 excluded_count += 1
                 continue
             if expected_geom is not None and not feature_matches_geometry(
-                    feature, expected_geom):
+                    feature, expected_geom, expected_wkb=expected_wkb):
                 continue
             _geom_ok_fids.append(feature.id())
             attrs_ok = True
@@ -418,6 +427,90 @@ def _find_by_snapshot(
             return chosen
         flog(f"_find_by_snapshot: ambiguous, {len(matches)} matches found "
              f"eid={event.event_id} fids={matches[:5]}", "WARNING")
+    return None
+
+
+def _find_by_attrs_only(
+    layer, event: AuditEvent,
+    exclude_fids: Optional[set] = None,
+    min_attrs: int = 2,
+) -> Optional[int]:
+    """Attribute-only rescue scan (BL-RW-P1-25).
+
+    Used when the geometry-based ``_find_by_snapshot`` returns no candidate
+    (e.g. WKB precision drift through OGR write cycles) but the feature may
+    still exist under a drifted FID. Matches STRICTLY on every relevant
+    captured attribute that is non-null in the event; a feature-side NULL
+    counts as a mismatch (an empty feature must not match everything).
+
+    Returns the FID of the unique match. Multiple matches are refused
+    (no geometry available to bound the risk), fewer than *min_attrs*
+    comparable attributes make the event non-discriminant and return None.
+    """
+    from qgis.core import QgsFeatureRequest
+
+    expected_attrs = reconstruct_attributes(event)
+    fields = layer.fields()
+    pk_field_indices = set(layer.dataProvider().pkAttributeIndexes())
+    relevant = [
+        (hist_name, fields.indexOf(hist_name))
+        for hist_name, val in expected_attrs.items()
+        if all((
+            val is not None,
+            not is_layer_audit_field(hist_name),
+            fields.indexOf(hist_name) >= 0,
+            fields.indexOf(hist_name) not in pk_field_indices,
+        ))
+    ]
+    if len(relevant) < min_attrs:
+        flog(f"SNAP_SCAN eid={event.event_id} phase=attr_rescue "
+             f"non_discriminant n_attrs={len(relevant)} min={min_attrs}",
+             "INFO")
+        return None
+
+    # BL-RW-P1-26: the scan only reads feature.id() and the relevant
+    # attribute indexes; skip geometry materialisation (heavy polygons
+    # cost ~10ms/feature) and non-relevant attributes.
+    request = QgsFeatureRequest()
+    try:
+        request.setFlags(QgisCompat.NO_GEOMETRY)
+        request.setSubsetOfAttributes([idx for _name, idx in relevant])
+    except (AttributeError, TypeError):
+        pass
+    matches: List[int] = []
+    scanned = 0
+    source = get_feature_source(layer)
+    try:
+        for feature in source(request):
+            scanned += 1
+            if exclude_fids and feature.id() in exclude_fids:
+                continue
+            attrs_ok = True
+            for hist_name, idx in relevant:
+                actual_val = feature[idx]
+                if actual_val is None or not _qgis_vals_equal(
+                        actual_val, expected_attrs[hist_name]):
+                    attrs_ok = False
+                    break
+            if attrs_ok:
+                matches.append(feature.id())
+                if len(matches) > 1:
+                    break
+    except Exception as exc:
+        flog(f"SNAP_SCAN eid={event.event_id} phase=attr_rescue "
+             f"SCAN_ERR={exc}", "WARNING")
+        return None
+
+    if len(matches) == 1:
+        flog(f"SNAP_SCAN eid={event.event_id} phase=attr_rescue "
+             f"scanned={scanned} n_attrs={len(relevant)} result={matches[0]} "
+             f"(geometry drifted, strict attr match)", "WARNING")
+        return matches[0]
+    flog(f"SNAP_SCAN eid={event.event_id} phase=attr_rescue "
+         f"scanned={scanned} n_attrs={len(relevant)} "
+         f"matches={len(matches)} result=none"
+         f"{' (ambiguous, refused)' if len(matches) > 1 else ''}",
+         "INFO")
     return None
 
 
@@ -683,7 +776,12 @@ def _classify_restore_result(result: Dict[str, Any]) -> str:
     if reason_code:
         if reason_code == "absent_vs_insert_comp":
             return "skipped_idempotent"
-        if reason_code in ("target_absent", "identity_mismatch_fid_only"):
+        # target_unverifiable (BL-RW-P1-25) is a refusal that returns
+        # BEFORE any buffer mutation: classifying it "failed" made the
+        # strict runner roll back whole layers (134 events lost on the
+        # 2026-07-05 run). Soft-classify with target_absent.
+        if reason_code in ("target_absent", "identity_mismatch_fid_only",
+                           "target_unverifiable"):
             return "target_absent"
         if reason_code == "buffer_refused":
             return "failed"

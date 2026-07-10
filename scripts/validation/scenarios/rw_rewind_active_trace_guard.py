@@ -1,9 +1,11 @@
-"""Scenario BL-RW-P1-23-A2b: active trace guard blocks unsafe cascade rewind.
+"""Scenario BL-RW-P1-23-A2b: has_active_restore_traces detection primitive.
 
 Standalone proof that has_active_restore_traces detects a non-invalidated
-restore trace in the journal.  The dialog uses this to prevent a new rewind
-from replaying compensation on top of a previous restore, which is the root
-cause of FID-only collision in shapefile rewinds after a prior rewind.
+restore trace in the journal. Since BL-RW-P0-24 the dialog no longer BLOCKS
+on active traces (they are the persistent dedup memory, invariant I-8, and
+collapse_rewind_events neutralises already-compensated events); the function
+feeds the observability log 'recover_version: active_traces_present'.
+See scenarios/rw_trace_lifecycle.py for the lifecycle proof.
 """
 import sqlite3
 from datetime import datetime, timezone

@@ -36,6 +36,31 @@ from .core.geometry_utils import (
 # layer.changeGeometry / layer.addFeatures calls inside restore_batch.
 _CHUNK_SIZE = 5
 
+# BL-RW-P1-26: the strict runner bounds each event-loop tick by TIME,
+# not by a fixed action count. A fixed count freezes the UI when single
+# actions are expensive (measured 2026-07-05: 5 actions x ~5s of heavy
+# polygon scans = 25.5s single chunk on zone_mkt_rip). 40ms keeps the
+# progress animation fluid; the max-actions cap bounds per-tick work
+# when actions are cheap.
+_CHUNK_BUDGET_MS = 40.0
+_CHUNK_MAX_ACTIONS = 50
+
+
+def _chunk_should_yield(elapsed_ms: float, n_done: int,
+                        budget_ms: float = _CHUNK_BUDGET_MS,
+                        max_actions: int = _CHUNK_MAX_ACTIONS) -> bool:
+    """Decide whether the strict apply loop must yield to the event loop.
+
+    Progress guarantee: never yields before at least one action ran,
+    even when a single action blows the budget (it already happened,
+    yielding first would deadlock the plan). Yields once the time
+    budget is exhausted or max_actions were processed.
+    """
+    if n_done <= 0:
+        return False
+    return elapsed_ms >= budget_ms or n_done >= max_actions
+
+
 _RUNNER_TO_CYCLE: Dict[str, str] = {
     "RestoreRunner": "event_restore",
     "StrictRestoreRunner": "rewind",
@@ -656,15 +681,19 @@ class StrictRestoreRunner(QObject):
         layer = self._strict_layer
         actions = plan.actions
         start = self._strict_action_idx
-        end = min(start + _CHUNK_SIZE, len(actions))
         chunk_t0 = time.monotonic()
 
         if self._cancelled:
             self._rollback_strict(prefix, "cancel_requested")
             return
 
-        for i in range(start, end):
+        i = start
+        while i < len(actions):
+            elapsed_ms = (time.monotonic() - chunk_t0) * 1000.0
+            if _chunk_should_yield(elapsed_ms, i - start):
+                break
             action = actions[i]
+            i += 1
             event = events_by_id.get(action.event_id)
             if event is None:
                 self._errors.append(f"Evt {action.event_id}: Event data not found")
@@ -738,6 +767,7 @@ class StrictRestoreRunner(QObject):
                 self._rollback_strict(prefix, "apply_failed")
                 return
 
+        end = i
         self._strict_action_idx = end
         self._processed += (end - start)
         self.progress.emit(self._processed, len(self._events))

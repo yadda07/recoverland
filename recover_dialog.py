@@ -2152,6 +2152,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         snap = SnapshotOverlaySession()
         self._review_snap_session = snap
         self._review_snap_mode = True
+        self._review_connect_auto_refresh()
 
         today = _dt.date.today().isoformat()
         first_iso = ((_dt.date.today() - _dt.timedelta(days=5 * 365)).isoformat() + "T00:00:00")
@@ -2753,10 +2754,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         canvas = self.iface.mapCanvas()
         canvas.extentsChanged.connect(self._review_on_extent_changed)
         if self._tracker is not None:
-            try:
-                self._tracker.committed_features.connect(self._review_on_extent_changed)
-            except (AttributeError, TypeError):
-                pass
+            self._tracker.committed_features.connect(self._review_on_commit_changed)
         self._show_review_status_bar()
         if self._review_status_widget is not None:
             self._review_status_widget.activate()
@@ -2771,13 +2769,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         canvas = self.iface.mapCanvas()
         try:
             canvas.extentsChanged.disconnect(self._review_on_extent_changed)
-        except TypeError:
-            pass
+        except TypeError as exc:
+            flog(f"review: canvas_disconnect_failed reason={exc}", "WARNING")
         if self._tracker is not None:
             try:
-                self._tracker.committed_features.disconnect(self._review_on_extent_changed)
-            except (AttributeError, TypeError):
-                pass
+                self._tracker.committed_features.disconnect(self._review_on_commit_changed)
+            except (AttributeError, TypeError) as exc:
+                flog(f"review: tracker_disconnect_failed reason={exc}", "WARNING")
         if self._review_status_widget is not None:
             self._review_status_widget.deactivate()
         self._hide_review_status_bar()
@@ -2795,6 +2793,36 @@ class RecoverDialog(QDialog, LoggerMixin):
             return
         if self._review_snap_mode and self._review_snap_pending_iso:
             self._on_snapshot_date_changed(self._review_snap_pending_iso)
+
+    def _review_on_commit_changed(self, n_events: int) -> None:
+        """Slot for tracker committed_features signal (after WriteQueue flush).
+
+        Invalidates the snapshot cache and triggers a rebuild when in Review
+        Snapshot mode. This ensures commits during a session are reflected
+        immediately without requiring a date change.
+
+        Args:
+            n_events: Number of events persisted in the flush batch.
+        """
+        if not self._review_active:
+            return
+        if not self._review_snap_mode:
+            return
+        if not self._review_snap_pending_iso:
+            return
+        flog(
+            f"review: commit_signal_received n_events={n_events} "
+            f"iso={self._review_snap_pending_iso} invalidating_cache",
+            "INFO",
+        )
+        self._review_snap_raw_result = None
+        self._review_snap_raw_iso = ""
+        flog(
+            f"review: cache_invalidated iso={self._review_snap_pending_iso} "
+            f"rebuild_debounced",
+            "INFO",
+        )
+        self._review_debounce.start()
 
     def _recover_event_mode(self) -> None:
         """Event mode: threaded search with start/end date range."""
@@ -2853,26 +2881,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         undo_events = (sum(len(v) for v in self._last_restore_by_ds.values())
                        if self._last_restore_by_ds else 0)
 
-        # BL-RW-P1-23-A2: if the in-memory undo state is gone (dialog closed /
-        # QGIS restarted) but the journal still contains active restore traces,
-        # a new rewind would replay compensation on top of an already restored
-        # layer.  For FID-only layers this can corrupt or skip features.  Block
-        # until the user explicitly undoes the previous restore via the UI.
+        # BL-RW-P0-24: active traces are the persistent dedup memory
+        # (invariant I-8).  A new rewind proceeds even without in-memory undo
+        # state: the fetch includes active traces and collapse_rewind_events
+        # neutralises every already-compensated event, so nothing is replayed.
         if undo_layers == 0:
             read_conn = self._get_dialog_read_conn()
             if read_conn is not None and has_active_restore_traces(
                 read_conn, list(checked_fps), trace_id=trace_id
             ):
-                flog(f"[{trace_id}] recover_version: BLOCKED active_restore_traces "
-                     f"datasource_count={len(checked_fps)}", "WARNING")
-                self._is_recovering = False
-                self.enable_controls(True)
-                self.recover_button.setEnabled(True)
-                qlog(self.tr(
-                    "Un rewind/restore actif existe pour une couche selectionnee. "
-                    "Annulez-le via 'Annuler le dernier restore' avant de rewinder."
-                ), "WARNING")
-                return
+                flog(f"[{trace_id}] recover_version: active_traces_present "
+                     f"datasource_count={len(checked_fps)} -> proceed, "
+                     f"dedup neutralises already-compensated events")
 
         include_traces = True
         flog(f"[{trace_id}] recover_version: start scope={len(checked_fps)} layer(s) "
@@ -4330,42 +4350,6 @@ class RecoverDialog(QDialog, LoggerMixin):
                 except Exception:
                     pass
 
-    def _invalidate_orphan_traces_on_open(self) -> None:
-        """Purge all active trace events that have no in-memory undo state.
-
-        Called at dialog open (when _last_restore_by_ds is None) and on every
-        project switch so that the rewind dedup never sees traces from a
-        previous QGIS session that were never invalidated.
-        """
-        if self._journal is None or not getattr(self._journal, 'is_open', False):
-            flog("_invalidate_orphan_traces_on_open: skipped journal=None or closed")
-            return
-        from datetime import datetime, timezone
-        now_iso = datetime.now(timezone.utc).isoformat()
-        conn = None
-        try:
-            conn = self._journal.create_write_connection()
-            cursor = conn.execute(
-                "UPDATE audit_event SET invalidated_at = ? "
-                "WHERE restored_from_event_id IS NOT NULL "
-                "AND invalidated_at IS NULL",
-                [now_iso],
-            )
-            rowcount = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
-            conn.commit()
-            flog(
-                f"_invalidate_orphan_traces_on_open: "
-                f"legacy_traces_purged={rowcount} at={now_iso}"
-            )
-        except Exception as exc:
-            flog(f"_invalidate_orphan_traces_on_open: failed: {exc}", "WARNING")
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
     def reset_undo_state(self) -> None:
         """Drop the last-restore memory (called by the plugin on project switch).
 
@@ -4377,7 +4361,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._pending_rewind_events = None
         if hasattr(self, 'undo_last_btn'):
             self.undo_last_btn.setEnabled(False)
-        self._invalidate_orphan_traces_on_open()
         if had_state:
             flog("RecoverDialog: undo state reset (project switched)")
 
@@ -4407,8 +4390,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         super().showEvent(event)
         flog("RecoverDialog: shown")
         self._stats_cache.invalidate()
-        if not self._last_restore_by_ds:
-            self._invalidate_orphan_traces_on_open()
         if hasattr(self, '_layer_refresh_timer'):
             self._layer_refresh_timer.start()
         self._refresh_journal_status()

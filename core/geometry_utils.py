@@ -373,23 +373,40 @@ def is_geometry_present(geom) -> bool:
     return True
 
 
-def feature_matches_geometry(feature, expected_geom) -> bool:
+def feature_matches_geometry(feature, expected_geom, expected_wkb=None) -> bool:
     """Return True when *feature*'s geometry matches *expected_geom*.
 
-    Two-step comparison shared between the snapshot scanners in
-    restore_service and the buffer ops in restore_executor (DUP-10):
+    Comparison shared between the snapshot scanners in restore_service
+    and the buffer ops in restore_executor (DUP-10):
+      0. Bounding-box fast reject (BL-RW-P1-26): two geometries with
+         different exact bounding boxes cannot be equal, and the bbox
+         compare avoids both the WKB byte copy and the GEOS ``equals``
+         construction that dominated the rewind apply phase on heavy
+         polygons (measured 55s/59s on zone_mkt_rip, 2026-07-05).
+         Encoding variants of the same shape (ring orientation,
+         redundant Z) share the same vertices hence the same bbox, so
+         they still reach the equals() fallback.
       1. Byte-for-byte WKB equality (fast path; the audit pipeline
          re-serialises geometries the same way QGIS does).
       2. ``QgsGeometry.equals`` fallback for the cases where two valid
-         WKB encodings represent the same shape (e.g. ring orientation,
-         redundant Z coordinate).
+         WKB encodings represent the same shape.
+
+    *expected_wkb* lets per-event scan loops serialise the expected
+    geometry ONCE instead of once per scanned feature.
     """
     if not is_geometry_present(expected_geom):
         return False
     current = feature.geometry()
     if not is_geometry_present(current):
         return False
-    if geometries_equal(bytes(current.asWkb()), bytes(expected_geom.asWkb())):
+    try:
+        if current.boundingBox() != expected_geom.boundingBox():
+            return False
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    if expected_wkb is None:
+        expected_wkb = bytes(expected_geom.asWkb())
+    if geometries_equal(bytes(current.asWkb()), expected_wkb):
         return True
     if hasattr(current, "equals"):
         return bool(current.equals(expected_geom))
