@@ -1068,6 +1068,13 @@
           "evidence": "Fix runtime ajoute au livrable (demande user): recover_dialog.py self-heal de la pill Review en status bar quand le dialog est reutilise au reopen (recover.py cache self.dlg -> __init__/setup non rejoues). _show_review_status_bar recree le widget via _setup_review_status_bar si None (flog INFO 'recreating'), WARNING si indispo; showEvent l'appelle inconditionnellement avant activate(). py_compile=0, flake8=0 sur recover_dialog.py. Rebuild --clean: n_entries=95, SELFHEAL_IN_ZIP=True, MD=[], VER 3.40/5.0.0/4.99. Commit 255ce5b sur main (c2c380d..255ce5b): 1 fichier, +15/-3. STATIC seulement: le chemin self-heal n'est PAS prouve runtime."
         },
         {
+          "ts": "2026-07-09T00:00:00Z",
+          "from": "PATCHED",
+          "to": "PATCHED",
+          "by": "/orchestrator",
+          "evidence": "Packaging-only change: validate_zip.py moved from repo root to scripts/validation/ (dev-only QA helper) to ensure exclusion from shipped ZIP. Updated validate_zip.py to use Path for cross-platform resolution. Added validate_zip.py to EXCLUDE_FILES in build_release.py (defense-in-depth). Updated .gitignore to exclude validation temp files and build_log.txt. Build evidence: level=INFO event=release_done version=5.0.1 n_entries=95 size_kb=421. Validation: TOP_ROOTS=['RecoverLand'], TOTAL_ENTRIES=95, SIZE_KB=1526, FORBIDDEN_CHECK=PASS, REQUIRED_CHECK=PASS. Commit 187bf79: 3 files changed, 47 insertions. No runtime behavior affected."
+        },
+        {
           "ts": "2026-06-22T18:11:00Z",
           "from": "PATCHED",
           "to": "PATCHED",
