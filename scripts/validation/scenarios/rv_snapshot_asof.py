@@ -14,9 +14,8 @@ Ou bien ::
     exec(open(r"<plugin>/scripts/validation/scenarios/rv_snapshot_asof.py").read())
 
 THESE validee : a une date T, le mode Snapshot affiche l'etat fidele =
-reconstruction(entites tracees a T) FUSIONNEE avec etat courant(entites non
-tracees), sans doublon ; les entites tracees creees apres T ou supprimees avant
-T sont absentes.
+reconstruction(entites tracees a T), sans doublon ; les entites tracees creees
+apres T ou supprimees avant T sont absentes.
 
 Le verdict reel (PASS/FAIL par assertion) est imprime ET ecrit dans
 recoverland_debug.log via flog, prefixe par le trace_id du scenario.
@@ -216,141 +215,6 @@ def _run_engine_phase(results) -> SnapshotResult:
 
 
 # ------------------------------------------------------------------ #
-# Phase 2 : fusion baseline (necessite une couche memoire QGIS)       #
-# ------------------------------------------------------------------ #
-
-
-def _run_merge_phase(results, engine_result) -> None:
-    """Build a memory layer + a SnapshotResult, run merge_untracked_base, assert."""
-    try:
-        from qgis.core import (
-            QgsFeature,
-            QgsGeometry,
-            QgsProject,
-            QgsVectorLayer,
-        )
-    except ImportError as exc:
-        _check(results, "MERGE_env", False,
-               f"QGIS indisponible: {exc!r} (phase merge sautee)")
-        return
-
-    from recoverland.widgets.snapshot_rebuild_worker import (
-        _feature_entity_fp,
-        _resolve_pk_field,
-        merge_untracked_base,
-    )
-    from recoverland.core.temporal_snapshot_engine import SnapshotFeature
-
-    # Champs declares via l'URI memoire: version-proof (pas de divergence
-    # QVariant 3.44/Qt5 vs QMetaType 4.0/Qt6).
-    lyr = QgsVectorLayer(
-        "Point?crs=EPSG:4326&field=gid:integer&field=name:string",
-        "__rv_asof_src", "memory",
-    )
-    dp = lyr.dataProvider()
-
-    def _feat(gid, name, x, y):
-        f = QgsFeature(lyr.fields())
-        f.setAttribute("gid", gid)
-        f.setAttribute("name", name)
-        f.setGeometry(QgsGeometry.fromWkt(f"POINT({x} {y})"))
-        return f
-
-    # Roles: A tracee+presente a T (reconstruite); B tracee creee-apres-T;
-    # C tracee supprimee-avant-T (mais encore live); U non tracee (jamais editee).
-    dp.addFeatures([_feat(1, "A_now", 1, 1), _feat(2, "B_now", 2, 2),
-                    _feat(3, "C_now", 3, 3), _feat(10, "U_now", 10, 10)])
-    lyr.updateExtents()
-    QgsProject.instance().addMapLayer(lyr, False)
-
-    try:
-        # Cles calculees par la VRAIE fonction d'identite (independante de la
-        # presence d'un PK: couche memoire -> fid:<id>). Le scenario teste la
-        # logique de dedup, pas le format de cle.
-        pk_field = _resolve_pk_field(lyr)
-        by_name = {f["name"]: f for f in lyr.getFeatures()}
-        key = {n: _feature_entity_fp(f, pk_field) for n, f in by_name.items()}
-        flog(
-            f"[{results.trace_id}] rv_asof: merge_keys pk_field={pk_field} "
-            f"A={key['A_now']} B={key['B_now']} C={key['C_now']} U={key['U_now']}",
-            "INFO",
-        )
-
-        layer_infos = [{
-            "fingerprint": _DS_FP,
-            "layer_id": lyr.id(),
-            "layer_name": "couche_test",
-            "storage_crs": "EPSG:4326",
-        }]
-        # tracked_fps : toutes les entites ayant >=1 evenement (A, B, C).
-        tracked_fps = {_DS_FP: {key["A_now"], key["B_now"], key["C_now"]}}
-        # features reconstruites a T : seulement A (present).
-        recon_feat = SnapshotFeature(
-            entity_fp=key["A_now"], geom_wkb=b"", attrs_json='{"gid":1,"name":"A1"}',
-            crs_authid="EPSG:4326", last_event_id=2, last_op="UPDATE",
-            last_created_at="2026-02-15T08:00:00",
-        )
-        base_result = SnapshotResult(
-            features={_DS_FP: {key["A_now"]: recon_feat}},
-            cutoff_dt=datetime(2026, 3, 1, tzinfo=timezone.utc),
-            n_fps=1, n_entities=1, n_absent=1, n_unknown=1, elapsed_ms=0,
-            trace_id=results.trace_id, all_event_markers=(), tracked_fps=tracked_fps,
-        )
-
-        merged = merge_untracked_base(base_result, layer_infos, None,
-                                      trace_id=results.trace_id)
-        mfeats = merged.features.get(_DS_FP, {})
-        mkeys = set(mfeats.keys())
-
-        _check(results, "A5_untracked_added_unchanged",
-               key["U_now"] in mkeys and mfeats[key["U_now"]].last_op == "UNCHANGED",
-               f"U={key['U_now']} present last_op="
-               f"{mfeats.get(key['U_now']) and mfeats[key['U_now']].last_op}")
-
-        _check(results, "A6_reconstructed_not_duplicated",
-               key["A_now"] in mkeys and mfeats[key["A_now"]].last_op == "UPDATE",
-               f"A={key['A_now']} last_op={mfeats.get(key['A_now']) and mfeats[key['A_now']].last_op} "
-               f"(reconstruit, non ecrase par le live)", brutal=True)
-
-        _check(results, "A7_tracked_absent_not_merged",
-               key["B_now"] not in mkeys and key["C_now"] not in mkeys,
-               f"B/C (tracees mais absentes a T) non re-ajoutees par le merge; "
-               f"mkeys={sorted(mkeys)}", brutal=True)
-
-        # A8 (RL-E1-03) : cutoff ANTERIEUR a la baseline T0 (debut du suivi)
-        # -> les entites non suivies ne sont PAS presumees presentes, et la
-        # couche est signalee dans baseline_missing_layers.
-        pre_baseline_result = SnapshotResult(
-            features={_DS_FP: {key["A_now"]: recon_feat}},
-            cutoff_dt=datetime(2025, 12, 1, tzinfo=timezone.utc),  # avant T0
-            n_fps=1, n_entities=1, n_absent=0, n_unknown=0, elapsed_ms=0,
-            trace_id=results.trace_id, all_event_markers=(),
-            tracked_fps=tracked_fps,
-            layer_baseline={_DS_FP: "2026-01-10T08:00:00"},  # T0 > cutoff
-        )
-        merged_pre = merge_untracked_base(pre_baseline_result, layer_infos, None,
-                                          trace_id=results.trace_id)
-        pre_keys = set(merged_pre.features.get(_DS_FP, {}).keys())
-        _check(results, "A8_before_baseline_untracked_not_present",
-               key["U_now"] not in pre_keys
-               and "couche_test" in merged_pre.baseline_missing_layers,
-               f"U non presume present avant T0; "
-               f"baseline_missing={merged_pre.baseline_missing_layers}",
-               brutal=True)
-
-        # A9 (RL-E1-04) : couche memoire sans PK -> identity=fid-only WEAK
-        # -> la couche doit etre signalee dans fid_only_layers pour avertir
-        # l'utilisateur du risque de renumerotation FID.
-        _check(results, "A9_fid_only_layer_warned",
-               "couche_test" in merged.fid_only_layers,
-               f"fid_only_layers={merged.fid_only_layers} "
-               f"(attendu 'couche_test' car memory provider sans PK)",
-               brutal=True)
-    finally:
-        QgsProject.instance().removeMapLayer(lyr.id())
-
-
-# ------------------------------------------------------------------ #
 # Entree                                                              #
 # ------------------------------------------------------------------ #
 
@@ -362,8 +226,7 @@ def run() -> dict:
     flog(f"[{results.trace_id}] rv_asof: scenario_start", "INFO")
     print(f"=== rv_snapshot_asof trace_id={results.trace_id} ===")
 
-    engine_result = _run_engine_phase(results)
-    _run_merge_phase(results, engine_result)
+    _run_engine_phase(results)
 
     n_total = len(results)
     n_pass = sum(1 for _, p, _, _ in results if p)

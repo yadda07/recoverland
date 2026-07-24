@@ -68,15 +68,6 @@ class SnapshotResult(NamedTuple):
     partial   : True if the result is incomplete (e.g. volume guard tripped);
                 callers MUST surface a degraded/partial indicator (never silent).
     partial_reason : short machine-readable reason when ``partial`` is True.
-    fid_only_layers : layer names whose identity falls back to fid:<id> (no
-                stable PK). The as-of-T view for these layers is at risk of
-                FID re-numbering; callers MUST surface a persistent warning.
-    layer_baseline : {datasource_fp: earliest_event_iso} — the tracking-start
-                baseline T0 (first recorded event). Used to decide whether
-                untracked features may be assumed present at T.
-    baseline_missing_layers : layer names for which T < T0 (the journal has no
-                information at the requested date); untracked features were NOT
-                assumed present and the caller MUST warn.
     """
 
     features: dict
@@ -88,12 +79,8 @@ class SnapshotResult(NamedTuple):
     elapsed_ms: int
     trace_id: str
     all_event_markers: tuple = ()
-    tracked_fps: dict = {}
     partial: bool = False
     partial_reason: str = ""
-    fid_only_layers: tuple = ()
-    layer_baseline: dict = {}
-    baseline_missing_layers: tuple = ()
 
 
 # ------------------------------------------------------------------ #
@@ -193,11 +180,11 @@ def _canonical_fallback_key(feature_identity_json) -> str:
     """Canonical entity key when entity_fingerprint is absent.
 
     Mirrors identity.compute_entity_fingerprint so the reconstruction key
-    matches the one recomputed live by snapshot_rebuild_worker._feature_entity_fp
-    (``pk:<field>=<value>`` or ``fid:<id>``). Without this alignment a
-    NULL-fingerprint entity is reconstructed under ``fid:<raw_json>`` while the
-    baseline merge keys it ``fid:<id>`` — the same feature is then painted twice
-    (once reconstructed at T, once live). Kept QGIS-free (pure json).
+    matches the canonical format (``pk:<field>=<value>`` or ``fid:<id>``).
+    Without this alignment a NULL-fingerprint entity is reconstructed under
+    ``fid:<raw_json>`` while the baseline merge keys it ``fid:<id>`` — the same
+    feature is then painted twice (once reconstructed at T, once live).
+    Kept QGIS-free (pure json).
     """
     try:
         identity = json.loads(feature_identity_json) if feature_identity_json else None
