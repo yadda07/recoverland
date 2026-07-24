@@ -78,11 +78,12 @@ class WriteQueue:
         flog("WriteQueue: writer thread stopped")
 
     def enqueue(self, events: List[AuditEvent]) -> bool:
-        """Add events to the write queue.
+        """Add events to the write queue (all-or-nothing per batch).
 
-        Validates JSON fields before accepting. Returns False and saves
-        events to the pending recovery file if the queue would exceed the
-        hard limit, signaling that tracking should be halted.
+        Validates all events before any are enqueued. If any event is invalid,
+        the entire batch is saved to pending recovery and False is returned.
+        Returns False and saves events to pending recovery if the queue would
+        exceed the hard limit, signaling that tracking should be halted.
         """
         qsize = self._queue.qsize()
         # Pre-check capacity against the batch size to prevent a huge single
@@ -99,12 +100,29 @@ class WriteQueue:
             )
             self._save_lost_events(events)
             return False
-        accepted = 0
-        for event in events:
+
+        # Pre-validate all events before any put() to ensure atomicity (INV-1)
+        invalid_count = 0
+        first_invalid_idx = -1
+        for idx, event in enumerate(events):
             if not _validate_event(event):
-                continue
+                invalid_count += 1
+                if first_invalid_idx == -1:
+                    first_invalid_idx = idx
+
+        if invalid_count > 0:
+            flog(
+                f"WriteQueue: event=wq_enqueue_rejected n_events={len(events)} "
+                f"n_invalid={invalid_count} first_invalid_idx={first_invalid_idx}",
+                "ERROR",
+            )
+            self._save_lost_events(events)
+            return False
+
+        # All events valid: enqueue them
+        for event in events:
             self._queue.put(event)
-            accepted += 1
+
         qsize = self._queue.qsize()
         if qsize > _QUEUE_EARLY_WARNING and not self._early_warning_emitted:
             self._early_warning_emitted = True
@@ -113,14 +131,6 @@ class WriteQueue:
                 self._on_early_warning()
         elif qsize > _QUEUE_WARNING_THRESHOLD:
             flog(f"WriteQueue: queue size={qsize} exceeds threshold", "WARNING")
-        if accepted < len(events):
-            rejected = len(events) - accepted
-            flog(
-                f"WriteQueue: accepted {accepted}/{len(events)} events "
-                f"({rejected} rejected by validator)",
-                "ERROR",
-            )
-            return False
         return True
 
     def set_early_warning_callback(self, callback) -> None:
@@ -248,7 +258,10 @@ class WriteQueue:
 def _validate_event(event: AuditEvent) -> bool:
     """Reject events with obviously invalid JSON fields before they enter the queue."""
     if not event.operation_type or event.operation_type not in ("INSERT", "UPDATE", "DELETE"):
-        flog(f"WriteQueue: rejected event with bad operation_type={event.operation_type!r}", "WARNING")
+        flog(
+            f"WriteQueue: rejected event with bad operation_type={event.operation_type!r}",
+            "WARNING",
+        )
         return False
     if not event.attributes_json or not isinstance(event.attributes_json, str):
         flog("WriteQueue: rejected event with empty/non-string attributes_json", "WARNING")
