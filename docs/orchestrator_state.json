@@ -1434,6 +1434,110 @@
       "commit_hash": "",
       "log_evidence_excerpt": "n/a_open",
       "last_report": ""
+    },
+    {
+      "id": "BL-RVW-P0-02-E3",
+      "title": "E3: suppression code mort merge_untracked_base + champs SnapshotResult morts + phase 2 rv_snapshot_asof",
+      "priority": "P0",
+      "effort": "M",
+      "root_cause": "Code mort identifie par l'architecte (cadrage 2026-07-24): merge_untracked_base et ses dependances (_parse_iso_utc, _resolve_pk_field, _feature_entity_fp, _BASE_FEATURE_CAP, imports get_identity_strength_for_layer/IdentityStrength) ne sont plus utilises suite a la decision de ne pas fusionner les entites non tracees dans le mode Review. Les champs SnapshotResult associes (tracked_fps, fid_only_layers, layer_baseline, baseline_missing_layers) sont egalement morts. La phase 2 du scenario rv_snapshot_asof teste cette fonctionnalite supprimee et doit etre retiree.",
+      "state": "PROVEN",
+      "blocked_by": [],
+      "scenario_path": "scripts/validation/scenarios/rv_snapshot_asof.py",
+      "scenario_status": "passing_runtime_qgis",
+      "patch_files": [
+        "widgets/snapshot_rebuild_worker.py",
+        "core/temporal_snapshot_engine.py",
+        "scripts/validation/scenarios/rv_snapshot_asof.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-07-05T05:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "decision D-2026-07-05-05"
+        },
+        {
+          "ts": "2026-07-24T10:00:00Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/architecte",
+          "evidence": "verdict GO_WITH_NOTES cadrage 2026-07-24, suppression pure independante de E1"
+        },
+        {
+          "ts": "2026-07-24T11:00:00Z",
+          "from": "SCOPED",
+          "to": "REPRODUCED",
+          "by": "/corrector",
+          "evidence": "grep pre-suppression atteste code mort present"
+        },
+        {
+          "ts": "2026-07-24T12:00:00Z",
+          "from": "REPRODUCED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "py_compile OK + grep post-suppression 0 reference. Le round 1 a ete rejete pour reecriture hors contrat."
+        },
+        {
+          "ts": "2026-07-24T13:10:00Z",
+          "from": "PATCHED",
+          "to": "PROVEN",
+          "by": "/orchestrator",
+          "evidence": "G4 runtime QGIS console user: rv_snapshot_asof trace_id=00832825 SYNTHESE PASS 7/7 assertions dont 5/5 antitheses brutales (A2 last_op=UPDATE, A2b name='A1' scalaire, A2c name='A0' avant UPDATE, A2d forme-liste 'E1', A3 n_unknown=1, A4 n_absent=1, A1 keys_fid=['fid:77']). Zero ligne MERGE_env: phase 2 absente du run, suppression effective. Moteur de reconstruction intact post-E3."
+        }
+      ],
+      "commit_hash": "3dc12c0",
+      "log_evidence_excerpt": "[00832825] rv_asof: SYNTHESE: PASS -- 7/7 assertions, dont 5/5 antitheses brutales.",
+      "last_report": ""
+    },
+    {
+      "id": "RL-E2-02",
+      "title": "WriteQueue.enqueue atomique tout-ou-rien par lot",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "enqueue() valide les events UN PAR UN dans la boucle (write_queue.py:102-124). Si _validate_event rejete l event N, les events 0..N-1 sont DEJA dans la queue et seront ecrits en SQLite. Le retour False desactive le tracker (edit_tracker.py:421-427) mais les events partiels restent en queue -> session partiellement persistee, violation de l atomicite. De plus les events valides d un lot rejete ne sont ni en SQLite ni dans le fichier pending -> perte silencieuse partielle.",
+      "state": "PATCHED",
+      "blocked_by": [],
+      "scenario_path": "scripts/validation/scenarios/rw_wq_atomic_enqueue.py",
+      "scenario_status": "passing_offline",
+      "patch_files": [
+        "core/write_queue.py",
+        "scripts/validation/scenarios/rw_wq_atomic_enqueue.py"
+      ],
+      "history": [
+        {
+          "ts": "2026-07-24T10:00:00Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/reviewer",
+          "evidence": "audit 2026-07-24 acceptation partielle silencieuse write_queue.py:102-123"
+        },
+        {
+          "ts": "2026-07-24T11:00:00Z",
+          "from": "OPEN",
+          "to": "SCOPED",
+          "by": "/architecte",
+          "evidence": "verdict GO, pre-validation avant premier put, lot entier vers pending sur rejet"
+        },
+        {
+          "ts": "2026-07-24T12:00:00Z",
+          "from": "SCOPED",
+          "to": "REPRODUCED",
+          "by": "/corrector",
+          "evidence": "scenario FAIL avant patch avec compte SQLite partiel (4 events au lieu de 0), trace_id=test123"
+        },
+        {
+          "ts": "2026-07-24T13:00:00Z",
+          "from": "REPRODUCED",
+          "to": "PATCHED",
+          "by": "/corrector",
+          "evidence": "scenario PASS apres patch 5/5 assertions, trace_id=64b4da52"
+        }
+      ],
+      "commit_hash": "d1abaa1",
+      "log_evidence_excerpt": "[validation] verdict=PASS passed=5/5 duration_ms=729 trace_id=64b4da52",
+      "last_report": "scripts/validation/reports/rw_wq_atomic_enqueue_20260724_123852.json"
     }
   ]
 }
