@@ -538,15 +538,29 @@ def antithese() -> dict[str, Any]:
     }
 
 
+def _in_qgis() -> bool:
+    """True when running inside a QGIS session.
+
+    `sys.exit()` raises SystemExit; propagated out of the QGIS Python
+    console it closes the main window. Same guard as the note in
+    `i18n_runtime_qgis.py`.
+    """
+    return "qgis.utils" in sys.modules
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "scan"
     if mode == "antithese":
-        sys.exit(0 if antithese()["verdict"] == "PASS" else 1)
+        exit_code = 0 if antithese()["verdict"] == "PASS" else 1
     elif mode == "all":
         r1 = run()
         r2 = antithese()
         overall = "PASS" if r1["verdict"] == "PASS" and r2["verdict"] == "PASS" else "FAIL"
         print(f"\n[i18n] OVERALL verdict={overall} scan={r1['verdict']} antithese={r2['verdict']}")
-        sys.exit(0 if overall == "PASS" else 1)
+        exit_code = 0 if overall == "PASS" else 1
     else:
-        sys.exit(0 if run()["verdict"] == "PASS" else 1)
+        exit_code = 0 if run()["verdict"] == "PASS" else 1
+    if _in_qgis():
+        print(f"[i18n] exit_code={exit_code} sys_exit=skipped reason=qgis_session")
+    else:
+        sys.exit(exit_code)
