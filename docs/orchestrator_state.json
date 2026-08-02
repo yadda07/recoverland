@@ -2,11 +2,11 @@
   "schema_version": 1,
   "generated_at": "2026-07-05T14:10:00Z",
   "session_active": {
-    "current_item": "BL-RVW-P1-03",
-    "current_state": "PATCHED",
+    "current_item": "RL-E11-01",
+    "current_state": "OPEN",
     "current_pilot": "/orchestrator",
-    "started_at": "2026-07-05T11:20:00Z",
-    "notes": "Audit /reviewer complet du mode Review: 13 findings, 5 causes racines. Vague subagents 2026-07-05: G1 paralleles /architecte sur BL-RVW-P1-03 et BL-RVW-P0-02 (GO_WITH_NOTES x2; P0-02 cadre seulement, decoupe E1/E2/E3 pour la vague suivante); /corrector sur BL-RVW-P1-03 en 4 rounds (round 1 REFUSE par l'orchestrateur: compteur non race-free + scenario complaisant) -> PATCHED PASS 17/17 trace_id=add74d15. EN ATTENTE G4 RUNTIME QGIS USER, trois checks possibles dans la meme session: BL-RVW-P0-01 (scrub post-rewind, citer n_traces_resolved>0), BL-RVW-P1-03 (commit pendant Review, citer commit_signal_received puis cache_invalidated ... rebuild_debounced), BL-RVW-P1-06 (re-run activation Review projet rbal_auvergne pour departager H1 clone SVG vs H2 queue legende via async_create_step_slow). Puis G5 commits cibles (attention: worktree porte des changements anterieurs non commites, staging par hunks requis). Note heritee 13:00Z: BL-RVW-P1-06 OPEN, gel ~70s activation Review (23 couches, journal 178.7MB), creation overlays instrumentee (step_elapsed_ms/queue_gap_ms, ventilation build/clone/insert). MAJ 2026-07-08: regularisation ledger apres verification (grep FORCE_APPLY inconditionne _buffer_update L693-699; layer_geom_index 0 call-site) -> creation BL-RW-P1-27 SCOPED, BL-RW-P1-28 SCOPED, BL-RW-P2-29 OPEN. Decision dispatch: G4 runtime QGIS + G5 commits des 5 PATCHED d'abord; P1-27/P1-28 touchent restore_service/executor deja porteurs de patches non commites, aucun empilement avant DONE des 5."
+    "started_at": "2026-08-02T17:06:06Z",
+    "notes": "Session 2026-08-02 nettoyage + reconciliation. (1) Purge 164 artefacts generes / 1742 Mo (stress_snapshot_*.json sans consommateur, _tmp_*, build/, dist/, logs, __pycache__). (2) Commit 4b0d6e5: suppression des stubs Time Lens (3 widgets docstring-only), des 19 scenarios scripts/validation/scenarios/lens/ qui importaient core/lens_planner, lens_renderer, lens_contracts et widgets/temporal_lens_dock tous absents, de p_validate_rewind_breakdown.py (importait scripts.validate_rewind absent), des alias widgets/geogit_* sans call-site et de docs/antithese_geogit_snapshot_2026-05-21.md (note interne dans un depot public). Verification: 134 fichiers compiles, 0 reference pendante. core/layer_geom_index.py conserve (decision reportee a BL-RW-P1-27). (3) Regularisation: les items RL-E* de docs/BACKLOG.md n'etaient pas dans la machine a etats; injectes en OPEN. RL-E9-01 non injecte (obsolete), RL-E3-01 non injecte (fusionne dans RL-E1-01). (4) Epopee E11 creee sur trois faits verifies: harness de validation Rewind disparu, sous-mode ReView Diff documente mais absent du code, doc publique decrivant des modules supprimes. Prochaine gate: G1 /architecte sur RL-E11-01 (sans harness, aucune preuve de reconstruction n'est possible), puis G4 runtime QGIS des 4 PATCHED en attente."
   },
   "session_history": [
     {
@@ -129,6 +129,14 @@
         "D-2026-07-05-04: BL-RVW-P1-03 mecanisme commit->Review concu (le signal committed_features n'a jamais existe, EditSessionTracker est une classe pure et le connect recover_dialog.py:2757 no-op silencieux): pont QObject possede par le tracker expose en property committed_features + hook post-flush dans WriteQueue pour emettre APRES persistance SQLite (debounce 600ms = loterie: poll writer 0.1s, retries 0.2/0.4/0.8s). Delegations /perf et /qgis-plugin repliees en contraintes corrector + antitheses G3.5 (elles ne changent pas la decision G1).",
         "D-2026-07-05-05: BL-RVW-P0-02 modele backward = derivation old-side du 1er event > T APRES _materialize_traces (composition BL-RVW-P0-01); fallback geometrie live REJETE (faux visuel, ne pas peindre + compteur n_no_geom); merge_untracked_base et champs SnapshotResult morts SUPPRIMES en E3 (tranche le coeur CR-5 de BL-RVW-P2-05, les secondaires F-7/F-8/F-10..F-13 restent a trier dans P2-05); decoupage E1 moteur+SQL (M) -> E2 exposition UI (S) -> E3 nettoyage+reecriture rv_snapshot_asof (M)."
       ]
+    },
+    {
+      "session": "",
+      "started_at": "2026-07-05T11:20:00Z",
+      "ended_at": "2026-08-02T17:06:06Z",
+      "objective": "",
+      "deliverables": "",
+      "decisions": ""
     }
   ],
   "items": [
@@ -1538,6 +1546,918 @@
       "commit_hash": "d1abaa1",
       "log_evidence_excerpt": "[validation] verdict=PASS passed=5/5 duration_ms=729 trace_id=64b4da52",
       "last_report": "scripts/validation/reports/rw_wq_atomic_enqueue_20260724_123852.json"
+    },
+    {
+      "id": "RL-E1-05",
+      "title": "Entites preexistantes (1er evenement = UPDATE) : attributs incomplets a T",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E1-05 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E1-06",
+      "title": "Couches sans geometrie / geometrie NULL invisibles dans l'overlay",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E1-06 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E2-01",
+      "title": "Capture tronquee sous pression memoire mais commit accepte",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E2-01 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E2-03",
+      "title": "Faux DELETE quand le provider rejette les suppressions",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E2-03 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E2-04",
+      "title": "Horodatages identiques pour tous les evenements d'un commit",
+      "priority": "P1",
+      "effort": "S",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E2-04 (refs fichier:ligne dans le document). Verifie 2026-08-02: 'sequence_in_session' absent de core/*.py.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E2-05",
+      "title": "Durabilite WAL `synchronous=NORMAL` (perte sur crash OS)",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E2-05 (refs fichier:ligne dans le document). Verifie 2026-08-02: core/sqlite_schema.py:51 'PRAGMA synchronous=NORMAL'.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E2-06",
+      "title": "Derive de schema (renommage de champ) non modelisee",
+      "priority": "P2",
+      "effort": "L",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E2-06 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E2-07",
+      "title": "`gid` traite comme metadonnee d'audit (changements de `gid` manques)",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E2-07 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E2-08",
+      "title": "Journal reseau / multi-utilisateur sans garde-fou",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E2-08 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E3-03",
+      "title": "Suite de scenarios runtime complete",
+      "priority": "P1",
+      "effort": "XL",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E3-03 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E3-04",
+      "title": "Comparaison \" golden file \" GPKG de bout en bout",
+      "priority": "P2",
+      "effort": "L",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E3-04 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E3-05",
+      "title": "Audit CI de respect de la charte `compat`",
+      "priority": "P2",
+      "effort": "S",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E3-05 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E4-01",
+      "title": "Objet-dieu `recover_dialog.py` (~4370 lignes)",
+      "priority": "P1",
+      "effort": "XL",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E4-01 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E4-02",
+      "title": "Pas de jeton de generation de requete -> resultats perimes affiches",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E4-02 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E4-03",
+      "title": "Workers zombies non joints",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E4-03 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E4-04",
+      "title": "Cycle d'arret fragile (`wait(500)`, `join(timeout=10)`)",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E4-04 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E4-05",
+      "title": "`suppress()` sans watchdog (capture bloquee possible)",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E4-05 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E4-06",
+      "title": "Violations de la charte `compat` hors `compat.py`",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E4-06 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E5-01",
+      "title": "Restore destructif sur couches source (filet de securite)",
+      "priority": "P1",
+      "effort": "L",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E5-01 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E5-02",
+      "title": "Aucune preuve verifiable de la correction du snapshot",
+      "priority": "P1",
+      "effort": "L",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E5-02 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E5-03",
+      "title": "Desactivation du suivi sans confirmation depuis la barre d'etat",
+      "priority": "P2",
+      "effort": "S",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E5-03 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E5-04",
+      "title": "Indicateur \" snapshot partiel \" (plafond 50 000) absent",
+      "priority": "P2",
+      "effort": "S",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E5-04 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E5-05",
+      "title": "Decouvrabilite du menu (hors menus Vecteur/Base de donnees)",
+      "priority": "P3",
+      "effort": "S",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E5-05 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E6-01",
+      "title": "`metadata.txt` : `license=` manquant, auteur/copyright incoherent, README absent",
+      "priority": "P1",
+      "effort": "S",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E6-01 (refs fichier:ligne dans le document). Verifie 2026-08-02: metadata.txt sans ligne 'license='; aucun README.md a la racine. author=Youcef ADDA / email coherents avec LICENSE (partie deja OK).",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E6-02",
+      "title": "Auto-install pip au chargement (vendoriser `defusedxml`)",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E6-02 (refs fichier:ligne dans le document). Verifie 2026-08-02: deps.py installe encore via pip au chargement (API in-process L43-64 + fallback subprocess L130). _vendor/defusedxml present mais l'appel pip n'est pas supprime.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E6-03",
+      "title": "Changelog monolithique dans `metadata.txt` -> `CHANGELOG.md`",
+      "priority": "P2",
+      "effort": "S",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E6-03 (refs fichier:ligne dans le document). Verifie 2026-08-02: aucun CHANGELOG.md a la racine.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E6-04",
+      "title": "Modele de rapport de bug non SIG",
+      "priority": "P2",
+      "effort": "S",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E6-04 (refs fichier:ligne dans le document). Verifie 2026-08-02: .github/ISSUE_TEMPLATE/bug_report.md L28/31/34 demande Browser / Smartphone.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E7-01",
+      "title": "i18n incomplete : pas de `.qm` livre, TS incomplet",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E7-01 (refs fichier:ligne dans le document). Verifie 2026-08-02: i18n/ contient recoverland_en.ts/.qm seuls, aucun fr.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E7-02",
+      "title": "Accessibilite : aucun `setAccessibleName`",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E7-02 (refs fichier:ligne dans le document). Verifie 2026-08-02: 0 occurrence de setAccessibleName dans *.py et widgets/*.py.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E8-01",
+      "title": "RGPD : note de confidentialite, purge/retention, capture d'attributs sensibles",
+      "priority": "P1",
+      "effort": "L",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E8-01 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E8-02",
+      "title": "Chiffrement du journal au repos (option)",
+      "priority": "P2",
+      "effort": "L",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E8-02 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E9-02",
+      "title": "Restauration sur thread UI par petits chunks",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E9-02 (refs fichier:ligne dans le document). Verifie 2026-08-02: restore_runner.py:37 '_CHUNK_SIZE = 5'.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E9-03",
+      "title": "Plafonds 50 000 codes en dur (non configurables)",
+      "priority": "P2",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E9-03 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E10-01",
+      "title": "Panneau de diagnostic / export \" rapport de support \" utilisateur",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E10-01 (refs fichier:ligne dans le document). ",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E10-02",
+      "title": "Erreur SQLite fatale dans la boucle d'ecriture sans alerte/reprise",
+      "priority": "P1",
+      "effort": "M",
+      "root_cause": "Specification docs/BACKLOG.md section RL-E10-02 (refs fichier:ligne dans le document). Verifie 2026-08-02: 'on_writer_fatal' absent de core/*.py.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Regularisation ledger 2026-08-02: item present dans docs/BACKLOG.md mais jamais entre dans la machine a etats. Entree OPEN, aucun travail presume."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E11-01",
+      "title": "Harness de validation Rewind absent: aucun score de reconstruction mesurable",
+      "priority": "P0",
+      "effort": "M",
+      "root_cause": "Verifie 2026-08-02: scripts/validate_rewind.py n'existe plus dans le depot alors qu'il est le consommateur unique des snapshots produits par scripts/stress_edit.py et la reference du protocole (11 renvois dans scripts/SESSION_REWIND.md). scripts/validation/scenarios/hypotheses/p_validate_rewind_breakdown.py l'importait et a ete supprime (commit 4b0d6e5). Consequence: la promesse produit 'reconstruire n'importe quelle donnee a n'importe quel T' n'a plus aucune mesure de bout en bout; les 10 snapshots de 180 Mo etaient des artefacts sans consommateur (purges 2026-08-02). Attendu: un harness rejouable qui capture un etat de reference, stresse le projet, rewind au cutoff et produit un score par couche/champ/geometrie.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Cree 2026-08-02 par l'audit d'inventaire du depot (nettoyage + reconciliation backlog/ledger). Fait verifie cite dans root_cause."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E11-02",
+      "title": "Sous-mode ReView Diff documente mais absent du code (decision reintegrer ou aligner)",
+      "priority": "P1",
+      "effort": "L",
+      "root_cause": "Verifie 2026-08-02: 0 occurrence de diff_window, updates_stacked et review_session dans les *.py du plugin, alors que AGENTS.md annonce trois sous-modes ReView (Diff, Snapshot, Time Lens) et que docs/geogit.html decrit un ReviewCacheWorker sur fetch_events_in_zone. Seul le sous-mode Snapshot existe (temporal_snapshot_engine, snapshot_overlay_session, canvas_date_bar, snapshot_rebuild_worker). Effets de bord: core/wkb_envelope.py et core/event_stream_repository.fetch_events_in_zone (exporte par core/__init__) n'ont aucun call-site runtime. Decision requise: reimplanter le sous-mode Diff ou aligner AGENTS.md + docs et retirer les helpers orphelins.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Cree 2026-08-02 par l'audit d'inventaire du depot (nettoyage + reconciliation backlog/ledger). Fait verifie cite dans root_cause."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
+    },
+    {
+      "id": "RL-E11-03",
+      "title": "Doc rot: la documentation publique decrit des modules supprimes",
+      "priority": "P2",
+      "effort": "S",
+      "root_cause": "Verifie 2026-08-02: docs/geogit.html tabule widgets/temporal_lens_dock.py (994 lignes), temporal_lens_map_tool.py (108) et temporal_lens_polygon_map_tool.py (111) comme fichiers livres; ces fichiers sont supprimes (commit 4b0d6e5) et le dock autonome n'existe plus. AGENTS.md annonce aussi un sous-mode Time Lens inexistant. Un utilisateur qui lit la doc ne retrouve pas le produit.",
+      "state": "OPEN",
+      "blocked_by": [],
+      "scenario_path": "",
+      "runtime_scenario_path": "",
+      "scenario_status": "not_created",
+      "patch_files": [],
+      "history": [
+        {
+          "ts": "2026-08-02T17:06:06Z",
+          "from": null,
+          "to": "OPEN",
+          "by": "/orchestrator",
+          "evidence": "Cree 2026-08-02 par l'audit d'inventaire du depot (nettoyage + reconciliation backlog/ledger). Fait verifie cite dans root_cause."
+        }
+      ],
+      "commit_hash": "",
+      "log_evidence_excerpt": ""
     }
   ]
 }
