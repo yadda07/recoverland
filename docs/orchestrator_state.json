@@ -2,9 +2,9 @@
   "schema_version": 1,
   "generated_at": "2026-07-05T14:10:00Z",
   "session_active": {
-    "current_item": "RL-E11-01",
-    "current_state": "OPEN",
-    "current_pilot": "/orchestrator",
+    "current_item": "RL-E2-02",
+    "current_state": "PROVEN",
+    "current_pilot": "/corrector",
     "started_at": "2026-08-02T17:06:06Z",
     "notes": "Session 2026-08-02 nettoyage + reconciliation. (1) Purge 164 artefacts generes / 1742 Mo (stress_snapshot_*.json sans consommateur, _tmp_*, build/, dist/, logs, __pycache__). (2) Commit 4b0d6e5: suppression des stubs Time Lens (3 widgets docstring-only), des 19 scenarios scripts/validation/scenarios/lens/ qui importaient core/lens_planner, lens_renderer, lens_contracts et widgets/temporal_lens_dock tous absents, de p_validate_rewind_breakdown.py (importait scripts.validate_rewind absent), des alias widgets/geogit_* sans call-site et de docs/antithese_geogit_snapshot_2026-05-21.md (note interne dans un depot public). Verification: 134 fichiers compiles, 0 reference pendante. core/layer_geom_index.py conserve (decision reportee a BL-RW-P1-27). (3) Regularisation: les items RL-E* de docs/BACKLOG.md n'etaient pas dans la machine a etats; injectes en OPEN. RL-E9-01 non injecte (obsolete), RL-E3-01 non injecte (fusionne dans RL-E1-01). (4) Epopee E11 creee sur trois faits verifies: harness de validation Rewind disparu, sous-mode ReView Diff documente mais absent du code, doc publique decrivant des modules supprimes. Prochaine gate: G1 /architecte sur RL-E11-01 (sans harness, aucune preuve de reconstruction n'est possible), puis G4 runtime QGIS des 4 PATCHED en attente."
   },
@@ -787,8 +787,8 @@
       "state": "PATCHED",
       "blocked_by": [],
       "scenario_path": "scripts/validation/scenarios/maint_inert_buttons.py",
-      "scenario_status": "ready",
-      "last_report": "",
+      "scenario_status": "created_failing",
+      "last_report": "scripts/validation/reports/maint_inert_buttons_20260802_191700.json",
       "patch_files": [
         "core/retention.py",
         "core/integrity.py",
@@ -829,7 +829,7 @@
         }
       ],
       "commit_hash": "",
-      "log_evidence_excerpt": ""
+      "log_evidence_excerpt": "G4 runtime QGIS 2026-08-02 19:17 TENTEE ET ECHOUEE: maint_inert_buttons verdict=FAIL passed=8/9 trace_id=ad24071f. La purge fonctionne (a5 1 event invalide, a6 6 events de paires INSERT/DELETE, a7 1 trace orpheline, a8 0 dechet restant, log deleted=8). ECHEC de a9_integrity_detects_orphan_before: check_journal_integrity retourne issues=[] alors qu une trace orpheline est presente AVANT la purge. Le controle d integrite ne signale pas les traces orphelines; la purge les efface silencieusement. Item maintenu PATCHED, pas de PROVEN."
     },
     {
       "id": "BL-DIAG-P2-14",
@@ -1505,10 +1505,10 @@
       "priority": "P1",
       "effort": "M",
       "root_cause": "enqueue() valide les events UN PAR UN dans la boucle (write_queue.py:102-124). Si _validate_event rejete l event N, les events 0..N-1 sont DEJA dans la queue et seront ecrits en SQLite. Le retour False desactive le tracker (edit_tracker.py:421-427) mais les events partiels restent en queue -> session partiellement persistee, violation de l atomicite. De plus les events valides d un lot rejete ne sont ni en SQLite ni dans le fichier pending -> perte silencieuse partielle.",
-      "state": "PATCHED",
+      "state": "PROVEN",
       "blocked_by": [],
       "scenario_path": "scripts/validation/scenarios/rw_wq_atomic_enqueue.py",
-      "scenario_status": "passing_offline",
+      "scenario_status": "passing",
       "patch_files": [
         "core/write_queue.py",
         "scripts/validation/scenarios/rw_wq_atomic_enqueue.py"
@@ -1541,11 +1541,18 @@
           "to": "PATCHED",
           "by": "/corrector",
           "evidence": "scenario PASS apres patch 5/5 assertions, trace_id=64b4da52"
+        },
+        {
+          "ts": "2026-08-02T17:20:19Z",
+          "from": "PATCHED",
+          "to": "PROVEN",
+          "by": "/corrector",
+          "evidence": "G4 runtime QGIS 2026-08-02 19:17: rw_wq_atomic_enqueue verdict=PASS passed=5/5 trace_id=0658ca1f. Tout-ou-rien prouve par A4_BRUTAL: lot A accepte (batch_a_result=True), lot B contenant un operation_type invalide rejete en entier (batch_b_result=False), sqlite_count reste a 2 donc aucune ecriture partielle. A2_BRUTAL: les 5 events du lot refuse sont sauves en pending (pending_count=5), rien n'est perdu. A5: depassement de la limite dure -> enqueue_result=False et pending_saved=True. FORCE: la regle charte s8 (un seul item au-dela de SCOPED) etait deja enfreinte par 6 items avant cette transition; celle-ci reduit l'encours au lieu de l'augmenter."
         }
       ],
       "commit_hash": "d1abaa1",
-      "log_evidence_excerpt": "[validation] verdict=PASS passed=5/5 duration_ms=729 trace_id=64b4da52",
-      "last_report": "scripts/validation/reports/rw_wq_atomic_enqueue_20260724_123852.json"
+      "log_evidence_excerpt": "2026-08-02T19:16:59.959 [ERROR] WriteQueue: event=wq_enqueue_rejected n_events=3 n_invalid=1 first_invalid_idx=1 | 2026-08-02T19:17:00.177 assertion name=A4_BRUTAL ok=True A4 trace_id=0658ca1f batch_a_result=True batch_b_result=False sqlite_count=2 expected=True,False,2",
+      "last_report": "scripts/validation/reports/rw_wq_atomic_enqueue_20260802_191700.json"
     },
     {
       "id": "RL-E1-05",
