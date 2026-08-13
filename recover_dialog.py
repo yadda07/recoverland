@@ -139,6 +139,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._active_search_trace_id = ""
         self._active_restore_trace_id = ""
         self._dialog_read_conn = None
+        # (journal_path, context) already told to the user: the degraded
+        # reconciliation is a property of the journal, not of the click,
+        # so the project-open warning must not repeat on every refresh.
+        self._reconciliation_notified: set = set()
         self._version_fetch_thread = None
         self._version_restore_cutoff = None
         self._geom_preview = GeometryPreviewManager(iface.mapCanvas())
@@ -380,6 +384,88 @@ class RecoverDialog(QDialog, LoggerMixin):
             health_suggestion=health_suggestion,
         )
 
+    def _ambiguous_datasource_names(self) -> list:
+        """Layer names the v6 reconciliation refused to attach.
+
+        Two DB tables that collapsed into one fingerprint are not an
+        identity: the migration declined to guess which one owns the old
+        history rather than attach it to the wrong table. The user has to
+        read those names before he scopes a rewind on them.
+        """
+        conn = self._get_dialog_read_conn()
+        if conn is None:
+            return []
+        try:
+            from .core.datasource_alias import get_ambiguous_datasources
+            ambiguous = get_ambiguous_datasources(conn)
+        except Exception as exc:  # noqa: BLE001 - a warning never blocks
+            flog(f"ambiguous_datasource_names: unreadable: {exc}", "WARNING")
+            return []
+        names = []
+        for item in ambiguous:
+            for name in (item.layer_names or ()):
+                if name and name not in names:
+                    names.append(name)
+            if not item.layer_names and item.fingerprint:
+                short = item.fingerprint[-40:]
+                if short not in names:
+                    names.append(short)
+        return names
+
+    def _warn_if_reconciliation_degraded(self, context: str) -> bool:
+        """Tell the user that part of the history is not attached.
+
+        `JournalManager` has known this since the journal was opened and
+        `datasource_alias.describe_reconciliation` has known how to say
+        it; nothing read either, so a rewind was offered on a scope whose
+        older events it cannot reach, without a word. Returns True when a
+        warning was emitted.
+
+        The ``project`` context speaks once per journal (it runs on every
+        show and every project switch); ``rewind`` speaks every time,
+        because it warns about the operation the user just launched.
+        """
+        journal = self._journal
+        if journal is None or not journal.is_open:
+            return False
+        try:
+            if not journal.is_reconciliation_degraded:
+                return False
+        except Exception as exc:  # noqa: BLE001 - never block on a warning
+            flog(f"reconciliation warning: unreadable state: {exc}", "WARNING")
+            return False
+
+        key = (journal.path or "", context)
+        if context == "project":
+            if key in self._reconciliation_notified:
+                return False
+            self._reconciliation_notified.add(key)
+
+        try:
+            message = journal.reconciliation_warning()
+        except Exception as exc:  # noqa: BLE001
+            flog(f"reconciliation warning: undescribable: {exc}", "WARNING")
+            message = ""
+        if not message:
+            return False
+
+        names = self._ambiguous_datasource_names()
+        if names:
+            # describe_reconciliation stops at three; a rewind must name
+            # every source it may under-cover, not the first three.
+            message += " " + self.tr(
+                "Sources concernees : {names}."
+            ).format(names=", ".join(names))
+        if context == "rewind":
+            message = self.tr(
+                "Restauration lancee sur un historique partiellement "
+                "rattache."
+            ) + " " + message
+        qlog(message, "WARNING")
+        flog(f"reconciliation_warning_shown context={context} "
+             f"ambiguous={len(names)} journal={journal.path}", "WARNING")
+        return True
+
     def _get_dialog_read_conn(self):
         """Return a reusable read connection with proper PRAGMAs."""
         if self._dialog_read_conn is not None:
@@ -530,6 +616,10 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._refresh_smart_bar()
             return
         self._set_journal_info_visible(True)
+        # Said BEFORE the per-layer scoping below is offered: the list of
+        # layers about to be proposed hides the fact that part of their
+        # history is not attached to them.
+        self._warn_if_reconciliation_degraded("project")
         self._request_stats_refresh()
 
     def _request_stats_refresh(self) -> None:
@@ -2893,6 +2983,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         if self._refuse_fingerprint_collision(checked_fps, trace_id):
             self._active_restore_trace_id = ""
             return
+
+        # A fingerprint the v6 migration refused to attach is the softer
+        # cousin of the collision above: the events are all there, but the
+        # ones written under the old identity stay out of this scope. The
+        # user must read that before the rewind writes anything, not after
+        # wondering why his oldest edits were not undone.
+        self._warn_if_reconciliation_degraded("rewind")
         undo_layers = len(self._last_restore_by_ds) if self._last_restore_by_ds else 0
         undo_events = (sum(len(v) for v in self._last_restore_by_ds.values())
                        if self._last_restore_by_ds else 0)
@@ -3458,6 +3555,11 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _on_version_restore_done(self, result) -> None:
         trace_id = self._active_restore_trace_id
         self._restore_in_progress = False
+        # RLU-053: read the partial bucket off the runner BEFORE dropping
+        # the reference; it is the only place that knows which captured
+        # fields the buffer had to abandon on the way in.
+        partial_n, partial_fields = self._partial_restore_report(
+            self._restore_runner)
         self._restore_runner = None
         cleanup_temp_layers()
         self._smooth_set_progress(100)
@@ -3492,14 +3594,24 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._version_restore_events = None
 
         detail_lines = self._build_restore_summary(result.by_ds)
-        if result.total_fail == 0 and not result.errors:
+        partial_line = self._format_partial_restore(partial_n, partial_fields)
+        if result.total_fail == 0 and not result.errors and not partial_line:
             summary = self.tr("{count} entite(s) restauree(s) avec succes.").format(count=result.total_ok)
             qlog(summary + detail_lines)
+        elif result.total_fail == 0 and not result.errors:
+            # RLU-053: nothing failed, yet some features came back without
+            # every captured field. "avec succes" would send the user away
+            # convinced his entities are back as they were, when part of
+            # them still carries today's values.
+            summary = self.tr(
+                "{count} entite(s) restauree(s), dont {partial} incomplete(s)."
+            ).format(count=result.total_ok, partial=partial_n)
+            qlog(summary + partial_line + detail_lines, "WARNING")
         else:
             msg = self.tr("{ok} restauree(s), {fail} echouee(s).").format(ok=result.total_ok, fail=result.total_fail)
             if result.errors:
                 msg += " | " + " | ".join(result.errors[:5])
-            qlog(msg + detail_lines, "WARNING")
+            qlog(msg + partial_line + detail_lines, "WARNING")
 
         if result.total_ok > 0:
             flog(f"recover_version: refreshing canvas for {result.total_ok} ok")
@@ -3554,6 +3666,46 @@ class RecoverDialog(QDialog, LoggerMixin):
             flog(line)
         flog(f"=== END REWIND_STATE [{label}] ===")
         return counts
+
+    def _partial_restore_report(self, runner) -> tuple:
+        """RLU-053: ``(n_features, field_names)`` restored incompletely.
+
+        Asks the runner that just finished how many features it wrote
+        without every captured field, and which columns stayed behind.
+        ``(0, ())`` for a runner that cannot answer (event restore, undo):
+        those paths refuse a drifted event instead of writing a hybrid,
+        so they have nothing to declare.
+        """
+        reader = getattr(runner, "partial_restore_report", None)
+        if not callable(reader):
+            return (0, ())
+        try:
+            count, fields = reader()
+        except Exception as exc:  # noqa: BLE001 - a report never crashes
+            flog(f"partial_restore_report: unreadable: {exc}", "WARNING")
+            return (0, ())
+        return (int(count or 0), tuple(fields or ()))
+
+    def _format_partial_restore(self, count: int, fields: tuple) -> str:
+        """One line naming the fields a rewind could not put back.
+
+        Empty string when the rewind was complete, so the caller can test
+        it directly. The field names are the whole point: knowing that
+        "3 entities are incomplete" without knowing WHICH columns leaves
+        the user unable to repair anything by hand.
+        """
+        if count <= 0:
+            return ""
+        if fields:
+            return "\n" + self.tr(
+                "{count} entite(s) reecrite(s) sans tous leurs champs : "
+                "{fields} n'ont pas ete restaures (le schema de la couche "
+                "a change depuis la capture)."
+            ).format(count=count, fields=", ".join(fields))
+        return "\n" + self.tr(
+            "{count} entite(s) reecrite(s) sans tous leurs champs captures "
+            "(le schema de la couche a change depuis la capture)."
+        ).format(count=count)
 
     def _build_restore_summary(self, by_ds: dict) -> str:
         """Build per-layer operation breakdown from by_ds event groups."""
@@ -4548,6 +4700,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         """
         self._close_dialog_read_conn()
         self._stats_cache = LayerStatsCache()
+        # New project, new journal, new reconciliation verdict: the
+        # warning is due again.
+        self._reconciliation_notified = set()
         self._initial_bounds_applied = False
         self._search_events = []
         self._all_attr_keys = []

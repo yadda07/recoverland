@@ -212,15 +212,28 @@ class WriteQueue:
             flog("WriteQueue: writer connection opened")
 
             while not self._stop_event.is_set():
+                # Drain OUTSIDE the guard below, on purpose. get_nowait()
+                # has already removed these events from the queue, so this
+                # list is the only reference left to them: draining inside
+                # the try would let an unexpected error destroy the very
+                # batch that triggered it (the thread survived, the events
+                # did not). Held here, they can still be rescued.
+                batch = self._drain_batch()
                 # Any unexpected error inside the loop used to end the thread
                 # and turn the queue into a silent black hole for the rest of
                 # the session. Keep the consumer alive: the next iteration
                 # drains the queue again, and a batch that cannot be written
                 # is already routed to pending recovery by the write path.
                 try:
-                    batch = self._drain_batch()
                     if batch:
                         self._write_batch_with_retry(conn, batch)
+                        # Handed over: either committed, or already routed
+                        # to pending recovery by the retry helper. Drop the
+                        # reference so a failure in the rest of this
+                        # iteration (WAL checkpoint) cannot save the same
+                        # events a second time and duplicate them at the
+                        # next startup import.
+                        batch = []
                     else:
                         self._stop_event.wait(timeout=0.1)
                     now = time.monotonic()
@@ -229,10 +242,12 @@ class WriteQueue:
                         last_checkpoint = now
                 except Exception as loop_err:  # noqa: BLE001
                     flog(
-                        f"WriteQueue: writer loop error, staying alive: "
-                        f"{loop_err}",
+                        f"WriteQueue: writer loop error, staying alive, "
+                        f"{len(batch)} event(s) of the failed batch saved to "
+                        f"pending recovery: {loop_err}",
                         "ERROR",
                     )
+                    self._save_lost_events(batch)
                     self._stop_event.wait(timeout=0.1)
 
         except sqlite3.Error as e:
