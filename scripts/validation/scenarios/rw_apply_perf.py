@@ -106,8 +106,10 @@ def run(ctx):
     rr = ctx.data["rr"]
 
     # 1. Classification FIX-A.
-    mk = lambda code: {"success": False, "status": "FAILED",
-                       "reason_code": code, "message": "x"}
+    def mk(code):
+        return {"success": False, "status": "FAILED",
+                "reason_code": code, "message": "x"}
+
     ctx.data["cls_unverifiable"] = rs._classify_restore_result(
         mk("target_unverifiable"))
     ctx.data["cls_buffer_refused"] = rs._classify_restore_result(

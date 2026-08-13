@@ -147,7 +147,8 @@ def _check_recover_hash(results: list[tuple[str, bool, str]], capture: bool) -> 
 _SELFTEST_FIXTURES = {
     "renamed_public_method": (
         "class RecoverDialog(QDialog, LoggerMixin):\n"
-        "    def __init__(self, iface, journal=None, tracker=None, write_queue=None): self._review_wants_persist=False\n"
+        "    def __init__(self, iface, journal=None, tracker=None, "
+        "write_queue=None): self._review_wants_persist=False\n"
         "    def cleanup_resources(self): pass\n"
         "    def on_project_renamed(self, tracker=None): pass\n"  # renamed!
         "    def on_events_committed(self, edited_fingerprint=''): pass\n"
@@ -168,7 +169,8 @@ _SELFTEST_FIXTURES = {
     ),
     "lost_qdialog_base": (
         "class RecoverDialog(object):\n"  # not a QDialog!
-        "    def __init__(self, iface, journal=None, tracker=None, write_queue=None): self._review_wants_persist=False\n"
+        "    def __init__(self, iface, journal=None, tracker=None, "
+        "write_queue=None): self._review_wants_persist=False\n"
         "    def cleanup_resources(self): pass\n"
         "    def on_project_switched(self, tracker=None): pass\n"
         "    def on_events_committed(self, edited_fingerprint=''): pass\n"

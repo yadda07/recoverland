@@ -192,4 +192,3 @@ print(f"[i18n-runtime] === END trace_id={trace_id} ===")
 _log_to_file(f"[i18n-runtime] verdict={verdict} passed={n_pass}/{n_total} trace_id={trace_id}")
 
 # NOTE: Do NOT call sys.exit() here. In QGIS Python console, sys.exit() closes QGIS.
-

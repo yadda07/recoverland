@@ -434,14 +434,14 @@ def antithese() -> dict[str, Any]:
         scan2 = _scan_file(path2)
         tr_calls = scan2.get("tr_calls", [])
         missing = [
-            (l, p, ctx, src)
-            for l, p, ctx, src in tr_calls
+            (ln, p, ctx, src)
+            for ln, p, ctx, src in tr_calls
             if ctx == "ReviewStatusWidget"
             and src == "Chaine inexistante dans le ts"
         ]
         ts_entries = _parse_ts(_TS_PATH) if _TS_PATH.is_file() else {}
         not_in_ts = [
-            (l, p, ctx, src) for l, p, ctx, src in missing
+            (ln, p, ctx, src) for ln, p, ctx, src in missing
             if (ctx, src) not in ts_entries
         ]
         results.append((
