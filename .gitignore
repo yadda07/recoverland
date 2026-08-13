@@ -19,7 +19,9 @@ scripts/check_rewind.py
 scripts/purge_journal.py
 scripts/purge_test_artifacts.py
 scripts/query_tzpa_events.py
-scripts/stress_edit.py
+# stress_edit.py is versioned since 2026-08-13: a test harness kept out
+# of the repo protects nothing and nobody else can reproduce its runs.
+# Its output stays ignored (stress_snapshot_*.json above).
 scripts/validate_rewind.py
 scripts/tmp_*.py
 
