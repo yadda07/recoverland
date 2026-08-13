@@ -54,6 +54,15 @@ def _entity_key(event: AuditEvent) -> str:
     JSON is rendered -- key order, spacing -- then split one entity's history
     across several dedup buckets, and each bucket was collapsed on its own.
     Review showed one feature, rewind planned on two.
+
+    The datasource part is the fingerprint the event carries, and the read
+    paths hand it over ALREADY canonicalised
+    (`datasource_alias.canonicalize_event_fingerprints`): expanding the
+    scope in SQL alone brought the old rows back with their historical
+    fingerprint, which split one entity across as many buckets as it had
+    identities -- an INSERT made under a filtered fingerprint and the
+    DELETE that undid it after the filter was removed then looked like two
+    unrelated lifetimes and both got compensated.
     """
     return "".join((
         event.datasource_fingerprint or "",

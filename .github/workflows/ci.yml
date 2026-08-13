@@ -43,11 +43,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Minimum supported (3.40 LTR) + latest stable 3.x, per RL-E3-02.
-        # QGIS 4.0 images use distribution-suffixed tags (questing/trixie);
-        # pin one here for explicit Qt6 coverage. "3.40" is quoted so YAML
-        # keeps it a string (unquoted 3.40 -> float 3.4 -> wrong image tag).
-        qgis_tag: ["3.40", latest]
+        # The declared support range, both ends and the moving edge:
+        #   3.40  -> qgisMinimumVersion, Qt5/PyQt5
+        #   4.2.0 -> qgisMaximumVersion in practice, Qt6/PyQt6
+        #   latest -> master nightly, catches drift before it ships
+        # Until 4.2.0 was added, NO job in this matrix ran on Qt6, so every
+        # Qt6-only defect passed CI green (that is how the legend-defer
+        # TypeError in snapshot_overlay_session survived a release).
+        # Quote every tag: unquoted 3.40 is YAML float 3.4 -> wrong image.
+        qgis_tag: ["3.40", "4.2.0", "latest"]
     steps:
       # Check out into a `recoverland` directory so the plugin is importable
       # as the `recoverland` package by the runtime scenarios.

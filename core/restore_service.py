@@ -11,6 +11,7 @@ from .audit_backend import AuditEvent, RestoreReport
 from .schema_drift import (
     parse_field_schema, extract_current_schema,
     compare_schemas, DriftReport, safe_field_mapping,
+    dropped_fields, format_drift_message,
 )
 from .search_service import reconstruct_attributes, reconstruct_new_attributes
 from .geometry_utils import (
@@ -108,8 +109,23 @@ def pre_check_restore(layer, event: AuditEvent) -> PreCheckResult:
     curr_schema = extract_current_schema(layer)
     drift = compare_schemas(hist_schema, curr_schema)
 
-    if not drift.is_compatible and drift.missing_in_current:
-        reason = f"Schema drift: missing fields {drift.missing_in_current}"
+    # RLU-053. Two reasons to refuse, and one message that names BOTH.
+    #   - a captured column has vanished: its old value has nowhere to go;
+    #   - a captured column was retyped: the value cannot enter it either.
+    # The old wording only listed the vanished columns. A user who reads
+    # "missing fields [code, alt]" recreates those two, replays the
+    # restore convinced the problem is solved, and loses the retyped
+    # field without a word. A partial restore announced as a full one is
+    # the failure this invariant exists to prevent, so the pre-check
+    # refuses instead of writing a hybrid feature.
+    captured = reconstruct_attributes(event)
+    if not isinstance(captured, dict):
+        # Unreadable attribute payload: assume every drifted field was
+        # captured rather than let a corrupt event through unchecked.
+        captured = None
+    lost = dropped_fields(drift, captured)
+    if drift.missing_in_current or lost:
+        reason = f"Schema drift: {format_drift_message(drift)}"
         return PreCheckResult(False, reason, drift)
 
     return PreCheckResult(True, "OK", drift)
@@ -121,6 +137,99 @@ def _layer_geometry_type(layer):
         return layer.geometryType()
     except (AttributeError, RuntimeError):
         return QgisCompat.GEOM_UNKNOWN
+
+
+def _layer_wkb_type_repr(layer) -> str:
+    """Readable WKB type of *layer* for diagnostics, never raising."""
+    try:
+        return str(layer.wkbType())
+    except (AttributeError, RuntimeError):
+        return "?"
+
+
+def _dirty_session_refusal(layer_error: Optional[str],
+                           context: str) -> Optional[Dict[str, Any]]:
+    """Turn a `validate_restore_layer_state` verdict into a refusal dict.
+
+    The event-by-event restore writes THROUGH the provider, under the
+    user's editing buffer. His own attribute values are still in that
+    buffer, so his next Save replays them over what we just wrote, while
+    the geometry -- which was not in his buffer -- keeps the restored
+    one. The feature ends up in a state it never had: geometry from
+    yesterday, attributes from today, and a journal entry claiming a
+    successful restore. `restore_batch` has always consulted the guard;
+    the single-event path must too, or the same event on the same layer
+    succeeds or fails depending on which button the user pressed.
+    """
+    if not layer_error:
+        return None
+    flog(f"{context}: refused, {layer_error}", "WARNING")
+    return {
+        "success": False,
+        "reason_code": "dirty_edit_session",
+        "message": layer_error,
+    }
+
+
+def _find_restore_duplicate(layer, event: AuditEvent) -> Optional[int]:
+    """FID of a feature already carrying the whole snapshot of *event*.
+
+    Idempotence proof for the re-insertion of a deleted feature. The PK
+    guard in `restore_deleted_feature` cannot fire on a FID-only layer (a
+    shapefile captures no PK), and cannot fire on a GPKG either: the
+    re-insert receives a FRESH fid, so the historical one the guard looks
+    for never comes back. Both replays therefore added one copy per
+    click, each answering "Restored".
+
+    Proof is deliberately strict -- geometry AND every captured non-null
+    attribute -- and returns None as soon as there is nothing solid to
+    compare (unreadable geometry, no comparable attribute). Claiming
+    "already there" wrongly would leave the feature missing while
+    reporting success, so absence of evidence must never be read as
+    evidence of presence.
+    """
+    from qgis.core import QgsFeatureRequest
+
+    expected_geom = (rebuild_geometry(event.geometry_wkb)
+                     if event.geometry_wkb is not None else None)
+    if event.geometry_wkb is not None and not is_geometry_present(expected_geom):
+        return None
+
+    attrs = reconstruct_attributes(event)
+    if not isinstance(attrs, dict):
+        attrs = {}
+    fields = layer.fields()
+    try:
+        pk_indices = set(layer.dataProvider().pkAttributeIndexes())
+    except (AttributeError, RuntimeError):
+        pk_indices = set()
+    comparable = []
+    for name, value in attrs.items():
+        idx = fields.indexOf(name)
+        if any((value is None, is_layer_audit_field(name),
+                idx < 0, idx in pk_indices)):
+            continue
+        comparable.append((name, idx))
+    if expected_geom is None and not comparable:
+        return None
+
+    request = QgsFeatureRequest()
+    if expected_geom is not None and hasattr(request, "setFilterRect"):
+        request.setFilterRect(expected_geom.boundingBox())
+    expected_wkb = bytes(expected_geom.asWkb()) if expected_geom else None
+    source = get_feature_source(layer)
+    try:
+        for feature in source(request):
+            if expected_geom is not None and not feature_matches_geometry(
+                    feature, expected_geom, expected_wkb=expected_wkb):
+                continue
+            if all(_qgis_vals_equal(feature[idx], attrs[name])
+                   for name, idx in comparable):
+                return feature.id()
+    except Exception as exc:  # noqa: BLE001 - never fail a restore on a scan
+        flog(f"_find_restore_duplicate: scan failed "
+             f"eid={event.event_id}: {exc}", "WARNING")
+    return None
 
 
 def _geometry_for_write(layer, event: AuditEvent, wkb: Optional[bytes],
@@ -216,6 +325,11 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
     Returns dict with 'success', 'message', and optionally 'fid'.
     """
     eid = event.event_id or 0
+    dirty = _dirty_session_refusal(
+        validate_restore_layer_state(layer), f"restore_deleted[{eid}]")
+    if dirty is not None:
+        return dirty
+
     check = pre_check_restore(layer, event)
     if not check.can_restore:
         flog(f"restore_deleted[{eid}]: pre_check failed: {check.reason}", "WARNING")
@@ -228,7 +342,19 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
         existing_fid = _find_target_feature(layer, identity)
         if existing_fid is not None:
             flog(f"restore_deleted[{eid}]: skip, {pk_field}={pk_value} already exists fid={existing_fid}")
-            return {"success": True, "message": "Already exists (skip)", "fid": existing_fid}
+            return {"success": True, "message": "Already exists (skip)",
+                    "skipped": True, "fid": existing_fid}
+
+    # Second line of idempotence: replaying a restore must not add a copy.
+    # Double-click, relaunch after a partial rewind, two users on the same
+    # GPKG, resume after a crash -- replays are routine, and the PK guard
+    # above is unreachable on the two most common file formats.
+    duplicate_fid = _find_restore_duplicate(layer, event)
+    if duplicate_fid is not None:
+        flog(f"restore_deleted[{eid}]: skip, snapshot already present "
+             f"fid={duplicate_fid} (replay of an applied restore)")
+        return {"success": True, "skipped": True, "fid": duplicate_fid,
+                "message": "Already exists (skip): feature already restored"}
 
     attrs = reconstruct_attributes(event)
     geom, geom_error = _geometry_for_write(
@@ -279,6 +405,12 @@ def restore_inserted_feature(layer, event: AuditEvent,
     """
     if layer is None:
         return {"success": False, "message": "Target layer not found"}
+
+    dirty = _dirty_session_refusal(
+        validate_restore_layer_state(layer),
+        f"restore_inserted[{event.event_id or 0}]")
+    if dirty is not None:
+        return dirty
 
     provider = layer.dataProvider()
     if provider is None:
@@ -793,6 +925,12 @@ def restore_updated_feature(layer, event: AuditEvent,
 
     Uses the old values from the delta to update the current feature.
     """
+    dirty = _dirty_session_refusal(
+        validate_restore_layer_state(layer),
+        f"restore_updated[{event.event_id or 0}]")
+    if dirty is not None:
+        return dirty
+
     check = pre_check_restore(layer, event)
     if not check.can_restore:
         return {"success": False, "message": check.reason}
@@ -842,19 +980,38 @@ def restore_updated_feature(layer, event: AuditEvent,
     geom, geom_error = _geometry_for_write(
         layer, event, event.geometry_wkb, eid, "restore_updated")
     if geom_error is not None:
+        # Both types on one line: the user needs to know what the event
+        # carries AND what the layer accepts to understand the refusal.
+        flog(f"restore_updated[{eid}]: geometry refused "
+             f"reason_code={geom_error.get('reason_code')} "
+             f"event_geometry_type={event.geometry_type!r} "
+             f"layer_wkb_type={_layer_wkb_type_repr(layer)}", "WARNING")
         return geom_error
 
     if attr_changes:
         success = provider.changeAttributeValues(attr_changes)
         if not success:
-            return {"success": False, "message": "Attribute update failed"}
+            # The file knows exactly why it said no -- "NOT NULL
+            # constraint failed: zones.code" names the blocking column.
+            # Dropping that for a bare "Attribute update failed" leaves
+            # the user with nothing to act on. restore_deleted_feature
+            # has always surfaced provider.errors(); so does this path.
+            errors = provider.errors()
+            msg = "; ".join(errors) if errors else "Attribute update failed"
+            flog(f"restore_updated[{eid}]: attribute write refused "
+                 f"fid={target_fid} msg={msg}", "ERROR")
+            return {"success": False, "reason_code": "provider_refused",
+                    "message": msg}
 
     if geom is not None:
         geom_changes = {target_fid: geom}
         if not provider.changeGeometryValues(geom_changes):
-            flog(f"restore_updated[{eid}]: geom update failed fid={target_fid}",
-                 "ERROR")
-            return {"success": False, "message": "Geometry update failed"}
+            errors = provider.errors()
+            msg = "; ".join(errors) if errors else "Geometry update failed"
+            flog(f"restore_updated[{eid}]: geom update failed fid={target_fid} "
+                 f"msg={msg}", "ERROR")
+            return {"success": False, "reason_code": "provider_refused",
+                    "message": msg}
 
     geom_status = "geom_restored" if geom is not None else "no_geom"
     flog(f"restore_updated[{eid}]: OK fid={target_fid} "
@@ -946,13 +1103,18 @@ def _classify_restore_result(result: Dict[str, Any]) -> str:
     did not yet tag results still classify correctly.
 
     Returned values are mutually exclusive and stable:
-        "applied", "skipped_idempotent", "target_absent",
-        "geometry_drift", "failed".
+        "applied", "applied_partial", "skipped_idempotent",
+        "target_absent", "geometry_drift", "failed".
     """
     reason_code = (result.get("reason_code") or "").strip()
     if reason_code:
         if reason_code == "absent_vs_insert_comp":
             return "skipped_idempotent"
+        # RLU-053: a write that had to abandon captured fields is not a
+        # full restore. It keeps its own bucket so it can never be
+        # counted next to the complete ones.
+        if reason_code == "applied_partial":
+            return "applied_partial"
         # target_unverifiable (BL-RW-P1-25) is a refusal that returns
         # BEFORE any buffer mutation: classifying it "failed" made the
         # strict runner roll back whole layers (134 events lost on the

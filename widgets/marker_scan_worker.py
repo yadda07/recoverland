@@ -18,6 +18,7 @@ Design constraints
 """
 from __future__ import annotations
 
+import sqlite3
 import time
 import uuid
 from typing import List
@@ -29,14 +30,44 @@ from ..core.wkb_envelope import envelope_intersects, parse_envelope
 
 _MARKER_SCAN_LIMIT = 5000
 
-_SQL_MARKERS_IN_ZONE = (
-    "SELECT created_at, operation_type, geometry_wkb, new_geometry_wkb"
-    " FROM audit_event"
-    " WHERE datasource_fingerprint = ?"
-    " AND created_at >= ? AND created_at <= ?"
-    " AND invalidated_at IS NULL"
-    " ORDER BY created_at ASC LIMIT ?"
-)
+
+def _build_markers_sql(scoped: bool) -> str:
+    """Marker query, alias-aware or not.
+
+    The date bar draws the marks the user clicks on to travel back. Left
+    on the bare fingerprint equality, it stopped showing the days that
+    were captured under an obsolete fingerprint: those edits became
+    unreachable through the only control that leads to them. The
+    fingerprint is bound once (`?1`) so the parameter tuple is unchanged.
+    """
+    from .snapshot_rebuild_worker import _plain, _scoped
+
+    column = "datasource_fingerprint"
+    where = _scoped(column) if scoped else _plain(column)
+    return "".join((
+        "SELECT created_at, operation_type, geometry_wkb, new_geometry_wkb",
+        " FROM audit_event",
+        " WHERE ", where,
+        " AND created_at >= ?2 AND created_at <= ?3",
+        " AND invalidated_at IS NULL",
+        " ORDER BY created_at ASC LIMIT ?4",
+    ))
+
+
+_SQL_MARKERS_IN_ZONE = _build_markers_sql(True)
+_SQL_MARKERS_IN_ZONE_NO_ALIAS = _build_markers_sql(False)
+
+
+def _execute_markers(conn, params: tuple):
+    """Run the marker query, degrading on a journal with no alias table."""
+    try:
+        return conn.execute(_SQL_MARKERS_IN_ZONE, params)
+    except sqlite3.OperationalError as exc:
+        if "datasource_alias" not in str(exc):
+            raise
+        flog(f"marker_scan: no datasource_alias table ({exc}); scanning the "
+             f"asked fingerprint only", "WARNING")
+        return conn.execute(_SQL_MARKERS_IN_ZONE_NO_ALIAS, params)
 
 
 class MarkerScanWorker(QThread):
@@ -105,8 +136,8 @@ class MarkerScanWorker(QThread):
                     continue
 
                 bbox_xy = (bbox.xMinimum(), bbox.yMinimum(), bbox.xMaximum(), bbox.yMaximum())
-                rows = conn.execute(
-                    _SQL_MARKERS_IN_ZONE,
+                rows = _execute_markers(
+                    conn,
                     (ds_fp, self._t_min, self._t_max, _MARKER_SCAN_LIMIT + 1),
                 ).fetchall()
 

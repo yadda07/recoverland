@@ -172,13 +172,24 @@ def find_target_layer(event: AuditEvent, read_conn=None) -> object:
 
     Search order:
     1. Layer ID match in loaded project layers.
-    2. Datasource fingerprint match in loaded layers.
+    2. Datasource EQUIVALENCE with a loaded layer.
     3. Recreate from datasource registry (if read_conn provided).
+
+    Step 2 compares by equivalence, not by string equality: an event
+    captured before the v6 canonical form (a display filter in the
+    source, a path written the other way round) carries a fingerprint
+    that no longer equals the one the loaded layer computes today. With
+    a strict `==` the layer the user has in front of him is not
+    recognised and the restore silently falls back to a temporary layer
+    rebuilt from the registry -- writing to a copy while he watches the
+    original.
 
     Returns QgsVectorLayer or None.
     """
     from qgis.core import QgsProject, QgsVectorLayer
-    from .identity import compute_datasource_fingerprint
+    from .identity import (
+        compute_datasource_fingerprint, datasource_fingerprints_match,
+    )
 
     for layer in QgsProject.instance().mapLayers().values():
         if not isinstance(layer, QgsVectorLayer):
@@ -186,18 +197,36 @@ def find_target_layer(event: AuditEvent, read_conn=None) -> object:
         if layer.id() == event.layer_id_snapshot:
             return layer
 
+    scope = _event_scope(event, read_conn)
     for layer in QgsProject.instance().mapLayers().values():
         if not isinstance(layer, QgsVectorLayer):
             continue
         try:
-            if compute_datasource_fingerprint(layer) == event.datasource_fingerprint:
-                return layer
+            current = compute_datasource_fingerprint(layer)
         except Exception:
             continue
+        if current in scope:
+            return layer
+        if any(datasource_fingerprints_match(fp, current) for fp in scope):
+            return layer
 
     if read_conn is not None:
         return _try_restore_from_registry(event, read_conn)
     return None
+
+
+def _event_scope(event: AuditEvent, read_conn=None) -> set:
+    """The event's fingerprint plus every form aliased to it."""
+    fingerprint = event.datasource_fingerprint or ""
+    scope = {fingerprint} if fingerprint else set()
+    if read_conn is None or not fingerprint:
+        return scope
+    try:
+        from .datasource_alias import expand_fingerprints
+        scope.update(expand_fingerprints(read_conn, fingerprint))
+    except Exception as exc:  # noqa: BLE001 - degrade to the raw fingerprint
+        flog(f"find_target_layer: alias expansion failed: {exc}", "WARNING")
+    return scope
 
 
 def _try_restore_from_registry(event: AuditEvent, read_conn) -> object:

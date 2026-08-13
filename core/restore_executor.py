@@ -15,7 +15,9 @@ from .restore_contracts import (
 from .restore_planner import preflight_check
 from .restore_service import restore_batch, build_restore_trace_event
 from .search_service import reconstruct_attributes
-from .schema_drift import safe_field_mapping
+from .schema_drift import (
+    safe_field_mapping, field_mapping_report, format_dropped_fields,
+)
 from .constants import MAKEVALID_DRIFT_TOLERANCE
 from .geometry_utils import (
     rebuild_geometry, is_geometry_present,
@@ -33,6 +35,10 @@ from .logger import flog, flog_kv
 # can show "applied / skipped_idempotent / failed / failed_target_absent
 # / failed_geometry_drift" breakdown.
 RESTORE_REASON_APPLIED = "applied"
+# RLU-053: the write happened but the schema moved under it, so some
+# captured fields never made it back. Distinct from "applied" on purpose:
+# an amputated restore must never be counted with the complete ones.
+RESTORE_REASON_APPLIED_PARTIAL = "applied_partial"
 RESTORE_REASON_SKIPPED_IDEMPOTENT = "skipped_idempotent"
 RESTORE_REASON_TARGET_ABSENT = "target_absent"
 RESTORE_REASON_GEOMETRY_DRIFT = "geometry_drift"
@@ -275,7 +281,7 @@ def _buffer_insert(layer, event: AuditEvent,
 
     attrs = reconstruct_attributes(event)
     geom = rebuild_geometry(event.geometry_wkb)
-    mapping = _safe_field_mapping(layer, event)
+    mapping, dropped = _field_mapping_report(layer, event, attrs)
 
     feature = QgsFeature(layer.fields())
     fields = layer.fields()
@@ -313,13 +319,10 @@ def _buffer_insert(layer, event: AuditEvent,
     flog_kv("INFO", "BUF_INS", module="restore_executor", **ins_fields)
     # BL-RW-P2-14: tag the success path explicitly so _classify_restore_result
     # doesn't have to fall back to message parsing.
-    return {
-        "success": True,
-        "status": "APPLIED",
-        "reason_code": "applied",
-        "message": "Inserted via buffer",
-        "fid": new_fid,
-    }
+    # RLU-053: a feature re-inserted without the fields the schema lost is
+    # not the feature that was deleted; say which ones stayed behind.
+    return _buffer_outcome(
+        dropped, "Inserted via buffer", event.event_id, fid=new_fid)
 
 
 def _record_remap(fid_remap: Optional[Dict], event: AuditEvent,
@@ -692,7 +695,8 @@ def _buffer_update(layer, event: AuditEvent,
     flog(f"BUF_UPD eid={event.event_id} fp={fp} remap={remap_verdict} "
          f"target={target_fid} trusted={trusted}", "DEBUG")
 
-    mapping = _safe_field_mapping(layer, event)
+    old_attrs = reconstruct_attributes(event)
+    mapping, dropped = _field_mapping_report(layer, event, old_attrs)
 
     if target_fid is not None and not trusted:
         # Same proof rule as the event-by-event restore path: one definition
@@ -754,7 +758,6 @@ def _buffer_update(layer, event: AuditEvent,
         flog(f"_buffer_update: using fid_remap "
              f"eid={event.event_id} fid={target_fid}")
 
-    old_attrs = reconstruct_attributes(event)
     fields = layer.fields()
 
     attr_ok = 0
@@ -899,16 +902,16 @@ def _buffer_update(layer, event: AuditEvent,
         attr_ok=attr_ok, attr_fail=attr_fail,
         geom_status=geom_status, status="applied",
     )
+    if dropped:
+        _upd_fields["dropped"] = ",".join(sorted(dropped))
     if trace_id:
         _upd_fields["trace_id"] = trace_id
     flog_kv("INFO", "BUF_UPD", module="restore_executor", **_upd_fields)
     # BL-RW-P2-14: tag the success path explicitly.
-    return {
-        "success": True,
-        "status": "APPLIED",
-        "reason_code": "applied",
-        "message": "Reverted via buffer",
-    }
+    # RLU-053: the rewind never runs pre_check_restore, so this is the only
+    # place where a field abandoned to schema drift can reach the user.
+    return _buffer_outcome(
+        dropped, "Reverted via buffer", event.event_id, fid=target_fid)
 
 
 def _safe_field_mapping(layer, event: AuditEvent) -> dict:
@@ -920,6 +923,63 @@ def _safe_field_mapping(layer, event: AuditEvent) -> dict:
     upfront.
     """
     return safe_field_mapping(event, layer=layer)
+
+
+def _field_mapping_report(layer, event: AuditEvent, attrs=None):
+    """Mapping to apply, plus the captured fields the drift forbids.
+
+    Same computation as `_safe_field_mapping`, but keeps the list of
+    abandoned fields so the caller can report them. Every buffer op that
+    writes attributes must use this one: the rewind never runs
+    `pre_check_restore`, so it is the only place where the user can be
+    told that his restore came back incomplete (RLU-053).
+    """
+    return field_mapping_report(event, layer=layer, attrs=attrs)
+
+
+def _buffer_outcome(dropped: dict, message: str, eid,
+                    fid: Optional[int] = None) -> dict:
+    """Success dict for a buffer write: APPLIED, or APPLIED_PARTIAL.
+
+    RLU-053. The rewind writes what the current schema still accepts,
+    which is the right call -- refusing everything would throw away the
+    fields that CAN come back. What is not acceptable is announcing that
+    outcome as a complete restore: the user reads "Reverted", believes
+    his feature is back to its former state, and keeps a hybrid -- some
+    values from yesterday, the others from today -- with nothing in the
+    result or the log to warn him.
+
+    So a write that had to abandon captured fields comes back with its
+    own status, its own reason code (the one the breakdown counts) and
+    the list of the fields left behind.
+    """
+    result = {
+        "success": True,
+        "status": "APPLIED",
+        "reason_code": RESTORE_REASON_APPLIED,
+        "message": message,
+    }
+    if fid is not None:
+        result["fid"] = fid
+    if not dropped:
+        return result
+
+    names = sorted(dropped)
+    flog(f"BUF_DRIFT eid={eid} fid={fid if fid is not None else '?'} "
+         f"status=APPLIED_PARTIAL reason_code={RESTORE_REASON_APPLIED_PARTIAL} "
+         f"dropped={names} (schema moved since capture: these fields keep "
+         f"their current values)", "WARNING")
+    result.update({
+        "status": "APPLIED_PARTIAL",
+        "reason_code": RESTORE_REASON_APPLIED_PARTIAL,
+        "partial": True,
+        "dropped_fields": names,
+        "message": (
+            f"{message} - INCOMPLETE: {len(names)} captured field(s) not "
+            f"restored: {format_dropped_fields(dropped)}"
+        ),
+    })
+    return result
 
 
 def _apply_insert_if_already_present(layer, event, attrs, geom, mapping):

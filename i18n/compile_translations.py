@@ -8,6 +8,12 @@ Usage (QGIS Python console or standalone):
     from recoverland.i18n.compile_translations import compile_ts_files
     compile_ts_files()
 """
+# Required: this module annotates with PEP 604 unions (`str | None`), which are
+# evaluated at def time. QGIS 3.40 is packaged against Python 3.9 on several
+# Linux distributions, where that raises TypeError at import. The future import
+# defers annotation evaluation to strings, so the module loads on 3.9 too.
+from __future__ import annotations
+
 import os
 import shutil
 import struct

@@ -207,19 +207,34 @@ def _build_action(
 
     conflict = None
     if not event.entity_fingerprint:
-        severity = "blocking" if require_fingerprint else "warning"
         details = (
-            "Temporal restore requires stable identity"
+            "Temporal restore requires stable identity: event skipped"
             if require_fingerprint
             else "FID-based fallback will be used"
         )
+        # Severity is a WARNING even in temporal mode, although the event is
+        # still dropped from the plan. Compensating a row we cannot name
+        # would edit whichever feature happens to carry that fid today, so
+        # the row does not get an action. But `preflight_check` turns any
+        # blocking conflict into a refusal of the WHOLE group: one legacy
+        # row -- a line written before the entity_fingerprint backfill --
+        # cancelled the rewind of every perfectly identified entity of the
+        # layer, and the user read "Preflight blocked" without recovering
+        # anything. Naming the row in the warnings and restoring the rest is
+        # strictly more of the user's data back.
+        # Fail-closed is preserved at the other end: a plan where NO event
+        # has an identity ends up with zero action and preflight still
+        # blocks it ("No actions in plan").
         conflict = Conflict(
             event_id=eid,
             reason="missing_entity_fingerprint",
-            severity=severity,
+            severity="warning",
             details=details,
         )
         if require_fingerprint:
+            flog(f"restore_planner: event skipped, no stable identity "
+                 f"eid={eid} op={event.operation_type} "
+                 f"datasource={event.datasource_fingerprint}", "WARNING")
             return None, conflict
 
     action = PlannedAction(

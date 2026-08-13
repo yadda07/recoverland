@@ -20,7 +20,8 @@ from .edit_buffer import (
 from .identity import (
     compute_datasource_fingerprint, compute_feature_identity,
     compute_project_fingerprint, extract_layer_name,
-    compute_entity_fingerprint,
+    compute_entity_fingerprint, canonicalize_fingerprint,
+    datasource_fingerprints_match, layer_is_selected,
 )
 from .sqlite_schema import CURRENT_SCHEMA_VERSION
 from .geometry_utils import geometries_equal, geometry_to_wkb, wkb_short_repr
@@ -76,6 +77,10 @@ class EditSessionTracker:
         # memory budget. Cleared on the next editing session.
         self._pressure_paused = False
         self._allowed_layer_fingerprints: set = set()  # empty = track all
+        # `_allowed_layer_fingerprints` as the user persisted it, PLUS the
+        # canonical form of each entry and every alias the journal knows.
+        # See `_is_tracked`.
+        self._tracked_scope: set = set()
         self._session_event_count = 0
         self._on_commit_callback = None
         self._on_overflow_callback = None
@@ -186,26 +191,142 @@ class EditSessionTracker:
         flog("EditSessionTracker: deactivated")
 
     def set_filter(self, layer_fingerprints: set) -> None:
-        """Restrict tracking to these datasource fingerprints. Empty set = track all."""
-        self._allowed_layer_fingerprints = set(layer_fingerprints)
+        """Restrict tracking to these datasource fingerprints. Empty set = track all.
+
+        The list comes from `QgsSettings` (`RecoverLand/tracked_layer_fingerprints`),
+        written once and reread at every start, so it holds fingerprints
+        computed by OLDER rules. Testing membership by strict equality
+        after the v6 canonicalisation matched nothing at all and capture
+        stopped silently -- the worst failure this plugin can have. The
+        set is therefore widened once here (canonical forms + journal
+        aliases) and every membership test goes through `_is_tracked`.
+        """
+        self._allowed_layer_fingerprints = {
+            fp for fp in (layer_fingerprints or set()) if fp
+        }
+        self._tracked_scope = self._expand_tracked(
+            self._allowed_layer_fingerprints)
         for layer_id in list(self._connected_layers.keys()):
             layer_fp = self._layer_fingerprints.get(layer_id)
-            if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
-                layer = self._connected_layers.get(layer_id)
+            layer = self._connected_layers.get(layer_id)
+            admitted = (self._is_tracked(layer_fp) if layer is None
+                        else self.admit_layer(layer, layer_fp))
+            if not admitted:
                 if layer is not None:
                     try:
                         self.disconnect_layer(layer)
                     except RuntimeError:
                         pass
+        n_candidates = 0
         try:
             from qgis.core import QgsProject, QgsVectorLayer
             for layer in QgsProject.instance().mapLayers().values():
                 if isinstance(layer, QgsVectorLayer):
+                    n_candidates += 1
                     self.connect_layer(layer)
         except (ImportError, RuntimeError) as exc:
             # Benign during shutdown or in unit test harness without QgsProject.
             flog(f"EditSessionTracker.set_filter: reconnect skipped: {exc}", "DEBUG")
-        flog(f"EditSessionTracker: filter set, {len(self._allowed_layer_fingerprints)} layer(s)")
+        flog(f"EditSessionTracker: filter set, "
+             f"{len(self._allowed_layer_fingerprints)} layer(s) asked, "
+             f"{len(self._tracked_scope)} fingerprint(s) accepted "
+             f"(canonical forms and journal aliases included), "
+             f"{len(self._connected_layers)} of {n_candidates} vector layer(s) "
+             f"connected")
+        if (self._allowed_layer_fingerprints and n_candidates
+                and not self._connected_layers):
+            # Mute plugin: the selection matches no layer of this project.
+            # Loud on purpose -- capturing nothing looks exactly like having
+            # nothing to capture, and the difference only shows up the day
+            # the user needs the history back.
+            flog(
+                f"EditSessionTracker: the tracking selection matches NONE of "
+                f"the {n_candidates} vector layer(s) of this project; no edit "
+                f"will be captured. Selected fingerprints="
+                f"{sorted(fp[-60:] for fp in self._allowed_layer_fingerprints)}",
+                "ERROR",
+            )
+
+    def _expand_tracked(self, fingerprints: set) -> set:
+        """Widen the persisted selection to every equivalent fingerprint."""
+        scope = set()
+        for fingerprint in fingerprints:
+            scope.add(fingerprint)
+            try:
+                scope.add(canonicalize_fingerprint(fingerprint))
+            except Exception as exc:  # noqa: BLE001 - never lose capture
+                flog(f"EditSessionTracker: cannot canonicalise a tracked "
+                     f"fingerprint ({exc})", "WARNING")
+        try:
+            conn = self._journal_manager.get_connection()
+            from .datasource_alias import expand_fingerprints
+            for fingerprint in list(scope):
+                scope.update(expand_fingerprints(conn, fingerprint))
+        except Exception as exc:  # noqa: BLE001 - journal not open yet
+            flog(f"EditSessionTracker: alias expansion of the tracked list "
+                 f"skipped ({type(exc).__name__}: {exc})", "DEBUG")
+        return {fp for fp in scope if fp}
+
+    def admit_layer(self, layer, layer_fp) -> bool:
+        """Decide whether *layer* is in the tracked selection, and remember it.
+
+        The selection persisted in QgsSettings holds whatever fingerprint form
+        was current when the user ticked the box. After the v6 canonicalisation
+        a DB layer's canonical form no longer equals its stored one, and the
+        table token cannot be derived backwards, so no amount of canonicalising
+        `layer_fp` recovers the match: it has to be recomputed FROM THE LAYER.
+
+        Resolving it through the journal's alias table was not an option --
+        capture would then depend on a row that may not exist (no registry
+        entry, an ambiguous source we refuse to guess, a read-only journal, a
+        migration that has not run). Capture must never go silent because of a
+        missing row.
+
+        When a layer is admitted on its historical form, its canonical
+        fingerprint joins the scope, so the per-signal guards downstream --
+        which only ever see a fingerprint string -- keep agreeing with this
+        decision.
+        """
+        if self._is_tracked(layer_fp):
+            return True
+        try:
+            if not layer_is_selected(layer, self._allowed_layer_fingerprints):
+                return False
+        except Exception as exc:  # noqa: BLE001 - a doubt never stops capture
+            flog(f"EditSessionTracker: selection test degraded for "
+                 f"{str(layer_fp)[-60:]}: {exc}", "WARNING")
+            return True
+        if layer_fp:
+            self._tracked_scope.add(layer_fp)
+            flog(f"EditSessionTracker: layer admitted on its historical "
+                 f"fingerprint, canonical form added to scope "
+                 f"{str(layer_fp)[-60:]}")
+        return True
+
+    def _is_tracked(self, layer_fp) -> bool:
+        """True when this datasource is in the user's tracking selection.
+
+        Equivalence, never string equality: the same file opened with a
+        display filter, a path written relative instead of absolute, or a
+        fingerprint captured before v6 all denote the same source. Any of
+        them failing to match means the layer is no longer audited and
+        the user is told nothing.
+        """
+        if not self._allowed_layer_fingerprints:
+            return True
+        if not layer_fp:
+            return False
+        if layer_fp in self._tracked_scope:
+            return True
+        try:
+            if canonicalize_fingerprint(layer_fp) in self._tracked_scope:
+                return True
+            return any(datasource_fingerprints_match(tracked, layer_fp)
+                       for tracked in self._tracked_scope)
+        except Exception as exc:  # noqa: BLE001 - a doubt never stops capture
+            flog(f"EditSessionTracker: tracking test degraded for "
+                 f"{layer_fp[:60]!r}: {exc}", "WARNING")
+            return True
 
     def connect_layer(self, layer) -> None:
         """Start monitoring a layer for edit events.
@@ -234,7 +355,7 @@ class EditSessionTracker:
         except (RuntimeError, AttributeError):
             pass
         layer_fp = compute_datasource_fingerprint(layer)
-        if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
+        if not self._is_tracked(layer_fp):
             return
         if layer_id in self._connected_layers:
             return
@@ -386,7 +507,7 @@ class EditSessionTracker:
         if not self._active or self.is_suppressed:
             return
         layer_fp = self._layer_fingerprints.get(layer_id)
-        if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
+        if not self._is_tracked(layer_fp):
             return
         self._create_buffer(layer_id)
         flog(f"EditSessionTracker: editing started on {layer_id}")
@@ -396,7 +517,7 @@ class EditSessionTracker:
         if not self._active or self.is_suppressed:
             return
         layer_fp = self._layer_fingerprints.get(layer_id)
-        if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
+        if not self._is_tracked(layer_fp):
             return
         layer = self._connected_layers.get(layer_id)
         if layer is None:
@@ -412,7 +533,7 @@ class EditSessionTracker:
         if not self._active or self.is_suppressed:
             return
         layer_fp = self._layer_fingerprints.get(layer_id)
-        if self._allowed_layer_fingerprints and layer_fp not in self._allowed_layer_fingerprints:
+        if not self._is_tracked(layer_fp):
             return
         layer = self._connected_layers.get(layer_id)
         buf = self._buffers.pop(layer_id, None)

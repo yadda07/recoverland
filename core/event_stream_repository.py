@@ -8,6 +8,9 @@ import sqlite3
 from typing import List, NamedTuple, Optional
 
 from .audit_backend import AuditEvent
+from .datasource_alias import (
+    canonicalize_event_fingerprints, expand_fingerprints,
+)
 from .search_service import _row_to_event
 from .restore_contracts import (
     RestoreCutoff, CutoffType, MAX_EVENTS_PER_RESTORE,
@@ -28,6 +31,33 @@ class FetchStats(NamedTuple):
 _EVENT_COLUMNS = AUDIT_EVENT_SELECT_SQL
 
 
+def resolve_scope(conn: sqlite3.Connection, datasource_fp: str) -> List[str]:
+    """Fingerprints a read scoped on `datasource_fp` must cover.
+
+    The asked fingerprint plus every obsolete form the v6 reconciliation
+    attached to it. Degrades to ``[datasource_fp]`` on a journal with no
+    `datasource_alias` table: an incomplete rewind is bad, a rewind that
+    raises is unusable.
+    """
+    if not datasource_fp:
+        return []
+    scope = expand_fingerprints(conn, datasource_fp)
+    return scope or [datasource_fp]
+
+
+def _canonicalize_events(conn: sqlite3.Connection,
+                         events: List[AuditEvent]) -> List[AuditEvent]:
+    """Unify the fingerprint of events read through an alias.
+
+    Delegates to `datasource_alias.canonicalize_event_fingerprints` so
+    every read path -- rewind, review, search -- agrees on what one
+    datasource IS. Expanding the scope in SQL alone is not enough: the
+    rows come back carrying their historical fingerprint, and the rewind
+    dedup keys on that field.
+    """
+    return canonicalize_event_fingerprints(conn, events)
+
+
 def fetch_entity_stream(
     conn: sqlite3.Connection,
     datasource_fp: str,
@@ -35,15 +65,21 @@ def fetch_entity_stream(
     limit: int = MAX_EVENTS_PER_RESTORE,
 ) -> List[AuditEvent]:
     """Fetch all events for a single entity, ordered by event_id ASC."""
+    scope = resolve_scope(conn, datasource_fp)
+    if not scope:
+        return []
+    placeholders = ",".join("?" for _ in scope)
     assert_safe_fragment(_EVENT_COLUMNS)
+    assert_safe_fragment(placeholders)
     # B608: _EVENT_COLUMNS is a module-level column whitelist; values via `?`.
     query = (
         "SELECT " + _EVENT_COLUMNS + " FROM audit_event"  # nosec B608
-        " WHERE datasource_fingerprint = ? AND entity_fingerprint = ?"
+        " WHERE datasource_fingerprint IN (" + placeholders + ")"
+        " AND entity_fingerprint = ?"
         " ORDER BY event_id ASC LIMIT ?"
     )
-    rows = conn.execute(query, (datasource_fp, entity_fp, limit)).fetchall()
-    return [_row_to_event(r) for r in rows]
+    rows = conn.execute(query, list(scope) + [entity_fp, limit]).fetchall()
+    return _canonicalize_events(conn, [_row_to_event(r) for r in rows])
 
 
 def has_active_restore_traces(
@@ -61,6 +97,7 @@ def has_active_restore_traces(
     """
     if not datasource_fps:
         return False
+    datasource_fps = _expand_all(conn, datasource_fps)
     placeholders = ",".join("?" for _ in datasource_fps)
     query = "".join((
         "SELECT 1 FROM audit_event WHERE ",
@@ -107,6 +144,7 @@ def fetch_active_traces_before_cutoff(
     """
     if not datasource_fps:
         return []
+    datasource_fps = _expand_all(conn, datasource_fps)
     if cutoff.cutoff_type == CutoffType.BY_EVENT_ID:
         cutoff_col = "event_id"
     elif cutoff.cutoff_type == CutoffType.BY_DATE:
@@ -139,7 +177,8 @@ def fetch_active_traces_before_cutoff(
         " ORDER BY created_at DESC, event_id DESC",
     ))
     params = list(datasource_fps) + list(datasource_fps) + [cutoff.value]
-    traces = [_row_to_event(r) for r in conn.execute(query, params).fetchall()]
+    traces = _canonicalize_events(
+        conn, [_row_to_event(r) for r in conn.execute(query, params).fetchall()])
     flog(
         f"fetch_active_traces_before_cutoff: trace_id={trace_id} "
         f"datasource_count={len(datasource_fps)} "
@@ -172,7 +211,7 @@ def fetch_events_after_cutoff(
     a compensatory action (which causes feature accumulation).
     """
     with timed_op("fetch_events_after_cutoff", trace_id):
-        where, params = _cutoff_where(datasource_fp, cutoff,
+        where, params = _cutoff_where(resolve_scope(conn, datasource_fp), cutoff,
                                       include_traces=include_traces)
         if where is None:
             flog(
@@ -194,7 +233,10 @@ def fetch_events_after_cutoff(
             " ORDER BY created_at DESC, event_id DESC LIMIT ?",
         ))
         params.append(limit)
-        events = [_row_to_event(r) for r in conn.execute(query, params).fetchall()]
+        events = _canonicalize_events(
+            conn,
+            [_row_to_event(r) for r in conn.execute(query, params).fetchall()],
+        )
         if len(events) >= limit:
             n_total = count_events_after_cutoff(
                 conn, datasource_fp, cutoff, trace_id=trace_id,
@@ -280,16 +322,19 @@ def fetch_events_in_zone(
           by datasource membership.
     """
     with timed_op("fetch_events_in_zone", trace_id):
+        scope = resolve_scope(conn, datasource_fp) or [datasource_fp]
+        placeholders = ",".join("?" for _ in scope)
         assert_safe_fragment(_EVENT_COLUMNS)
+        assert_safe_fragment(placeholders)
         # B608: _EVENT_COLUMNS is a module-level whitelist; values via `?`.
         query = (
             "SELECT " + _EVENT_COLUMNS + " FROM audit_event"  # nosec B608
-            " WHERE datasource_fingerprint = ?"
+            " WHERE datasource_fingerprint IN (" + placeholders + ")"
             " AND created_at >= ? AND created_at <= ?"
             " ORDER BY created_at ASC, event_id ASC LIMIT ?"
         )
         rows = conn.execute(
-            query, (datasource_fp, t_min, t_max, limit + 1)
+            query, list(scope) + [t_min, t_max, limit + 1]
         ).fetchall()
 
         n_total = len(rows)
@@ -312,6 +357,7 @@ def fetch_events_in_zone(
             else:
                 n_dropped_bbox += 1
 
+        events = _canonicalize_events(conn, events)
         stats = FetchStats(
             n_events_total=n_total,
             n_events_returned=len(events),
@@ -342,7 +388,7 @@ def count_events_after_cutoff(
     list stay consistent.
     """
     with timed_op("count_events_after_cutoff", trace_id):
-        where, params = _cutoff_where(datasource_fp, cutoff,
+        where, params = _cutoff_where(resolve_scope(conn, datasource_fp), cutoff,
                                       include_traces=include_traces)
         if where is None:
             flog(
@@ -389,7 +435,8 @@ def fetch_events_by_ids(
         " WHERE event_id IN (" + placeholders + ")"
         " ORDER BY event_id DESC"
     )
-    return [_row_to_event(r) for r in conn.execute(query, event_ids).fetchall()]
+    return _canonicalize_events(
+        conn, [_row_to_event(r) for r in conn.execute(query, event_ids).fetchall()])
 
 
 def fetch_events_by_session(
@@ -415,7 +462,7 @@ def fetch_events_by_session(
         " ORDER BY event_id DESC LIMIT ?"
     )
     rows = conn.execute(query, (session_id, limit)).fetchall()
-    events = [_row_to_event(r) for r in rows]
+    events = _canonicalize_events(conn, [_row_to_event(r) for r in rows])
     flog(
         f"fetch_events_by_session: session_id={session_id} "
         f"n_events={len(events)} limit={limit}",
@@ -447,12 +494,22 @@ def get_oldest_event_date(
     conn: sqlite3.Connection,
     datasource_fp: Optional[str] = None,
 ) -> Optional[str]:
-    """Return created_at of the oldest event for a datasource (or all), or None."""
+    """Return created_at of the oldest event for a datasource (or all), or None.
+
+    Alias-aware: the horizon offered to the user must cover the history
+    the rewind is about to replay, including the events captured under an
+    obsolete fingerprint. A horizon that stops short hides the oldest
+    part of the history behind a date cursor that refuses to go there.
+    """
     if datasource_fp:
+        scope = resolve_scope(conn, datasource_fp)
+        placeholders = ",".join("?" for _ in scope)
+        assert_safe_fragment(placeholders)
+        # B608: `placeholders` is only `?,?,...`; values via params.
         row = conn.execute(
-            "SELECT MIN(created_at) FROM audit_event"
-            " WHERE datasource_fingerprint = ?",
-            (datasource_fp,),
+            "SELECT MIN(created_at) FROM audit_event"  # nosec B608
+            " WHERE datasource_fingerprint IN (" + placeholders + ")",
+            list(scope),
         ).fetchone()
     else:
         row = conn.execute(
@@ -463,18 +520,36 @@ def get_oldest_event_date(
     return None
 
 
+def _expand_all(conn: sqlite3.Connection, datasource_fps) -> List[str]:
+    """Union of the scopes of several fingerprints, order preserved."""
+    out: List[str] = []
+    seen = set()
+    for fingerprint in datasource_fps or []:
+        for resolved in resolve_scope(conn, fingerprint):
+            if resolved not in seen:
+                seen.add(resolved)
+                out.append(resolved)
+    return out
+
+
 def _cutoff_where(
-    datasource_fp: Optional[str], cutoff: RestoreCutoff,
+    datasource_fps, cutoff: RestoreCutoff,
     include_traces: bool = True,
 ) -> tuple:
     """Build WHERE clause and params for a cutoff filter.
 
-    When datasource_fp is None, the clause applies to all layers.
+    *datasource_fps* is the SCOPE of the read: the asked fingerprint plus
+    the obsolete forms aliased to it (see `resolve_scope`). A bare string
+    is accepted and treated as a one-element scope. None / empty means
+    all layers.
     When *include_traces* is True, restore_trace_events whose original
     event falls within the window are included (with invalidated_at IS NULL
     to exclude soft-deleted traces).
     Returns (where_clause, params) or (None, []) if cutoff type is invalid.
     """
+    if isinstance(datasource_fps, str):
+        datasource_fps = [datasource_fps] if datasource_fps else []
+    ds_params = [fp for fp in (datasource_fps or []) if fp]
     op = ">=" if cutoff.inclusive else ">"
 
     if cutoff.cutoff_type == CutoffType.BY_EVENT_ID:
@@ -485,8 +560,14 @@ def _cutoff_where(
         flog(f"event_stream_repository: unknown cutoff type {cutoff.cutoff_type}", "WARNING")
         return None, []
 
-    ds_cond = "datasource_fingerprint = ? AND " if datasource_fp else ""
-    ds_params = [datasource_fp] if datasource_fp else []
+    if ds_params:
+        ds_cond = "".join((
+            "datasource_fingerprint IN (",
+            ",".join("?" for _ in ds_params),
+            ") AND ",
+        ))
+    else:
+        ds_cond = ""
 
     # Defense-in-depth: every fragment that ends up inside the SQL string
     # must pass the whitelist check. ds_cond / cutoff_col / op are already
