@@ -47,6 +47,10 @@ MAX_SAMPLES = 5
 
 SNAPSHOT_NAME = "stress_snapshot_latest.json"
 
+# Above this, the snapshot is not loaded at all. Stress fewer
+# LAYERS instead of comparing fewer features.
+MAX_SNAPSHOT_MB = 40
+
 
 def _snapshot_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), SNAPSHOT_NAME)
@@ -109,6 +113,24 @@ def verify():
         print(f"[verify] no snapshot at {path}")
         print("[verify] run stress_edit.py first: it writes the ground truth.")
         return
+
+    # json.load builds the whole file as Python objects, several times its
+    # size in RAM, inside the QGIS process. A 193 MB snapshot -- what you get
+    # when every layer of a real project is photographed -- freezes QGIS
+    # before printing a single line. Refuse rather than hang, and say what to
+    # do about it: the fix is to stress FEWER LAYERS, never to compare fewer
+    # features, which would hide exactly what this script exists to find.
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    if size_mb > MAX_SNAPSHOT_MB:
+        print(f"[verify] snapshot is {size_mb:.0f} MB "
+              f"(limit {MAX_SNAPSHOT_MB} MB) -- NOT loading it.")
+        print("[verify] loading it would take gigabytes of RAM in QGIS.")
+        print("[verify] Lower MAX_LAYERS in stress_edit.py and run the whole")
+        print("[verify] cycle again: snapshot, stress, rewind, verify.")
+        print("[verify] Do NOT raise this limit to force it through: a")
+        print("[verify] verification that freezes QGIS proves nothing.")
+        return
+    print(f"[verify] reading snapshot ({size_mb:.1f} MB)...")
     with open(path, "r", encoding="utf-8") as fh:
         snap = json.load(fh)
 
