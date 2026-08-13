@@ -101,6 +101,8 @@ var RL_SEARCH = [
   {t:'Fichier deplace',k:'deplace rename chemin fingerprint orphelin',h:'limits.html#file-moved',p:'limites'},
   {t:'Lecteur reseau',k:'reseau unc montage lecteur',h:'limits.html#network-drive',p:'limites'},
   {t:'FID instable',k:'fid shapefile compactage repack',h:'limits.html#fid-instable',p:'limites'},
+  {t:'Horizon de recuperation',k:'fid recycle sans cle primaire pk horizon rewind cible introuvable retention',h:'limits.html#fid-recycling',p:'limites'},
+  {t:'Identite BD fusionnee',k:'migration v6 alias empreinte schema table postgres ambigu rattachement',h:'limits.html#db-identity-merge',p:'limites'},
   {t:'Couche memoire',k:'memory volatile temporaire',h:'limits.html#memory-layer',p:'limites'},
   {t:'Journal maintenance',k:'maintenance purge vacuum compaction retention integrity',h:'maintenance.html#vision',p:'maintenance'},
   {t:'Health monitoring',k:'health monitor size threshold disk space warning critical',h:'maintenance.html#health',p:'maintenance'},

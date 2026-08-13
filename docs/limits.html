@@ -15,7 +15,7 @@
 <header class="bar">
   <a class="bar-logo" href="index.html">
     <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
-    <span class="bar-name">RecoverLand</span><span class="bar-ver">5.0.1</span>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">6.0.0</span>
   </a>
   <nav class="bar-nav">
     <a href="index.html">Overview</a>
@@ -39,7 +39,9 @@
   <a href="#file-moved">File moved</a>
   <a href="#network-drive">Network drive</a>
   <a href="#fid-instable">Unstable FID</a>
+  <a href="#fid-recycling">Recovery horizon</a>
   <a href="#fid-minus-one">FID = -1</a>
+  <a href="#db-identity-merge">Merged DB identity</a>
   <div class="cat">Capture</div>
   <a href="#outside-qgis">Changes outside QGIS</a>
   <a href="#tracking-off">Recording disabled</a>
@@ -103,8 +105,17 @@
 </svg>
 </div>
 
+<h3>What 6.0.0 changed, and what it did not</h3>
+<p>Version 6.0.0 added an alias mechanism: the <code>datasource_alias</code> table links an obsolete fingerprint to the current one, and every read path expands a fingerprint into all of its historical forms. That mechanism repairs the fingerprints the plugin used to <em>compute</em> incorrectly. It does not repair a file that has actually moved.</p>
+<p>The migration recomputes the canonical fingerprint from the source URI recorded in <code>datasource_registry</code> at capture time. For a moved file that URI still holds the old path, so the recomputed value equals the stored one, no alias row is written, and the source is simply counted as already canonical.</p>
+<p>Two neighbouring cases <em>are</em> fixed and no longer fork the history of a file:</p>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>A display filter (<code>Layer &gt; Filter</code>, which QGIS appends as <code>|subset=...</code>) or an opening option (<code>|geometrytype=...</code>). Only the identifying keys <code>layername</code> and <code>layerid</code> take part in the identity now, so filtering a layer no longer starts a parallel history that a filter-off rewind never sees.</li>
+  <li>A <code>spatialite</code> connection string or a <code>delimitedtext</code> URI, which used to be passed through <code>abspath</code> and therefore depended on the directory QGIS was launched from.</li>
+</ul>
+
 <h3>Consequence</h3>
-<p>The existing history remains intact and browsable (it is not deleted). But RecoverLand does not know that the moved file is the same as the old one. Searching by layer does not show the old history.</p>
+<p>The existing history remains intact and browsable (it is not deleted). But RecoverLand does not know that the moved file is the same as the old one. Searching by layer does not show the old history, and no action in the dialogs re-attaches it: the alias table is written by the migration, never by the interface. The <code>add_alias</code> function is part of the plugin's public Python API, so an alias can be written by hand from the QGIS console, but that is not a supported workflow and nothing validates the pair you give it beyond refusing cycles.</p>
 
 <h3>How to avoid it</h3>
 <ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
@@ -120,21 +131,33 @@
 <p><span class="strength s-medium">MODERATE</span></p>
 
 <h3>The problem</h3>
-<p>If a file is accessible as <code>Z:\share\vegetation.shp</code> on one workstation and as <code>\\server\share\vegetation.shp</code> on another, the two paths produce different fingerprints even though they point to the same physical file.</p>
+<p>By default the fingerprint of a file source contains its absolute path. If a file is accessible as <code>Z:\share\vegetation.shp</code> on one workstation and as <code>\\server\share\vegetation.shp</code> on another, the two paths produce different fingerprints even though they point to the same physical file.</p>
 
 <p>Same problem if the drive letter changes: <code>Z:</code> one day, <code>Y:</code> the next.</p>
+
+<h3>Partial mitigation: project-relative fingerprints</h3>
+<p>The environment variable <code>RECOVERLAND_FINGERPRINT_MODE=relative</code> makes the fingerprint of file-based sources (<code>ogr</code>, <code>spatialite</code>, <code>delimitedtext</code>) carry the path <em>relative to the QGIS project home</em> instead of the absolute path. When the project file and its data live under the same share, the mount point disappears from the fingerprint and the same history is recognised whatever letter the drive was given.</p>
+
+<p>What that mode does <strong>not</strong> do:</p>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>It is off by default. Any other value, or no value at all, means absolute mode.</li>
+  <li>It is an environment variable of the QGIS process, not a project setting. It has to be set on every workstation, and set before capture starts.</li>
+  <li>If the project has no home path (a project never saved) or if the data sits on a different drive from the project, no relative form exists: the plugin falls back to the absolute path and writes a WARNING in the log.</li>
+  <li>Turning it on later does not re-attach a journal already written under absolute paths. The two forms are recognised as the same layer when RecoverLand looks for the layer an event belongs to, or checks whether a layer is being tracked; the history <em>query</em> is widened only through alias rows, and no alias is created for a mode change.</li>
+</ul>
 
 <h3>How to avoid it</h3>
 <ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
   <li>Always use the same path to access the file (always the drive letter, or always the UNC path)</li>
   <li>Fix the network drive letter so it does not change between sessions</li>
+  <li>Or keep the project file and its data under one share, and set <code>RECOVERLAND_FINGERPRINT_MODE=relative</code> on every workstation before the first capture</li>
 </ul>
 </section>
 
 <!-- ====== UNSTABLE FID ====== -->
 <section id="fid-instable">
 <h2>Unstable FID (shapefile, GeoJSON)</h2>
-<p><span class="strength s-critical">CRITICAL</span></p>
+<p><span class="strength s-medium">MODERATE</span></p>
 
 <h3>The problem</h3>
 <p>The FID of a shapefile is the record number in the .dbf file. This number can change if:</p>
@@ -144,13 +167,69 @@
   <li>An external script reorganizes the records</li>
 </ul>
 
-<div class="danger"><strong>Concrete risk</strong>: You recorded a change on feature FID=42 (a building). The shapefile is re-exported. FID 42 now refers to a road. If you restore, RecoverLand writes the building's attributes onto the road. The data is corrupted.</div>
+<h3>What happens now</h3>
+<p>Until 6.0.0 the consequence was corruption: you recorded a change on feature FID=42 (a building), the shapefile was re-exported, FID 42 became a road, and the restore wrote the building's attributes onto the road while reporting success. That is fixed. Before writing on a target reached by FID alone, the restore has to <em>prove</em> the target is the feature the event describes:</p>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>if a primary key resolved the target, the FID never entered the picture and there is nothing to check;</li>
+  <li>if the event captured a post-edit geometry, the feature sitting at that FID must still carry it;</li>
+  <li>for an attribute-only edit, the feature sitting at that FID must still carry the new value of every field the event changed.</li>
+</ul>
+<p>When none of those can be established &mdash; including the case where the event carries no post-edit state to compare at all &mdash; the write is refused and the action is reported as a failure. Refusing loses a restore; applying would destroy a feature.</p>
+<p>The same rule governs a compensatory DELETE: a feature is only deleted when it still matches the snapshot captured at INSERT time, or when a scan by geometry, then by attributes, locates the genuine feature under another FID.</p>
+
+<div class="warn"><strong>What is left</strong>: RecoverLand no longer writes on the wrong feature, but on a re-exported or repacked shapefile a growing share of restores is simply refused. Over the life of a layer with no primary key that becomes the dominant failure mode &mdash; see <a href="#fid-recycling">Recovery horizon without a primary key</a>.</div>
 
 <h3>How to avoid it</h3>
 <ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
-  <li>Use GeoPackage instead of Shapefile when possible</li>
+  <li>Use a format that carries a real primary key (GeoPackage, SpatiaLite, PostGIS) instead of a shapefile: RecoverLand classes those sources as strong identity, a shapefile and a GeoJSON as medium, which means the FID is all there is</li>
   <li>If you must use a shapefile, do not re-export it between captures and restores</li>
-  <li>Before restoring on a shapefile, manually verify that the FID still corresponds to the expected feature</li>
+  <li>Read the report of a restore: an action refused for an unverifiable target is counted as a failure and its reason is given, never silently skipped</li>
+</ul>
+</section>
+
+<!-- ====== RECOVERY HORIZON WITHOUT PK ====== -->
+<section id="fid-recycling">
+<h2>Recovery horizon without a primary key</h2>
+<p><span class="strength s-critical">CRITICAL</span></p>
+
+<h3>The problem</h3>
+<p>When a layer's provider declares no primary key, the identity RecoverLand records for a feature is the FID alone: <code>{"fid": 412}</code>. There is nothing else to record.</p>
+
+<p>OGR reuses the FIDs freed by a deletion. Every deletion followed by a compaction puts a different feature under a number that journal entries already refer to. The journal is not wrong &mdash; it says what it saw &mdash; but the number it holds stops designating the feature it described.</p>
+
+<p>This is not the re-export accident documented above, which happens at one point in time and which you can decide to avoid. It is cumulative and it is silent. Ordinary editing consumes the ability to go back: the further back a rewind reaches, the larger the share of its actions that address FIDs since handed to another feature. Capture keeps working, the journal keeps growing, search keeps returning results. The loss only becomes visible at the moment of the rewind.</p>
+
+<h3>What it looks like on a real project</h3>
+<p>An FTTX project, three months of insertions, modifications and deletions on layers with no primary key. A rewind to an old date produced this:</p>
+
+<div class="tw"><table>
+<thead><tr><th>Outcome of the 73 planned actions</th><th>Count</th></tr></thead>
+<tbody>
+  <tr><td>Restored</td><td>6</td></tr>
+  <tr><td>Already in the target state, nothing to do</td><td>3</td></tr>
+  <tr><td>Refused: the geometry no longer matches the capture</td><td>5</td></tr>
+  <tr><td><strong>Failed: no target found</strong></td><td><strong>59</strong></td></tr>
+</tbody>
+</table></div>
+
+<p>Fifty-nine actions out of seventy-three had no feature to act on. The events were all present; the entities they name were no longer reachable under those numbers. That run is recorded and replayed by the test suite (<code>scripts/validation/scenarios/rw_cycle_summary_truth.py</code>).</p>
+
+<div class="danger"><strong>What this means</strong>: on a layer with no primary key, the reliable recovery window is not the retention period. It is however far back the FIDs still designate the same features, and that horizon shortens on its own with every deletion. RecoverLand will not corrupt your data trying &mdash; it refuses to write a target it cannot prove &mdash; but it cannot restore what it cannot find.</div>
+
+<h3>Why RecoverLand cannot repair this for you</h3>
+<p>The FID is the only identity the layer offers. Rebuilding a lost link would mean guessing which of the current features is the one the event described, and a wrong guess overwrites an unrelated feature &mdash; the exact failure this page exists to prevent. The engine stops at the honest answer instead. The message bar gives the restored and failed counts and the first failure reasons; the plugin log breaks the run down by cause, with the actions whose target was absent counted separately from the ones that were applied, skipped as already in place, or refused on a geometry mismatch. That breakdown is where the four numbers of the table above come from.</p>
+
+<h3>What a primary key changes, and what it does not</h3>
+<p>When the provider declares a primary key, RecoverLand records it next to the FID (<code>pk_field</code> / <code>pk_value</code>) and resolves the target with it. If the key is not found, the restore stops there and never falls back to the FID, precisely because the FID may point at an unrelated feature. A primary key removes this cause of degradation: the identity travels with the row, and deletions elsewhere in the table cost nothing.</p>
+
+<div class="warn"><strong>A primary key does not make the window unlimited.</strong> Retention prunes by age whatever the identity: the purge deletes every event whose date is older than <code>now (UTC) &minus; retention_days</code>. <code>retention_days</code> defaults to 365 and is settable between 7 and 3650 days in the Maintenance dialog, alongside a <code>max_events</code> cap (default 1&nbsp;000&nbsp;000) that removes the oldest events beyond that count. Startup auto-purge is off by default, so nothing is deleted until you enable it or run a purge yourself &mdash; but once an event is purged it is gone. A rewind to a date the journal no longer covers is refused outright rather than replayed on what survived.</div>
+
+<h3>How to reduce the exposure</h3>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>Give the layer a real primary key: a GeoPackage or SpatiaLite table with an integer primary key, or PostGIS. This is the only measure that removes the cause instead of delaying it.</li>
+  <li>On a layer with no primary key, treat the journal as a short-term safety net: check and restore soon after the incident, not months later.</li>
+  <li>Do not compact or re-export such a layer between a capture and a restore.</li>
+  <li>Read the report of every rewind, and the log line behind it. The count of actions whose target was absent is the measure of how much of that history is still reachable; nothing is written for those actions.</li>
 </ul>
 </section>
 
@@ -164,6 +243,35 @@
 
 <h3>Real impact</h3>
 <p>This case is rare because RecoverLand captures at commit time (<code>afterCommitChanges</code>), not during editing. At that point, QGIS has already assigned a definitive FID. The risk is theoretical.</p>
+</section>
+
+<!-- ====== MERGED DB IDENTITY ====== -->
+<section id="db-identity-merge">
+<h2>Pre-6.0.0 database history left unattached</h2>
+<p><span class="strength s-medium">MODERATE</span></p>
+
+<h3>The problem</h3>
+<p>Before 6.0.0, the fingerprint of a PostgreSQL, MS SQL or Oracle source captured the <em>schema</em> where it meant the table. Every table of one schema therefore shared a single identity and their histories were merged in the journal.</p>
+
+<p>6.0.0 computes the fingerprint correctly, and the v6 migration attaches the obsolete fingerprints to the new ones by writing alias rows &mdash; without rewriting a single journal event. Read paths expand a fingerprint into all of its historical forms, so an old journal stays usable after the upgrade.</p>
+
+<p>That repair is impossible in one case: when an old fingerprint would have to split into <em>several</em> current ones. The journal holds one merged history, several tables claim it, and nothing in the data says which events belong to which table. The migration refuses to guess. It writes no alias row for that source, and the old events stay filed under the merged fingerprint.</p>
+
+<h3>How the migration decides</h3>
+<p>The probe only runs on database providers, and only when the table part of the fingerprint actually moves. It then asks how many distinct QGIS layer identifiers were ever recorded under that fingerprint:</p>
+<ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>more than one &mdash; the fingerprint covered several layers: ambiguous, no alias;</li>
+  <li>exactly one &mdash; the fingerprint names one source: the alias is written;</li>
+  <li>none recorded at all (journal written by a very old build) &mdash; the layer names are used as a fallback, and more than one name is again ambiguous.</li>
+</ul>
+<p>The same "leave it alone" outcome applies to a fingerprint the journal has no source address for, and to a pass that could not finish. A pass that did not complete is not marked done: it is retried the next time the project is opened.</p>
+
+<h3>Consequence</h3>
+<p>No event is lost and nothing is rewritten &mdash; deleting the alias rows restores the pre-migration state exactly. But a rewind scoped on the current identity of such a table does not reach the events captured under the merged fingerprint.</p>
+
+<div class="warn"><strong>You are told which sources</strong>: RecoverLand names the affected layers in the message bar, once when the project is opened, and again every time a rewind is launched on a journal whose reconciliation is degraded. If you see that message, treat the older history of the named layers as consultable but not restorable through a rewind on the current identity.</div>
+
+<div class="tip"><strong>Capture is not affected</strong>: recording never depends on a journal row. A tracked-layer selection saved by any earlier version keeps designating the same layers, because membership is tested on both the current and the historical form of the fingerprint.</div>
 </section>
 
 <!-- ====== OUTSIDE QGIS ====== -->
@@ -377,7 +485,9 @@
   <a href="#file-moved">File moved</a>
   <a href="#network-drive">Network drive</a>
   <a href="#fid-instable">Unstable FID</a>
+  <a href="#fid-recycling">Recovery horizon</a>
   <a href="#fid-minus-one">FID = -1</a>
+  <a href="#db-identity-merge">Merged DB identity</a>
   <a href="#outside-qgis">Outside QGIS</a>
   <a href="#tracking-off">Recording off</a>
   <a href="#disk-full">Disk full</a>
@@ -393,7 +503,7 @@
 </aside>
 </div>
 
-<footer>RecoverLand 5.0.1 &middot; GEODECI &middot; Technical documentation</footer>
-<script src="rl.js?v=20"></script>
+<footer>RecoverLand 6.0.0 &middot; GEODECI &middot; Technical documentation</footer>
+<script src="rl.js?v=21"></script>
 </body>
 </html>
