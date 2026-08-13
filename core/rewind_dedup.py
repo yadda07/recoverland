@@ -262,13 +262,26 @@ def collapse_rewind_events_with_stats(
     if fp_split_eid:
         events = _apply_fid_recycle_rewrite(events, fp_split_eid)
 
+    # USER events only. The compensated span below is anchored on the event a
+    # trace says it compensated, and that anchor is only meaningful if it is a
+    # real user edit. When a trace references another trace (chained rewinds),
+    # taking the older trace as the low bound stretched the span across the
+    # whole period between the two rewinds, and every user edit made in
+    # between was neutralised although nothing had ever compensated it -- the
+    # very hole the span was introduced to close.
     by_eid: Dict[int, AuditEvent] = {
-        e.event_id: e for e in events if e.event_id is not None
+        e.event_id: e for e in events
+        if e.event_id is not None and not _is_trace(e)
     }
 
     neutralised_user_eids: set = set()
-    # Per entity: the compensated WINDOW, not the whole entity (I-8).
-    # {entity_key: [oldest_compensated_key, newest_trace_key]}
+    # Per entity: the compensated WINDOWS, not the whole entity (I-8).
+    # {entity_key: [[lo, hi], ...]} -- a LIST, one interval per rewind, never
+    # merged into a single min/max. Merging looked harmless and was not: two
+    # rewinds on the same entity produced one interval spanning from the first
+    # compensated event to the last trace, so any edit made BETWEEN the two
+    # rewinds fell inside it and was neutralised although nothing had ever
+    # compensated it.
     compensated_span: Dict[str, list] = {}
     user_events: List[AuditEvent] = []
     trace_count = 0
@@ -293,16 +306,17 @@ def collapse_rewind_events_with_stats(
             # alone is not enough to neutralise the whole compensated
             # chain -- hence the span rather than a bare eid set.
             src = by_eid.get(ref)
+            if src is None:
+                # Source purged by retention, belonging to another
+                # datasource, or itself a trace. Degenerate span [trace,
+                # trace]: only the exact event_id stays neutralised, nothing
+                # is swallowed by range. Erring wide here re-opens the hole.
+                flog(f"rewind_dedup: trace eid={event.event_id} references "
+                     f"eid={ref} which is not a user event in this window; "
+                     f"span narrowed to the trace itself", "WARNING")
             lo = _order_key(src if src is not None else event)
             hi = _order_key(event)
-            span = compensated_span.get(key)
-            if span is None:
-                compensated_span[key] = [lo, hi]
-            else:
-                if lo < span[0]:
-                    span[0] = lo
-                if hi > span[1]:
-                    span[1] = hi
+            compensated_span.setdefault(key, []).append((lo, hi))
             continue
         user_events.append(event)
 
@@ -315,14 +329,15 @@ def collapse_rewind_events_with_stats(
         if e.event_id in neutralised_user_eids:
             dropped.append(e)
             continue
-        span = compensated_span.get(_entity_key(e))
-        # Strictly inside the compensated span => already undone by the
-        # previous rewind. At or after the trace => a NEW user edit made
-        # after that rewind; it has never been compensated and MUST stay
-        # active, otherwise the entity never returns to its cutoff state
-        # and the dialog wrongly reports "nothing to restore"
-        # (scenario rw_dedup_post_trace_edit).
-        if span is not None and span[0] <= _order_key(e) < span[1]:
+        spans = compensated_span.get(_entity_key(e)) or ()
+        key_e = _order_key(e)
+        # Inside ONE of the compensated intervals => already undone by that
+        # rewind. Between two intervals, or after the last one => a user edit
+        # that no rewind has ever compensated; it MUST stay active, otherwise
+        # the entity never returns to its cutoff state and the dialog wrongly
+        # reports "nothing to restore" (rw_dedup_post_trace_edit,
+        # tx_rewind_broken_trace_memory).
+        if any(lo <= key_e < hi for lo, hi in spans):
             dropped.append(e)
         else:
             active.append(e)
