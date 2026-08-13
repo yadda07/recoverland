@@ -40,12 +40,26 @@ from typing import List, Dict, Optional, Tuple
 from .audit_backend import AuditEvent
 from .logger import flog
 from .serialization import extract_delta_new, extract_delta_old
+from .temporal_snapshot_engine import compute_entity_key
 
 
 def _entity_key(event: AuditEvent) -> str:
-    if event.entity_fingerprint:
-        return f"{event.datasource_fingerprint}::{event.entity_fingerprint}"
-    return f"{event.datasource_fingerprint}::{event.feature_identity_json}"
+    """Per-entity key, scoped by datasource.
+
+    Delegates the entity part to ``temporal_snapshot_engine.compute_entity_key``
+    so the rewind engine and the review engine agree on what one entity IS.
+    They did not: with no ``entity_fingerprint`` (rows written before the
+    backfill), review canonicalised the identity to ``fid:5`` while rewind
+    used the raw ``feature_identity_json`` string. Any change in how that
+    JSON is rendered -- key order, spacing -- then split one entity's history
+    across several dedup buckets, and each bucket was collapsed on its own.
+    Review showed one feature, rewind planned on two.
+    """
+    return "".join((
+        event.datasource_fingerprint or "",
+        "::",
+        compute_entity_key(event.entity_fingerprint, event.feature_identity_json),
+    ))
 
 
 def _detect_fid_recycle(
