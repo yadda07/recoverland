@@ -21,6 +21,7 @@ import time
 import uuid
 from typing import Dict, List, Optional
 
+from ..compat import clear_flag
 from .logger import flog
 
 
@@ -156,7 +157,12 @@ class SnapshotOverlaySession:
                     flag_ns = getattr(QgsLayerTreeModel, "Flag", QgsLayerTreeModel)
                     show_legend = getattr(flag_ns, "ShowLegend", None)
                     if show_legend is not None:
-                        model.setFlags(original_flags & ~show_legend)
+                        # clear_flag, not `original_flags & ~show_legend`: on
+                        # PyQt6 that expression collapses to a bare int and
+                        # setFlags rejects it, which silently disabled this
+                        # whole optimisation on QGIS 4 (the TypeError was
+                        # swallowed by the except below).
+                        model.setFlags(clear_flag(original_flags, show_legend))
                         flog(
                             f"[{trace_id}] snapshot_overlay: legend_defer applied "
                             f"n_layers={total} mode=show_legend_flag",
@@ -171,10 +177,13 @@ class SnapshotOverlaySession:
                         model = None
                         original_flags = None
         except Exception as exc:  # noqa: BLE001
+            # ERROR, not WARNING: this branch is how a cross-version break in
+            # the flag arithmetic stayed invisible for a whole release. The
+            # feature degrades silently, so the log line is the only signal.
             flog(
                 f"[{trace_id}] snapshot_overlay: legend_defer_unavailable "
                 f"reason={type(exc).__name__} msg={exc}",
-                "WARNING",
+                "ERROR",
             )
             model = None
             original_flags = None

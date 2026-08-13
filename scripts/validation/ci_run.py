@@ -22,6 +22,9 @@ import traceback
 # Scenarios to run in CI. Each module must expose ``run() -> dict`` with a
 # ``verdict`` key ("PASS"/"FAIL"). Add new scenarios here as they land.
 _SCENARIOS = (
+    # Runs on every image of the CI matrix; this is what makes the Qt5/Qt6
+    # split an enforced contract rather than a claim in metadata.txt.
+    "recoverland.scripts.validation.scenarios.compat_cross_version",
     "recoverland.scripts.validation.scenarios.rv_snapshot_asof",
     "recoverland.scripts.validation.scenarios.rv_snapshot_volume",
 )

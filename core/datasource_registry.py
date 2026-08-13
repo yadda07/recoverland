@@ -98,7 +98,34 @@ def purge_orphan_datasources(conn: sqlite3.Connection) -> int:
 
 def lookup_datasource(conn: sqlite3.Connection,
                       fingerprint: str) -> Optional[DatasourceInfo]:
-    """Look up stored datasource info by fingerprint. Returns None if not found."""
+    """Look up stored datasource info by fingerprint. Returns None if not found.
+
+    Alias-aware: a journal migrated to v6 can hold the registry row of a
+    source under its OBSOLETE fingerprint only. Looking up the canonical
+    form strictly would answer "unknown source" and a restore on a layer
+    the user has not loaded would fail with nothing to reconnect to.
+    The canonical form is tried first; the aliases are only consulted
+    when it is absent.
+    """
+    from .datasource_alias import expand_fingerprints
+
+    try:
+        candidates = expand_fingerprints(conn, fingerprint) or [fingerprint]
+    except Exception as e:  # noqa: BLE001 - a lookup never blocks a restore
+        flog(f"datasource_registry: alias expansion failed: {e}", "WARNING")
+        candidates = [fingerprint]
+    for candidate in candidates:
+        info = _lookup_exact(conn, candidate)
+        if info is not None:
+            if candidate != fingerprint:
+                flog(f"datasource_registry: {fingerprint} resolved through "
+                     f"alias {candidate}")
+            return info
+    return None
+
+
+def _lookup_exact(conn: sqlite3.Connection,
+                  fingerprint: str) -> Optional[DatasourceInfo]:
     try:
         row = conn.execute(
             """SELECT datasource_fingerprint, provider_type, source_uri,

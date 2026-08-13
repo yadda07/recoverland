@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 
 from .audit_backend import AuditEvent, SearchCriteria, SearchResult
+from .datasource_alias import (
+    canonical_target_map, canonicalize_event_fingerprints, expand_fingerprints,
+)
 from .logger import flog, timed_op
 from .serialization import (
     extract_delta_new, extract_delta_old, is_layer_audit_field,
@@ -57,7 +60,8 @@ def search_events(conn: sqlite3.Connection,
         page = max(criteria.page, 1)
         offset = (page - 1) * page_size
 
-        where_clause, params = _build_where_clause(criteria)
+        where_clause, params = _build_where_clause(
+            criteria, scope=_scope_for(conn, criteria))
         total = _count_matching(conn, where_clause, params)
         flog(f"search_events: conditions={len(params)} total={total}")
 
@@ -72,7 +76,8 @@ def search_events(conn: sqlite3.Connection,
         ))
         all_params = params + [page_size, offset]
         rows = conn.execute(query, all_params).fetchall()
-        events = [_row_to_event(row) for row in rows]
+        events = canonicalize_event_fingerprints(
+            conn, [_row_to_event(row) for row in rows])
 
         return SearchResult(
             events=events, total_count=total, page=page, page_size=page_size
@@ -81,8 +86,24 @@ def search_events(conn: sqlite3.Connection,
 
 def count_events(conn: sqlite3.Connection, criteria: SearchCriteria) -> int:
     """Count matching events without loading data."""
-    where_clause, params = _build_where_clause(criteria)
+    where_clause, params = _build_where_clause(
+        criteria, scope=_scope_for(conn, criteria))
     return _count_matching(conn, where_clause, params)
+
+
+def _scope_for(conn: sqlite3.Connection, criteria: SearchCriteria) -> list:
+    """Fingerprints a search on `criteria.datasource_fingerprint` covers.
+
+    A journal migrated to v6 holds events written under obsolete
+    fingerprints; the search must show them under the current identity,
+    or the user sees a truncated history and no sign that anything is
+    missing. Degrades to the asked fingerprint alone when the alias
+    table is absent.
+    """
+    fingerprint = criteria.datasource_fingerprint
+    if not fingerprint:
+        return []
+    return expand_fingerprints(conn, fingerprint) or [fingerprint]
 
 
 def get_event_by_id(conn: sqlite3.Connection, event_id: int) -> Optional[AuditEvent]:
@@ -102,7 +123,14 @@ _MAX_DISTINCT_RESULTS = 1000
 
 
 def get_distinct_layers(conn: sqlite3.Connection) -> List[Dict[str, str]]:
-    """List distinct audited layers with their display names."""
+    """List distinct audited layers with their display names.
+
+    Obsolete fingerprints are hidden when the canonical form they point
+    at is listed too: they name the same layer, and picking one of them
+    in the interface would scope a rewind on half of the history without
+    saying so. They stay listed when their target is absent from the
+    journal, so nothing ever disappears from the user's view.
+    """
     try:
         rows = conn.execute(
             "SELECT datasource_fingerprint, layer_name, provider_type"
@@ -110,10 +138,7 @@ def get_distinct_layers(conn: sqlite3.Connection) -> List[Dict[str, str]]:
             (_MAX_DISTINCT_RESULTS,),
         ).fetchall()
         if rows:
-            return [
-                {"fingerprint": r[0], "name": r[1], "provider": r[2]}
-                for r in rows
-            ]
+            return _hide_aliased_layers(conn, rows)
     except sqlite3.OperationalError:
         pass
     query = """
@@ -124,10 +149,19 @@ def get_distinct_layers(conn: sqlite3.Connection) -> List[Dict[str, str]]:
         LIMIT ?
     """
     rows = conn.execute(query, (_MAX_DISTINCT_RESULTS,)).fetchall()
-    return [
-        {"fingerprint": r[0], "name": r[1], "provider": r[2]}
-        for r in rows
-    ]
+    return _hide_aliased_layers(conn, rows)
+
+
+def _hide_aliased_layers(conn: sqlite3.Connection, rows) -> List[Dict[str, str]]:
+    aliases = canonical_target_map(conn)
+    listed = {r[0] for r in rows}
+    out = []
+    for row in rows:
+        target = aliases.get(row[0])
+        if target and target in listed:
+            continue
+        out.append({"fingerprint": row[0], "name": row[1], "provider": row[2]})
+    return out
 
 
 def get_distinct_users(conn: sqlite3.Connection) -> List[str]:
@@ -147,7 +181,8 @@ def summarize_scope(conn: sqlite3.Connection, criteria: SearchCriteria) -> Journ
         page=1,
         page_size=1,
     )
-    where_clause, params = _build_where_clause(scope_criteria)
+    where_clause, params = _build_where_clause(
+        scope_criteria, scope=_scope_for(conn, scope_criteria))
     assert_safe_fragment(where_clause)
     # B608: static aggregate; `where_clause` is internally built and asserted; values via `params`.
     query = (
@@ -174,7 +209,15 @@ def summarize_scope(conn: sqlite3.Connection, criteria: SearchCriteria) -> Journ
 
 
 def _build_where_clause(criteria: SearchCriteria,
-                        include_traces: bool = False) -> Tuple[str, list]:
+                        include_traces: bool = False,
+                        scope: Optional[list] = None) -> Tuple[str, list]:
+    """Build the WHERE clause of a search.
+
+    *scope*, when given, replaces the single-fingerprint equality by the
+    set of fingerprints that denote the same source (canonical form plus
+    its aliases). Callers that have a connection must pass it; the
+    default keeps the strict behaviour for callers that do not.
+    """
     conditions = []
     params = []
 
@@ -187,8 +230,12 @@ def _build_where_clause(criteria: SearchCriteria,
         conditions.append("restored_from_event_id IS NULL")
 
     if criteria.datasource_fingerprint:
-        conditions.append("datasource_fingerprint = ?")
-        params.append(_checked(criteria.datasource_fingerprint))
+        fingerprints = [fp for fp in (scope or []) if fp]
+        if not fingerprints:
+            fingerprints = [criteria.datasource_fingerprint]
+        placeholders = ",".join("?" for _ in fingerprints)
+        conditions.append("datasource_fingerprint IN (" + placeholders + ")")
+        params.extend(_checked(fp) for fp in fingerprints)
 
     if criteria.layer_name:
         conditions.append("layer_name_snapshot = ?")

@@ -677,6 +677,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             return set()
 
     def _refresh_layers_panel(self) -> None:
+        from .core.identity import layer_is_selected
         """Rebuild checkboxes from currently loaded vector layers."""
         allowed = self._load_tracked_layer_ids()
         layout = self.layers_container_layout
@@ -694,7 +695,11 @@ class RecoverDialog(QDialog, LoggerMixin):
             cb = QCheckBox(layer.name())
             layer_fp = compute_datasource_fingerprint(layer)
             cb.setProperty("layer_fingerprint", layer_fp)
-            checked = (not allowed) or (layer_fp in allowed)
+            # Same equivalence the tracker uses: a selection persisted
+            # under the pre-v6 rules must keep showing its layers ticked,
+            # otherwise the panel reads 'not tracked' and the first save
+            # silently drops them from the selection.
+            checked = layer_is_selected(layer, allowed)
             if not checked:
                 all_tracked = False
             cb.blockSignals(True)
@@ -708,7 +713,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         elif all_tracked:
             self.layers_status_label.setText(self.tr("Toutes les couches surveillées"))
         else:
-            n = sum(1 for lyr in layers if compute_datasource_fingerprint(lyr) in allowed)
+            n = sum(1 for lyr in layers if layer_is_selected(lyr, allowed))
             self.layers_status_label.setText(
                 self.tr("{n} / {total} couche(s) surveillée(s)").format(n=n, total=len(layers)))
 

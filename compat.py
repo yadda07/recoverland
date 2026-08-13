@@ -295,6 +295,34 @@ class QgisCompat:
     WKB_NO_GEOMETRY = _resolve_wkb_no_geometry()
 
 
+def clear_flag(flags, flag):
+    """Return *flags* with *flag* cleared, in the type the setter expects.
+
+    ``flags & ~flag`` is NOT portable across the two bindings:
+
+    - PyQt5: ``~flag`` is a plain int, but the left operand is a sip ``Flags``
+      wrapper that absorbs it, so the result is still ``Flags`` and sip accepts
+      it.
+    - PyQt6: the flag is an ``IntEnum``/``Flag`` whose ``&`` with an int returns
+      a bare ``int``, which sip refuses::
+
+          TypeError: QgsLayerTreeModel.setFlags(): argument 1 has unexpected
+          type 'int'
+
+    Measured on QGIS 3.40.15 / PyQt 5.15.11 and QGIS 4.0.3 / PyQt 6.11.0.
+    Rebuilding through ``type(flags)`` keeps the value in the original type on
+    both, so the setter and the later restore round-trip cleanly.
+
+    Args:
+        flags: The current flag set, as returned by the owning object.
+        flag: The single flag to clear.
+
+    Returns:
+        A value of ``type(flags)`` with *flag* removed.
+    """
+    return type(flags)(int(flags) & ~int(flag))
+
+
 class QgisVersion(NamedTuple):
     """Parsed QGIS version (major, minor, patch)."""
     major: int

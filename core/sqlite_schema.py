@@ -3,12 +3,13 @@
 Provides DDL statements and idempotent schema creation.
 All PRAGMAs are applied at every connection open.
 """
+import os
 import sqlite3
 from typing import List, Tuple
 
 from .logger import flog
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 # Authoritative column order for the audit_event table. Every SELECT/INSERT
 # site (search_service, event_stream_repository, write_queue, integrity)
@@ -158,8 +159,28 @@ def apply_pragmas(conn: sqlite3.Connection) -> None:
 
 
 def initialize_schema(conn: sqlite3.Connection) -> None:
-    """Create all tables and indexes if they don't exist. Idempotent."""
+    """Create all tables and indexes if they don't exist. Idempotent.
+
+    Read-only journals (network share mounted read-only, file marked
+    read-only) are detected BEFORE anything tries to write and served as
+    they are: raising here would take the whole project down at the very
+    moment the user upgrades the plugin, for a schema change he did not
+    ask for. The history stays readable, only its evolution is deferred.
+
+    A journal that is writable but LOCKED by another instance is a
+    different story: the error is propagated so the caller can name the
+    lock instead of silently working on a journal it cannot update.
+    """
     apply_pragmas(conn)
+    if not _is_writable(conn):
+        flog(
+            f"sqlite_schema: journal is read-only "
+            f"(path={_main_db_path(conn)!r}); schema left at version "
+            f"{get_schema_version(conn)}, migrations and datasource "
+            f"reconciliation deferred. The journal stays readable.",
+            "WARNING",
+        )
+        return
     with conn:
         for ddl in _TABLE_DDL:
             conn.execute(ddl)
@@ -169,6 +190,56 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         for ddl in _INDEX_DDL:
             conn.execute(ddl)
         _record_schema_version(conn)
+        _reconcile_datasources(conn)
+
+
+def _main_db_path(conn: sqlite3.Connection) -> str:
+    """Filesystem path of the `main` database, '' for memory/temp DBs."""
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            if len(row) >= 3 and row[1] == "main":
+                return row[2] or ""
+    except sqlite3.Error as exc:
+        flog(f"sqlite_schema: cannot read database_list: {exc}", "DEBUG")
+    return ""
+
+
+def _is_writable(conn: sqlite3.Connection) -> bool:
+    """True when the journal file can actually be written to.
+
+    Checked on the FILE, not by attempting a write: `BEGIN IMMEDIATE`
+    succeeds on a read-only WAL database, so a probe transaction proves
+    nothing, and a real probe write would dirty a file we were asked not
+    to touch. An unknown path (memory / temp database) counts as
+    writable so nothing regresses in tests and tooling.
+    """
+    path = _main_db_path(conn)
+    if not path:
+        return True
+    try:
+        if not os.path.isfile(path):
+            return True
+        return os.access(path, os.W_OK)
+    except OSError as exc:
+        flog(f"sqlite_schema: writability check failed on {path!r}: {exc}",
+             "DEBUG")
+        return True
+
+
+def _reconcile_datasources(conn: sqlite3.Connection) -> None:
+    """Run the v6 datasource reconciliation inside the schema transaction.
+
+    Lives here so that a journal is either fully migrated or not migrated
+    at all: the alias rows and the schema version commit together. Never
+    raises -- a reconciliation that fails is retried at the next open,
+    while a plugin that refuses to open is useless.
+    """
+    try:
+        from .datasource_alias import reconcile_legacy_fingerprints
+        reconcile_legacy_fingerprints(conn)
+    except Exception as exc:  # noqa: BLE001 - opening the journal wins
+        flog(f"sqlite_schema: datasource reconciliation skipped "
+             f"({type(exc).__name__}: {exc})", "WARNING")
 
 
 def _record_schema_version(conn: sqlite3.Connection) -> None:
@@ -215,6 +286,8 @@ def get_migration_plan(current_version: int) -> List[Tuple[int, str, str]]:
         migrations.append((4, "Add datasource_alias table", _V4_MIGRATION_SQL))
     if current_version < 5:
         migrations.append((5, "Add invalidated_at for soft-delete traces", _V5_MIGRATION_SQL))
+    if current_version < 6:
+        migrations.append((6, "Reconcile legacy datasource fingerprints", _V6_MIGRATION_SQL))
     return migrations
 
 
@@ -234,6 +307,15 @@ _V4_MIGRATION_SQL = (
 )
 
 _V5_MIGRATION_SQL = "ALTER TABLE audit_event ADD COLUMN invalidated_at TEXT"
+
+# v6 changes no column and no table: `datasource_alias` has existed since
+# v4. What it changes is the way a fingerprint is computed, and the
+# repair is a set of ALIAS rows written by
+# `datasource_alias.reconcile_legacy_fingerprints` -- run at every open,
+# inside this same transaction, so an interrupted migration retries
+# instead of leaving a half-reconciled journal. Not one row of
+# `audit_event` is touched.
+_V6_MIGRATION_SQL = ""
 
 
 def _run_migrations(conn: sqlite3.Connection, current_version: int) -> None:

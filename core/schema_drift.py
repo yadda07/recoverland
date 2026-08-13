@@ -23,6 +23,22 @@ class DriftReport(NamedTuple):
     is_compatible: bool
 
 
+class FieldMapping(NamedTuple):
+    """A restore mapping together with what it could NOT carry.
+
+    ``mapping`` is the historical-name -> current-name dict consumed by
+    ``serialization.iter_mapped_attributes``.
+
+    ``dropped`` names the captured fields that cannot be written back,
+    keyed by historical name, with a readable reason. Callers must report
+    it: a restore that loses fields in silence hands the user a hybrid
+    feature -- some values from yesterday, the rest from today -- while
+    announcing a full restore (RLU-053).
+    """
+    mapping: Dict[str, str]
+    dropped: Dict[str, str]
+
+
 def parse_field_schema(field_schema_json: str) -> List[FieldInfo]:
     """Parse stored field_schema_json into FieldInfo list."""
     try:
@@ -99,7 +115,13 @@ def _types_compatible(hist: FieldInfo, curr: FieldInfo) -> bool:
     if hist.type_name.lower() == curr.type_name.lower():
         return True
     compatible_groups = [
-        {"int4", "integer", "int", "int8", "bigint", "smallint", "int2"},
+        # "integer64" is what OGR reports for a shapefile (.dbf) integer
+        # column, and what QGIS shows after exporting a GPKG whose column
+        # was plain "Integer". Leaving it out of the group made every
+        # integer field of every shapefile look retyped, so every integer
+        # was skipped in silence at each restore (RLU-053).
+        {"int4", "integer", "int", "int8", "bigint", "smallint", "int2",
+         "integer64", "int64", "long", "longlong"},
         {"float8", "double", "real", "float4", "numeric", "decimal"},
         {"varchar", "text", "string", "char", "character varying"},
         {"bool", "boolean"},
@@ -118,18 +140,58 @@ def _types_compatible(hist: FieldInfo, curr: FieldInfo) -> bool:
 def build_field_mapping(drift: DriftReport, historical: List[FieldInfo]) -> Dict[str, str]:
     """Build a name-to-name mapping for restore.
 
-    Only matched fields are mapped. Missing and type-changed fields
-    are excluded (caller decides strategy).
+    Matched fields map to themselves.
+
+    Fields whose column disappeared stay in the mapping ON PURPOSE:
+    ``serialization.iter_mapped_attributes`` resolves them to ``idx < 0``,
+    skips them and logs the skip, so the single write choke point of the
+    restore path keeps a trace of what the drift costs. They are never
+    written -- there is no column left to write them into.
+
+    Type-changed fields are excluded: their column still exists, so
+    mapping them would push a value the column cannot hold.
+
+    The mapping alone cannot tell a caller what it lost on the way; the
+    list of dropped fields comes from ``dropped_fields`` /
+    ``field_mapping_report``, which every write path must report.
     """
     mapping = {}
     for name in drift.matched:
         mapping[name] = name
+    for name in drift.missing_in_current:
+        mapping[name] = name
     return mapping
 
 
-def safe_field_mapping(event, layer=None,
-                       drift: Optional[DriftReport] = None) -> Dict[str, str]:
-    """Build a field-name mapping for restore handling schema drift.
+def dropped_fields(drift: DriftReport,
+                   attrs: Optional[Dict] = None) -> Dict[str, str]:
+    """Captured fields the restore cannot write back: name -> reason.
+
+    When *attrs* is given (the attributes the event actually captured),
+    only fields carried by this event are reported: a column that drifted
+    but was never captured costs the user nothing.
+    """
+    dropped: Dict[str, str] = {}
+    for name in drift.missing_in_current:
+        if attrs is None or name in attrs:
+            dropped[name] = "field no longer exists in the layer"
+    for name, change in drift.type_changed.items():
+        if attrs is None or name in attrs:
+            dropped[name] = f"incompatible type change ({change})"
+    return dropped
+
+
+def format_dropped_fields(dropped: Dict[str, str]) -> str:
+    """Readable summary of the fields a restore had to abandon."""
+    return ", ".join(
+        f"{name} [{reason}]" for name, reason in sorted(dropped.items())
+    )
+
+
+def field_mapping_report(event, layer=None,
+                         drift: Optional[DriftReport] = None,
+                         attrs: Optional[Dict] = None) -> FieldMapping:
+    """Mapping to apply AND the captured fields it had to abandon.
 
     Resolution order:
       1. If *drift* is supplied, reuse it (caller already paid for the
@@ -139,8 +201,8 @@ def safe_field_mapping(event, layer=None,
          current schema. This is the path used by restore_executor's
          buffer ops which do not have a precomputed drift.
       3. Else fall back to identity mapping (every historical field
-         maps to itself). Defensive default for callers that proceed
-         without a precheck (legacy undo paths).
+         maps to itself) and no drop. Defensive default for callers that
+         proceed without a precheck (legacy undo paths).
 
     Reuses parse_field_schema / extract_current_schema / compare_schemas
     so the mapping behaviour is identical across restore_service and
@@ -150,8 +212,22 @@ def safe_field_mapping(event, layer=None,
     if drift is None and layer is not None:
         drift = compare_schemas(hist, extract_current_schema(layer))
     if drift is None:
-        return {f.name: f.name for f in hist}
-    return build_field_mapping(drift, hist)
+        return FieldMapping({f.name: f.name for f in hist}, {})
+    return FieldMapping(
+        build_field_mapping(drift, hist),
+        dropped_fields(drift, attrs),
+    )
+
+
+def safe_field_mapping(event, layer=None,
+                       drift: Optional[DriftReport] = None) -> Dict[str, str]:
+    """Field-name mapping for restore, drift handled (see FieldMapping).
+
+    Kept for call sites that only need the mapping. Any call site that
+    reports an outcome to the user must use ``field_mapping_report`` and
+    surface ``dropped``.
+    """
+    return field_mapping_report(event, layer=layer, drift=drift).mapping
 
 
 def format_drift_message(drift: DriftReport) -> str:

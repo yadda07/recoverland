@@ -142,6 +142,7 @@ class JournalManager:
         self._path: Optional[str] = None
         self._unsaved_session_token: Optional[str] = None
         self._lock_acquired: bool = False
+        self._reconciliation = None
 
     @property
     def path(self) -> Optional[str]:
@@ -155,6 +156,31 @@ class JournalManager:
     def is_lock_degraded(self) -> bool:
         """True if the journal is open but the writer lock could not be acquired."""
         return self.is_open and not self._lock_acquired
+
+    @property
+    def is_reconciliation_degraded(self) -> bool:
+        """True when part of the history is not attached to its source.
+
+        The v6 reconciliation refuses to guess: an ambiguous source, a
+        fingerprint with no registered address, or an interrupted pass
+        leaves events readable under their old identity but invisible to
+        a rewind scoped on the current one. The interface must be able
+        to say so BEFORE proposing a rewind.
+        """
+        report = self._reconciliation
+        return bool(report is not None and report.is_degraded)
+
+    def reconciliation_warning(self) -> str:
+        """French, user-facing summary of the degradation ('' if none)."""
+        if self._conn is None:
+            return ""
+        try:
+            from .datasource_alias import describe_reconciliation
+            return describe_reconciliation(self._conn)
+        except Exception as exc:  # noqa: BLE001 - a warning never blocks
+            flog(f"JournalManager: cannot describe reconciliation: {exc}",
+                 "WARNING")
+            return ""
 
     def open_for_project(self, project_path: str, profile_path: str) -> str:
         """Open or create the journal for the given project context.
@@ -203,6 +229,7 @@ class JournalManager:
             self._path = None
             self._unsaved_session_token = None
             self._lock_acquired = False
+            self._reconciliation = None
 
     def open_readonly_connection(self) -> sqlite3.Connection:
         """Open a read-only connection dedicated to Time Lens (IL-I1).
@@ -274,6 +301,37 @@ class JournalManager:
             conn.close()
             raise
         self._conn = conn
+        self._load_reconciliation_state(conn)
+
+    def _load_reconciliation_state(self, conn: sqlite3.Connection) -> None:
+        """Read back what the v6 reconciliation could and could not do."""
+        self._reconciliation = None
+        try:
+            from .datasource_alias import load_reconciliation
+            report = load_reconciliation(conn)
+        except Exception as exc:  # noqa: BLE001 - never block the open
+            flog(f"JournalManager: cannot read the reconciliation report: "
+                 f"{exc}", "WARNING")
+            return
+        self._reconciliation = report
+        if report is None:
+            return
+        if report.is_degraded:
+            flog(
+                f"JournalManager: datasource reconciliation degraded "
+                f"status={report.status} ambiguous={len(report.ambiguous)} "
+                f"without_source_uri={len(report.without_source_uri)} "
+                f"aliases_created={report.aliases_created} "
+                f"scanned={report.scanned}",
+                "WARNING",
+            )
+        else:
+            flog(
+                f"JournalManager: datasource reconciliation ok "
+                f"scanned={report.scanned} "
+                f"aliases={report.aliases_created}",
+                "DEBUG",
+            )
 
     @staticmethod
     def _refresh_planner_stats(conn: sqlite3.Connection) -> None:

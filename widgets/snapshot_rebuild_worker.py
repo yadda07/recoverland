@@ -14,6 +14,7 @@ join fetches the full row.  With an index on
 """
 from __future__ import annotations
 
+import sqlite3
 import time
 import uuid
 from datetime import datetime
@@ -28,34 +29,126 @@ from ..core.sqlite_schema import AUDIT_EVENT_COLUMNS
 
 _ALIASED_COLS = ", ".join(f"ae.{c}" for c in AUDIT_EVENT_COLUMNS)
 
-_SQL_ALL_EVENTS_BEFORE = "".join([
-    "SELECT ", _ALIASED_COLS,
-    " FROM audit_event ae",
-    " WHERE ae.datasource_fingerprint = ?",
-    " AND ae.created_at <= ?",
-    " AND ae.invalidated_at IS NULL",
-    " ORDER BY ae.entity_fingerprint, ae.created_at, ae.event_id",
-])
 
-_SQL_DATE_RANGE = (
-    "SELECT MIN(created_at), MAX(created_at)"
-    " FROM audit_event"
-    " WHERE datasource_fingerprint = ?"
-    " AND invalidated_at IS NULL"
-)
+def _self_describing(column: str) -> str:
+    """Match the fingerprints of the SAME file opened with display options.
 
-# CHANGE B: entity_fingerprints with at least one event strictly AFTER the
-# cutoff. These are the ONLY entities whose state at T differs from the current
-# / live data, so Review reconstructs and shows only these (no duplication of
-# the unchanged source layers). feature_identity_json is fetched for the
-# NULL-fingerprint fallback so keys match the reconstruction exactly (see
-# temporal_snapshot_engine.compute_entity_key).
-_SQL_FPS_CHANGED_AFTER = (
-    "SELECT DISTINCT entity_fingerprint, feature_identity_json FROM audit_event"
-    " WHERE datasource_fingerprint = ?"
-    " AND created_at > ?"
-    " AND invalidated_at IS NULL"
-)
+    A file fingerprint carries its own source: ``ogr::<path>|layername=x``.
+    Everything a pre-v6 capture appended after it -- ``|subset=``,
+    ``|geometrytype=`` -- is a display option, so a row whose fingerprint
+    is the asked one PLUS such tokens describes the same table and the
+    same features. Recognising it needs no table and no registry, which
+    is what REVIEW needs: it rebuilds a past state on a read-only
+    connection, on journals that may never have been migrated.
+
+    Two guards keep it exact:
+      * the extra part must start at a ``|`` boundary (`substr`, not
+        `LIKE`: a path routinely contains ``_``, a LIKE wildcard, and
+        would then match neighbouring paths);
+      * it must carry no ``layername=`` / ``layerid=`` of its own, or
+        ``file.gpkg`` would swallow every layer of that GeoPackage.
+    """
+    rest = "".join(("substr(", column, ", length(?1) + 1)"))
+    return "".join((
+        "(substr(", column, ", 1, length(?1) + 1) = ?1 || '|'",
+        " AND instr(", rest, ", '|layername=') = 0",
+        " AND instr(", rest, ", '|layerid=') = 0)",
+    ))
+
+
+def _scoped(column: str) -> str:
+    """Predicate matching a datasource fingerprint AND its v6 aliases.
+
+    REVIEW rebuilds a past state from its own SQL, outside the
+    `event_stream_repository` expansion point. Filtering on the bare
+    equality made it silently ignore everything captured under an
+    obsolete fingerprint: the user was shown a state of the world that
+    never existed, with nothing saying it was incomplete.
+
+    Three ways of naming one source, all resolved here: the fingerprint
+    itself, the aliases the v6 reconciliation attached to it (the only
+    way a DB source can be resolved), and the self-describing forms
+    above (which still work on a journal nobody could migrate).
+
+    The fingerprint is bound ONCE (`?1`) so the parameter tuples of the
+    callers stay exactly what they were.
+    """
+    return "".join((
+        "(", column, " = ?1 OR ", column, " IN ("
+        "SELECT alias_fingerprint FROM datasource_alias "
+        "WHERE target_fingerprint = ?1) OR ",
+        _self_describing(column), ")",
+    ))
+
+
+def _plain(column: str) -> str:
+    """Same predicate for a journal with no `datasource_alias` table."""
+    return "".join((
+        "(", column, " = ?1 OR ", _self_describing(column), ")",
+    ))
+
+
+def _build_queries(scope) -> tuple:
+    all_events_before = "".join([
+        "SELECT ", _ALIASED_COLS,
+        " FROM audit_event ae",
+        " WHERE ", scope("ae.datasource_fingerprint"),
+        " AND ae.created_at <= ?2",
+        " AND ae.invalidated_at IS NULL",
+        " ORDER BY ae.entity_fingerprint, ae.created_at, ae.event_id",
+    ])
+    date_range = "".join([
+        "SELECT MIN(created_at), MAX(created_at)",
+        " FROM audit_event",
+        " WHERE ", scope("datasource_fingerprint"),
+        " AND invalidated_at IS NULL",
+    ])
+    # CHANGE B: entity_fingerprints with at least one event strictly AFTER
+    # the cutoff. These are the ONLY entities whose state at T differs from
+    # the current / live data, so Review reconstructs and shows only these
+    # (no duplication of the unchanged source layers). feature_identity_json
+    # is fetched for the NULL-fingerprint fallback so keys match the
+    # reconstruction exactly (see temporal_snapshot_engine.compute_entity_key).
+    fps_changed_after = "".join([
+        "SELECT DISTINCT entity_fingerprint, feature_identity_json",
+        " FROM audit_event",
+        " WHERE ", scope("datasource_fingerprint"),
+        " AND created_at > ?2",
+        " AND invalidated_at IS NULL",
+    ])
+    return all_events_before, date_range, fps_changed_after
+
+
+(_SQL_ALL_EVENTS_BEFORE, _SQL_DATE_RANGE,
+ _SQL_FPS_CHANGED_AFTER) = _build_queries(_scoped)
+(_SQL_ALL_EVENTS_BEFORE_NO_ALIAS, _SQL_DATE_RANGE_NO_ALIAS,
+ _SQL_FPS_CHANGED_AFTER_NO_ALIAS) = _build_queries(_plain)
+
+_NO_ALIAS_FALLBACK = {
+    _SQL_ALL_EVENTS_BEFORE: _SQL_ALL_EVENTS_BEFORE_NO_ALIAS,
+    _SQL_DATE_RANGE: _SQL_DATE_RANGE_NO_ALIAS,
+    _SQL_FPS_CHANGED_AFTER: _SQL_FPS_CHANGED_AFTER_NO_ALIAS,
+}
+
+
+def _execute(conn, sql: str, params: tuple):
+    """Run an alias-aware query, degrading on a pre-v4 journal.
+
+    A journal written before the `datasource_alias` table existed has
+    nothing to expand: serving the asked fingerprint alone is exactly
+    right there, and raising would take REVIEW down on a journal that
+    reads perfectly.
+    """
+    try:
+        return conn.execute(sql, params)
+    except sqlite3.OperationalError as exc:
+        fallback = _NO_ALIAS_FALLBACK.get(sql)
+        if fallback is None or "datasource_alias" not in str(exc):
+            raise
+        flog(f"snap_worker: no datasource_alias table ({exc}); reading the "
+             f"asked fingerprint only", "WARNING")
+        return conn.execute(fallback, params)
+
 
 # RL-E1-02 (Option A): volume guard. The reconstruction needs the FULL event
 # chain per entity (attrs deltas + geometry walk-back), so we keep the full
@@ -140,8 +233,8 @@ class SnapshotRebuildWorker(QThread):
                     flog(f"[{tid}] snap_worker: cancelled", "INFO")
                     return
                 fp = info["fingerprint"]
-                rows_c = conn.execute(
-                    _SQL_FPS_CHANGED_AFTER, (fp, self._cutoff_iso)
+                rows_c = _execute(
+                    conn, _SQL_FPS_CHANGED_AFTER, (fp, self._cutoff_iso)
                 ).fetchall()
                 keys = {compute_entity_key(r[0], r[1]) for r in rows_c}
                 changed_after[fp] = keys
@@ -172,8 +265,8 @@ class SnapshotRebuildWorker(QThread):
                 fp = info["fingerprint"]
                 # Stream the cursor (bounded), never fetchall() unbounded.
                 events = []
-                cursor = conn.execute(
-                    _SQL_ALL_EVENTS_BEFORE,
+                cursor = _execute(
+                    conn, _SQL_ALL_EVENTS_BEFORE,
                     (fp, self._cutoff_iso),
                 )
                 for row in cursor:
@@ -387,8 +480,8 @@ def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
     try:
         conn = journal.create_read_connection()
         for info in layer_infos:
-            row = conn.execute(
-                _SQL_DATE_RANGE, (info["fingerprint"],)
+            row = _execute(
+                conn, _SQL_DATE_RANGE, (info["fingerprint"],)
             ).fetchone()
             if row:
                 if row[0] and (not first_iso or row[0] < first_iso):

@@ -15,6 +15,10 @@ Convention: top-level script, run from QGIS Python console via:
 
 Output: [i18n-runtime] verdict=PASS|FAIL passed=N/M trace_id=...
 """
+# `Path | None` below is evaluated at def time; QGIS 3.40 ships on Python 3.9
+# in some Linux packages, where that raises TypeError at import.
+from __future__ import annotations
+
 from pathlib import Path
 import sys
 import uuid

@@ -6,6 +6,8 @@ conflict policies, provider matrix, and plan structures.
 Serves as the single source of truth for BL-00 (cadrage) and
 BL-01 (noyau metier). All restore logic references these contracts.
 """
+from collections import namedtuple
+from datetime import datetime, timezone
 from enum import Enum
 from typing import NamedTuple, List, Dict, Optional, Any, Tuple
 
@@ -51,17 +53,117 @@ COMPENSATORY_OPS: Dict[str, str] = {
 }
 
 
-class RestoreCutoff(NamedTuple):
-    cutoff_type: CutoffType
-    value: Any
-    # Inclusive cutoff: events with `created_at >= value` are included.
-    # SQLite stores timestamps with second precision: an event committed
-    # within the same second as the cutoff would otherwise be silently
-    # dropped, which is the dominant rewind regression pattern (see
-    # SESSION_REWIND.md §17.1 H-S3).  Default True is the safe behaviour;
-    # callers needing a strict `>` filter must pass `inclusive=False`
-    # explicitly.
-    inclusive: bool = True
+MIN_CUTOFF_DATE_LEN = 10  # "YYYY-MM-DD"
+
+
+def parse_cutoff_date(value: Any) -> Optional[datetime]:
+    """Parse a BY_DATE cutoff value, or None when it is not a date.
+
+    Accepts what the product actually produces: the ``isoformat()`` of the
+    capture path (with or without microseconds, with or without a UTC
+    offset), the ``yyyy-MM-ddTHH:mm:ss`` string the rewind dialog builds,
+    a legacy journal stamp using a space separator, and a bare
+    ``YYYY-MM-DD``. A trailing ``Z`` is rewritten to ``+00:00`` because
+    ``datetime.fromisoformat`` only accepts it from Python 3.11 and the
+    plugin still runs on the 3.9 shipped with QGIS 3.40.
+
+    Anything else -- None, empty string, free text -- is NOT a date and
+    returns None. Callers must treat that as "no readable bound".
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if len(text) < MIN_CUTOFF_DATE_LEN:
+        return None
+    if text[-1] in ("Z", "z"):
+        text = "".join((text[:-1], "+00:00"))
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def normalize_cutoff_date(value: Any) -> Optional[str]:
+    """Journal-comparable spelling of a BY_DATE cutoff value.
+
+    The cutoff is never compared as a date: it goes into SQL as
+    ``created_at >= ?``, a STRING comparison against what the capture path
+    wrote (``datetime.now(timezone.utc).isoformat()``). Two spellings of
+    the same instant must therefore be made identical, or the read window
+    silently misses events:
+
+      * ``...T09:00:00.000000+00:00`` and ``...T09:00:00+00:00`` are the
+        same instant, but ``'.'`` (0x2E) sorts after ``'+'`` (0x2B). An
+        event written on a round second (``isoformat()`` omits a zero
+        microsecond) fell OUTSIDE a bound written with microseconds: the
+        edit was never undone, the trace that referenced it was never
+        read, and the rewind still reported success.
+      * an offset other than +00:00 compares character by character
+        against a journal that is always UTC.
+
+    Re-emitting through ``datetime.isoformat()`` after converting to UTC
+    produces exactly the spelling the journal uses. Two forms are left
+    untouched on purpose: a bare ``YYYY-MM-DD`` and a naive value, which
+    are PREFIXES of any stamp of the same day/second -- that prefix is
+    what makes the dialog's ``yyyy-MM-ddTHH:mm:ss`` bound take the whole
+    second, so the separator of the input is preserved too.
+
+    An unusable value normalizes to None: ``created_at >= NULL`` is never
+    true, so a bound nobody can read selects NOTHING. The empty string did
+    the opposite -- ``created_at >= ''`` is true for every row, i.e.
+    "rewind the whole journal" for a bound the user never typed.
+    """
+    parsed = parse_cutoff_date(value)
+    if parsed is None:
+        return None
+    text = value.strip()
+    if len(text) == MIN_CUTOFF_DATE_LEN:
+        # Date-only bound: keep the prefix form. Expanding it to midnight
+        # would push it PAST every stamp of that day written with a space
+        # separator (' ' < 'T'), which empties the window on old journals.
+        return text
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat(sep=text[MIN_CUTOFF_DATE_LEN])
+
+
+_RestoreCutoffBase = namedtuple(
+    "RestoreCutoff", ("cutoff_type", "value", "inclusive"))
+
+
+class RestoreCutoff(_RestoreCutoffBase):
+    """Read-window bound: what the user asked to go back to.
+
+    Fields: ``cutoff_type`` (CutoffType), ``value``, ``inclusive``.
+
+    Inclusive cutoff: events with `created_at >= value` are included.
+    SQLite stores timestamps with second precision: an event committed
+    within the same second as the cutoff would otherwise be silently
+    dropped, which is the dominant rewind regression pattern (see
+    SESSION_REWIND.md §17.1 H-S3).  Default True is the safe behaviour;
+    callers needing a strict `>` filter must pass `inclusive=False`
+    explicitly.
+
+    A BY_DATE value is normalized at construction
+    (:func:`normalize_cutoff_date`) so that every consumer -- the SQL
+    window, the retention coverage check, the preflight -- compares the
+    same string. Normalizing here rather than in each reader is what
+    guarantees they cannot disagree. ``_replace`` bypasses ``__new__``
+    (namedtuple builds through ``_make``), so :func:`validate_cutoff`
+    re-checks the value instead of trusting the construction path.
+    """
+
+    # No class-level field annotations here: assigning `inclusive: bool =
+    # True` in the body would shadow the tuple accessor with a plain class
+    # attribute and every cutoff would read back as inclusive. The
+    # signature below carries both the types and the default.
+    __slots__ = ()
+
+    def __new__(cls, cutoff_type: CutoffType, value: Any = None,
+                inclusive: bool = True):
+        if cutoff_type == CutoffType.BY_DATE:
+            value = normalize_cutoff_date(value)
+        return super().__new__(cls, cutoff_type, value, inclusive)
 
 
 class PlannedAction(NamedTuple):
@@ -164,13 +266,22 @@ def is_restore_allowed(
 
 
 def validate_cutoff(cutoff: RestoreCutoff) -> Optional[str]:
-    """Validate a cutoff value. Returns error message or None if valid."""
+    """Validate a cutoff value. Returns error message or None if valid.
+
+    A length check is not a date check: "pas-une-date-du-tout" is 20
+    characters long and was declared valid, so the user got "no event
+    after this date" for a date that does not exist instead of a typing
+    error -- and a bound that only LOOKS like a date can select the whole
+    journal by string comparison. The value must parse.
+    """
     if cutoff.cutoff_type == CutoffType.BY_EVENT_ID:
         if not isinstance(cutoff.value, int) or cutoff.value < 1:
             return "event_id must be a positive integer"
     elif cutoff.cutoff_type == CutoffType.BY_DATE:
-        if not isinstance(cutoff.value, str) or len(cutoff.value) < 10:
+        if not isinstance(cutoff.value, str) or len(cutoff.value) < MIN_CUTOFF_DATE_LEN:
             return "date must be an ISO 8601 string (min 10 chars)"
+        if parse_cutoff_date(cutoff.value) is None:
+            return "date is not a readable ISO 8601 timestamp"
     return None
 
 
