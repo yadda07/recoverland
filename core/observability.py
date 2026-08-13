@@ -31,7 +31,7 @@ import time
 import traceback
 from typing import Any, Dict, List, Tuple
 
-from .logger import flog
+from .logger import flog, _format_kv_value
 
 
 # ----------------------------- Cycle stats ----------------------------- #
@@ -245,18 +245,22 @@ def log_cycle_summary(
     stats: bag of counters / values; only canonical keys appear in the
     summary, the rest are dropped to keep the line greppable.
     """
+    # Values go through the shared key=value formatter: a stat carrying a
+    # space (a skip reason, a layer name) used to shift every following
+    # pair, and CYCLE_SUMMARY is the first line read after a failed
+    # rewind.
     prefix = f"[{trace_id}] " if trace_id else ""
-    parts: List[str] = [f"cycle={cycle}"]
+    parts: List[str] = [f"cycle={_format_kv_value(cycle)}"]
     for key in _SUMMARY_KEYS_ORDER:
         if key in stats:
-            parts.append(f"{key}={stats[key]}")
+            parts.append(f"{key}={_format_kv_value(stats[key])}")
     # Surface unknown but present keys at the tail for forward
     # compatibility (new phase instrumentation without code change).
     extra_keys = sorted(k for k in stats.keys() if k not in _SUMMARY_KEYS_ORDER)
     for key in extra_keys:
-        parts.append(f"{key}={stats[key]}")
+        parts.append(f"{key}={_format_kv_value(stats[key])}")
     if elapsed_ms:
-        parts.append(f"elapsed_ms={elapsed_ms}")
+        parts.append(f"elapsed_ms={_format_kv_value(elapsed_ms)}")
     flog(f"{prefix}CYCLE_SUMMARY {' '.join(parts)}")
 
     for severity, code, msg in _detect_anomalies(cycle, stats):
@@ -274,7 +278,7 @@ def log_state_transition(
     """
     if old == new:
         return
-    ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items())
+    ctx_str = " ".join(f"{k}={_format_kv_value(v)}" for k, v in ctx.items())
     suffix = f" {ctx_str}" if ctx_str else ""
     flog(f"STATE {component}.{attr}: {_short(old)} -> {_short(new)}{suffix}")
 
@@ -307,12 +311,16 @@ def assert_invariant(condition: bool, name: str, **ctx: Any) -> bool:
     """
     if condition:
         return True
-    ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items())
+    ctx_str = " ".join(f"{k}={_format_kv_value(v)}" for k, v in ctx.items())
     try:
         frame = traceback.extract_stack(limit=3)[-2]
         loc = f"{frame.filename}:{frame.lineno} in {frame.name}"
     except Exception:  # pragma: no cover - defensive only
         loc = "unknown"
     suffix = f" {ctx_str}" if ctx_str else ""
-    flog(f"INVARIANT_VIOLATED name={name} at={loc}{suffix}", "CRITICAL")
+    flog(
+        f"INVARIANT_VIOLATED name={_format_kv_value(name)} "
+        f"at={_format_kv_value(loc)}{suffix}",
+        "CRITICAL",
+    )
     return False

@@ -72,6 +72,9 @@ class EditSessionTracker:
         self._signal_connections: Dict[str, List] = {}
         self._active = False
         self._suppress_depth = 0
+        # True while capture is paused because a commit blew the buffer
+        # memory budget. Cleared on the next editing session.
+        self._pressure_paused = False
         self._allowed_layer_fingerprints: set = set()  # empty = track all
         self._session_event_count = 0
         self._on_commit_callback = None
@@ -378,6 +381,8 @@ class EditSessionTracker:
         return buf
 
     def _on_editing_started(self, layer_id: str) -> None:
+        if self._pressure_paused and not self.is_suppressed:
+            self._resume_after_buffer_pressure()
         if not self._active or self.is_suppressed:
             return
         layer_fp = self._layer_fingerprints.get(layer_id)
@@ -413,6 +418,18 @@ class EditSessionTracker:
         buf = self._buffers.pop(layer_id, None)
         if layer is None or buf is None:
             return
+        try:
+            self._emit_commit_events(layer, layer_id, buf)
+        finally:
+            # A capture that ran over budget must not end like an ordinary
+            # commit: the tracker stops until the next editing session so
+            # the halt is visible instead of silent.
+            if buf.over_budget and self._active:
+                self._pause_after_buffer_pressure(buf)
+
+    def _emit_commit_events(self, layer, layer_id: str,
+                            buf: EditSessionBuffer) -> None:
+        """Build, enqueue and announce the events of one committed session."""
         events = self._generate_events(layer, buf)
         if not events:
             flog(f"EditSessionTracker: commit on {layer_id} produced 0 real events "
@@ -438,6 +455,34 @@ class EditSessionTracker:
             self._on_commit_callback(
                 len(events), layer_name, is_mass_delete, delete_count,
                 events[0].datasource_fingerprint)
+
+    def _pause_after_buffer_pressure(self, buf: EditSessionBuffer) -> None:
+        """Stop capture after a commit whose capture blew the memory budget.
+
+        The write-queue overflow branch already deactivates tracking so
+        the halt is visible; a capture that ran over its memory budget
+        used to pass unnoticed while being at least as dangerous. The
+        events of the commit that blew the budget have already been
+        emitted (the pre-edit state of a modified feature exists nowhere
+        else), so nothing is lost by stopping here.
+        """
+        self._pressure_paused = True
+        self.deactivate()
+        flog(f"EditSessionTracker: capture paused after buffer pressure on "
+             f"{buf.layer_id} ({buf.approx_memory_mb:.0f} MB, "
+             f"{buf.total_tracked} features), re-arms on the next "
+             f"editing session", "ERROR")
+
+    def _resume_after_buffer_pressure(self) -> None:
+        """Re-arm capture that a memory spike had paused.
+
+        The oversized buffer was released with its commit, so a new
+        editing session starts from an empty one. Staying off would let
+        a single spike blind the plugin for the rest of the work session.
+        """
+        self._pressure_paused = False
+        self.activate()
+        flog("EditSessionTracker: capture re-armed, buffer pressure cleared")
 
     def _register_datasource(self, layer) -> None:
         """Store the layer's source URI in the journal registry for future restore."""
@@ -472,7 +517,7 @@ class EditSessionTracker:
             flog(f"EditSessionTracker: committedFeaturesAdded but no layer "
                  f"for {layer_id}", "WARNING")
             return
-        field_names = [f.name() for f in layer.fields()]
+        field_names = self._capture_field_names(layer)
         for feature in features:
             attrs = serialize_attributes(feature, field_names)
             wkb = geometry_to_wkb(feature.geometry())
@@ -596,8 +641,12 @@ class EditSessionTracker:
         capture entirely. This avoids recording phantom events when a user
         opens edit mode and commits without modifying anything.
 
-        Guards against OOM: checks buffer thresholds after each capture
-        phase, stopping capture if the hard memory limit is exceeded.
+        Memory budget: the capture of the commit in progress always runs to
+        completion. Cutting it short used to drop the modifications phase,
+        and the pre-edit state of a modified feature exists nowhere else:
+        the commit landed on disk with no way back. Blowing the budget is
+        recorded on the buffer instead, and the tracker pauses once the
+        events are out (see _pause_after_buffer_pressure).
         """
         edit_buf = layer.editBuffer()
         if edit_buf is None:
@@ -616,20 +665,38 @@ class EditSessionTracker:
                  "commit without modifications, skipping capture")
             return
         provider = layer.dataProvider()
-        field_names = [f.name() for f in layer.fields()]
+        field_names = self._capture_field_names(layer)
         self._capture_deletions(provider, edit_buf, buf, field_names)
-        if self._check_buffer_pressure(buf):
-            return
+        over_budget = self._check_buffer_pressure(buf)
         self._capture_modifications(layer, provider, edit_buf, buf, field_names)
-        self._check_buffer_pressure(buf)
+        over_budget = self._check_buffer_pressure(buf) or over_budget
         self._capture_additions(edit_buf, buf)
+        if over_budget:
+            buf.over_budget = True
+
+    @staticmethod
+    def _capture_field_names(layer) -> List[str]:
+        """Field names to capture: the PROVIDER's, never the layer's.
+
+        ``layer.fields()`` also carries joined and virtual fields, which
+        the datasource does not store. The OLD state is read from the
+        provider (no value for them) and the NEW state from the layer
+        (which resolves them), so capturing them turns a plain vertex
+        move into a phantom attribute change, and the restore then
+        computes a field index the provider does not have.
+        """
+        provider = layer.dataProvider()
+        if provider is None:
+            return [f.name() for f in layer.fields()]
+        return [f.name() for f in provider.fields()]
 
     def _check_buffer_pressure(self, buf: EditSessionBuffer) -> bool:
         """Log warning if buffer exceeds soft threshold; return True if hard limit hit."""
         if buf.approx_memory_mb > self._MEMORY_HARD_LIMIT_MB:
             flog(f"EditSessionTracker: buffer hard limit reached "
                  f"({buf.approx_memory_mb:.0f} MB, {buf.total_tracked} features) "
-                 f"on {buf.layer_id}, stopping capture to prevent OOM", "ERROR")
+                 f"on {buf.layer_id}, finishing this commit then pausing "
+                 f"capture", "ERROR")
             return True
         if buf.needs_flush():
             flog(f"EditSessionTracker: buffer pressure warning "
@@ -684,9 +751,17 @@ class EditSessionTracker:
              f"excluded_added={sorted(excluded_added)} "
              f"excluded_deleted={sorted(excluded_deleted)}")
 
-        all_mod_fids = geom_fids | attr_only_fids
+        # NEW geometry is read only for the features whose geometry the
+        # edit buffer actually changed. Attribute-only features get their
+        # OLD state read with NO_GEOMETRY below; reading a NEW geometry
+        # for them made _make_update_event compare None against the
+        # current position, so every attribute edit was journalled as a
+        # geometry change that never happened - and the false-commit
+        # filter, which needs geom_changed to be False, never fired.
         new_state_by_fid = self._capture_new_state(
-            layer, all_mod_fids, field_names)
+            layer, geom_fids, field_names)
+        new_state_by_fid.update(self._capture_new_state(
+            layer, attr_only_fids, field_names, with_geometry=False))
 
         captured_geom: set = set()
         if geom_fids:
@@ -734,16 +809,26 @@ class EditSessionTracker:
                      f"these fids cannot be generated)", "ERROR")
 
     @staticmethod
-    def _capture_new_state(layer, fids, field_names) -> Dict[int, tuple]:
-        """Return {fid: (new_attrs_dict, new_geom_wkb)} read from layer+buffer."""
+    def _capture_new_state(layer, fids, field_names,
+                           with_geometry: bool = True) -> Dict[int, tuple]:
+        """Return {fid: (new_attrs_dict, new_geom_wkb)} read from layer+buffer.
+
+        ``with_geometry=False`` leaves the NEW geometry at None for the
+        features whose geometry the user never touched, so the UPDATE
+        event carries no geometry at all instead of a fake OLD=None ->
+        NEW=current transition.
+        """
         if not fids:
             return {}
         from qgis.core import QgsFeatureRequest
         result: Dict[int, tuple] = {}
         request = QgsFeatureRequest().setFilterFids(list(fids))
+        if not with_geometry:
+            from ..compat import QgisCompat
+            request.setFlags(QgisCompat.NO_GEOMETRY)
         for feature in layer.getFeatures(request):
             attrs = serialize_attributes(feature, field_names)
-            wkb = geometry_to_wkb(feature.geometry())
+            wkb = geometry_to_wkb(feature.geometry()) if with_geometry else None
             result[feature.id()] = (attrs, wkb)
         missing = set(fids) - set(result.keys())
         if missing:
@@ -804,7 +889,7 @@ class EditSessionTracker:
         now = datetime.now(timezone.utc).isoformat()
         field_schema = serialize_field_schema(layer.fields())
         geom_type, crs = self._get_layer_geometry_info(layer)
-        field_names = [f.name() for f in layer.fields()]
+        field_names = self._capture_field_names(layer)
 
         committed_deletions = buf.get_committed_deletions()
         committed_geom_changes = buf.get_committed_geom_changes()
@@ -1009,7 +1094,7 @@ class EditSessionTracker:
         feature = next(layer.dataProvider().getFeatures(request), None)
         if feature is None:
             return None
-        field_names = [f.name() for f in layer.fields()]
+        field_names = EditSessionTracker._capture_field_names(layer)
         attrs = serialize_attributes(feature, field_names)
         attrs_json = build_full_snapshot(attrs)
         wkb = geometry_to_wkb(feature.geometry())

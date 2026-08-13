@@ -107,6 +107,33 @@ def _read_lock_file(lock_path: str) -> Optional[tuple]:
     return (pid, host, ts)
 
 
+def sqlite_readonly_uri(path: str) -> str:
+    """Build a SQLite `file:` URI opening `path` read-only.
+
+    A filesystem path is NOT a URI. SQLite splits `file:<path>?<query>#<frag>`
+    and percent-decodes the path, so interpolating a raw path silently breaks
+    on characters users routinely put in folder names:
+
+      * `#` (as in "Lot #12") ends the path: everything after it -- including
+        the `?mode=ro` -- becomes a fragment. SQLite then opens a DIFFERENT,
+        truncated path in read-write mode and CREATES it if missing. Capture
+        keeps writing to the real journal (raw path, non-URI connection)
+        while every read sees an empty database, so rewind reports "nothing
+        to restore" on a full journal and drops a ghost file next to it.
+      * `%41` is decoded to `A`, pointing the read at another directory.
+
+    Only the three characters SQLite gives URI meaning to are escaped. The
+    rest of the path is left untouched on purpose: `Path.as_uri()` would
+    rewrite a UNC path `\\\\server\\share\\x` into the authority form
+    `file://server/share/x`, which SQLite rejects, and network shares are a
+    normal place to keep a project.
+    """
+    # Order matters: '%' first, or the escapes introduced below get escaped.
+    return "file:" + (
+        path.replace("%", "%25").replace("#", "%23").replace("?", "%3F")
+    ) + "?mode=ro"
+
+
 class JournalManager:
     """Manages the SQLite audit journal file and connections."""
 
@@ -196,7 +223,7 @@ class JournalManager:
         if self._path is None:
             raise RuntimeError("Journal is not open")
         conn = sqlite3.connect(
-            f"file:{self._path}?mode=ro",
+            sqlite_readonly_uri(self._path),
             uri=True,
             check_same_thread=False,
         )
@@ -221,7 +248,7 @@ class JournalManager:
         if self._path is None:
             raise RuntimeError("Journal is not open")
         conn = sqlite3.connect(
-            f"file:{self._path}?mode=ro",
+            sqlite_readonly_uri(self._path),
             uri=True,
             check_same_thread=False,
         )

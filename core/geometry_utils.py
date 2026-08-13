@@ -5,6 +5,7 @@ Stores geometry as binary WKB in SQLite, with CRS tracked separately.
 Tables without geometry get geometry_wkb=NULL, geometry_type='NoGeometry'.
 """
 import hashlib
+import math
 import os
 from typing import Optional, Tuple
 
@@ -40,15 +41,28 @@ def _compute_makevalid_drift(geom_before, geom_after) -> Tuple[str, str, float]:
       - `wkb_hash_*` are 8-hex-char SHA-256 prefixes of `bytes(geom.asWkb())`.
         They equal each other if and only if the WKB byte sequences are
         identical.
-      - `drift_units` is the L_infinity (Chebyshev) distance between the
-        two bounding boxes expressed in the geometry CRS units:
-            max(|xmin_a - xmin_b|, |ymin_a - ymin_b|,
-                |xmax_a - xmax_b|, |ymax_a - ymax_b|)
-        A drift of 0 means the bboxes coincide exactly. Identical inputs
-        always produce drift=0, but drift=0 does not imply identical WKB
-        (two distinct shapes can share a bbox). Treat as a fast,
-        conservative coarse-grained drift metric, not a full geometric
-        equality test.
+      - `drift_units` is a distance in the geometry CRS units, the largest
+        of three terms:
+          1. the L_infinity (Chebyshev) distance between the two bounding
+             boxes:
+                 max(|xmin_a - xmin_b|, |ymin_a - ymin_b|,
+                     |xmax_a - xmax_b|, |ymax_a - ymax_b|)
+          2. the difference of perimeters/lengths |len_a - len_b|;
+          3. the difference of areas brought back to a length, |area_a -
+             area_b| divided by the longest boundary (the mean width of
+             the band that changed hands). When neither geometry has a
+             boundary the square root of the area delta is used instead.
+        Identical inputs always produce drift=0.
+
+    Terms 2 and 3 exist because the bbox alone is blind to exactly what
+    `makeValid()` does (I-8): it reorganises the inside of a shape while
+    keeping its extreme vertices. A bowtie becomes two disjoint triangles
+    (area 0 -> 50), two overlapping parts get merged (area 200 -> 150),
+    an arc is linearised (same endpoints, shorter length). In each case
+    the bounding box is identical to the bit, so a bbox-only metric
+    reported drift=0 and the rewind applied a shape the user never had.
+    Comparing lengths and areas as well catches those three families
+    while staying a single number the caller compares to one tolerance.
 
     Used by `core/restore_executor.py:_buffer_update` (BL-RW-P1-08,
     CR-8) to decide whether the result of `QgsGeometry.makeValid()` is
@@ -80,23 +94,49 @@ def _compute_makevalid_drift(geom_before, geom_after) -> Tuple[str, str, float]:
             abs(bb_a.xMaximum() - bb_b.xMaximum()),
             abs(bb_a.yMaximum() - bb_b.yMaximum()),
         )
+        len_b = float(geom_before.length())
+        len_a = float(geom_after.length())
+        area_b = float(geom_before.area())
+        area_a = float(geom_after.area())
     except Exception:
-        drift = float("inf")
+        return hash_before, hash_after, float("inf")
+
+    drift = max(drift, abs(len_a - len_b))
+
+    delta_area = abs(area_a - area_b)
+    boundary = max(len_b, len_a)
+    if boundary > 0.0:
+        drift = max(drift, delta_area / boundary)
+    elif delta_area > 0.0:
+        drift = max(drift, math.sqrt(delta_area))
 
     return hash_before, hash_after, drift
 
 
 def geometry_to_wkb(geom) -> Optional[bytes]:
-    """Convert a QgsGeometry to WKB bytes, or None when absent/empty.
+    """Convert a QgsGeometry to WKB bytes, or None when the geometry is absent.
 
-    Centralises the ``geom is not None and not geom.isNull() and
-    not geom.isEmpty()`` guard followed by ``bytes(geom.asWkb())``
-    that recurs in edit_tracker every time the buffer is mirrored to
-    an audit event (DUP-08).
+    "Absent" means None or a NULL QgsGeometry: the state a provider
+    reports for a feature that carries no geometry at all, and the state
+    the journal represents with ``geometry_wkb IS NULL``.
+
+    An EMPTY geometry (``POLYGON EMPTY``) is a DIFFERENT state: it keeps
+    its type and has a real 9-byte WKB. Folding it into NULL made the two
+    indistinguishable in the journal, so restoring an event whose
+    geometry was empty skipped the geometry write entirely and still
+    reported success (I-8). Empty geometries are therefore serialised
+    like any other.
     """
-    if not is_geometry_present(geom):
+    if geom is None:
         return None
-    return bytes(geom.asWkb())
+    try:
+        if geom.isNull():
+            return None
+    except (AttributeError, RuntimeError):
+        # geom does not implement the QgsGeometry interface (mock/stub).
+        return None
+    wkb = bytes(geom.asWkb())
+    return wkb or None
 
 
 def extract_geometry_wkb(feature) -> Optional[bytes]:
@@ -157,15 +197,35 @@ def extract_crs_authid(layer) -> Optional[str]:
 
 
 def rebuild_geometry(wkb_data: Optional[bytes]):
-    """Reconstruct a QgsGeometry from WKB bytes.
+    """Reconstruct a QgsGeometry from WKB bytes, or None if undecodable.
 
-    Returns None if wkb_data is None or empty.
+    Returns None when *wkb_data* is None, zero-length, or when QGIS
+    cannot decode it.
+
+    A failed decode used to be invisible (I-8). ``QgsGeometry.fromWkb``
+    reports it by leaving the geometry NULL - its return value cannot be
+    trusted, the PyQt binding of QGIS 4.x returns None whatever the
+    outcome - so a truncated or corrupted blob (interrupted write, full
+    disk, partial copy of the journal) produced a NULL QgsGeometry that
+    was NOT ``None``. Every caller testing ``is not None`` then wrote
+    that NULL geometry onto a live feature and destroyed the very data
+    the plugin exists to save. Callers must keep treating None as "no
+    geometry to write" AND, when the event announced one, as a refusal.
+
+    An EMPTY but typed geometry (``POLYGON EMPTY``) decodes to a
+    non-null geometry and is returned as-is: it is a legitimate captured
+    state, not a decode failure.
     """
     if wkb_data is None or len(wkb_data) == 0:
         return None
     from qgis.core import QgsGeometry
     geom = QgsGeometry()
     geom.fromWkb(wkb_data)
+    try:
+        if geom.isNull():
+            return None
+    except (AttributeError, RuntimeError):
+        return None
     return geom
 
 
@@ -343,6 +403,64 @@ def reproject_geometry_for_render(
         return None
 
     return repro
+
+
+# Transforms reused across restores, keyed by (src_authid, dst_authid).
+# A restore batch on a reprojected layer hits the same pair for every
+# event; building one QgsCoordinateTransform per event is pure waste.
+_WRITE_TRANSFORM_CACHE: dict = {}
+
+
+def geometry_for_layer_crs(geom, src_crs_authid: Optional[str], layer,
+                           trace_id: str = "") -> Tuple[object, str]:
+    """Express *geom* in the CRS of *layer* before it is written back.
+
+    The journal stores the WKB verbatim, hence in the raw coordinates of
+    the CRS the layer had AT CAPTURE TIME (``event.crs_authid``). When
+    the layer has been reprojected since - or when a wrongly declared
+    CRS has been corrected - writing those coordinates back as they are
+    teleports the feature (2.35, 48.85 degrees written into a metric
+    layer lands ~6900 km away) while the restore still reports success
+    (I-3). The read side already reprojects for rendering; the write
+    side must do the same, or refuse.
+
+    Returns ``(geometry, status)``:
+        (geom, "same_crs")      both CRS agree; *geom* is untouched, so a
+                                legitimate restore stays byte-identical.
+        (geom, "unknown_crs")   the event or the layer has no usable CRS
+                                (legacy event, non-spatial layer):
+                                nothing can be decided, geometry as-is.
+        (reprojected, "reprojected")
+        (None, "transform_failed")  the transform could not be built or
+                                applied (CRS not installed locally, out
+                                of domain): the caller MUST refuse to
+                                write rather than misplace the feature.
+    """
+    if geom is None:
+        return None, "unknown_crs"
+    if not src_crs_authid:
+        return geom, "unknown_crs"
+
+    dst_crs_authid = None
+    try:
+        crs = layer.crs()
+        if crs is not None and crs.isValid():
+            dst_crs_authid = crs.authid()
+    except (AttributeError, RuntimeError):
+        dst_crs_authid = None
+    if not dst_crs_authid:
+        return geom, "unknown_crs"
+
+    if dst_crs_authid == src_crs_authid:
+        return geom, "same_crs"
+
+    repro = reproject_geometry_for_render(
+        geom, src_crs_authid, dst_crs_authid,
+        _WRITE_TRANSFORM_CACHE, trace_id=trace_id,
+    )
+    if repro is None:
+        return None, "transform_failed"
+    return repro, "reprojected"
 
 
 def geometries_equal(wkb_a: Optional[bytes], wkb_b: Optional[bytes]) -> bool:

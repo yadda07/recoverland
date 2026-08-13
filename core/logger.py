@@ -40,11 +40,46 @@ def _resolve_log_path() -> str:
 
 _LOG_FILE = _resolve_log_path()
 
+
+class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler that never drops a record it cannot rotate.
+
+    Several QGIS instances can share one profile, hence one debug log.
+    The rollover then renames a file a sibling process still holds open,
+    which fails on Windows, and the stock handler answers by discarding
+    the record. The debug log is the only forensic material left after an
+    incident, so keep appending to the current file instead: an oversized
+    log is recoverable, a missing line is not. A failed rotation is
+    retried later rather than on every record, so a permanently held file
+    does not cost a failed rename per line.
+    """
+
+    _RETRY_DELAY_S = 60.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._rollover_retry_at = 0.0
+
+    def doRollover(self):
+        if time.monotonic() < self._rollover_retry_at:
+            return
+        try:
+            super().doRollover()
+            self._rollover_retry_at = 0.0
+        except OSError as exc:
+            self._rollover_retry_at = time.monotonic() + self._RETRY_DELAY_S
+            if self.stream is None:
+                self.stream = self._open()
+            self.stream.write(
+                f"# rollover postponed ({exc}); still appending here\n"
+            )
+
+
 _file_logger = logging.getLogger("RecoverLand.FileDebug")
 _file_logger.setLevel(logging.DEBUG)
 _file_logger.propagate = False
 if not _file_logger.handlers:
-    _fh = logging.handlers.RotatingFileHandler(
+    _fh = _SharedRotatingFileHandler(
         _LOG_FILE,
         mode='a',
         maxBytes=_LOG_MAX_BYTES,
@@ -90,7 +125,7 @@ def set_project_log_path(journal_path: str) -> None:
         return
     log_path = os.path.join(log_dir, "recoverland_debug.log")
     try:
-        handler = logging.handlers.RotatingFileHandler(
+        handler = _SharedRotatingFileHandler(
             log_path,
             mode='a',
             maxBytes=_LOG_MAX_BYTES,
@@ -150,14 +185,30 @@ def flog(message: str, level: str = "INFO") -> None:
 
 _KV_QUOTE_TRIGGERS = (" ", "=", '"', "'", "\n", "\t")
 
+# Line breaks are the only characters that destroy a record: the handler
+# writes them literally, the file then holds two physical lines, and the
+# second one has no timestamp so every reader drops it while the first is
+# left with an unclosed quote. Substituted, never emitted raw. Backslashes
+# are deliberately left alone: doubling them would rewrite every Windows
+# path already present in the log for no gain.
+_KV_LINE_BREAKS = (("\r\n", "\\n"), ("\n", "\\n"), ("\r", "\\r"))
+
+
+def _escape_line_breaks(s: str) -> str:
+    for raw, escaped in _KV_LINE_BREAKS:
+        if raw in s:
+            s = s.replace(raw, escaped)
+    return s
+
 
 def _format_kv_value(value) -> str:
     """Render a single value for the key=value log format.
 
-    Bare token for simple values. Values containing space, '=', quote,
-    newline or tab are wrapped in matching quotes so the parser
+    Bare token for simple values. Values containing space, '=', quote or
+    tab are wrapped in matching quotes so the parser
     (`scripts.validation.parse_log._KV_RE`) can recover the original
-    string by stripping the outermost quotes.
+    string by stripping the outermost quotes. Line breaks are replaced by
+    their escape sequence so the record stays on one physical line.
 
     Quote selection:
         - no special character        -> bare token
@@ -167,7 +218,7 @@ def _format_kv_value(value) -> str:
           backslash escape (unambiguous but requires a tolerant parser)
         - other special character     -> wrapped in double quotes
     """
-    s = str(value)
+    s = _escape_line_breaks(str(value))
     if s == "":
         return '""'
     if not any(c in s for c in _KV_QUOTE_TRIGGERS):

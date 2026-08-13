@@ -196,6 +196,27 @@ def _finish_runner(
             tracker.unsuppress()
 
 
+def _abort_started_run(runner, runner_name: str, exc: BaseException,
+                       trace_id: str = "") -> None:
+    """Close a run whose start() died before the async chain could begin.
+
+    The three runners suppress the edit tracker in start() and release it
+    in _finish(), at the end of a chain driven by QTimer. When the very
+    first step raises (layer removed from the project, destroyed C++
+    object, SQLite failure), that chain never runs: the tracker used to
+    stay suppressed for the rest of the session, so the plugin silently
+    stopped journalling the user's edits right after a failed restore -
+    exactly when he starts repairing by hand. Finishing the runner here
+    releases the lock and tells the dialog the run is over; the caller
+    still sees the original exception.
+    """
+    prefix = f"[{trace_id}] " if trace_id else ""
+    flog(f"{prefix}{runner_name}: start aborted, releasing capture lock "
+         f"({type(exc).__name__}: {exc})", "ERROR")
+    runner._errors.append(f"Restauration interrompue: {exc}")
+    runner._finish()
+
+
 def _resolve_runner_layer(
     find_layer_fn: Callable[[AuditEvent], object],
     group: list,
@@ -304,7 +325,11 @@ class RestoreRunner(QObject):
         flog(f"{prefix}RestoreRunner: start events={len(self._events)} groups={len(self._groups)}")
         if self._tracker is not None:
             self._tracker.suppress()
-        self._advance_group()
+        try:
+            self._advance_group()
+        except BaseException as exc:
+            _abort_started_run(self, "RestoreRunner", exc, self._trace_id)
+            raise
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -512,7 +537,11 @@ class StrictRestoreRunner(QObject):
              f"layers={len(self._groups)} strategy=STRICT")
         if self._tracker is not None:
             self._tracker.suppress()
-        self._advance_group()
+        try:
+            self._advance_group()
+        except BaseException as exc:
+            _abort_started_run(self, "StrictRestoreRunner", exc, self._trace_id)
+            raise
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -1089,7 +1118,11 @@ class UndoRunner(QObject):
              f"total_events={total_events}")
         if self._tracker is not None:
             self._tracker.suppress()
-        self._process_next_group()
+        try:
+            self._process_next_group()
+        except BaseException as exc:
+            _abort_started_run(self, "UndoRunner", exc)
+            raise
 
     def cancel(self) -> None:
         self._cancelled = True

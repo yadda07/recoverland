@@ -60,6 +60,7 @@ class RecoverPlugin:
         self._integrity_result = None
         self._disk_timer = None
         self._disk_journal_path = None
+        self._disk_low_warned = False
         self._duplicate_of: Optional[str] = None
 
     def initGui(self):
@@ -422,6 +423,9 @@ class RecoverPlugin:
         currently_on = settings.value(
             "RecoverLand/tracking_enabled", True, type=bool,
         )
+        # Either way the user has taken over: the disk monitor must not
+        # undo his choice when free space changes.
+        settings.setValue("RecoverLand/tracking_disabled_by_disk", False)
         if currently_on:
             self._tracker.deactivate()
             settings.setValue("RecoverLand/tracking_enabled", False)
@@ -455,20 +459,55 @@ class RecoverPlugin:
 
     def _start_disk_monitor(self, journal_path: str) -> None:
         """P1.2 / P0.4: Start a periodic timer checking disk space every 5 minutes."""
-        from .core.disk_monitor import check_disk_for_path, _CHECK_INTERVAL_SEC
+        from .core.disk_monitor import (
+            check_disk_for_path, format_disk_message, _CHECK_INTERVAL_SEC,
+        )
         self._disk_journal_path = journal_path
+        self._disk_low_warned = False
 
         def _check():
             if not self._journal or not self._journal.is_open:
                 return
             status = check_disk_for_path(self._disk_journal_path)
+            settings = QgsSettings()
             if status.is_critical:
+                self._disk_low_warned = False
                 if self._tracker and self._tracker.is_active:
                     self._tracker.deactivate()
-                    QgsSettings().setValue("RecoverLand/tracking_enabled", False)
-                    from .core.disk_monitor import format_disk_message
+                    settings.setValue("RecoverLand/tracking_enabled", False)
+                    # Remember who cut the recording. The setting is
+                    # persistent: without this marker the user stays
+                    # without capture after freeing the disk, even across
+                    # a restart, until he thinks of clicking the status
+                    # bar indicator again.
+                    settings.setValue(
+                        "RecoverLand/tracking_disabled_by_disk", True)
                     qlog(format_disk_message(status), "ERROR")
                     self._update_status_bar()
+                return
+            if status.is_low:
+                # Early warning: below the critical threshold the
+                # recording is cut without notice, so say it once while
+                # there is still room to act.
+                if not self._disk_low_warned:
+                    self._disk_low_warned = True
+                    qlog(format_disk_message(status), "WARNING")
+                return
+            self._disk_low_warned = False
+            if not settings.value(
+                "RecoverLand/tracking_disabled_by_disk", False, type=bool,
+            ):
+                return
+            settings.setValue("RecoverLand/tracking_disabled_by_disk", False)
+            settings.setValue("RecoverLand/tracking_enabled", True)
+            if self._tracker and not self._tracker.is_active:
+                self._tracker.activate()
+            qlog(QCoreApplication.translate(
+                "RecoverPlugin",
+                "Espace disque de nouveau suffisant : "
+                "l'enregistrement a ete reactive."
+            ))
+            self._update_status_bar()
 
         self._disk_timer = QTimer()
         self._disk_timer.timeout.connect(_check)

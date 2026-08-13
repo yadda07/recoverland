@@ -67,6 +67,11 @@ class EditSessionBuffer:
         self._committed_geom_changes: Dict[int, Optional[bytes]] = {}
         self._committed_attr_changes: Dict[int, Dict[int, Any]] = {}
         self._committed_deletions: Set[int] = set()
+        # Set by the tracker when capturing this commit ran past its hard
+        # memory budget. The capture still completes (the pre-edit state of
+        # a modified feature exists nowhere else), but the tracker pauses
+        # afterwards instead of carrying on as if nothing happened.
+        self.over_budget = False
 
     @property
     def modified_count(self) -> int:
@@ -173,6 +178,7 @@ class EditSessionBuffer:
         self._committed_attr_changes.clear()
         self._committed_deletions.clear()
         self._approx_bytes = 0
+        self.over_budget = False
         flog(f"EditSessionBuffer: cleared for layer {self.layer_id}")
 
     def compute_net_effect(self) -> Dict[str, Set[int]]:

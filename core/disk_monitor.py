@@ -32,14 +32,22 @@ _THRESHOLD_CRITICAL = 100 * 1024 * 1024   # 100 MB
 
 
 def check_disk_for_path(path: str) -> DiskStatus:
-    """Check disk space for the volume containing path."""
+    """Check disk space for the volume containing path.
+
+    A volume that cannot be measured is reported critical, never healthy:
+    an unplugged network share, a drive letter that disappeared or a
+    device that is not ready all answer "0 byte free", and calling that
+    healthy is what lets every following write fail in silence while the
+    status bar shows a journal in good shape.
+    """
     if not path:
+        # No journal open yet: nothing to watch, and no volume to blame.
         return DiskStatus(0, 0, "", False, False)
     target = os.path.dirname(path) if not os.path.isdir(path) else path
     if not os.path.exists(target):
         target = _find_existing_parent(target)
     if not target:
-        return DiskStatus(0, 0, "", False, False)
+        return _unreadable(path, "volume unreachable")
     try:
         usage = shutil.disk_usage(target)
         return DiskStatus(
@@ -50,12 +58,38 @@ def check_disk_for_path(path: str) -> DiskStatus:
             is_critical=usage.free < _THRESHOLD_CRITICAL,
         )
     except (OSError, ValueError) as e:
-        flog(f"disk_monitor: check failed for {target}: {e}", "WARNING")
-        return DiskStatus(0, 0, "", True, False)
+        return _unreadable(path, f"check failed for {target}: {e}")
+
+
+def _unreadable(path: str, reason: str) -> DiskStatus:
+    """Status for a volume we could not measure at all.
+
+    total_bytes == 0 marks "no reading obtained" and tells
+    format_disk_message to name the real problem rather than pretend the
+    disk is full. An empty path means no journal is open yet, which is
+    not an incident: it is reported without a log line.
+    """
+    if path:
+        flog(f"disk_monitor: {reason}", "WARNING")
+    return DiskStatus(
+        free_bytes=0,
+        total_bytes=0,
+        volume_path=_extract_volume(path) if path else "",
+        is_low=True,
+        is_critical=True,
+    )
 
 
 def format_disk_message(status: DiskStatus) -> str:
     """Build user-facing message from disk status."""
+    if status.is_critical and status.total_bytes <= 0:
+        # No reading at all: naming a free size here would be a lie.
+        return _tr(
+            "Volume du journal inaccessible{volume}. "
+            "L'enregistrement a ete desactive pour eviter la perte de donnees."
+        ).format(
+            volume=f" ({status.volume_path})" if status.volume_path else "",
+        )
     if status.is_critical:
         return _tr(
             "Espace disque critique sur {volume} : "

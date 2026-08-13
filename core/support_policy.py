@@ -44,9 +44,12 @@ _PROVIDER_POLICIES = {
         "spatialite", SupportLevel.FULL, IdentityStrength.STRONG,
         True, True, 1, "SQLite spatial"
     ),
+    # capture=False: EditSessionTracker refuses every layer whose identity
+    # strength is NONE, so announcing capture=True made the public API
+    # promise a protection the tracker never delivers.
     "memory": ProviderPolicy(
         "memory", SupportLevel.INFORMATIONAL, IdentityStrength.NONE,
-        True, False, 0, "Non-persisted data"
+        False, False, 0, "Non-persisted data, no stable feature identity"
     ),
     "virtual": ProviderPolicy(
         "virtual", SupportLevel.REFUSED, IdentityStrength.NONE,

@@ -16,6 +16,7 @@ from .search_service import reconstruct_attributes, reconstruct_new_attributes
 from .geometry_utils import (
     rebuild_geometry, is_geometry_present,
     feature_matches_geometry, get_feature_source,
+    geometry_for_layer_crs, extract_crs_authid,
 )
 from .identity import get_identity_strength_for_layer
 from .support_policy import IdentityStrength
@@ -114,6 +115,101 @@ def pre_check_restore(layer, event: AuditEvent) -> PreCheckResult:
     return PreCheckResult(True, "OK", drift)
 
 
+def _layer_geometry_type(layer):
+    """Geometry type of *layer*, or GEOM_UNKNOWN when it cannot be read."""
+    try:
+        return layer.geometryType()
+    except (AttributeError, RuntimeError):
+        return QgisCompat.GEOM_UNKNOWN
+
+
+def _geometry_for_write(layer, event: AuditEvent, wkb: Optional[bytes],
+                        eid: int, context: str) -> tuple:
+    """Rebuild the geometry of *event* and make it safe to write on *layer*.
+
+    Returns ``(geom, error)``:
+      - ``(None, None)``  nothing to write: the event carries no geometry,
+        or the target layer is a plain table (the geometric part of the
+        event is then inert, the row is still restored);
+      - ``(geom, None)``  the geometry may be written as-is;
+      - ``(None, error)`` a ready-to-return failure dict: the geometry
+        must NOT be written.
+
+    Three refusals, ordered by what they cost the user. The rewind path
+    (`restore_executor._buffer_update`) already knows the first one; the
+    event-by-event path accepted what the rewind refused.
+
+      1. decode - a truncated or corrupted blob rebuilds to nothing.
+         Writing it wipes the geometry of the live feature, which is the
+         worst outcome for a recovery tool (reason_code ``corrupt_wkb``,
+         sibling of the rewind's ``rebuilt_empty``).
+      2. CRS - the WKB holds raw coordinates of ``event.crs_authid``, the
+         CRS of the layer at capture time. Reproject into the layer CRS,
+         or refuse rather than send the feature thousands of kilometres
+         away (reason_code ``crs_mismatch``).
+      3. geometry type - a Point must not be written into a Polygon
+         layer: depending on the driver the layer silently becomes
+         heterogeneous or the write fails with a raw OGR message
+         (reason_code ``geometry_type_mismatch``).
+    """
+    if wkb is None:
+        return None, None
+
+    layer_geom_type = _layer_geometry_type(layer)
+    if layer_geom_type == QgisCompat.GEOM_NULL:
+        flog(f"{context}[{eid}]: non-spatial layer, event geometry ignored")
+        return None, None
+
+    geom = rebuild_geometry(wkb)
+    if geom is None:
+        flog(f"{context}[{eid}]: reason_code=corrupt_wkb wkb_len={len(wkb)} "
+             f"status=refused (writing it would destroy the live geometry)",
+             "ERROR")
+        return None, {
+            "success": False,
+            "reason_code": "corrupt_wkb",
+            "message": "Geometry unreadable (corrupt WKB); nothing written",
+        }
+
+    aligned, crs_status = geometry_for_layer_crs(
+        geom, event.crs_authid, layer)
+    if crs_status in ("reprojected", "transform_failed"):
+        flog(f"{context}[{eid}]: crs_mismatch event_crs={event.crs_authid} "
+             f"layer_crs={extract_crs_authid(layer)} action={crs_status}",
+             "WARNING")
+    if aligned is None:
+        return None, {
+            "success": False,
+            "reason_code": "crs_mismatch",
+            "message": (
+                f"Geometry captured in {event.crs_authid} cannot be "
+                f"converted to {extract_crs_authid(layer)}; nothing written"
+            ),
+        }
+    geom = aligned
+
+    if layer_geom_type != QgisCompat.GEOM_UNKNOWN:
+        try:
+            geom_type = geom.type()
+        except (AttributeError, RuntimeError):
+            geom_type = layer_geom_type
+        if geom_type != layer_geom_type:
+            flog(f"{context}[{eid}]: reason_code=geometry_type_mismatch "
+                 f"event_geom_type={event.geometry_type} "
+                 f"layer_geom_type={int(layer_geom_type)} status=refused",
+                 "ERROR")
+            return None, {
+                "success": False,
+                "reason_code": "geometry_type_mismatch",
+                "message": (
+                    f"Geometry of the event ({event.geometry_type}) is "
+                    f"incompatible with the layer; nothing written"
+                ),
+            }
+
+    return geom, None
+
+
 def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
     """Re-insert a deleted feature into the target layer.
 
@@ -135,7 +231,10 @@ def restore_deleted_feature(layer, event: AuditEvent) -> Dict[str, Any]:
             return {"success": True, "message": "Already exists (skip)", "fid": existing_fid}
 
     attrs = reconstruct_attributes(event)
-    geom = rebuild_geometry(event.geometry_wkb)
+    geom, geom_error = _geometry_for_write(
+        layer, event, event.geometry_wkb, eid, "restore_deleted")
+    if geom_error is not None:
+        return geom_error
     field_mapping = _build_safe_mapping(check.drift, event)
     geom_str = 'yes' if geom else 'no'
     flog(
@@ -737,21 +836,27 @@ def restore_updated_feature(layer, event: AuditEvent,
     if has_geom and not bool(provider.capabilities() & QgisCompat.CAP_CHANGE_GEOMETRIES):
         return {"success": False, "message": "Provider lacks geometry change capability"}
 
+    # Vet the geometry BEFORE touching the feature: a refusal must leave
+    # the attributes untouched too, otherwise the feature ends up in a
+    # state that existed at no point in its history.
+    geom, geom_error = _geometry_for_write(
+        layer, event, event.geometry_wkb, eid, "restore_updated")
+    if geom_error is not None:
+        return geom_error
+
     if attr_changes:
         success = provider.changeAttributeValues(attr_changes)
         if not success:
             return {"success": False, "message": "Attribute update failed"}
 
-    if has_geom:
-        geom = rebuild_geometry(event.geometry_wkb)
-        if geom is not None:
-            geom_changes = {target_fid: geom}
-            if not provider.changeGeometryValues(geom_changes):
-                flog(f"restore_updated[{eid}]: geom update failed fid={target_fid}",
-                     "ERROR")
-                return {"success": False, "message": "Geometry update failed"}
+    if geom is not None:
+        geom_changes = {target_fid: geom}
+        if not provider.changeGeometryValues(geom_changes):
+            flog(f"restore_updated[{eid}]: geom update failed fid={target_fid}",
+                 "ERROR")
+            return {"success": False, "message": "Geometry update failed"}
 
-    geom_status = "geom_restored" if has_geom else "no_geom"
+    geom_status = "geom_restored" if geom is not None else "no_geom"
     flog(f"restore_updated[{eid}]: OK fid={target_fid} "
          f"attr_changes={len(attr_changes)} {geom_status}")
     return {"success": True, "message": "Reverted"}
