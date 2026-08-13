@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .assert_log import assert_sequence_in_order
-from .parse_log import LogRecord, parse_line, read_records
+from .parse_log import LogRecord, read_records
 
 # Milestones derived from recover_dialog.py (line refs are documentation of
 # provenance, matched as substrings on the raw log line; trace-id prefixes and

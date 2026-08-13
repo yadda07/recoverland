@@ -33,11 +33,28 @@ _REGRESSION_DIR = _HERE / "scenarios" / "regression"
 
 
 def _resolve_log_path() -> Path:
-    """Return the RecoverLand debug log path via the plugin public API.
+    """Return the RecoverLand debug log path.
 
-    Falls back to the conventional profile location if the plugin is
-    not loaded (offline tooling).
+    Order matters, and the first entry is the one that makes log-based
+    assertions work anywhere:
+
+    1. ``core.logger._LOG_FILE`` — the path the logger ACTUALLY opened, once
+       and for all, at import time. Asking the logger removes any chance of
+       the runner and the logger disagreeing, which is exactly what happened
+       on a headless run: the logger resolved the profile through
+       QgsApplication while the runner rebuilt a hard-coded Windows path, so
+       every ``assert_log_contains`` came back with n=0 on code that had
+       behaved perfectly. The same mismatch would make the suite unrunnable
+       on Linux/CI, where that hard-coded path does not exist at all.
+    2. the plugin's public API, when the plugin is loaded in a live QGIS.
+    3. the conventional profile location, last resort for offline tooling.
     """
+    try:
+        from recoverland.core.logger import _LOG_FILE  # type: ignore
+        if _LOG_FILE:
+            return Path(_LOG_FILE)
+    except Exception:
+        pass
     try:
         from qgis.utils import plugins  # type: ignore
         plugin = plugins.get("recoverland")

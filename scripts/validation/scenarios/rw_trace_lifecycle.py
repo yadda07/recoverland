@@ -34,6 +34,7 @@ def _find_unscoped_wipe(source: str):
             hits.append(source[:m.start()].count("\n") + 1)
     return hits
 
+
 _PLUGIN_ROOT = Path(__file__).resolve().parents[3]
 _PLUGINS_PARENT = _PLUGIN_ROOT.parent
 if str(_PLUGINS_PARENT) not in sys.path:

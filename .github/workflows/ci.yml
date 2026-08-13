@@ -62,3 +62,47 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           xvfb-run -a python3 -m recoverland.scripts.validation.ci_run
+
+      # The rewind / restore / review suite. These use the
+      # setup(ctx)/run(ctx)/assertions(ctx) contract consumed by
+      # scripts/validation/runner.py, which ci_run.py above cannot drive
+      # (it expects the other contract, `run() -> dict`).
+      #
+      # Explicit list rather than a glob: the directory also holds scenarios
+      # that do not start (incompatible contract) or whose source assertions
+      # point at lines that have since moved. Adding a scenario here means
+      # committing to keeping it green — grow the list, never silently drop
+      # a name from it.
+      - name: Run rewind regression suite (headless)
+        working-directory: recoverland
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          xvfb-run -a python3 scripts/validation/headless_run.py \
+            scripts/validation/scenarios/i2_tracker_suppress.py \
+            scripts/validation/scenarios/i3_identity_strength_gate.py \
+            scripts/validation/scenarios/i8_rewind_idempotence.py \
+            scripts/validation/scenarios/log_format_audit.py \
+            scripts/validation/scenarios/p13_fingerprint_portable.py \
+            scripts/validation/scenarios/p17_dedup_fid_collision.py \
+            scripts/validation/scenarios/p18_makevalid_drift.py \
+            scripts/validation/scenarios/rs_update_target_proof.py \
+            scripts/validation/scenarios/rvw_cutoff_clock.py \
+            scripts/validation/scenarios/rvw_trace_replay.py \
+            scripts/validation/scenarios/rw_apply_perf.py \
+            scripts/validation/scenarios/rw_dedup_post_trace_edit.py \
+            scripts/validation/scenarios/rw_ds_fingerprint_collision.py \
+            scripts/validation/scenarios/rw_entity_key_canonical.py \
+            scripts/validation/scenarios/rw_fid_recycle_scoping.py \
+            scripts/validation/scenarios/rw_fuse_attrs_completeness.py \
+            scripts/validation/scenarios/rw_insert_comp_rescue.py \
+            scripts/validation/scenarios/rw_multi_hop_navigation.py \
+            scripts/validation/scenarios/rw_partial_rewind_resume.py \
+            scripts/validation/scenarios/rw_pending_roundtrip.py \
+            scripts/validation/scenarios/rw_rewind_active_trace_guard.py \
+            scripts/validation/scenarios/rw_rewind_fetch_limit.py \
+            scripts/validation/scenarios/rw_rewind_fid_recycle.py \
+            scripts/validation/scenarios/rw_trace_lifecycle.py \
+            scripts/validation/scenarios/rw_truncated_window_refused.py \
+            scripts/validation/scenarios/rw_wq_atomic_enqueue.py
