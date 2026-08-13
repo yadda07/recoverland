@@ -68,6 +68,16 @@ class RestoreReport(NamedTuple):
     #                          \u222a failed_geometry_drift)
     #   failed_other = failed \ (failed_target_absent
     #                            \u222a failed_geometry_drift)
+    # Two traps for whoever counts from this report:
+    #   - the three lists classify by REASON, independently of success:
+    #     an id can be in `failed` and in one of them. Derive `applied`
+    #     and `failed_other` by subtraction as above, never by summing
+    #     the lists, or the same action is counted twice.
+    #   - a write that had to abandon captured fields (RLU-053,
+    #     reason_code `applied_partial`) lands in `succeeded` with no
+    #     list of its own, so this contract cannot distinguish a complete
+    #     restore from a mutilated one. Only the buffer-level path
+    #     (`_apply_via_buffer` -> StrictRestoreRunner) can.
     skipped_idempotent: List[int] = []
     failed_target_absent: List[int] = []
     failed_geometry_drift: List[int] = []

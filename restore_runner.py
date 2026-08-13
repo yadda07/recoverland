@@ -9,7 +9,7 @@ main thread; this runner respects that constraint while avoiding freeze.
 from collections import defaultdict
 import json
 import time
-from typing import List, Dict, Optional, Callable
+from typing import Any, List, Dict, Optional, Callable
 
 from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 
@@ -23,7 +23,7 @@ from .core.restore_service import (
 from .core.restore_executor import _apply_via_buffer
 from .core.workflow_service import GroupedRestoreResult
 from .core.logger import flog
-from .core.observability import log_cycle_summary
+from .core.observability import assert_invariant, log_cycle_summary
 from .core.geometry_utils import (
     feature_geom_short_repr, heavy_diag_enabled, wkb_short_repr,
 )
@@ -73,6 +73,125 @@ def _cycle_for_runner(runner_name: str) -> str:
     return _RUNNER_TO_CYCLE.get(runner_name, runner_name.lower())
 
 
+# The mutually-exclusive outcomes a planned action can end in. Every
+# action increments exactly one of them; that is what makes the
+# conservation invariant below checkable at all. `cancelled` is kept
+# apart: those actions were never attempted, so they belong to no
+# outcome and must never be folded into a failure.
+_OUTCOME_BUCKETS = (
+    "applied", "applied_partial", "skipped_idempotent",
+    "failed", "failed_target_absent", "failed_geometry_drift",
+)
+
+
+def _apply_counters(breakdown: Dict[str, int]) -> Dict[str, int]:
+    """Derive the counters CYCLE_SUMMARY publishes from the outcome buckets.
+
+    Measured on a real project (2026-08-12), the line said:
+
+        plan_actions=73 apply_ok=14 apply_skipped=67 apply_fail=59
+        applied=6 failed=0 failed_target_absent=59 skipped_idempotent=3
+
+    73 planned actions, 140 counted results, and a rewind that failed on
+    59 of them announcing `failed=0`. Three different populations were
+    printed side by side as if they partitioned the plan:
+
+      * `apply_skipped` was ``events - events_that_fully_succeeded``, an
+        EVENT-level number (73 - 6 = 67) covering every failure and every
+        skip a second time, on top of the ACTION-level `apply_ok` and
+        `apply_fail`. That is the double count: 14 + 59 already totalled
+        the 73 actions before `apply_skipped` was added.
+      * `apply_ok` counted everything the provider did not reject
+        (6 applied + 3 idempotent skips + 5 drift refusals), so it
+        contradicted `applied=6` on the same line.
+      * `failed` published the residual "no specific category" bucket
+        under the name a reader takes for the failure TOTAL.
+
+    Here the three counters are computed from the buckets and from
+    nothing else, so they partition the plan by construction:
+
+        apply_ok      = applied + applied_partial
+        apply_skipped = skipped_idempotent
+        apply_fail    = failed + failed_target_absent
+                        + failed_geometry_drift
+
+    `failed` then publishes that failure total (never 0 while an action
+    failed) and the residual keeps the explicit name `failed_other`.
+
+    Returns the buckets plus the derived counters and ``outcome_sum``,
+    the total of the six outcome buckets.
+    """
+    out: Dict[str, int] = {
+        key: int(breakdown.get(key, 0) or 0) for key in _OUTCOME_BUCKETS
+    }
+    out["cancelled"] = int(breakdown.get("cancelled", 0) or 0)
+    out["outcome_sum"] = sum(out[key] for key in _OUTCOME_BUCKETS)
+    out["apply_ok"] = out["applied"] + out["applied_partial"]
+    out["apply_skipped"] = out["skipped_idempotent"]
+    out["apply_fail"] = (out["failed"] + out["failed_target_absent"]
+                         + out["failed_geometry_drift"])
+    return out
+
+
+def _assert_bucket_conservation(
+    runner_name: str, trace_id: str, counters: Dict[str, int],
+    total_ok: int, total_fail: int, plan_actions: Optional[int],
+) -> bool:
+    """Check the buckets against BOTH accounting bases, loudly.
+
+    * ``total_ok + total_fail`` is what the runner counted while
+      applying. This base was already checked.
+    * ``plan_actions`` is what CYCLE_SUMMARY publishes, i.e. the number
+      the reader adds the apply counters against. It was never checked,
+      which is how the 2026-08-12 line could pass the invariant
+      (6+0+3+0+59+5 == 14+59 == 73, silence) while publishing 140
+      results for 73 actions: the counters on the line were simply not
+      the buckets the invariant was verifying.
+
+    Returns True when both bases agree. Never raises: the data changes
+    already landed on disk, it is the metrics that are suspect, and a
+    rewind must not be reported as crashed because its accounting drifted.
+    """
+    detail: Dict[str, Any] = {
+        "runner": runner_name,
+        "applied": counters["applied"],
+        "applied_partial": counters["applied_partial"],
+        "skipped_idempotent": counters["skipped_idempotent"],
+        "failed_other": counters["failed"],
+        "failed_target_absent": counters["failed_target_absent"],
+        "failed_geometry_drift": counters["failed_geometry_drift"],
+        "cancelled": counters["cancelled"],
+    }
+    if trace_id:
+        detail["trace"] = trace_id
+
+    outcome_sum = counters["outcome_sum"]
+    expected = int(total_ok) + int(total_fail)
+    ok_totals = assert_invariant(
+        outcome_sum == expected,
+        "apply_buckets_vs_totals",
+        base="total_ok+total_fail", expected=expected,
+        bucket_sum=outcome_sum, delta=outcome_sum - expected,
+        **detail,
+    )
+
+    ok_plan = True
+    if plan_actions is not None:
+        published = outcome_sum + counters["cancelled"]
+        planned = int(plan_actions)
+        ok_plan = assert_invariant(
+            published == planned,
+            "apply_buckets_vs_plan_actions",
+            base="plan_actions", expected=planned,
+            bucket_sum=published, delta=published - planned,
+            apply_ok=counters["apply_ok"],
+            apply_skipped=counters["apply_skipped"],
+            apply_fail=counters["apply_fail"],
+            **detail,
+        )
+    return bool(ok_totals and ok_plan)
+
+
 def _finish_runner(
     runner,
     *,
@@ -92,6 +211,10 @@ def _finish_runner(
     extra_stats: Optional[Dict[str, int]] = None,
     # BL-RW-P3-18: per-category breakdown propagated to runner.finished.
     breakdown: Optional[Dict[str, int]] = None,
+    # RLU-054: the number of actions CYCLE_SUMMARY is accounted against.
+    # Supplied by the runner that owns a plan; None on the paths that
+    # have no per-action classification (undo).
+    plan_actions: Optional[int] = None,
 ) -> None:
     """Common end-of-run pipeline for the three QObject runners.
 
@@ -106,37 +229,31 @@ def _finish_runner(
       4. Emit ``runner.finished`` so the dialog drives the next step.
       5. Always unsuppress the edit tracker on the way out, even when
          the emit raises, otherwise tracking stays paused indefinitely.
+
+    RLU-054: the CYCLE_SUMMARY apply counters are derived from the
+    outcome buckets here (see `_apply_counters`) instead of being
+    collected from three different populations, and the conservation
+    invariant is checked against the base the line publishes as well as
+    against the runner's own totals.
     """
     prefix = f"[{trace_id}] " if trace_id else ""
-    bd = breakdown or {}
-    applied = int(bd.get("applied", 0))
+    counters = _apply_counters(breakdown or {})
+    applied = counters["applied"]
     # RLU-053: a write that had to abandon captured fields is a success
     # for the provider and a mutilation for the user. It leaves `applied`
     # so that "restored" never counts a hybrid feature.
-    applied_partial = int(bd.get("applied_partial", 0))
-    skipped_idempotent = int(bd.get("skipped_idempotent", 0))
-    failed_other = int(bd.get("failed", 0))
-    failed_target_absent = int(bd.get("failed_target_absent", 0))
-    failed_geometry_drift = int(bd.get("failed_geometry_drift", 0))
+    applied_partial = counters["applied_partial"]
+    skipped_idempotent = counters["skipped_idempotent"]
+    failed_other = counters["failed"]
+    failed_target_absent = counters["failed_target_absent"]
+    failed_geometry_drift = counters["failed_geometry_drift"]
+    cancelled = counters["cancelled"]
 
-    # BL-RW-P3-18 antithesis: conservation invariant.
-    # Any drift between total_ok+total_fail and the 6-bucket sum exposes
-    # a classification bug. We log a WARNING but do not raise; the user
-    # gets correct restore results, just without trustworthy metrics.
-    bucket_sum = (applied + applied_partial + skipped_idempotent
-                  + failed_other + failed_target_absent
-                  + failed_geometry_drift)
-    expected = total_ok + total_fail
-    if breakdown is not None and bucket_sum != expected:
-        flog(
-            f"{prefix}{runner_name}: BREAKDOWN_INVARIANT_VIOLATION "
-            f"bucket_sum={bucket_sum} total_ok+total_fail={expected} "
-            f"delta={bucket_sum - expected} "
-            f"applied={applied} applied_partial={applied_partial} "
-            f"skipped_idempotent={skipped_idempotent} "
-            f"failed={failed_other} target_absent={failed_target_absent} "
-            f"geometry_drift={failed_geometry_drift}",
-            "WARNING",
+    conserved = True
+    if breakdown is not None:
+        conserved = _assert_bucket_conservation(
+            runner_name, trace_id, counters,
+            total_ok, total_fail, plan_actions,
         )
     try:
         if traces and write_queue is not None:
@@ -167,37 +284,57 @@ def _finish_runner(
             int((time.monotonic() - started_at) * 1000)
             if started_at else 0
         )
-        if status_label is not None:
-            flog(f"{prefix}{runner_name}: finish status={status_label} "
-                 f"ok={total_ok} fail={total_fail} elapsed_ms={elapsed_ms} "
-                 f"applied={applied} applied_partial={applied_partial} "
-                 f"skipped_idempotent={skipped_idempotent} "
-                 f"failed={failed_other} "
-                 f"failed_target_absent={failed_target_absent} "
-                 f"failed_geometry_drift={failed_geometry_drift}")
-        else:
-            flog(f"{prefix}{runner_name}: finish ok={total_ok} "
-                 f"fail={total_fail} elapsed_ms={elapsed_ms} "
-                 f"applied={applied} applied_partial={applied_partial} "
-                 f"skipped_idempotent={skipped_idempotent} "
-                 f"failed={failed_other} "
-                 f"failed_target_absent={failed_target_absent} "
-                 f"failed_geometry_drift={failed_geometry_drift}")
+        # `failed_other` is named in full here too: the short `failed=`
+        # on this line was read as the failure total by anyone grepping
+        # a run, exactly like on CYCLE_SUMMARY.
+        status_part = (
+            f"status={status_label} " if status_label is not None else ""
+        )
+        flog(f"{prefix}{runner_name}: finish {status_part}"
+             f"ok={total_ok} fail={total_fail} elapsed_ms={elapsed_ms} "
+             f"applied={applied} applied_partial={applied_partial} "
+             f"skipped_idempotent={skipped_idempotent} "
+             f"failed_other={failed_other} "
+             f"failed_target_absent={failed_target_absent} "
+             f"failed_geometry_drift={failed_geometry_drift} "
+             f"cancelled={cancelled}")
 
         cycle_name = cycle or _cycle_for_runner(runner_name)
-        cycle_stats: Dict[str, int] = {
-            "apply_ok": total_ok,
-            "apply_fail": total_fail,
-            "traces_written": len(traces) if traces else 0,
-            "applied": applied,
-            "applied_partial": applied_partial,
-            "skipped_idempotent": skipped_idempotent,
-            "failed": failed_other,
-            "failed_target_absent": failed_target_absent,
-            "failed_geometry_drift": failed_geometry_drift,
-        }
-        if extra_stats:
-            cycle_stats.update(extra_stats)
+        cycle_stats: Dict[str, Any] = dict(extra_stats or {})
+        cycle_stats["traces_written"] = len(traces) if traces else 0
+        if plan_actions is not None:
+            cycle_stats["plan_actions"] = int(plan_actions)
+        if breakdown is None:
+            # No per-action classification on this path (undo). Publish
+            # the provider-level totals and NOT a row of zeroed buckets:
+            # `failed=0` printed next to a non-zero `apply_fail` reads as
+            # "no failure", which is the opposite of what happened.
+            cycle_stats["apply_ok"] = total_ok
+            cycle_stats["apply_fail"] = total_fail
+        else:
+            cycle_stats.update({
+                # Disjoint by construction: ok + skipped + fail
+                # (+ cancelled) == plan_actions.
+                "apply_ok": counters["apply_ok"],
+                "apply_skipped": counters["apply_skipped"],
+                "apply_fail": counters["apply_fail"],
+                "applied": applied,
+                "applied_partial": applied_partial,
+                "skipped_idempotent": skipped_idempotent,
+                # `failed` is the failure TOTAL, `failed_other` the
+                # residual bucket. The reverse convention is what
+                # announced failed=0 on a rewind that failed 59 times.
+                "failed": counters["apply_fail"],
+                "failed_other": failed_other,
+                "failed_target_absent": failed_target_absent,
+                "failed_geometry_drift": failed_geometry_drift,
+            })
+            if cancelled:
+                cycle_stats["cancelled"] = cancelled
+            if not conserved:
+                # The counters did not add up; say so on the line the
+                # user re-reads rather than only in the CRITICAL above.
+                cycle_stats["bucket_conservation"] = "violated"
         log_cycle_summary(trace_id, cycle_name, cycle_stats, elapsed_ms)
 
         runner.finished.emit(result)
@@ -435,6 +572,10 @@ class RestoreRunner(QObject):
             QTimer.singleShot(0, self._process_chunk)
 
     def _finish(self) -> None:
+        # RLU-054: one event yields exactly one result here, so the plan
+        # base is the event count and whatever a cancellation left
+        # unprocessed is `cancelled` -- never silently a failure.
+        cancelled = max(len(self._events) - self._processed, 0)
         _finish_runner(
             self,
             runner_name="RestoreRunner",
@@ -447,12 +588,14 @@ class RestoreRunner(QObject):
             started_at=self._started_at,
             tracker=self._tracker,
             trace_id=self._trace_id,
+            plan_actions=len(self._events),
             breakdown={
                 "applied": self._applied,
                 "skipped_idempotent": self._skipped_idempotent,
                 "failed": self._failed_other,
                 "failed_target_absent": self._failed_target_absent,
                 "failed_geometry_drift": self._failed_geometry_drift,
+                "cancelled": cancelled,
             },
         )
 
@@ -521,6 +664,19 @@ class StrictRestoreRunner(QObject):
         self._strict_fid_remap: Dict = {}
         self._strict_skipped: List[int] = []
         self._all_succeeded_ids: set = set()
+
+        # RLU-054: the base CYCLE_SUMMARY is accounted against. Counted
+        # as the run goes, layer by layer, because that is the only place
+        # that knows how many actions a plan really carried:
+        #   _plan_actions — actions the planner emitted, plus the events
+        #     of a group refused whole (no layer, preflight blocked, no
+        #     edit session) since those never reached the planner's
+        #     verdict and are accounted as one failure each.
+        #   _plan_skipped — events the planner dropped (no stable
+        #     identity): never applied, never failed, and until now
+        #     invisible on the line.
+        self._plan_actions = 0
+        self._plan_skipped = 0
 
         # BL-RW-P3-18: per-category breakdown accumulator (mirror of
         # RestoreRunner). Per-layer counters are kept separate so a
@@ -616,6 +772,9 @@ class StrictRestoreRunner(QObject):
             self._errors.extend(errors)
             # BL-RW-P4-21: layer cannot be resolved -> entire group is
             # accounted as failed_other so the breakdown invariant holds.
+            # RLU-054: and as many planned actions, so the failures it
+            # adds stay inside the base the summary publishes.
+            self._plan_actions += len(group)
             self._failed_other += len(group)
             self._total_fail += len(group)
             self._processed += len(group)
@@ -645,6 +804,7 @@ class StrictRestoreRunner(QObject):
             self._errors.append(f"Preflight blocked: {msg}")
             # BL-RW-P4-21: preflight blocked the whole group -> count
             # every action as failed_other.
+            self._plan_actions += len(group)
             self._failed_other += len(group)
             self._total_fail += len(group)
             self._processed += len(group)
@@ -658,6 +818,7 @@ class StrictRestoreRunner(QObject):
             self._errors.append(f"Layer check failed: {msg}")
             # BL-RW-P4-21: layer-level preflight refused the layer ->
             # whole group is failed_other.
+            self._plan_actions += len(group)
             self._failed_other += len(group)
             self._total_fail += len(group)
             self._processed += len(group)
@@ -692,12 +853,23 @@ class StrictRestoreRunner(QObject):
                 self._errors.append("Cannot start editing on layer")
                 # BL-RW-P4-21: cannot open the layer for editing ->
                 # whole group is failed_other.
+                self._plan_actions += len(group)
                 self._failed_other += len(group)
                 self._total_fail += len(group)
                 self._processed += len(group)
                 self.progress.emit(self._processed, len(self._events))
                 QTimer.singleShot(0, self._advance_group)
                 return
+
+        # RLU-054: from here the layer enters the apply phase, so every
+        # action of ITS plan will land in exactly one outcome bucket. The
+        # events the planner refused (no stable identity) are counted
+        # apart: they are neither applied, nor skipped at runtime, nor
+        # failed, and folding them into any of those was part of what made
+        # the summary add up to twice the plan.
+        n_actions = len(plan.actions)
+        self._plan_actions += n_actions
+        self._plan_skipped += max(len(group) - n_actions, 0)
 
         count_before = layer.featureCount()
         self._strict_count_before = count_before
@@ -1125,17 +1297,28 @@ class StrictRestoreRunner(QObject):
                          if e.event_id in self._all_succeeded_ids]
             if ok_events:
                 succeeded_by_ds[fp] = ok_events
-        skipped_total = sum(len(v) for v in self._by_ds.values()) - sum(
+        excluded_from_undo = sum(len(v) for v in self._by_ds.values()) - sum(
             len(v) for v in succeeded_by_ds.values())
-        if skipped_total > 0:
+        if excluded_from_undo > 0:
             flog(f"StrictRestoreRunner: by_ds filtered: "
-                 f"{skipped_total} skipped event(s) excluded from undo scope")
-        plan_actions_total = sum(len(v) for v in self._by_ds.values())
+                 f"{excluded_from_undo} event(s) excluded from undo scope")
+        # RLU-054: `excluded_from_undo` used to be published as
+        # `apply_skipped`. It is an EVENT-level number (every event that
+        # did not fully succeed, whatever the reason) and it was printed
+        # next to the ACTION-level apply_ok/apply_fail, which already
+        # totalled the plan: 73 actions came out as 14+67+59 = 140
+        # results. It stays a log line about the undo scope, which is
+        # what it measures; the summary now publishes the buckets.
+        cancelled = sum(
+            len(group) for _fp, group in self._groups[self._group_idx:]
+        )
+        if cancelled:
+            flog(f"StrictRestoreRunner: cancelled "
+                 f"actions_never_attempted={cancelled} "
+                 f"groups_left={len(self._groups) - self._group_idx}",
+                 "WARNING")
         merged_extra: Dict[str, int] = dict(self._extra_stats)
-        merged_extra.update({
-            "plan_actions": plan_actions_total,
-            "apply_skipped": skipped_total,
-        })
+        merged_extra["plan_skipped"] = self._plan_skipped
         if self._applied_partial:
             # RLU-053: named once per run, before the dialog reads them,
             # so the log tells the same story as the message the user
@@ -1157,6 +1340,7 @@ class StrictRestoreRunner(QObject):
             trace_id=self._trace_id,
             status_label=status,
             extra_stats=merged_extra,
+            plan_actions=self._plan_actions + cancelled,
             breakdown={
                 "applied": self._applied,
                 "applied_partial": self._applied_partial,
@@ -1164,6 +1348,7 @@ class StrictRestoreRunner(QObject):
                 "failed": self._failed_other,
                 "failed_target_absent": self._failed_target_absent,
                 "failed_geometry_drift": self._failed_geometry_drift,
+                "cancelled": cancelled,
             },
         )
 
