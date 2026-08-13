@@ -53,6 +53,20 @@ class WriteQueue:
         """Start the writer thread for the given database path."""
         if self._running:
             self.stop()
+        # Queued events belong to the journal they were captured against.
+        # Restarting on another project's journal (project A -> project B)
+        # would drain them into B with A's fingerprints. Route them to A's
+        # pending-recovery file instead of moving them across projects.
+        if self._db_path and self._db_path != db_path:
+            orphans = self._drain_all()
+            if orphans:
+                flog(
+                    f"WriteQueue: {len(orphans)} event(s) left over from "
+                    f"{self._db_path}, saved to pending recovery before "
+                    f"switching journal",
+                    "WARNING",
+                )
+                self._save_lost_events(orphans)
         self._db_path = db_path
         self._stop_event.clear()
         self._thread = threading.Thread(
@@ -65,17 +79,33 @@ class WriteQueue:
         flog("WriteQueue: writer thread started")
 
     def stop(self) -> None:
-        """Stop the writer thread, flushing remaining events."""
-        if not self._running:
-            return
+        """Stop the writer thread, flushing remaining events.
+
+        Idempotent and safe on a queue that was never started.
+        """
+        was_running = self._running
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=_FLUSH_TIMEOUT_SEC)
-            if self._thread.is_alive():
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=_FLUSH_TIMEOUT_SEC)
+            if thread.is_alive():
                 flog("WriteQueue: thread did not stop in time", "WARNING")
         self._running = False
         self._thread = None
-        flog("WriteQueue: writer thread stopped")
+        # The writer flushes on its way out, but it may have died long before
+        # (fatal SQLite error) or an event may have landed after its last
+        # drain. Never leave an accepted event in RAM: check the queue
+        # ourselves and route what is left to the pending-recovery file.
+        leftover = self._drain_all()
+        if leftover:
+            flog(
+                f"WriteQueue: {len(leftover)} event(s) still queued after the "
+                f"writer stopped, saved to pending recovery",
+                "ERROR",
+            )
+            self._save_lost_events(leftover)
+        if was_running:
+            flog("WriteQueue: writer thread stopped")
 
     def enqueue(self, events: List[AuditEvent]) -> bool:
         """Add events to the write queue (all-or-nothing per batch).
@@ -84,7 +114,25 @@ class WriteQueue:
         the entire batch is saved to pending recovery and False is returned.
         Returns False and saves events to pending recovery if the queue would
         exceed the hard limit, signaling that tracking should be halted.
+        Returns False as well when no live writer thread can drain the queue.
         """
+        # A queue without a live consumer is a black hole: returning True
+        # would be an acknowledgement for events nobody will ever write, and
+        # the caller (EditSessionTracker) drops them on that promise. This
+        # covers a queue never started (journal could not be opened), one
+        # already stopped (project closing), and one whose writer thread died.
+        thread = self._thread
+        thread_alive = thread is not None and thread.is_alive()
+        if not self._running or not thread_alive:
+            flog(
+                f"WriteQueue: event=wq_enqueue_no_writer n_events={len(events)} "
+                f"running={self._running} thread_alive={thread_alive}, "
+                f"saving {len(events)} events to pending recovery",
+                "ERROR",
+            )
+            self._save_lost_events(events)
+            return False
+
         qsize = self._queue.qsize()
         # Pre-check capacity against the batch size to prevent a huge single
         # call (e.g. 100k mass deletes) from silently overflowing after the
@@ -164,18 +212,33 @@ class WriteQueue:
             flog("WriteQueue: writer connection opened")
 
             while not self._stop_event.is_set():
-                batch = self._drain_batch()
-                if batch:
-                    self._write_batch_with_retry(conn, batch)
-                else:
+                # Any unexpected error inside the loop used to end the thread
+                # and turn the queue into a silent black hole for the rest of
+                # the session. Keep the consumer alive: the next iteration
+                # drains the queue again, and a batch that cannot be written
+                # is already routed to pending recovery by the write path.
+                try:
+                    batch = self._drain_batch()
+                    if batch:
+                        self._write_batch_with_retry(conn, batch)
+                    else:
+                        self._stop_event.wait(timeout=0.1)
+                    now = time.monotonic()
+                    if now - last_checkpoint > _WAL_CHECKPOINT_INTERVAL_SEC:
+                        _try_wal_checkpoint(conn)
+                        last_checkpoint = now
+                except Exception as loop_err:  # noqa: BLE001
+                    flog(
+                        f"WriteQueue: writer loop error, staying alive: "
+                        f"{loop_err}",
+                        "ERROR",
+                    )
                     self._stop_event.wait(timeout=0.1)
-                now = time.monotonic()
-                if now - last_checkpoint > _WAL_CHECKPOINT_INTERVAL_SEC:
-                    _try_wal_checkpoint(conn)
-                    last_checkpoint = now
 
         except sqlite3.Error as e:
             flog(f"WriteQueue: fatal SQLite error: {e}", "ERROR")
+        except Exception as e:  # noqa: BLE001
+            flog(f"WriteQueue: fatal writer error: {e}", "ERROR")
         finally:
             remaining = self._drain_all()
             if remaining and conn is not None:
@@ -220,20 +283,30 @@ class WriteQueue:
             try:
                 with conn:
                     conn.executemany(_INSERT_SQL, params)
-                flog(f"WriteQueue: wrote {len(batch)} events")
-                if self._on_flush_callback is not None:
-                    self._on_flush_callback(len(batch))
-                return
             except sqlite3.OperationalError as e:
                 last_err = e
                 wait = _BATCH_RETRY_BASE_SEC * (2 ** attempt)
                 flog(f"WriteQueue: retry {attempt + 1}/{_BATCH_RETRY_COUNT} "
                      f"after {wait:.1f}s: {e}", "WARNING")
                 time.sleep(wait)
+                continue
             except sqlite3.Error as e:
                 flog(f"WriteQueue: non-retryable batch error: {e}", "ERROR")
                 self._save_lost_events(batch)
                 return
+            flog(f"WriteQueue: wrote {len(batch)} events")
+            # The batch is committed. The callback is only a notification
+            # (a Qt signal towards a bridge the plugin may already have
+            # destroyed): its failure must neither be mistaken for a write
+            # failure nor kill the writer thread.
+            if self._on_flush_callback is not None:
+                try:
+                    self._on_flush_callback(len(batch))
+                except Exception as cb_err:  # noqa: BLE001
+                    flog(f"WriteQueue: flush callback failed after "
+                         f"{len(batch)} events were committed: {cb_err}",
+                         "ERROR")
+            return
         flog(f"WriteQueue: batch failed after {_BATCH_RETRY_COUNT} retries: "
              f"{last_err}", "ERROR")
         self._save_lost_events(batch)
@@ -245,7 +318,16 @@ class WriteQueue:
         from the producer (UI thread, enqueue overflow) and the writer
         thread (batch failure).
         """
+        if not events:
+            return
         if not self._db_path:
+            # No journal path means no place to write the recovery file.
+            # Say it loudly instead of dropping the batch in silence.
+            flog(
+                f"WriteQueue: {len(events)} event(s) dropped, no journal path "
+                f"to write the pending recovery file",
+                "ERROR",
+            )
             return
         with self._pending_lock:
             try:

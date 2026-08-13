@@ -14,6 +14,7 @@ from .sqlite_schema import (
     AUDIT_EVENT_INSERT_SQL, AUDIT_EVENT_INSERT_PLACEHOLDERS,
     AUDIT_EVENT_INSERT_COLUMNS,
 )
+from .journal_manager import sqlite_readonly_uri
 from .logger import flog, timed_op
 
 _PENDING_FILENAME = "recoverland_pending.json"
@@ -96,7 +97,7 @@ def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult
             _check_wal_state(conn, issues)
             _check_schema_version(conn, issues)
             _check_logical_integrity(conn, issues)
-            recovered, rejected = _recover_pending_events(db_path, conn)
+            recovered, rejected = _recover_pending_events(db_path, conn, issues)
 
         except sqlite3.Error as e:
             issues.append(f"Cannot open journal: {e}")
@@ -188,8 +189,16 @@ def _check_orphan_datasources(conn: sqlite3.Connection, issues: List[str]) -> No
         issues.append(f"Orphan datasource check error: {e}")
 
 
-def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> tuple:
+def _recover_pending_events(db_path: str, conn: sqlite3.Connection,
+                            issues: List[str]) -> tuple:
     """Re-integrate events from the pending recovery file.
+
+    This file is written by a process that is already dying, so it is by
+    construction the one most likely to be truncated, empty or half-written.
+    It is also the LAST copy of edits the user was told were saved: a
+    pending entry may only disappear once it is written in the journal.
+    Every branch that keeps the file back therefore also reports an issue,
+    so the startup message stops saying "healthy" over an unread file.
 
     Returns (recovered_count, rejected_count).
     """
@@ -206,11 +215,36 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> tuple:
                 f"max={_MAX_PENDING_SIZE}, skipping auto-recovery",
                 "ERROR",
             )
+            issues.append(
+                f"Pending events file kept unrecovered "
+                f"(too large: {file_size} bytes)"
+            )
             return 0, 0
         with open(pending_path, "r", encoding="utf-8") as f:
             events = json.load(f)
 
-        if not isinstance(events, list) or len(events) == 0:
+        if not isinstance(events, list):
+            # The destructive branch this replaces: the file was removed as
+            # soon as the JSON root was not a list. A perfectly valid file of
+            # another shape -- an older {"events": [...]} layout, a manual
+            # merge, a partially rewritten root -- was deleted without one
+            # entry being read, and startup still announced a healthy
+            # journal. An unread file is a lead; a deleted one is data loss.
+            flog(
+                f"integrity: pending file root is {type(events).__name__}, "
+                f"not a list; kept untouched at {pending_path}",
+                "ERROR",
+            )
+            issues.append(
+                f"Pending events file kept unrecovered "
+                f"(unexpected JSON root: {type(events).__name__})"
+            )
+            return 0, 0
+
+        if len(events) == 0:
+            # An empty list is the one shape that provably holds nothing to
+            # recover, so removing it is safe and avoids a useless read at
+            # every startup.
             os.remove(pending_path)
             return 0, 0
 
@@ -229,8 +263,12 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection) -> tuple:
         flog(f"integrity: recovered {count} pending events")
         return count, 0
 
-    except (json.JSONDecodeError, OSError) as e:
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        # Unreadable bytes, zero-length file, unreadable encoding: the write
+        # was cut in flight. Keep the file and say so -- deleting it closes
+        # the only remaining lead on those edits.
         flog(f"integrity: pending recovery failed: {e}", "ERROR")
+        issues.append(f"Pending events file kept unrecovered ({e})")
         return 0, 0
 
 
@@ -348,7 +386,7 @@ def get_journal_health_report(db_path: str) -> JournalHealthReport:
     conn = None
     try:
         conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro", uri=True, check_same_thread=False
+            sqlite_readonly_uri(db_path), uri=True, check_same_thread=False
         )
         apply_pragmas(conn)
         version = get_schema_version(conn)

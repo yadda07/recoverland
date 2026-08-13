@@ -211,8 +211,33 @@ def purge_excess_events(conn: sqlite3.Connection, max_events: int) -> int:
     return _purge_excess(conn, max_events)
 
 
+def _excess_cut_boundary(conn: sqlite3.Connection, to_delete: int) -> Optional[str]:
+    """Return the created_at of the oldest event that must be kept.
+
+    `to_delete` is a row count; this turns it into a timestamp so the cut
+    can be aligned on a commit boundary.
+    """
+    row = conn.execute(
+        "SELECT created_at FROM audit_event"
+        " ORDER BY created_at ASC, event_id ASC LIMIT 1 OFFSET ?",
+        (to_delete,),
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
-    """Internal: delete oldest events that exceed max_events (batched)."""
+    """Internal: delete oldest events that exceed max_events (batched).
+
+    All events of one layer commit share a single created_at. Deleting a
+    plain row count would cut such a commit in two and leave a journal
+    whose dates no longer match any state the layer ever had: a later
+    rewind would compensate half of the entities and report success.
+    The cut is therefore aligned on the created_at of the oldest event
+    that must be kept, and only strictly older rows are deleted. When that
+    boundary falls inside a commit the whole commit is kept, so the cap is
+    a target, not a promise: purging a bit less is always preferable to
+    amputating a commit.
+    """
     if max_events <= 0:
         return 0
     total = conn.execute("SELECT COUNT(*) FROM audit_event").fetchone()[0]
@@ -221,21 +246,30 @@ def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
     to_delete = total - max_events
     deleted = 0
     try:
-        while deleted < to_delete:
-            chunk = min(_PURGE_BATCH_SIZE, to_delete - deleted)
+        boundary = _excess_cut_boundary(conn, to_delete)
+        if boundary is None:
+            return 0
+        while True:
             with conn:
                 cursor = conn.execute(
                     "DELETE FROM audit_event WHERE event_id IN "
                     "(SELECT event_id FROM audit_event "
-                    "ORDER BY created_at ASC, event_id ASC LIMIT ?)",
-                    (chunk,),
+                    "WHERE created_at < ? LIMIT ?)",
+                    (boundary, _PURGE_BATCH_SIZE),
                 )
                 batch = cursor.rowcount
             deleted += batch
-            if batch < chunk:
+            if batch < _PURGE_BATCH_SIZE:
                 break
         if deleted:
             flog(f"retention: purged {deleted} excess events (total was {total}, max={max_events})")
+        if deleted < to_delete:
+            flog(
+                f"retention: excess purge stopped on the commit boundary at {boundary}: "
+                f"{total - deleted} events kept for a cap of {max_events} "
+                f"(purging further would split a commit)",
+                "WARNING",
+            )
         return deleted
     except sqlite3.Error as e:
         flog(f"retention: excess purge error: {e}", "ERROR")
@@ -274,6 +308,36 @@ def get_journal_stats(conn: sqlite3.Connection) -> dict:
         "newest_event": active[2],
         "trace_events": int(trace[0] or 0) if trace else 0,
     }
+
+
+def check_journal_coverage(conn: sqlite3.Connection,
+                           cutoff,
+                           datasource_fp: Optional[str] = None) -> Optional[str]:
+    """Return a blocking reason if the journal no longer covers *cutoff*.
+
+    Retention is what removes the oldest events, so retention is what can
+    answer whether a rewind date is still backed by the journal. A date
+    older than the oldest surviving event is not reachable any more: the
+    rewind would replay what is left and report success on a state that
+    never existed.
+
+    *cutoff* is a restore_contracts.RestoreCutoff. Returns None when the
+    date is covered (or when the cutoff is not date-based). Callers of the
+    rewind pipeline pass the result to restore_planner.preflight_check via
+    its `oldest_event_date` argument, or surface it directly.
+    """
+    from .event_stream_repository import get_oldest_event_date
+    from .restore_planner import check_retention_coverage
+
+    try:
+        oldest = get_oldest_event_date(conn, datasource_fp)
+    except sqlite3.Error as e:
+        flog(f"retention: journal coverage lookup failed: {e}", "WARNING")
+        return None
+    reason = check_retention_coverage(cutoff, oldest)
+    if reason:
+        flog(f"retention: journal coverage refused: {reason}", "WARNING")
+    return reason
 
 
 def _compute_cutoff(retention_days: int) -> str:
@@ -398,8 +462,15 @@ def _purge_insert_delete_pairs(conn: sqlite3.Connection) -> int:
 
 
 def _post_purge_maintenance(conn: sqlite3.Connection) -> None:
-    """Refresh query planner stats and checkpoint WAL after a purge."""
-    _purge_orphan_traces(conn)
+    """Refresh query planner stats and checkpoint WAL after a purge.
+
+    Orphan traces are NOT collected here. A restore trace is the journal's
+    memory that an entity has already been compensated; deleting it because
+    retention removed the event it points to makes that compensation
+    invisible and the next rewind replays it, duplicating the entity.
+    Traces are only removed when the caller asks for it explicitly
+    (PurgeOptions.orphan_traces).
+    """
     try:
         conn.execute("ANALYZE audit_event")
         flog("retention: post-purge ANALYZE completed")

@@ -115,8 +115,20 @@ def check_retention_coverage(
     return None
 
 
-def preflight_check(plan: RestorePlan) -> PreflightReport:
-    """Validate a restore plan and produce a preflight report."""
+def preflight_check(
+    plan: RestorePlan, oldest_event_date: Optional[str] = None,
+) -> PreflightReport:
+    """Validate a restore plan and produce a preflight report.
+
+    *oldest_event_date* is the created_at of the oldest event still held by
+    the journal for `plan.datasource_fingerprint`
+    (event_stream_repository.get_oldest_event_date, or
+    retention.check_journal_coverage which wraps both). When it is supplied
+    and the requested date predates it, the plan is BLOCKED: replaying only
+    what survived a purge produces a state the layer never had, announced
+    as a success. The planner has no journal access of its own, so a caller
+    that omits the argument gets no coverage guard.
+    """
     blocking: List[str] = []
     warnings: List[str] = []
 
@@ -130,6 +142,14 @@ def preflight_check(plan: RestorePlan) -> PreflightReport:
         cutoff_err = validate_cutoff(plan.cutoff)
         if cutoff_err:
             blocking.append(f"Invalid cutoff: {cutoff_err}")
+        if oldest_event_date:
+            coverage_err = check_retention_coverage(
+                plan.cutoff, oldest_event_date)
+            if coverage_err:
+                flog(f"restore_planner: retention coverage refused "
+                     f"datasource={plan.datasource_fingerprint} "
+                     f"{coverage_err}", "WARNING")
+                blocking.append(f"Retention coverage: {coverage_err}")
 
     for conflict in plan.conflicts:
         if conflict.severity == "blocking":
