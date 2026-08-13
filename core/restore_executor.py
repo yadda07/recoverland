@@ -669,7 +669,9 @@ def _buffer_update(layer, event: AuditEvent,
     geometry (post-edit state). On failure, refuse rather than mutate the
     wrong feature.
     """
-    from .restore_service import _parse_identity, _find_target_feature
+    from .restore_service import (
+        _parse_identity, _find_target_feature, _verify_update_target,
+    )
 
     identity = _parse_identity(event.feature_identity_json)
     fp = event.entity_fingerprint or '?'
@@ -690,16 +692,41 @@ def _buffer_update(layer, event: AuditEvent,
     flog(f"BUF_UPD eid={event.event_id} fp={fp} remap={remap_verdict} "
          f"target={target_fid} trusted={trusted}", "DEBUG")
 
+    mapping = _safe_field_mapping(layer, event)
+
     if target_fid is not None and not trusted:
-        if not _target_matches_update_post_state(layer, target_fid, event):
+        # Same proof rule as the event-by-event restore path: one definition
+        # of "this really is the feature the event describes", shared by both
+        # engines. The previous check only compared the captured NEW geometry,
+        # so an attribute-only edit went through unverified, and when the
+        # comparison DID fail with no relocation possible the code logged
+        # FORCE_APPLY and wrote the OLD state onto the current occupant of the
+        # historical FID anyway. On a shapefile repacked between capture and
+        # rewind that occupant is an unrelated feature: it came out of the
+        # rewind wearing another object's name and geometry, reported as a
+        # success (scenario tx_prov_join_and_repack).
+        proven, why = _verify_update_target(
+            layer, target_fid, event, identity, mapping)
+        if not proven:
             fallback_fid = _find_update_target_by_post_state(layer, event)
-            if fallback_fid is None:
-                flog(f"BUF_UPD eid={event.event_id} fid={target_fid} "
-                     f"post_chk=fail no_fallback → FORCE_APPLY "
-                     f"(FID exists, apply comp RW-12)", "WARNING")
-            else:
-                flog(f"BUF_UPD eid={event.event_id} fid={target_fid}→fallback={fallback_fid} post_chk=recovered")
+            if fallback_fid is not None:
+                flog(f"BUF_UPD eid={event.event_id} "
+                     f"fid={target_fid}→fallback={fallback_fid} "
+                     f"post_chk=recovered")
                 target_fid = fallback_fid
+            else:
+                flog(f"BUF_UPD eid={event.event_id} fid={target_fid} "
+                     f"unverified reason={why} no_fallback status=refused "
+                     f"(FID may point at an unrelated feature)", "ERROR")
+                return {
+                    "success": False,
+                    "status": "FAILED",
+                    "reason_code": "target_unverifiable",
+                    "message": (
+                        "Target feature could not be verified "
+                        f"({why}); refusing to overwrite it"
+                    ),
+                }
 
     if target_fid is None:
         fallback_fid = _find_update_target_by_post_state(layer, event)
@@ -728,7 +755,6 @@ def _buffer_update(layer, event: AuditEvent,
              f"eid={event.event_id} fid={target_fid}")
 
     old_attrs = reconstruct_attributes(event)
-    mapping = _safe_field_mapping(layer, event)
     fields = layer.fields()
 
     attr_ok = 0
