@@ -187,6 +187,16 @@ def _find_restore_duplicate(layer, event: AuditEvent) -> Optional[int]:
     "already there" wrongly would leave the feature missing while
     reporting success, so absence of evidence must never be read as
     evidence of presence.
+
+    Geometry alone is NOT that proof. When the comparable list is empty
+    (every captured value null, or nothing left but the PK and the audit
+    columns), ``all()`` over it is vacuously true and any feature sharing
+    the geometry answered "already restored": a borne re-created at the
+    same coordinates with different attributes, a parcel re-drawn on the
+    same outline, a network node duplicated on purpose. The re-insertion
+    was then refused AND reported as a success -- the feature stayed
+    missing while the user read "Already exists". At least one attribute
+    must corroborate the geometry.
     """
     from qgis.core import QgsFeatureRequest
 
@@ -210,7 +220,10 @@ def _find_restore_duplicate(layer, event: AuditEvent) -> Optional[int]:
                 idx < 0, idx in pk_indices)):
             continue
         comparable.append((name, idx))
-    if expected_geom is None and not comparable:
+    if not comparable:
+        flog(f"_find_restore_duplicate: eid={event.event_id} "
+             f"no comparable attribute (captured={len(attrs)}); geometry "
+             f"alone cannot prove the feature is already back", "DEBUG")
         return None
 
     request = QgsFeatureRequest()

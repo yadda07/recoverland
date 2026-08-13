@@ -110,23 +110,30 @@ def _finish_runner(
     prefix = f"[{trace_id}] " if trace_id else ""
     bd = breakdown or {}
     applied = int(bd.get("applied", 0))
+    # RLU-053: a write that had to abandon captured fields is a success
+    # for the provider and a mutilation for the user. It leaves `applied`
+    # so that "restored" never counts a hybrid feature.
+    applied_partial = int(bd.get("applied_partial", 0))
     skipped_idempotent = int(bd.get("skipped_idempotent", 0))
     failed_other = int(bd.get("failed", 0))
     failed_target_absent = int(bd.get("failed_target_absent", 0))
     failed_geometry_drift = int(bd.get("failed_geometry_drift", 0))
 
     # BL-RW-P3-18 antithesis: conservation invariant.
-    # Any drift between total_ok+total_fail and the 5-bucket sum exposes
+    # Any drift between total_ok+total_fail and the 6-bucket sum exposes
     # a classification bug. We log a WARNING but do not raise; the user
     # gets correct restore results, just without trustworthy metrics.
-    bucket_sum = (applied + skipped_idempotent + failed_other + failed_target_absent + failed_geometry_drift)
+    bucket_sum = (applied + applied_partial + skipped_idempotent
+                  + failed_other + failed_target_absent
+                  + failed_geometry_drift)
     expected = total_ok + total_fail
     if breakdown is not None and bucket_sum != expected:
         flog(
             f"{prefix}{runner_name}: BREAKDOWN_INVARIANT_VIOLATION "
             f"bucket_sum={bucket_sum} total_ok+total_fail={expected} "
             f"delta={bucket_sum - expected} "
-            f"applied={applied} skipped_idempotent={skipped_idempotent} "
+            f"applied={applied} applied_partial={applied_partial} "
+            f"skipped_idempotent={skipped_idempotent} "
             f"failed={failed_other} target_absent={failed_target_absent} "
             f"geometry_drift={failed_geometry_drift}",
             "WARNING",
@@ -163,14 +170,16 @@ def _finish_runner(
         if status_label is not None:
             flog(f"{prefix}{runner_name}: finish status={status_label} "
                  f"ok={total_ok} fail={total_fail} elapsed_ms={elapsed_ms} "
-                 f"applied={applied} skipped_idempotent={skipped_idempotent} "
+                 f"applied={applied} applied_partial={applied_partial} "
+                 f"skipped_idempotent={skipped_idempotent} "
                  f"failed={failed_other} "
                  f"failed_target_absent={failed_target_absent} "
                  f"failed_geometry_drift={failed_geometry_drift}")
         else:
             flog(f"{prefix}{runner_name}: finish ok={total_ok} "
                  f"fail={total_fail} elapsed_ms={elapsed_ms} "
-                 f"applied={applied} skipped_idempotent={skipped_idempotent} "
+                 f"applied={applied} applied_partial={applied_partial} "
+                 f"skipped_idempotent={skipped_idempotent} "
                  f"failed={failed_other} "
                  f"failed_target_absent={failed_target_absent} "
                  f"failed_geometry_drift={failed_geometry_drift}")
@@ -181,6 +190,7 @@ def _finish_runner(
             "apply_fail": total_fail,
             "traces_written": len(traces) if traces else 0,
             "applied": applied,
+            "applied_partial": applied_partial,
             "skipped_idempotent": skipped_idempotent,
             "failed": failed_other,
             "failed_target_absent": failed_target_absent,
@@ -522,9 +532,17 @@ class StrictRestoreRunner(QObject):
         self._failed_other = 0
         self._failed_target_absent = 0
         self._failed_geometry_drift = 0
+        # RLU-053: features written without every captured field, and the
+        # names of the fields left behind. `_apply_via_buffer` says so
+        # (status=APPLIED_PARTIAL + dropped_fields); until now nobody
+        # read it, so a mutilated rewind was announced as a full one.
+        self._applied_partial = 0
+        self._partial_dropped: List[str] = []
         # Per-group accumulators reset at every _begin_strict_for_layer
         # and merged into the globals only on commit success.
         self._strict_group_applied = 0
+        self._strict_group_applied_partial = 0
+        self._strict_group_dropped: List[str] = []
         self._strict_group_skipped_idempotent = 0
         self._strict_group_failed_other = 0
         self._strict_group_failed_target_absent = 0
@@ -548,6 +566,35 @@ class StrictRestoreRunner(QObject):
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
         flog(f"{prefix}StrictRestoreRunner: cancel_requested "
              f"applied={self._total_ok}")
+
+    def partial_restore_report(self) -> tuple:
+        """RLU-053: ``(n_features, field_names)`` restored incompletely.
+
+        The count and the abandoned column names of every feature the
+        buffer wrote as APPLIED_PARTIAL, once the layers that carried
+        them have committed (a rolled-back layer contributes nothing).
+        The dialog reads this at the end of the run: it is what turns
+        "restauree" into "restauree, sans ces champs". ``(0, ())`` when
+        every captured field made it back.
+
+        Kept on the runner rather than in the emitted
+        ``GroupedRestoreResult``: that contract lives in
+        core/workflow_service.py and is shared with the two other
+        runners; extending it belongs to the module that owns it.
+        """
+        return (self._applied_partial, tuple(self._partial_dropped))
+
+    @staticmethod
+    def _merge_dropped(target: List[str], names) -> None:
+        """Append the unseen names of *names* to *target*, order kept.
+
+        The same column is dropped on every feature of a drifted layer;
+        the user must read it once, not once per feature.
+        """
+        for name in names or ():
+            text = str(name)
+            if text and text not in target:
+                target.append(text)
 
     def _advance_group(self) -> None:
         if self._cancelled or self._group_idx >= len(self._groups):
@@ -632,6 +679,8 @@ class StrictRestoreRunner(QObject):
         self._strict_fid_remap = {}
         # BL-RW-P4-21: reset per-group bucket accumulators.
         self._strict_group_applied = 0
+        self._strict_group_applied_partial = 0
+        self._strict_group_dropped = []
         self._strict_group_skipped_idempotent = 0
         self._strict_group_failed_other = 0
         self._strict_group_failed_target_absent = 0
@@ -760,6 +809,19 @@ class StrictRestoreRunner(QObject):
                     self._strict_group_failed_geometry_drift += 1
                 elif reason == "skipped_idempotent":
                     self._strict_group_skipped_idempotent += 1
+                elif reason == "applied_partial":
+                    # RLU-053: the buffer wrote the feature, but not every
+                    # captured field. Counting it with the complete ones
+                    # is what let a hybrid entity be announced as
+                    # "restored"; it gets its own bucket and its fields
+                    # are named to the user at the end of the run.
+                    self._strict_group_applied_partial += 1
+                    self._merge_dropped(self._strict_group_dropped,
+                                        result.get("dropped_fields"))
+                    flog(f"{prefix}StrictRestoreRunner: applied_partial "
+                         f"eid={action.event_id} "
+                         f"dropped={list(result.get('dropped_fields') or ())} "
+                         f"msg={result['message']}", "WARNING")
                 else:
                     self._strict_group_applied += 1
             else:
@@ -844,6 +906,11 @@ class StrictRestoreRunner(QObject):
         )
         self._failed_other += max(remainder_other, 0)
         self._strict_group_applied = 0
+        # RLU-053: the layer rolled back, so nothing was written
+        # incompletely either; the field names must not survive into the
+        # end-of-run report of a layer the user never got.
+        self._strict_group_applied_partial = 0
+        self._strict_group_dropped = []
         self._strict_group_skipped_idempotent = 0
         self._strict_group_failed_other = 0
         self._strict_group_failed_target_absent = 0
@@ -954,6 +1021,8 @@ class StrictRestoreRunner(QObject):
                 total_actions = len(self._strict_plan.actions)
                 self._failed_other += total_actions
                 self._strict_group_applied = 0
+                self._strict_group_applied_partial = 0
+                self._strict_group_dropped = []
                 self._strict_group_skipped_idempotent = 0
                 self._strict_group_failed_other = 0
                 self._strict_group_failed_target_absent = 0
@@ -994,6 +1063,10 @@ class StrictRestoreRunner(QObject):
         # accumulators reflect the final state and can be merged into
         # the global breakdown counters.
         self._applied += self._strict_group_applied
+        # RLU-053: the incomplete writes are on disk now, so their count
+        # and their abandoned columns become part of the run report.
+        self._applied_partial += self._strict_group_applied_partial
+        self._merge_dropped(self._partial_dropped, self._strict_group_dropped)
         self._skipped_idempotent += self._strict_group_skipped_idempotent
         self._failed_other += self._strict_group_failed_other
         self._failed_target_absent += self._strict_group_failed_target_absent
@@ -1001,10 +1074,14 @@ class StrictRestoreRunner(QObject):
         flog(f"{prefix}StrictRestoreRunner: commit_breakdown "
              f"layer={layer_name} ok={ok_count} skipped={skipped_count} "
              f"soft_fail={soft_fail_count} "
+             f"applied_partial={self._strict_group_applied_partial} "
+             f"dropped_fields={self._strict_group_dropped} "
              f"failed_target_absent={self._strict_group_failed_target_absent} "
              f"failed_geometry_drift={self._strict_group_failed_geometry_drift} "
              f"failed_other={self._strict_group_failed_other}")
         self._strict_group_applied = 0
+        self._strict_group_applied_partial = 0
+        self._strict_group_dropped = []
         self._strict_group_skipped_idempotent = 0
         self._strict_group_failed_other = 0
         self._strict_group_failed_target_absent = 0
@@ -1059,6 +1136,13 @@ class StrictRestoreRunner(QObject):
             "plan_actions": plan_actions_total,
             "apply_skipped": skipped_total,
         })
+        if self._applied_partial:
+            # RLU-053: named once per run, before the dialog reads them,
+            # so the log tells the same story as the message the user
+            # gets even when the dialog is closed mid-run.
+            flog(f"StrictRestoreRunner: partial_restore "
+                 f"features={self._applied_partial} "
+                 f"dropped_fields={self._partial_dropped}", "WARNING")
         _finish_runner(
             self,
             runner_name="StrictRestoreRunner",
@@ -1075,6 +1159,7 @@ class StrictRestoreRunner(QObject):
             extra_stats=merged_extra,
             breakdown={
                 "applied": self._applied,
+                "applied_partial": self._applied_partial,
                 "skipped_idempotent": self._skipped_idempotent,
                 "failed": self._failed_other,
                 "failed_target_absent": self._failed_target_absent,
