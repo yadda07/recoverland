@@ -31,7 +31,7 @@ from qgis.PyQt.QtWidgets import QToolTip, QWidget
 
 from ..compat import QtCompat
 from ..core.logger import flog
-from ..core.time_format import parse_iso_date
+from ..core.time_format import journal_now, parse_iso_date
 
 # ---- geometry -------------------------------------------------------------
 _TRACK_H = 7
@@ -169,7 +169,7 @@ class TemporalTimelineWidget(QWidget):
         if start is None or end is None:
             flog(f"timeline: set_range error first={first_iso} last={last_iso}", "WARNING")
             return
-        now = datetime.now()
+        now = journal_now()
         if end < start:
             start, end = end, start
         # Never let the axis run past "now" — future has no snapshots.
@@ -230,7 +230,7 @@ class TemporalTimelineWidget(QWidget):
         )
 
     def current_date_iso(self) -> str:
-        dt = self._current_dt or datetime.now()
+        dt = self._current_dt or journal_now()
         return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     def set_value_iso(self, iso: str) -> None:

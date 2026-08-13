@@ -30,7 +30,7 @@ from qgis.PyQt.QtWidgets import (
 
 from ..compat import QtCompat
 from ..core.logger import flog
-from ..core.time_format import parse_iso_date
+from ..core.time_format import journal_now, journal_today, parse_iso_date
 from .temporal_timeline_widget import TemporalTimelineWidget
 
 _BAR_HEIGHT = 46
@@ -146,11 +146,11 @@ class CanvasDateBar(QWidget):
             self._base_date = parse_iso_date(first_iso)
             self._end_date = parse_iso_date(last_iso)
         except (ValueError, TypeError):
-            self._base_date = date.today() - timedelta(days=365)
-            self._end_date = date.today()
+            self._base_date = journal_today() - timedelta(days=365)
+            self._end_date = journal_today()
 
         self._total_days = max(1, (self._end_date - self._base_date).days)
-        today = date.today()
+        today = journal_today()
         self._date_edit.setMinimumDate(
             QDate(self._base_date.year, self._base_date.month, self._base_date.day)
         )
@@ -505,8 +505,10 @@ class CanvasDateBar(QWidget):
         self._debounce.start()
 
     def _go_today(self) -> None:
-        today = date.today()
-        now = datetime.now()
+        # Journal clock, not wall clock: the cutoff this produces is compared
+        # against UTC created_at values (see time_format.journal_now).
+        today = journal_today()
+        now = journal_now()
         qd = QDate(today.year, today.month, today.day)
         self._syncing = True
         try:

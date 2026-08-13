@@ -29,6 +29,20 @@ _REQUIRED_EVENT_KEYS = frozenset({
 })
 
 
+# NOT NULL columns of audit_event: a pending payload that lost one of them
+# still has to produce a valid row rather than fail the whole recovery.
+_PENDING_DEFAULTS = {
+    "project_fingerprint": "",
+    "datasource_fingerprint": "",
+    "provider_type": "",
+    "operation_type": "",
+    "attributes_json": "{}",
+    "geometry_type": "NoGeometry",
+    "user_name": "unknown",
+    "created_at": "",
+}
+
+
 def _validate_pending_event(evt: dict) -> str:
     """Return empty string if valid, or a reason string if rejected."""
     if not isinstance(evt, dict):
@@ -36,7 +50,14 @@ def _validate_pending_event(evt: dict) -> str:
     missing = _REQUIRED_EVENT_KEYS - evt.keys()
     if missing:
         return f"missing keys: {missing}"
-    unknown = evt.keys() - _KNOWN_EVENT_KEYS
+    # event_id is tolerated, never inserted: save_pending_events serialises
+    # AuditEvent._asdict(), whose first field is event_id, while
+    # AUDIT_EVENT_INSERT_COLUMNS drops it (the column is AUTOINCREMENT).
+    # Rejecting on it made EVERY pending event unrecoverable -- the crash
+    # safety net announced to the user had never once put an event back in
+    # the journal. Filtering at read time rather than at write time also
+    # repairs the pending files already sitting on users' disks.
+    unknown = evt.keys() - _KNOWN_EVENT_KEYS - {"event_id"}
     if unknown:
         return f"unknown keys: {unknown}"
     if evt.get("operation_type") not in _VALID_OP_TYPES:
@@ -237,26 +258,15 @@ def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
                 continue
             try:
                 restored = _restore_event_from_json(dict(evt))
-                conn.execute(sql, (
-                    restored.get("project_fingerprint", ""),
-                    restored.get("datasource_fingerprint", ""),
-                    restored.get("layer_id_snapshot"),
-                    restored.get("layer_name_snapshot"),
-                    restored.get("provider_type", ""),
-                    restored.get("feature_identity_json"),
-                    restored.get("operation_type", ""),
-                    restored.get("attributes_json", "{}"),
-                    restored.get("geometry_wkb"),
-                    evt.get("geometry_type", "NoGeometry"),
-                    evt.get("crs_authid"),
-                    evt.get("field_schema_json"),
-                    evt.get("user_name", "unknown"),
-                    evt.get("session_id"),
-                    evt.get("created_at", ""),
-                    evt.get("restored_from_event_id"),
-                    evt.get("entity_fingerprint"),
-                    evt.get("event_schema_version"),
-                    restored.get("new_geometry_wkb"),
+                # Built from the column list, not hand-written: the previous
+                # literal tuple carried 19 values for 20 columns (it predated
+                # invalidated_at), so every insert raised and was swallowed as
+                # "skip pending event". Driving it off
+                # AUDIT_EVENT_INSERT_COLUMNS keeps it in lockstep with the
+                # schema the next time a column is added.
+                conn.execute(sql, tuple(
+                    restored.get(col, _PENDING_DEFAULTS.get(col))
+                    for col in AUDIT_EVENT_INSERT_COLUMNS
                 ))
                 count += 1
             except sqlite3.Error as e:

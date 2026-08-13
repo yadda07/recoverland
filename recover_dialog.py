@@ -2877,6 +2877,17 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._version_restore_cutoff = cutoff
         trace_id = generate_trace_id()
         self._active_restore_trace_id = trace_id
+
+        # A fingerprint that names two loaded layers is not an identity: the
+        # events of both merge into one datasource, the collapse buckets them
+        # together and a compensation can land on the wrong table. Known cause:
+        # the DB providers capture the schema instead of the table
+        # (identity._normalize_db_source). Refuse rather than operate on a
+        # merged identity -- correcting the fingerprint itself rewrites a value
+        # stored in every journal row and needs a migration.
+        if self._refuse_fingerprint_collision(checked_fps, trace_id):
+            self._active_restore_trace_id = ""
+            return
         undo_layers = len(self._last_restore_by_ds) if self._last_restore_by_ds else 0
         undo_events = (sum(len(v) for v in self._last_restore_by_ds.values())
                        if self._last_restore_by_ds else 0)
@@ -2885,14 +2896,34 @@ class RecoverDialog(QDialog, LoggerMixin):
         # (invariant I-8).  A new rewind proceeds even without in-memory undo
         # state: the fetch includes active traces and collapse_rewind_events
         # neutralises every already-compensated event, so nothing is replayed.
+        #
+        # That covers going FURTHER BACK. Going FORWARD (the layers sit at an
+        # older date than the one now requested) needs the opposite move:
+        # re-apply the events between the two dates by undoing their
+        # compensations. `_last_restore_by_ds` knows how, but it lives in RAM
+        # and is empty after a QGIS restart -- the rewind then reported
+        # "nothing to restore" while leaving the data one or more states
+        # behind. Rebuild that set from the journal, which is durable, so a
+        # sequence of hops behaves the same before and after a restart
+        # (scenario rw_multi_hop_navigation).
         if undo_layers == 0:
             read_conn = self._get_dialog_read_conn()
             if read_conn is not None and has_active_restore_traces(
                 read_conn, list(checked_fps), trace_id=trace_id
             ):
-                flog(f"[{trace_id}] recover_version: active_traces_present "
-                     f"datasource_count={len(checked_fps)} -> proceed, "
-                     f"dedup neutralises already-compensated events")
+                recovered = self._reapply_set_from_journal(
+                    read_conn, checked_fps, cutoff, trace_id)
+                if recovered:
+                    self._last_restore_by_ds = recovered
+                    undo_layers = len(recovered)
+                    undo_events = sum(len(v) for v in recovered.values())
+                    flog(f"[{trace_id}] recover_version: undo_state_rebuilt "
+                         f"from_journal layers={undo_layers} "
+                         f"events={undo_events} (forward hop)")
+                else:
+                    flog(f"[{trace_id}] recover_version: active_traces_present "
+                         f"datasource_count={len(checked_fps)} -> proceed, "
+                         f"dedup neutralises already-compensated events")
 
         include_traces = True
         flog(f"[{trace_id}] recover_version: start scope={len(checked_fps)} layer(s) "
@@ -2908,6 +2939,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._version_fetch_thread.stop()
             self._version_fetch_thread.wait(500)
 
+        self._version_fetch_total = 0
         self._version_fetch_thread = VersionFetchThread(
             self._journal, checked_fps, cutoff, trace_id=trace_id,
             include_traces=include_traces)
@@ -2917,6 +2949,11 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._version_fetch_thread.start()
 
     def _on_version_fetch_count_ready(self, total: int) -> None:
+        # Stashed so _on_version_fetch_done can tell a complete window from a
+        # window truncated by the per-datasource LIMIT. count_events_after_cutoff
+        # and fetch_events_after_cutoff share the same predicate, so any
+        # shortfall means events were dropped by the cap.
+        self._version_fetch_total = total
         if total > 0:
             self.update_phase(self.tr("{count} evenement(s) a analyser").format(count=total))
 
@@ -2933,16 +2970,140 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.recover_button.setEnabled(True)
         self.on_error(error_msg)
 
+    def _refuse_fingerprint_collision(self, checked_fps, trace_id: str) -> bool:
+        """Abort when a checked fingerprint denotes more than one loaded layer.
+
+        Returns True when the caller must stop. Never blocks on an internal
+        error: a guard that crashes a rewind is worse than the guard's absence.
+        """
+        from .core.identity import find_fingerprint_collisions
+
+        try:
+            from qgis.core import QgsProject, QgsVectorLayer
+            layers = [
+                lyr for lyr in QgsProject.instance().mapLayers().values()
+                if isinstance(lyr, QgsVectorLayer) and lyr.isValid()
+            ]
+            collisions = find_fingerprint_collisions(layers)
+        except Exception as exc:  # noqa: BLE001
+            flog(f"[{trace_id}] recover_version: collision check failed: {exc}",
+                 "WARNING")
+            return False
+
+        hit = {fp: names for fp, names in collisions.items() if fp in checked_fps}
+        if not hit:
+            return False
+
+        names = sorted({n for names in hit.values() for n in names})
+        flog(f"[{trace_id}] recover_version: fingerprint_collision "
+             f"n_fingerprints={len(hit)} layers={names} status=refused", "ERROR")
+        self._is_recovering = False
+        self._stop_logo_activity()
+        self.progress_bar.setVisible(False)
+        self.enable_controls(True)
+        self.recover_button.setEnabled(True)
+        QMessageBox.warning(
+            self,
+            self.tr("Couches non distinguables"),
+            self.tr(
+                "Ces couches partagent la meme empreinte de source : {layers}.\n\n"
+                "Leurs historiques sont melanges et une restauration pourrait "
+                "s'appliquer a la mauvaise couche. Restauration annulee."
+            ).format(layers=", ".join(names)),
+        )
+        return True
+
+    def _reapply_set_from_journal(self, read_conn, checked_fps, cutoff,
+                                  trace_id: str) -> dict:
+        """Rebuild the undo scope from the journal: {ds_fp: [user events]}.
+
+        Returns the user events that a previous rewind compensated and that
+        the requested cutoff puts back in the past -- i.e. the events to
+        re-apply to move the layers forward. Undoing their traces is exactly
+        what `UndoRunner` does, so the existing auto-undo path can consume
+        this without any change to the runner.
+
+        Empty dict when the hop only goes further back (nothing to re-apply)
+        or when the journal cannot be read: the caller then keeps the plain
+        compensate-only behaviour.
+        """
+        from .core.event_stream_repository import (
+            fetch_active_traces_before_cutoff, fetch_events_by_ids,
+        )
+
+        try:
+            traces = fetch_active_traces_before_cutoff(
+                read_conn, list(checked_fps), cutoff, trace_id=trace_id)
+            src_ids = [t.restored_from_event_id for t in traces
+                       if t.restored_from_event_id is not None]
+            if not src_ids:
+                return {}
+            by_ds: dict = {}
+            for event in fetch_events_by_ids(read_conn, src_ids):
+                by_ds.setdefault(event.datasource_fingerprint or '', []).append(event)
+            flog(f"[{trace_id}] reapply_set_from_journal: traces={len(traces)} "
+                 f"events={len(src_ids)} layers={len(by_ds)}")
+            return by_ds
+        except Exception as exc:  # noqa: BLE001 - never block a rewind on this
+            flog(f"[{trace_id}] reapply_set_from_journal: failed: {exc}",
+                 "WARNING")
+            return {}
+
+    def _refuse_truncated_window(self, raw_count: int, trace_id: str) -> bool:
+        """Abort the rewind when the fetched window was cut by the LIMIT.
+
+        ``fetch_events_after_cutoff`` caps each datasource at
+        MAX_EVENTS_PER_RESTORE and orders by ``created_at DESC``, so the
+        events it drops are the OLDEST ones -- precisely those that carry
+        the state at the cutoff. Replaying a truncated window brings the
+        layer to some intermediate state and reports success: a silent
+        partial rewind. The post-collapse volume guard cannot catch this
+        because the fetched list is already bounded by the cap.
+
+        ``count_events_after_cutoff`` and ``fetch_events_after_cutoff``
+        share the same WHERE clause, so a shortfall can only come from the
+        cap. Both conditions are required: the cap must have been reached
+        AND fewer events returned than exist, so that a concurrent
+        retention purge between the two queries is not mistaken for
+        truncation.
+
+        Returns True when the caller must stop.
+        """
+        from .core.restore_contracts import MAX_EVENTS_PER_RESTORE
+
+        fetch_total = getattr(self, "_version_fetch_total", 0)
+        if raw_count < MAX_EVENTS_PER_RESTORE or fetch_total <= raw_count:
+            return False
+
+        flog(f"[{trace_id}] rewind: truncated_window fetched={raw_count} "
+             f"total={fetch_total} dropped={fetch_total - raw_count} "
+             f"status=refused (oldest events dropped by the cap)", "ERROR")
+        self._is_recovering = False
+        self._stop_logo_activity()
+        self.progress_bar.setVisible(False)
+        self.enable_controls(True)
+        self.recover_button.setEnabled(True)
+        if trace_id:
+            self._active_restore_trace_id = ""
+        qlog(self.tr(
+            "{count} evenements depassent la limite ({limit}). "
+            "Choisissez une date plus recente."
+        ).format(count=fetch_total, limit=MAX_EVENTS_PER_RESTORE), "WARNING")
+        return True
+
     def _on_version_fetch_done(self, events) -> None:
         """Handle events fetched by background thread; run confirmations on main thread."""
         from .core.restore_contracts import MAX_EVENTS_PER_RESTORE, WARN_EVENTS_THRESHOLD
         from .core import collapse_rewind_events_with_stats
 
         raw_count = len(events)
+        trace_id = self._active_restore_trace_id
+        if self._refuse_truncated_window(raw_count, trace_id):
+            return
+
         events, dedup_stats = collapse_rewind_events_with_stats(events)
         total_count = len(events)
         cutoff_dt = getattr(self, '_version_cutoff_dt', None)
-        trace_id = self._active_restore_trace_id
         prior_rewind = bool(self._last_restore_by_ds)
         prior_count = (sum(len(v) for v in self._last_restore_by_ds.values())
                        if self._last_restore_by_ds else 0)
@@ -3190,6 +3351,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._version_fetch_thread = VersionFetchThread(
             self._journal, checked_fps, cutoff, trace_id=trace_id,
             include_traces=True)
+        # Keep the stashed total describing the LAST fetch, so the
+        # truncation guard in _on_post_undo_fetch_done compares like
+        # with like instead of against the pre-undo count.
+        self._version_fetch_total = 0
+        self._version_fetch_thread.count_ready.connect(
+            self._on_version_fetch_count_ready)
         self._version_fetch_thread.events_ready.connect(
             self._on_post_undo_fetch_done)
         self._version_fetch_thread.error_occurred.connect(
@@ -3205,9 +3372,13 @@ class RecoverDialog(QDialog, LoggerMixin):
         from .core import collapse_rewind_events_with_stats
 
         raw_count = len(events)
+        trace_id = self._active_restore_trace_id
+        if self._refuse_truncated_window(raw_count, trace_id):
+            self._restore_in_progress = False
+            return
+
         events, dedup_stats = collapse_rewind_events_with_stats(events)
         self._pending_cycle_stats = dict(dedup_stats)
-        trace_id = self._active_restore_trace_id
         flog(f"[{trace_id}] on_post_undo_fetch_done: raw={raw_count} "
              f"collapsed={len(events)}")
         for e in events:
