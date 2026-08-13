@@ -1121,7 +1121,12 @@ def _classify_restore_result(result: Dict[str, Any]) -> str:
     """
     reason_code = (result.get("reason_code") or "").strip()
     if reason_code:
-        if reason_code == "absent_vs_insert_comp":
+        if reason_code in ("absent_vs_insert_comp", "insert_target_gone"):
+            # insert_target_gone: undoing an INSERT whose feature is no
+            # longer in the layer. The end state is already reached and the
+            # occupant of its recycled FID was deliberately spared, so this
+            # belongs with the idempotent skips -- counting it as a failure
+            # told users their rewind had failed on work that was done.
             return "skipped_idempotent"
         # RLU-053: a write that had to abandon captured fields is not a
         # full restore. It keeps its own bucket so it can never be

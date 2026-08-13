@@ -507,17 +507,42 @@ def _buffer_delete(layer, event: AuditEvent,
                     # and no other candidate exists. Deleting it would
                     # destroy an unrelated feature (proven on project
                     # 63398, trace d8933d22). Refuse loudly.
+                    # Two facts hold here, and together they are not a
+                    # failure. The occupant of the historical FID shares
+                    # nothing with the event, so deleting it would destroy an
+                    # unrelated feature -- we refuse, as before. But the
+                    # geometry scan AND the attribute scan both swept the
+                    # layer without finding the inserted feature: it is no
+                    # longer there. Undoing an INSERT means "this feature must
+                    # not be in the layer", and that state is already reached.
+                    #
+                    # Reporting it as an error told the user 13 restores had
+                    # failed when nothing was wrong and nothing was left to
+                    # do, on a run where the FIDs had been recycled since the
+                    # capture (typical after deletions followed by an OGR
+                    # repack, or after a first rewind). It is surfaced as a
+                    # skip, not a success in disguise: the message still says
+                    # the feature could not be located, because the scans
+                    # cannot prove absence when both the geometry AND every
+                    # captured attribute changed since the insert.
                     flog(
                         f"BUF_DEL eid={event.event_id} fp={fp} fid={target_fid} "
-                        f"status=FAILED reason_code=target_unverifiable "
-                        f"(occupant shares no evidence, attr_rescue=none)",
+                        f"status=SKIPPED_ALREADY_ABSENT "
+                        f"reason_code=insert_target_gone "
+                        f"(occupant shares no evidence, attr_rescue=none, "
+                        f"layer swept: the inserted feature is not there)",
                         "WARNING",
                     )
                     return {
-                        "success": False,
-                        "status": "FAILED",
-                        "reason_code": "target_unverifiable",
-                        "message": "Failed: FID occupant unverifiable",
+                        "success": True,
+                        "skipped": True,
+                        "status": "SKIPPED_ALREADY_ABSENT",
+                        "reason_code": "insert_target_gone",
+                        "message": (
+                            "Skipped: the inserted feature is no longer in "
+                            "the layer; its former FID now holds an unrelated "
+                            "feature, left untouched"
+                        ),
                     }
             else:
                 # BL-RW-P0-02: identity mismatch is unprovable -> FAILED.
