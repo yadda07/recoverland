@@ -58,9 +58,11 @@ scripts/validation/_tmp_*
 scripts/validation/*.txt
 scripts/validation/scrub_*.py
 scripts/validation/scenarios/run_*.py
-scripts/validation/scenarios/rvw_*.py
-scripts/validation/scenarios/rw_*.py
 scripts/validation/scenarios/test_*.py
+# rw_* / rvw_* were ignored until 2026-08: the rewind and review regression
+# scenarios lived on disk only, so nothing guarded the engine between two
+# sessions. That is how the entity-key neutralisation landed in 8101627
+# without a covering scenario. They are versioned now.
 
 # Internal session notes (if revived locally)
 scripts/SESSION_REWIND.md

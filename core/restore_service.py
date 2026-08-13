@@ -632,6 +632,62 @@ def _verify_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:
         return False
 
 
+def _verify_update_target(layer, fid: int, event: AuditEvent,
+                          identity: Dict[str, Any],
+                          field_mapping: Dict[str, str]) -> tuple:
+    """Can we PROVE that feature *fid* is the one this event describes?
+
+    Returns ``(ok, reason)``.
+
+    A FID is not an identity on shapefiles and GeoJSON: OGR renumbers records
+    after a deletion or a re-export, so the feature sitting at the historical
+    FID may be a completely unrelated object. Writing the event's OLD state
+    onto it destroys that object's data -- the worst possible outcome for a
+    recovery tool, and a silent one.
+
+    Proof, in order of strength:
+      - a real primary key resolved the target: the FID never entered the
+        picture, nothing to check;
+      - the event captured a NEW geometry: the feature at *fid* must still
+        carry it (same check the rewind executor runs);
+      - attribute-only edit: the feature at *fid* must still carry the NEW
+        values of every field the event changed.
+
+    When nothing at all can be compared (legacy event with neither a NEW
+    geometry nor a NEW attribute side) the target stays unproven and the
+    caller refuses. Refusing loses a restore; applying corrupts a feature.
+    """
+    if identity.get("pk_field") and identity.get("pk_value") is not None:
+        return True, "pk"
+
+    from .restore_executor import _target_matches_update_post_state
+
+    if getattr(event, "new_geometry_wkb", None) is not None:
+        if _target_matches_update_post_state(layer, fid, event):
+            return True, "post_geom"
+        return False, "post_geom_mismatch"
+
+    new_attrs = reconstruct_new_attributes(event)
+    if not new_attrs:
+        return False, "no_post_state_captured"
+    feature = layer.getFeature(fid)
+    if feature is None or not feature.isValid():
+        return False, "target_unreadable"
+    fields = layer.fields()
+    compared = 0
+    for hist_name, cur_name in field_mapping.items():
+        if hist_name not in new_attrs:
+            continue
+        if fields.indexFromName(cur_name) < 0:
+            continue
+        compared += 1
+        if not _qgis_vals_equal(feature[cur_name], new_attrs[hist_name]):
+            return False, f"post_attr_mismatch:{cur_name}"
+    if compared == 0:
+        return False, "no_comparable_field"
+    return True, f"post_attrs:{compared}"
+
+
 def restore_updated_feature(layer, event: AuditEvent,
                             fid_cache: Optional[Dict] = None) -> Dict[str, Any]:
     """Revert a modified feature to its pre-update state.
@@ -655,9 +711,25 @@ def restore_updated_feature(layer, event: AuditEvent,
              f"identity={(event.feature_identity_json or '')[:80]}", "WARNING")
         return {"success": False, "message": "Target feature not found"}
 
-    flog(f"restore_updated[{eid}]: target_fid={target_fid}")
     old_attrs = reconstruct_attributes(event)
     field_mapping = _build_safe_mapping(check.drift, event)
+
+    proven, why = _verify_update_target(
+        layer, target_fid, event, identity, field_mapping)
+    if not proven:
+        flog(f"restore_updated[{eid}]: target_fid={target_fid} "
+             f"unverified reason={why} status=refused "
+             f"(FID may point at an unrelated feature)", "ERROR")
+        return {
+            "success": False,
+            "reason_code": "target_unverifiable",
+            "message": (
+                "Target feature could not be verified "
+                f"({why}); refusing to overwrite it"
+            ),
+        }
+
+    flog(f"restore_updated[{eid}]: target_fid={target_fid} verified_by={why}")
     attr_changes = _build_attribute_changes(layer, target_fid, old_attrs, field_mapping)
 
     provider = layer.dataProvider()

@@ -7,7 +7,7 @@ Feature identity = best available primary key or FID.
 import json
 import os
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, List, Any
 
 from .support_policy import IdentityStrength, refine_ogr_identity
 
@@ -173,6 +173,40 @@ def _normalize_db_source(raw: str, profile) -> str:
         f"{key}={parts.get(key, default)}"
         for key, default in profile
     )
+
+
+def find_fingerprint_collisions(layers) -> Dict[str, List[str]]:
+    """``{fingerprint: [layer names]}`` for fingerprints shared by 2+ layers.
+
+    A datasource fingerprint is supposed to name one table. For the DB
+    providers it currently does not: QGIS writes the table as
+    ``table="public"."routes" (geom)`` and :func:`_normalize_db_source`
+    captures the first double-quoted token, so ``public.routes`` and
+    ``public.rivieres`` both normalise to ``table=public``. Every table of a
+    schema then shares one identity, which merges their histories: two
+    features from two tables can land in the same dedup bucket, cancel each
+    other out as a net no-op, and neither gets restored -- or worse, a
+    compensation is applied to the wrong table.
+
+    Fixing the fingerprint itself changes a value already stored in every
+    journal row, so it needs a migration. This helper is the guard that can
+    ship first: the caller refuses a rewind whose scope contains a collision
+    instead of quietly operating on a merged identity. It costs one
+    fingerprint computation per layer.
+    """
+    from .logger import flog
+
+    by_fp: Dict[str, List[str]] = {}
+    for layer in layers or []:
+        try:
+            fp = compute_datasource_fingerprint(layer)
+        except Exception as exc:  # noqa: BLE001 - never block on a bad layer
+            flog(f"identity: fingerprint failed for a layer: {exc}", "WARNING")
+            continue
+        if not fp:
+            continue
+        by_fp.setdefault(fp, []).append(extract_layer_name(layer))
+    return {fp: names for fp, names in by_fp.items() if len(names) > 1}
 
 
 def _normalize_file_source(raw: str) -> str:

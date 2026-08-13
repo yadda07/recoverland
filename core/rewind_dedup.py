@@ -10,10 +10,14 @@ Two kinds of events live in the journal:
 
 Pipeline:
   1. Drop trace events; collect the set of user event_ids they reference
-     (already-compensated user events).
-  2. Drop those compensated user events from the active set: replaying
-     their compensatory action would duplicate the work and accumulate
-     features in the layer.
+     (already-compensated user events) and, per entity, the COMPENSATED
+     SPAN [oldest referenced event .. newest trace].
+  2. Drop the user events that fall inside that span: replaying their
+     compensatory action would duplicate the work and accumulate
+     features in the layer. User events at or after the newest trace are
+     edits made AFTER that rewind; they have never been compensated and
+     stay active, otherwise the entity can never be brought back to the
+     cutoff state (scenario rw_dedup_post_trace_edit).
   3. Apply the per-entity collapse on the remaining user-only chain:
 
        first=INSERT, last=DELETE  -> SKIP (created and destroyed after cutoff)
@@ -31,10 +35,11 @@ the captured NEW.
 Zero QGIS dependency. Pure deterministic logic.
 """
 import json
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 
 from .audit_backend import AuditEvent
 from .logger import flog
+from .serialization import extract_delta_new, extract_delta_old
 
 
 def _entity_key(event: AuditEvent) -> str:
@@ -80,49 +85,62 @@ def _detect_fid_recycle(
         fp_split_eid: dict {fp -> event_id of the most recent SPLIT}.
         splits: list of (fp, first_eid, second_eid) for logging.
     """
-    fp_split_eid: Dict[str, int] = {}
+    fp_split_eid: Dict[tuple, int] = {}
     splits: List[Tuple[str, int, int]] = []
     sorted_events = sorted(
         [e for e in events
          if e.event_id is not None and e.entity_fingerprint],
         key=lambda e: e.event_id,
     )
-    fp_state: Dict[str, str] = {}
-    fp_first_eid: Dict[str, int] = {}
+    fp_state: Dict[tuple, str] = {}
+    fp_first_eid: Dict[tuple, int] = {}
     for e in sorted_events:
-        fp = e.entity_fingerprint
+        # Keyed by (datasource, entity): 'fid:5' means a different feature in
+        # every layer. Keying on the fingerprint alone made a multi-layer
+        # rewind interleave the lifelines of unrelated features -- a DELETE
+        # in layer B closed the state of layer A's fid:5, and the next event
+        # in A was recorded as a recycle SPLIT. The split then rewrote the
+        # fingerprints of A's events and scattered one entity across two
+        # dedup buckets.
+        fp_key = (e.datasource_fingerprint, e.entity_fingerprint)
         op = e.operation_type
-        state = fp_state.get(fp)
+        state = fp_state.get(fp_key)
         if op == "INSERT":
             if state in ("closed", "pre_existing"):
-                fp_split_eid[fp] = e.event_id
-                splits.append((fp, fp_first_eid.get(fp), e.event_id))
-                fp_first_eid[fp] = e.event_id
+                fp_split_eid[fp_key] = e.event_id
+                splits.append((e.entity_fingerprint,
+                               fp_first_eid.get(fp_key), e.event_id))
+                fp_first_eid[fp_key] = e.event_id
             elif state is None:
-                fp_first_eid[fp] = e.event_id
-            fp_state[fp] = "open"
+                fp_first_eid[fp_key] = e.event_id
+            fp_state[fp_key] = "open"
         elif op == "DELETE":
             if state in ("open", "pre_existing", None):
-                fp_state[fp] = "closed"
+                fp_state[fp_key] = "closed"
         elif op == "UPDATE":
             if state is None:
-                fp_state[fp] = "pre_existing"
-                fp_first_eid[fp] = e.event_id
+                fp_state[fp_key] = "pre_existing"
+                fp_first_eid[fp_key] = e.event_id
             elif state == "closed":
-                fp_split_eid[fp] = e.event_id
-                splits.append((fp, fp_first_eid.get(fp), e.event_id))
-                fp_first_eid[fp] = e.event_id
-                fp_state[fp] = "pre_existing"
+                fp_split_eid[fp_key] = e.event_id
+                splits.append((e.entity_fingerprint,
+                               fp_first_eid.get(fp_key), e.event_id))
+                fp_first_eid[fp_key] = e.event_id
+                fp_state[fp_key] = "pre_existing"
             # state "open" or "pre_existing": no change
     return fp_split_eid, splits
 
 
 def _apply_fid_recycle_rewrite(
     events: List[AuditEvent],
-    fp_split_eid: Dict[str, int],
+    fp_split_eid: Dict[tuple, int],
 ) -> List[AuditEvent]:
     """Rewrite entity_fingerprint to fp@<split_eid> for events on or
     after a detected FID-recycle split.
+
+    Keys are (datasource_fingerprint, entity_fingerprint) pairs, so a split
+    detected in one layer never touches the identically-numbered feature of
+    another layer.
 
     Returns a new list; input is not mutated. Events without a matching
     split are returned unchanged.
@@ -132,12 +150,26 @@ def _apply_fid_recycle_rewrite(
     rewritten: List[AuditEvent] = []
     for e in events:
         fp = e.entity_fingerprint
-        if (fp and fp in fp_split_eid and e.event_id is not None and e.event_id >= fp_split_eid[fp]):
-            new_fp = f"{fp}@{fp_split_eid[fp]}"
+        fp_key = (e.datasource_fingerprint, fp)
+        split_eid = fp_split_eid.get(fp_key)
+        if (fp and split_eid is not None and e.event_id is not None
+                and e.event_id >= split_eid):
+            new_fp = f"{fp}@{split_eid}"
             rewritten.append(e._replace(entity_fingerprint=new_fp))
         else:
             rewritten.append(e)
     return rewritten
+
+
+def _order_key(event: AuditEvent) -> tuple:
+    """Chronological sort key for an event.
+
+    created_at first, event_id as tie-breaker: pending-recovery events are
+    re-inserted after a crash and receive an event_id that no longer
+    reflects chronological order (same rationale as the ORDER BY in
+    event_stream_repository.fetch_events_after_cutoff).
+    """
+    return ((event.created_at or ""), (event.event_id or 0))
 
 
 def _is_trace(event: AuditEvent) -> bool:
@@ -188,16 +220,42 @@ def collapse_rewind_events_with_stats(
     # same entity_fingerprint) and rewrite entity_fingerprint of the
     # second cycle so the per-entity bucketing below sees two distinct
     # entities. CR-1 / BL-RW-P1-07.
-    fp_split_eid, fid_recycle_splits = _detect_fid_recycle(events)
+    #
+    # Detection runs on the events that still DESCRIBE THE LIVE DATA:
+    #   - traces are excluded: a trace carries the compensating operation
+    #     (a DELETE is compensated by an INSERT), so feeding them to the
+    #     state machine read as "entity closed then re-INSERTed" and
+    #     recorded a phantom recycle split;
+    #   - already-compensated user events are excluded too: a DELETE that
+    #     a previous rewind has undone did not close anything, the feature
+    #     is back. Keeping it made a later UPDATE on that same feature look
+    #     like an FID recycle, which split the entity's history in two
+    #     buckets and left the older half uncompensated.
+    # The rewrite itself still applies to every event, traces included, so
+    # a genuine split keeps user events and their traces on the same key.
+    compensated_eids = {
+        e.restored_from_event_id for e in events
+        if _is_trace(e) and not _is_invalidated(e)
+        and e.restored_from_event_id is not None
+    }
+    fp_split_eid, fid_recycle_splits = _detect_fid_recycle([
+        e for e in events
+        if not _is_trace(e) and e.event_id not in compensated_eids
+    ])
     for fp, first_eid, second_eid in fid_recycle_splits:
         flog(f"rewind_dedup: fid_recycle_detected fp={fp} splits=2 "
              f"first_eid={first_eid} second_eid={second_eid}")
     if fp_split_eid:
         events = _apply_fid_recycle_rewrite(events, fp_split_eid)
 
+    by_eid: Dict[int, AuditEvent] = {
+        e.event_id: e for e in events if e.event_id is not None
+    }
+
     neutralised_user_eids: set = set()
-    neutralised_entity_keys: set = set()
-    eid_to_entity_key: Dict[int, str] = {}
+    # Per entity: the compensated WINDOW, not the whole entity (I-8).
+    # {entity_key: [oldest_compensated_key, newest_trace_key]}
+    compensated_span: Dict[str, list] = {}
     user_events: List[AuditEvent] = []
     trace_count = 0
     invalidated_count = 0
@@ -208,14 +266,31 @@ def collapse_rewind_events_with_stats(
                 invalidated_count += 1
                 continue
             ref = event.restored_from_event_id
-            if ref is not None:
-                neutralised_user_eids.add(ref)
-                key = _entity_key(event)
-                neutralised_entity_keys.add(key)
+            if ref is None:
+                continue
+            neutralised_user_eids.add(ref)
+            key = _entity_key(event)
+            # A rewind compensates a contiguous SUFFIX of the entity's
+            # history: everything from its cutoff up to the moment the
+            # trace was written. The span below marks exactly that
+            # interval. Chain fusion means a single trace can stand for
+            # several real events (the synthetic event carries only the
+            # oldest event_id), which is why the referenced event_id
+            # alone is not enough to neutralise the whole compensated
+            # chain -- hence the span rather than a bare eid set.
+            src = by_eid.get(ref)
+            lo = _order_key(src if src is not None else event)
+            hi = _order_key(event)
+            span = compensated_span.get(key)
+            if span is None:
+                compensated_span[key] = [lo, hi]
+            else:
+                if lo < span[0]:
+                    span[0] = lo
+                if hi > span[1]:
+                    span[1] = hi
             continue
         user_events.append(event)
-        if event.event_id is not None:
-            eid_to_entity_key[event.event_id] = _entity_key(event)
 
     active = []
     dropped = []
@@ -223,8 +298,17 @@ def collapse_rewind_events_with_stats(
         if e.event_id is None:
             active.append(e)
             continue
-        eid_key = eid_to_entity_key.get(e.event_id)
-        if e.event_id in neutralised_user_eids or eid_key in neutralised_entity_keys:
+        if e.event_id in neutralised_user_eids:
+            dropped.append(e)
+            continue
+        span = compensated_span.get(_entity_key(e))
+        # Strictly inside the compensated span => already undone by the
+        # previous rewind. At or after the trace => a NEW user edit made
+        # after that rewind; it has never been compensated and MUST stay
+        # active, otherwise the entity never returns to its cutoff state
+        # and the dialog wrongly reports "nothing to restore"
+        # (scenario rw_dedup_post_trace_edit).
+        if span is not None and span[0] <= _order_key(e) < span[1]:
             dropped.append(e)
         else:
             active.append(e)
@@ -234,7 +318,7 @@ def collapse_rewind_events_with_stats(
          f"{invalidated_count} invalidated) -> "
          f"{len(active)} active "
          f"({len(neutralised_user_eids)} by eid, "
-         f"{len(neutralised_entity_keys)} entity keys, "
+         f"{len(compensated_span)} compensated spans, "
          f"{len(dropped)} total neutralised)")
     for e in dropped:
         flog(f"rewind_dedup: neutralised eid={e.event_id} "
@@ -411,6 +495,35 @@ def _cancel_internal_lifetimes(chain_desc: List[AuditEvent]) -> List[AuditEvent]
     return list(reversed(survivors_asc))
 
 
+def _changed_only(event: AuditEvent) -> Dict[str, dict]:
+    """The ``changed_only`` delta of an event, {} when absent or invalid."""
+    if not event.attributes_json:
+        return {}
+    try:
+        payload = json.loads(event.attributes_json)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    changed = payload.get("changed_only")
+    return changed if isinstance(changed, dict) else {}
+
+
+def _oldest_old_geometry(chain: List[AuditEvent]) -> Optional[bytes]:
+    """OLD geometry of the oldest UPDATE of *chain* that carries one.
+
+    *chain* is DESC (newest first), so overwriting while walking forward
+    ends on the oldest -- i.e. the geometry the feature had at the cutoff.
+    An attribute-only UPDATE stores no geometry, so the walk must continue
+    instead of concluding "geometry unchanged" from the oldest event alone.
+    """
+    geom = None
+    for event in chain:
+        if event.operation_type == "UPDATE" and event.geometry_wkb is not None:
+            geom = event.geometry_wkb
+    return geom
+
+
 def _intermediates_all_updates(chain: List[AuditEvent]) -> bool:
     """Return True when every event between oldest and newest is UPDATE."""
     for event in chain[1:-1]:
@@ -437,14 +550,39 @@ def _fuse_long_chain(chain: List[AuditEvent]) -> List[AuditEvent]:
         return []
 
     if first_op == last_op == "UPDATE":
+        # Merge every delta of the chain, not just the oldest one: a field
+        # edited by an intermediate UPDATE is absent from the oldest event
+        # and would never be reverted (BL-RW fuse completeness). chain is
+        # DESC, so the OLD side keeps being overwritten until the oldest
+        # event wins (= cutoff value) while the NEW side stays on the
+        # newest (= live value, needed for post-state lookups).
+        merged: Dict[str, dict] = {}
+        for event in chain:
+            for field, val in _changed_only(event).items():
+                old = extract_delta_old(val)
+                if field in merged:
+                    merged[field]["old"] = old
+                else:
+                    merged[field] = {
+                        "old": old, "new": extract_delta_new(val),
+                    }
         synthetic = oldest._replace(
             feature_identity_json=newest.feature_identity_json,
             entity_fingerprint=newest.entity_fingerprint,
             new_geometry_wkb=newest.new_geometry_wkb,
         )
+        if merged:
+            synthetic = synthetic._replace(
+                attributes_json=json.dumps(
+                    {"changed_only": merged}, ensure_ascii=False),
+            )
+        cutoff_geom = _oldest_old_geometry(chain)
+        if cutoff_geom is not None:
+            synthetic = synthetic._replace(geometry_wkb=cutoff_geom)
         flog(f"rewind_dedup: fused {len(chain)} UPDATEs into 1 "
              f"synthetic UPDATE (oldest_eid={oldest.event_id} "
-             f"newest_eid={newest.event_id})")
+             f"newest_eid={newest.event_id} "
+             f"merged_fields={len(merged)})")
         return [synthetic]
 
     flog(f"rewind_dedup: fused {len(chain)} events into 2 "
@@ -465,27 +603,49 @@ def _fuse_update_delete(chain: List[AuditEvent]) -> AuditEvent:
 
     The synthetic DELETE carries:
       - operation_type = "DELETE" (compensation = INSERT)
-      - geometry_wkb = oldest UPDATE's old geometry (pre-UPDATE = cutoff)
-        with fallback to newest DELETE's geometry when the UPDATE was
-        attribute-only (geometry_wkb is None)
-      - attributes_json = full snapshot of oldest UPDATE's old attrs
+      - geometry_wkb = old geometry of the oldest UPDATE that carries one
+        (pre-UPDATE = cutoff), with fallback to the newest DELETE's
+        geometry when every UPDATE of the chain was attribute-only
+      - attributes_json = the COMPLETE state at cutoff
         (format: {"all_attributes": {...}}) so the INSERT compensation
-        restores all fields to their cutoff state
+        restores every field
       - identity = newest DELETE's identity (same FID)
+
+    Building the full state matters: the compensation for a DELETE is a
+    re-INSERT and `restore_executor._buffer_insert` only writes the fields
+    present in ``all_attributes``. Seeding it from the oldest UPDATE's
+    delta (which holds the edited fields ONLY) brought the feature back
+    with every other field NULL -- silent data loss on the ordinary
+    "edit one attribute, then delete" sequence. The DELETE event carries
+    the full state at deletion, so rolling the UPDATE deltas back over it
+    reconstructs the cutoff state exactly.
     """
     from .search_service import reconstruct_attributes
 
     oldest = chain[-1]
     newest = chain[0]
 
-    old_attrs = reconstruct_attributes(oldest)
+    cutoff_attrs = dict(reconstruct_attributes(newest))
+    if not cutoff_attrs:
+        # Defensive: a DELETE with no all_attributes payload. Degrade to
+        # the previous behaviour rather than re-inserting an empty feature.
+        cutoff_attrs = dict(reconstruct_attributes(oldest))
+        flog(f"rewind_dedup: fuse_update_delete no full snapshot on "
+             f"DELETE eid={newest.event_id}, degraded to oldest UPDATE "
+             f"delta ({len(cutoff_attrs)} field(s))", "WARNING")
+    # chain is DESC: iterating forward applies newest -> oldest, so the
+    # OLDEST old value wins = the value the field had at the cutoff.
+    for event in chain:
+        if event.operation_type != "UPDATE":
+            continue
+        for field, val in _changed_only(event).items():
+            cutoff_attrs[field] = extract_delta_old(val)
+
     synthetic_attrs = json.dumps(
-        {"all_attributes": old_attrs}, ensure_ascii=False)
-    synthetic_geom = (
-        oldest.geometry_wkb
-        if oldest.geometry_wkb is not None
-        else newest.geometry_wkb
-    )
+        {"all_attributes": cutoff_attrs}, ensure_ascii=False)
+    synthetic_geom = _oldest_old_geometry(chain)
+    if synthetic_geom is None:
+        synthetic_geom = newest.geometry_wkb
 
     synthetic = oldest._replace(
         operation_type="DELETE",

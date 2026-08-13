@@ -23,6 +23,7 @@ from qgis.PyQt.QtCore import QThread, pyqtSignal
 
 from ..core.logger import flog
 from ..core.search_service import _row_to_event
+from ..core.time_format import journal_today
 from ..core.sqlite_schema import AUDIT_EVENT_COLUMNS
 
 _ALIASED_COLS = ", ".join(f"ae.{c}" for c in AUDIT_EVENT_COLUMNS)
@@ -380,8 +381,6 @@ def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
 
     Runs on the calling thread (main thread acceptable — 1 row per layer).
     """
-    import datetime as _dt
-
     first_iso = ""
     last_iso = ""
     conn = None
@@ -409,7 +408,7 @@ def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
             except Exception:  # noqa: BLE001
                 pass
 
-    today = _dt.date.today().isoformat()
+    today = journal_today().isoformat()
     return (
         first_iso or "2020-01-01T00:00:00",
         last_iso or (today + "T23:59:59"),

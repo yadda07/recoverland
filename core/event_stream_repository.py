@@ -79,6 +79,78 @@ def has_active_restore_traces(
     return result
 
 
+def fetch_active_traces_before_cutoff(
+    conn: sqlite3.Connection,
+    datasource_fps: List[str],
+    cutoff: RestoreCutoff,
+    trace_id: str = "",
+) -> List[AuditEvent]:
+    """Active traces whose compensated event lies BEFORE the cutoff.
+
+    Undoing a trace re-applies the user event it compensated, so this is
+    exactly the set of compensations to undo in order to move the layers
+    FORWARD to *cutoff* -- the case "I rewound to an old date, now I want a
+    more recent one".
+
+    The predicate is the strict complement of the one
+    :func:`fetch_events_after_cutoff` uses to pick what must be compensated
+    (``>=`` when the cutoff is inclusive, ``>`` otherwise). Complement, so
+    every event of the history falls in exactly one of the two sets: no
+    event can be both compensated and re-applied, none can be forgotten.
+
+    Everything is derived from the journal, never from dialog state: the
+    in-memory ``_last_restore_by_ds`` is lost when QGIS closes, while the
+    traces are durable. Without this, forward navigation after a restart
+    silently did nothing (scenario rw_multi_hop_navigation).
+
+    Returns events ordered newest first, ready for reverse replay.
+    """
+    if not datasource_fps:
+        return []
+    if cutoff.cutoff_type == CutoffType.BY_EVENT_ID:
+        cutoff_col = "event_id"
+    elif cutoff.cutoff_type == CutoffType.BY_DATE:
+        cutoff_col = "created_at"
+    else:
+        flog(
+            f"fetch_active_traces_before_cutoff: trace_id={trace_id} "
+            f"unknown cutoff type {cutoff.cutoff_type} n_traces=0 "
+            f"status=invalid_cutoff",
+            "WARNING",
+        )
+        return []
+    op = "<" if cutoff.inclusive else "<="
+
+    placeholders = ",".join("?" for _ in datasource_fps)
+    assert_safe_fragment(_EVENT_COLUMNS)
+    assert_safe_fragment(cutoff_col)
+    assert_safe_fragment(op)
+    # B608: fragments are static branches; every value goes through `?`.
+    query = "".join((
+        "SELECT ", _EVENT_COLUMNS, " FROM audit_event",  # nosec B608
+        " WHERE datasource_fingerprint IN (", placeholders, ")",
+        " AND restored_from_event_id IS NOT NULL",
+        " AND invalidated_at IS NULL",
+        " AND restored_from_event_id IN (",
+        "SELECT event_id FROM audit_event WHERE ",
+        "datasource_fingerprint IN (", placeholders, ") AND ",
+        cutoff_col, " ", op, " ?",
+        ")",
+        " ORDER BY created_at DESC, event_id DESC",
+    ))
+    params = list(datasource_fps) + list(datasource_fps) + [cutoff.value]
+    traces = [_row_to_event(r) for r in conn.execute(query, params).fetchall()]
+    flog(
+        f"fetch_active_traces_before_cutoff: trace_id={trace_id} "
+        f"datasource_count={len(datasource_fps)} "
+        f"cutoff_type={cutoff.cutoff_type.value} "
+        f"inclusive={cutoff.inclusive} "
+        f"n_traces={len(traces)}",
+        "INFO" if traces else "DEBUG",
+    )
+    return traces
+
+
 def fetch_events_after_cutoff(
     conn: sqlite3.Connection,
     datasource_fp: str,

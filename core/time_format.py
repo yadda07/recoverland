@@ -13,6 +13,31 @@ def _tr(msg):
     return QCoreApplication.translate("TimeFormat", msg)
 
 
+def journal_now() -> datetime:
+    """The current instant on the JOURNAL's clock: naive UTC.
+
+    Every ``created_at`` in the journal is written as
+    ``datetime.now(timezone.utc).isoformat()``, and the Review chain compares
+    its cutoff against those values with a plain string / datetime comparison.
+    Anchoring the timeline's "now" on ``datetime.now()`` (local wall clock)
+    therefore put the scale and the data on two different clocks: in a
+    UTC+2 zone the Review lens queried an instant two hours away from the one
+    the Rewind slider would have used for the same visible date, so checking a
+    state in Review and then applying it with Rewind did not target the same
+    thing.
+
+    Naive rather than aware so it drops straight into the existing
+    ``date``/``datetime`` arithmetic of the timeline widgets, which is all
+    naive-UTC by construction.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def journal_today() -> date:
+    """Today on the journal's clock (UTC). See :func:`journal_now`."""
+    return journal_now().date()
+
+
 def format_relative_time(iso_timestamp: str) -> str:
     """Format an ISO timestamp as relative time ("il y a 5 min").
 
