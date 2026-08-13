@@ -11,6 +11,11 @@ category=Data Management
 tags=audit,recovery,restore,sketching,versioning,local,sqlite,temporal,rollback,health,preview
 icon=icon.svg
 qgisMaximumVersion=4.99
+# Qt6 builds of QGIS 3.x refuse to load a plugin without this flag:
+# pyplugin_installer/installer_data.py marks it error="incompatible" when
+# QT_VERSION_STR major == 6 and supportsQt6 is not TRUE/YES. QGIS 4.x dropped
+# the check (it is Qt6 by construction), so the flag is inert there.
+supportsQt6=True
 experimental=False
 deprecated=False
 homepage=https://github.com/yadda07/recoverland/

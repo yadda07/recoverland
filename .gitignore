@@ -78,3 +78,7 @@ _vendor/
 build/
 dist/
 build_log.txt
+
+# QGIS writes this beside the working directory when QgsApplication is
+# initialised headlessly (validation runs). Never part of the plugin.
+symbology-style.db
