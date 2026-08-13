@@ -46,13 +46,26 @@ class GroupedRestoreResult(NamedTuple):
     trace_events: list
     failed_eids: List[int] = []
     # BL-RW-P3-18: per-category breakdown propagated by the runners.
-    # `applied` is a strict subset of `total_ok`: it excludes events that
-    # the executor short-circuited as `skipped_idempotent`, `target_absent`
-    # or `geometry_drift`. Conservation invariant:
-    #   total_ok + total_fail == applied + skipped_idempotent
+    # `applied` is a strict subset of `total_ok`: it excludes events the
+    # executor short-circuited as `skipped_idempotent`, `target_absent`
+    # or `geometry_drift`, and (RLU-053) those written without every
+    # captured field. Conservation invariant, on the runner side:
+    #   total_ok + total_fail == applied + applied_partial
+    #                          + skipped_idempotent
     #                          + failed + failed_target_absent
     #                          + failed_geometry_drift
-    # (plus a `cancelled` delta when the runner was interrupted).
+    #                          (+ cancelled, actions never attempted)
+    # `applied_partial` and `cancelled` have no field here: the strict
+    # runner answers `partial_restore_report()` for the first, and both
+    # are published on its CYCLE_SUMMARY line. Do not reconstruct the
+    # partial count as `total_ok - applied - skipped_idempotent`.
+    #
+    # RLU-054, read this before displaying anything: `failed` is the
+    # RESIDUAL failure bucket ("no more precise reason"), NOT the failure
+    # total. A rewind that failed 59 times on absent targets carries
+    # failed=0 here. The total is
+    #   failed + failed_target_absent + failed_geometry_drift
+    # and that is what the runner publishes as `apply_fail` / `failed`.
     applied: int = 0
     skipped_idempotent: int = 0
     failed: int = 0
