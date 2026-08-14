@@ -175,16 +175,33 @@
   <li>for an attribute-only edit, the feature sitting at that FID must still carry the new value of every field the event changed.</li>
 </ul>
 <p>When none of those can be established &mdash; including the case where the event carries no post-edit state to compare at all &mdash; the write is refused and the action is reported as a failure. Refusing loses a restore; applying would destroy a feature.</p>
-<p>The same rule governs a compensatory DELETE: a feature is only deleted when it still matches the snapshot captured at INSERT time, or when a scan by geometry, then by attributes, locates the genuine feature under another FID.</p>
+<h3>The compensatory DELETE has one rung more</h3>
+<p>Undoing an INSERT means <em>deleting</em> a feature, and the proof required there stops one rung lower than the rule above. <code>_buffer_delete</code> in <code>core/restore_executor.py</code> tries, in this order:</p>
+<ol style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
+  <li>a target resolved by primary key, or a FID this same restore run has already remapped: no verification at all, the delete goes through;</li>
+  <li>otherwise the feature sitting at the historical FID must still match the INSERT snapshot &mdash; its geometry and every captured attribute;</li>
+  <li>on mismatch, the layer is swept for a feature matching that whole snapshot under another FID (if several match identically, the highest FID is taken, on the grounds that it is the duplicate a previous rewind created);</li>
+  <li>if that sweep finds nothing and the event being undone is an INSERT, a second sweep matches on attributes alone &mdash; strictly, on at least two comparable non-null captured fields, and it gives up if more than one feature matches;</li>
+  <li><strong>and if both sweeps come back empty, one last rung</strong>: the feature at the historical FID is deleted as soon as it shares <em>one</em> piece of evidence with the event &mdash; either its geometry matches, or a single captured attribute (primary-key and audit fields excluded) still carries the captured value.</li>
+</ol>
+<p>Only when the occupant shares nothing at all is the delete abandoned. It is then reported as a skip rather than a failure, on the grounds that two sweeps crossed the layer without finding the inserted feature. A compensatory DELETE whose source event is <em>not</em> an INSERT never reaches rungs 4 and 5: a mismatch there is a hard failure.</p>
 
-<div class="warn"><strong>What is left</strong>: RecoverLand no longer writes on the wrong feature, but on a re-exported or repacked shapefile a growing share of restores is simply refused. Over the life of a layer with no primary key that becomes the dominant failure mode &mdash; see <a href="#fid-recycling">Recovery horizon without a primary key</a>.</div>
+<div class="danger"><strong>Rung 5 is a low bar, and it is the one to know about.</strong> A single shared attribute value is enough to delete. On a layer where a captured field holds a value many features share &mdash; a type, a status, a batch number &mdash; a feature that inherited the recycled FID can clear that bar and be deleted in place of the one the event described. The fewer attributes an INSERT captured, the more likely that is. This rung exists because refusing every unproven delete left INSERTs visibly un-undone; it buys those back at the price of a proof that is circumstantial, not conclusive.</div>
+
+<div class="warn"><strong>What is left</strong>: apart from that rung, RecoverLand no longer writes on the wrong feature, but on a re-exported or repacked shapefile a growing share of restores is simply refused. Over the life of a layer with no primary key that becomes the dominant failure mode &mdash; see <a href="#fid-recycling">Recovery horizon without a primary key</a>.</div>
 
 <h3>How to avoid it</h3>
 <ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
-  <li>Use a format that carries a real primary key (GeoPackage, SpatiaLite, PostGIS) instead of a shapefile: RecoverLand classes those sources as strong identity, a shapefile and a GeoJSON as medium, which means the FID is all there is</li>
+  <li>Use a format that can carry a real primary key (GeoPackage, SpatiaLite, PostGIS) instead of a shapefile &mdash; but see the caveat below: the label RecoverLand puts on a source is not proof that a key exists</li>
   <li>If you must use a shapefile, do not re-export it between captures and restores</li>
-  <li>Read the report of a restore: an action refused for an unverifiable target is counted as a failure and its reason is given, never silently skipped</li>
+  <li>Read the report of a restore, and read it in the log panel: a refused action names its reason there. One case is <em>not</em> counted as a failure &mdash; undoing an INSERT whose feature can no longer be found anywhere in the layer is reported as a skip, because the feature being absent is the state that was asked for</li>
 </ul>
+
+<h3>"Strong identity" is read off the file extension</h3>
+<p><code>refine_ogr_identity</code> in <code>core/support_policy.py</code> decides the identity strength of an OGR source by looking for a substring in its URI: <code>.gpkg</code>, <code>.sqlite</code>, <code>.db</code> and <code>.fgb</code> are called strong, <code>.shp</code>, <code>.dbf</code> and <code>.geojson</code> medium, <code>.csv</code> and <code>.kml</code> weak. Nothing in that function asks the provider whether a primary key exists.</p>
+<p>What actually decides is elsewhere. <code>compute_feature_identity</code> in <code>core/identity.py</code> writes <code>pk_field</code> / <code>pk_value</code> into the recorded identity only when <code>dataProvider().pkAttributeIndexes()</code> is non-empty and the field carries a non-null value on that feature; otherwise the identity is <code>{"fid": N}</code> and nothing else. The restore proof reads that recorded identity, never the strength label.</p>
+
+<div class="warn"><strong>A GeoPackage with no declared primary key is labelled strong and recorded as a bare FID.</strong> It is then exposed to everything in <a href="#fid-recycling">Recovery horizon without a primary key</a>, whatever the label says. Changing container format is not by itself the mitigation; declaring a key is. To check on a given layer, look at the identity RecoverLand recorded for its events: <code>pk:&lt;field&gt;=&lt;value&gt;</code> means a key was found, <code>fid:&lt;n&gt;</code> means there is none.</div>
 </section>
 
 <!-- ====== RECOVERY HORIZON WITHOUT PK ====== -->
@@ -200,24 +217,28 @@
 <p>This is not the re-export accident documented above, which happens at one point in time and which you can decide to avoid. It is cumulative and it is silent. Ordinary editing consumes the ability to go back: the further back a rewind reaches, the larger the share of its actions that address FIDs since handed to another feature. Capture keeps working, the journal keeps growing, search keeps returning results. The loss only becomes visible at the moment of the rewind.</p>
 
 <h3>What it looks like on a real project</h3>
-<p>An FTTX project, three months of insertions, modifications and deletions on layers with no primary key. A rewind to an old date produced this:</p>
+<p>One rewind measured on a production project on 2026-08-12, over two layers whose events carry a FID-only identity (<code>fid:N</code>), gave this breakdown:</p>
 
 <div class="tw"><table>
-<thead><tr><th>Outcome of the 73 planned actions</th><th>Count</th></tr></thead>
+<thead><tr><th>Outcome of the 73 planned actions</th><th>Counter</th><th>Count</th></tr></thead>
 <tbody>
-  <tr><td>Restored</td><td>6</td></tr>
-  <tr><td>Already in the target state, nothing to do</td><td>3</td></tr>
-  <tr><td>Refused: the geometry no longer matches the capture</td><td>5</td></tr>
-  <tr><td><strong>Failed: no target found</strong></td><td><strong>59</strong></td></tr>
+  <tr><td>Restored</td><td><code>applied</code></td><td>6</td></tr>
+  <tr><td>Already in the target state, nothing to do</td><td><code>skipped_idempotent</code></td><td>3</td></tr>
+  <tr><td>Refused: the geometry no longer matches the capture</td><td><code>failed_geometry_drift</code></td><td>5</td></tr>
+  <tr><td><strong>Failed: the target could not be established</strong></td><td><code>failed_target_absent</code></td><td><strong>59</strong></td></tr>
 </tbody>
 </table></div>
 
-<p>Fifty-nine actions out of seventy-three had no feature to act on. The events were all present; the entities they name were no longer reachable under those numbers. That run is recorded and replayed by the test suite (<code>scripts/validation/scenarios/rw_cycle_summary_truth.py</code>).</p>
+<p>Fifty-nine actions out of seventy-three ended with no feature the restore was willing to act on. The events were all present; what the run could not do is establish which feature each of them designates today. Those five numbers &mdash; 73, 6, 3, 5, 59 &mdash; are the ones pinned in the versioned scenario <code>scripts/validation/scenarios/rw_cycle_summary_truth.py</code>, which replays that breakdown through the real runner. What the scenario checks is that the summary line adds up (the run that produced these counters had announced <code>failed=0</code> next to 59 failures); it does not re-execute the restore against a layer, so treat the table as one measurement, not as a repeatable benchmark.</p>
+
+<div class="warn"><strong>The counter names an outcome, not a cause.</strong> <code>failed_target_absent</code> aggregates three refusals (<code>_classify_restore_result</code> in <code>core/restore_service.py</code>): no feature found at the recorded identity, an occupant that could not be proved to be the right one, and a target the update path declined to verify. FID recycling is the cause this section is about, and it fits the shape of the measured run &mdash; but a feature genuinely deleted since capture, a layer re-exported, or a geometry that drifted while the captured attributes also changed all land in the same bucket. Nothing in the journal separates them. Read 59 as "59 actions found nothing they could prove", not as "59 recycled FIDs".</div>
 
 <div class="danger"><strong>What this means</strong>: on a layer with no primary key, the reliable recovery window is not the retention period. It is however far back the FIDs still designate the same features, and that horizon shortens on its own with every deletion. RecoverLand will not corrupt your data trying &mdash; it refuses to write a target it cannot prove &mdash; but it cannot restore what it cannot find.</div>
 
 <h3>Why RecoverLand cannot repair this for you</h3>
-<p>The FID is the only identity the layer offers. Rebuilding a lost link would mean guessing which of the current features is the one the event described, and a wrong guess overwrites an unrelated feature &mdash; the exact failure this page exists to prevent. The engine stops at the honest answer instead. The message bar gives the restored and failed counts and the first failure reasons; the plugin log breaks the run down by cause, with the actions whose target was absent counted separately from the ones that were applied, skipped as already in place, or refused on a geometry mismatch. That breakdown is where the four numbers of the table above come from.</p>
+<p>The FID is the only identity the layer offers. Rebuilding a lost link would mean guessing which of the current features is the one the event described, and a wrong guess overwrites an unrelated feature &mdash; the exact failure this page exists to prevent. The engine stops at the honest answer instead.</p>
+
+<div class="warn"><strong>Where the numbers are, and where they are not.</strong> Nothing about a rewind is pushed to the QGIS message bar. The restored and failed counts and the first five failure reasons go to the <strong>Log Messages panel</strong> (<code>View &gt; Panels &gt; Log Messages</code>, RecoverLand tab). The per-cause breakdown &mdash; the four counters of the table above, on one <code>CYCLE_SUMMARY</code> line &mdash; goes further still: to the debug file only, <code>&lt;QGIS profile&gt;/recoverland/recoverland_debug.log</code>, with a copy in <code>&lt;project&gt;/.recoverland/recoverland_debug.log</code>. A user who never opens either sees a rewind end with no visible verdict at all.</div>
 
 <h3>What a primary key changes, and what it does not</h3>
 <p>When the provider declares a primary key, RecoverLand records it next to the FID (<code>pk_field</code> / <code>pk_value</code>) and resolves the target with it. If the key is not found, the restore stops there and never falls back to the FID, precisely because the FID may point at an unrelated feature. A primary key removes this cause of degradation: the identity travels with the row, and deletions elsewhere in the table cost nothing.</p>
@@ -226,10 +247,10 @@
 
 <h3>How to reduce the exposure</h3>
 <ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
-  <li>Give the layer a real primary key: a GeoPackage or SpatiaLite table with an integer primary key, or PostGIS. This is the only measure that removes the cause instead of delaying it.</li>
+  <li>Give the layer a primary key the provider actually declares: an integer primary key on a GeoPackage or SpatiaLite table, or PostGIS. This is the only measure that removes the cause instead of delaying it. Changing container format without declaring a key changes only the label RecoverLand prints &mdash; see <a href="#fid-instable">"Strong identity" is read off the file extension</a>.</li>
   <li>On a layer with no primary key, treat the journal as a short-term safety net: check and restore soon after the incident, not months later.</li>
   <li>Do not compact or re-export such a layer between a capture and a restore.</li>
-  <li>Read the report of every rewind, and the log line behind it. The count of actions whose target was absent is the measure of how much of that history is still reachable; nothing is written for those actions.</li>
+  <li>After every rewind, open the Log Messages panel for the counts, and the debug file for the <code>CYCLE_SUMMARY</code> line behind them. <code>failed_target_absent</code> is the measure of how much of that history the engine could still tie to a feature; nothing is written for those actions.</li>
 </ul>
 </section>
 
@@ -269,7 +290,7 @@
 <h3>Consequence</h3>
 <p>No event is lost and nothing is rewritten &mdash; deleting the alias rows restores the pre-migration state exactly. But a rewind scoped on the current identity of such a table does not reach the events captured under the merged fingerprint.</p>
 
-<div class="warn"><strong>You are told which sources</strong>: RecoverLand names the affected layers in the message bar, once when the project is opened, and again every time a rewind is launched on a journal whose reconciliation is degraded. If you see that message, treat the older history of the named layers as consultable but not restorable through a rewind on the current identity.</div>
+<div class="warn"><strong>You are told which sources, but only in the log.</strong> RecoverLand names the affected layers through <code>qlog</code>, which writes to the debug file and to the QGIS <strong>Log Messages panel</strong> (<code>View &gt; Panels &gt; Log Messages</code>, RecoverLand tab). Nothing appears in the message bar, and nothing appears in the RecoverLand window itself. The warning is emitted once per journal when the RecoverLand dialog refreshes its layer list &mdash; not on project opening alone, so a user who never opens the dialog is never told &mdash; and again every time a rewind is launched on a degraded journal. If you see that message, treat the older history of the named layers as consultable but not restorable through a rewind on the current identity.</div>
 
 <div class="tip"><strong>Capture is not affected</strong>: recording never depends on a journal row. A tracked-layer selection saved by any earlier version keeps designating the same layers, because membership is tested on both the current and the historical form of the fingerprint.</div>
 </section>
@@ -321,14 +342,20 @@
 <p>If the disk hosting the journal drops below 100&nbsp;MB free, RecoverLand automatically disables tracking. Changes made after that point are not captured.</p>
 
 <h3>How it is handled</h3>
-<p>The <code>DiskMonitor</code> module checks disk space every 5 minutes and at startup. When the critical threshold is reached:</p>
+<p>The <code>DiskMonitor</code> module checks disk space when the journal is opened and every 5 minutes after that. When the critical threshold is reached:</p>
 <ul style="color:var(--tx2);margin:0 0 12px 20px;font-size:14px;line-height:2">
-  <li>Recording is automatically disabled</li>
-  <li>A red alert appears in the info bar with the free space remaining</li>
-  <li>At the warning threshold (500&nbsp;MB), only an orange notice is shown; recording continues</li>
+  <li>Recording is automatically disabled, and a persistent setting records that the disk monitor is the one who disabled it</li>
+  <li>A message giving the volume and the free space left is written to the QGIS Log Messages panel, at ERROR level, and the status bar indicator is refreshed</li>
+  <li>At the warning threshold (500&nbsp;MB), the same channel gets a WARNING-level notice, once; recording continues</li>
+  <li>A volume that cannot be measured at all &mdash; an unplugged share, a drive letter that disappeared &mdash; is treated as critical, not as healthy</li>
 </ul>
 
-<div class="warn"><strong>Recovery</strong>: Free up disk space, then re-enable the recording toggle manually. RecoverLand does not re-enable itself automatically after disk space is recovered.</div>
+<div class="warn"><strong>Neither alert is a banner.</strong> There is no coloured message bar and no dialog. Both go to the Log Messages panel (RecoverLand tab) and to the debug file. What a user actually sees on screen is the status bar indicator changing state. If recording stops mattering to you the moment you stop looking at that indicator, you will not notice the capture has stopped.</div>
+
+<h3>Recovery</h3>
+<p>Free up disk space. The monitor re-enables recording on its own: at the next check &mdash; up to 5 minutes later, or immediately if the journal is reopened &mdash; if free space is back above the warning threshold of 500&nbsp;MB <em>and</em> the setting says the disk monitor is the one who disabled recording, tracking is switched back on and a line saying so is written to the log.</p>
+
+<div class="info"><strong>Two conditions, both of which can leave it off.</strong> Recovering to 200&nbsp;MB free is not enough: the re-arming path requires clearing the 500&nbsp;MB warning threshold, not the 100&nbsp;MB critical one. And if you toggled recording yourself at any point &mdash; on or off &mdash; that clears the marker, and the monitor will never touch your choice again. In that case the toggle is yours to switch back on.</div>
 </section>
 
 <!-- ====== CRASH ====== -->
@@ -350,10 +377,10 @@
   <li><code>PRAGMA integrity_check</code> to detect journal corruption</li>
   <li>WAL checkpoint to consolidate pending writes</li>
   <li>Search for a <code>recoverland_pending.json</code> file containing events not written during the previous crash</li>
-  <li>Automatic re-integration of these events with notification to the user</li>
+  <li>Automatic re-integration of these events, and a message when some of them could not be recovered</li>
 </ul>
 
-<div class="tip"><strong>Zero silent loss</strong>: If events are lost despite the recovery mechanisms, the user is explicitly informed. No loss is hidden.</div>
+<div class="warn"><strong>No loss is hidden, but nothing interrupts you either</strong>: events lost despite the recovery mechanisms are reported through <code>qlog</code>, like every other RecoverLand message &mdash; the QGIS Log Messages panel and the debug file. Despite what the function that emits it is named after, no message bar item and no dialog is raised. Check the panel after a crash rather than assuming silence means nothing was lost.</div>
 </section>
 
 <!-- ====== SCHEMA DRIFT ====== -->
@@ -385,7 +412,11 @@
 <h2>Memory layer</h2>
 <p><span class="strength s-weak" style="background:var(--bg2);color:var(--tx2)">LOW</span></p>
 
-<p>Memory layers have no persistent source file. RecoverLand captures changes informally, but restore is impossible because the layer no longer exists after QGIS is closed.</p>
+<p>A memory layer (a QGIS scratch layer) has no persistent source file and no stable feature identity. RecoverLand does not capture it at all.</p>
+
+<p>The provider policy in <code>core/support_policy.py</code> gives <code>memory</code> an identity strength of <code>NONE</code>, with capture and restore both off. <code>EditSessionTracker.connect_layer</code> refuses every layer whose strength is <code>NONE</code> and returns before connecting a single edit signal, logging <code>action=refused reason=no_stable_identity</code>. No signal is bound, so no commit is ever seen and no event is ever written.</p>
+
+<div class="warn"><strong>You have no history for that layer, not a history you cannot restore.</strong> Nothing was recorded, so there is nothing to consult, search or export either &mdash; and the refusal is only visible in the log. Save a scratch layer to a real file before you start doing work in it you would mind losing.</div>
 </section>
 
 <!-- ====== JOURNAL SIZE ====== -->
@@ -396,14 +427,28 @@
 <h3>The problem</h3>
 <p>The journal grows indefinitely if retention is not configured. On a project with thousands of daily changes, the file can reach several hundred MB.</p>
 
-<h3>Impact</h3>
-<p>Search performance degrades gradually. SQLite remains performant up to several GB, but queries become slower beyond 100,000 events.</p>
+<h3>What the plugin actually measures</h3>
+<p>RecoverLand publishes no query-latency measurement, and this page will not invent one. What exists is a classification: <code>evaluate_journal_health</code> in <code>core/health_monitor.py</code> grades the journal on file size and event count and keeps the worse of the two grades.</p>
+
+<div class="tw"><table>
+<thead><tr><th>Grade</th><th>Reached at</th><th>What it produces</th></tr></thead>
+<tbody>
+  <tr><td>healthy</td><td>below 50&nbsp;MB and below 100,000 events</td><td>nothing</td></tr>
+  <tr><td>info</td><td>50&nbsp;MB or 100,000 events</td><td>the temporal coverage of the journal, and no suggestion</td></tr>
+  <tr><td>warning</td><td>200&nbsp;MB or 500,000 events</td><td>"journal growing, consider purging", plus a pointer to the Maintenance dialog</td></tr>
+  <tr><td>critical</td><td>500&nbsp;MB or 1,000,000 events</td><td>"large journal, purge recommended"</td></tr>
+</tbody>
+</table></div>
+
+<p>These are thresholds someone chose, not the point at which anything was observed to slow down. Crossing 100,000 events changes a label from healthy to info; it does not mean a query became slower there.</p>
 
 <h3>Solution</h3>
-<p>Use the Maintenance dialog to configure a retention policy. For example: keep 90 days of history and purge the rest. The health monitor alerts you when the journal is growing too large before it becomes a problem.</p>
+<p>Use the Maintenance dialog to configure a retention policy. For example: keep 90 days of history and purge the rest.</p>
+
+<div class="info"><strong>Do not wait to be told.</strong> The first grade that actually says something actionable is <em>warning</em>, at 200&nbsp;MB or 500,000 events. At <em>info</em> the indicator only reports how far back the journal reaches, which reads as a status line, not as a warning.</div>
 
 <h3>Impact of delta storage</h3>
-<p>RecoverLand uses delta storage for UPDATE: only the attributes that actually changed are recorded. On a 50-column table, changing one field stores 1 value instead of 50, reducing journal volume by 10 to 50 times compared to a full-row audit.</p>
+<p>RecoverLand uses delta storage for UPDATE: only the attributes that actually changed are recorded. On a 50-column table, changing one field stores 1 value instead of 50, recording one value instead of fifty. No measurement of the resulting journal size is published here: it depends entirely on how many columns a table has, how many of them an edit touches, and whether geometry changed</p>
 
 <div class="tw"><table>
 <thead><tr><th>Event type</th><th>Estimated size</th></tr></thead>
@@ -504,6 +549,6 @@
 </div>
 
 <footer>RecoverLand 6.0.0 &middot; GEODECI &middot; Technical documentation</footer>
-<script src="rl.js?v=21"></script>
+<script src="rl.js?v=22"></script>
 </body>
 </html>
