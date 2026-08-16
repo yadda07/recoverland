@@ -491,6 +491,47 @@ def is_geometry_present(geom) -> bool:
     return True
 
 
+def _cheap_shape_signature(geom):
+    """(vertex count, area, length) -- or None when unavailable.
+
+    A REJECT filter in front of `_canonical_rings`, which is the only
+    honest comparison but materialises and sorts every vertex IN PYTHON.
+    On a 200-feature layer of 500 KB multipolygons that is 6.3 million
+    point tuples per scan: measured 48 s for ONE event on zone_mkt_rip,
+    against 2.6 s before the canonical comparison existed. The three
+    quantities here are computed by QGIS in C++ and are invariant to ring
+    orientation, starting vertex and part order -- exactly what the
+    canonical comparison exists to see through -- so a mismatch is a
+    proof of difference and costs nothing.
+
+    Fails OPEN (returns None) so an uncomparable geometry falls through to
+    the expensive path rather than being wrongly rejected.
+    """
+    try:
+        n = geom.constGet().nCoordinates()
+        return (int(n), float(geom.area()), float(geom.length()))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _signatures_differ(a, b, rel_tol: float = 1e-9) -> bool:
+    """True when two cheap signatures prove the shapes differ.
+
+    Vertex counts must match exactly. Area and length are compared with a
+    relative tolerance: rotating a ring reorders the terms of the sums, so
+    the same shape can differ in the last bits of a double.
+    """
+    if a is None or b is None:
+        return False
+    if a[0] != b[0]:
+        return True
+    for x, y in ((a[1], b[1]), (a[2], b[2])):
+        scale = max(abs(x), abs(y), 1.0)
+        if abs(x - y) > scale * rel_tol:
+            return True
+    return False
+
+
 def _canonical_rings(geom):
     """Canonical, GEOS-free shape signature, or None when unavailable.
 
@@ -579,9 +620,11 @@ def feature_matches_geometry(feature, expected_geom, expected_wkb=None,
     if geometries_equal(bytes(current.asWkb()), expected_wkb):
         return True
 
-    cur_sig = _canonical_rings(current)
-    if cur_sig is not None and cur_sig == _canonical_rings(expected_geom):
-        return True
+    if not _signatures_differ(_cheap_shape_signature(current),
+                              _cheap_shape_signature(expected_geom)):
+        cur_rings = _canonical_rings(current)
+        if cur_rings is not None and cur_rings == _canonical_rings(expected_geom):
+            return True
 
     if hasattr(current, "equals") and bool(current.equals(expected_geom)):
         return True
