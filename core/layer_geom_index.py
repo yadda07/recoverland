@@ -70,8 +70,30 @@ class LayerGeomIndex:
     def built(self) -> bool:
         return self._built
 
+    def adopt(self, by_fid: Dict[int, Tuple[bytes, Tuple]]) -> None:
+        """Install digests computed elsewhere (BL-RW-P5-29).
+
+        The single full pass costs ~800 ms of pure OGR/GEOS work on the
+        user's layer. Done on the GUI thread it is an indivisible stall;
+        done in a worker it is invisible, because sip releases the GIL
+        around every C++ call (measured: animation frame interval 16.0 ms
+        during the worker read, against 43.2 ms with the current
+        chunked-on-GUI-thread apply). This is the door for the worker to
+        hand its result over; the digests are plain tuples, so nothing
+        Qt-owned crosses the thread boundary.
+        """
+        self._by_fid = dict(by_fid)
+        self._built = True
+        self._build_failed = False
+        flog(f"layer_geom_index: adopted layer={self._label!r} "
+             f"n_indexed={len(self._by_fid)} source=worker")
+
     def _build(self) -> None:
-        """Single full pass, geometries materialised once."""
+        """Single full pass, geometries materialised once.
+
+        Synchronous fallback for callers with no worker (validation
+        scenarios, the event-by-event path). Prefer `adopt`.
+        """
         t0 = time.monotonic()
         n_feats = 0
         n_indexed = 0
@@ -110,14 +132,28 @@ class LayerGeomIndex:
         return not self._build_failed
 
     def candidate_fids(self, expected_geom,
-                       expected_wkb: Optional[bytes] = None) -> List[int]:
-        """Fids plausibly equal to expected_geom (md5 OR exact bbox match).
+                       expected_wkb: Optional[bytes] = None
+                       ) -> Optional[List[int]]:
+        """Fids plausibly equal to expected_geom, BEST FIRST.
+
+        Returns ``None`` when the index cannot answer (build failed, or the
+        expected geometry has no digest) and a LIST when it can -- possibly
+        empty, meaning "I looked at every feature and none matches".
+        BL-RW-P5-29: the two used to be the same value, and an appelant
+        reading ``[]`` as "absent" turned a failed build into a silent
+        SKIPPED_IDEMPOTENT. `None` means "I do not know, go and scan".
+
+        Order matters as much as content. md5 candidates come FIRST: on the
+        user's layer 194 of 210 features share one bounding box, so a
+        bbox-matching list is the whole layer and re-verifying it costs the
+        scan it was meant to replace (measured 1076 ms). Serving the byte
+        -identical candidate first brings that to 14.4 ms.
 
         Callers MUST verify each candidate live before acting: digests
         pre-filter, they do not prove equality.
         """
         if not self.usable:
-            return []
+            return None
         if expected_wkb is not None and is_geometry_present(expected_geom):
             try:
                 exp_md5 = hashlib.md5(expected_wkb).digest()
@@ -129,16 +165,36 @@ class LayerGeomIndex:
                     round(rect.yMaximum(), _BBOX_PRECISION),
                 )
             except (AttributeError, RuntimeError, TypeError):
-                return []
+                return None
         else:
             digest = _geom_digest(expected_geom)
             if digest is None:
-                return []
+                return None
             exp_md5, exp_bbox = digest
-        return [
-            fid for fid, (md5, bbox) in self._by_fid.items()
-            if md5 == exp_md5 or bbox == exp_bbox
-        ]
+        exact, by_bbox = [], []
+        for fid, (md5, bbox) in self._by_fid.items():
+            if md5 == exp_md5:
+                exact.append(fid)
+            elif bbox == exp_bbox:
+                by_bbox.append(fid)
+        return exact + by_bbox
+
+    def drop(self) -> None:
+        """Make the index permanently unusable for this batch.
+
+        Called at every commit and rollback. commitChanges renumbers the
+        provider FIDs AND moves their content (measured: old fid 4 becomes
+        new fid 3), so a surviving index knows the right geometries under
+        the wrong fids. The live re-verification then rejects the proposed
+        fid and the caller concludes "absent" -- the renumbering turns
+        harmless false positives into SILENT FALSE NEGATIVES, which is the
+        one failure mode re-verification cannot catch. QGIS publishes no
+        old->new mapping for untouched rows, so this is not repairable:
+        the only safe answer is to stop answering.
+        """
+        self._by_fid.clear()
+        self._built = True
+        self._build_failed = True
 
     def evict(self, fid: int) -> None:
         """Drop a mutated/deleted fid: it will never be served stale."""

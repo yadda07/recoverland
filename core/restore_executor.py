@@ -801,14 +801,11 @@ def _buffer_update(layer, event: AuditEvent,
 
     fields = layer.fields()
 
-    attr_ok = 0
-    attr_fail = 0
-    for idx, value in iter_mapped_attributes(mapping, old_attrs, fields):
-        if layer.changeAttributeValue(target_fid, idx, value):
-            attr_ok += 1
-        else:
-            attr_fail += 1
-
+    # Geometry decides AND writes first; attributes follow at the end of
+    # the function. Every refusal below (corrupt WKB, empty rebuild, drift
+    # beyond tolerance, buffer rejection) used to fire with the restored
+    # attributes already in the buffer -- and the drift guard returns
+    # success/skipped, so the runner committed that half-written feature.
     geom_status = "no_geom_in_event"
     if event.geometry_wkb is not None:
         wkb_len = len(event.geometry_wkb)
@@ -864,7 +861,9 @@ def _buffer_update(layer, event: AuditEvent,
                         "reason_code": "geometry_drift",
                         "message": (
                             f"Skipped: makeValid drift {drift_units:.9f} "
-                            f"exceeds tolerance {MAKEVALID_DRIFT_TOLERANCE}"
+                            f"exceeds tolerance {MAKEVALID_DRIFT_TOLERANCE}; "
+                            f"feature left untouched (neither geometry nor "
+                            f"attributes were written)"
                         ),
                     }
                 flog(
@@ -930,6 +929,16 @@ def _buffer_update(layer, event: AuditEvent,
             flog(f"_buffer_update: geom changed "
                  f"eid={event.event_id} fid={target_fid}")
             geom_status = f"applied wkb_len={wkb_len}"
+
+    # Attributes last: reached only once the geometry is settled, so a
+    # geometry refusal above leaves the feature exactly as it was found.
+    attr_ok = 0
+    attr_fail = 0
+    for idx, value in iter_mapped_attributes(mapping, old_attrs, fields):
+        if layer.changeAttributeValue(target_fid, idx, value):
+            attr_ok += 1
+        else:
+            attr_fail += 1
 
     if attr_fail > 0 and attr_ok == 0:
         flog(f"_buffer_update: all attr changes REJECTED "
@@ -1063,7 +1072,7 @@ def _find_existing_by_identity(layer, event):
         return None
 
 
-def _find_existing_by_snapshot(layer, geom):
+def _find_existing_by_snapshot(layer, geom, geom_index=None):
     """Find a feature already present whose geometry matches.
 
     Used for INSERT idempotence and UPDATE post-state recovery. Geometry
@@ -1074,6 +1083,28 @@ def _find_existing_by_snapshot(layer, geom):
     trigger-altered fields, datetime serialization), which then leads to
     duplicate inserts on repeated rewinds.
     """
+    # BL-RW-P5-29: ask the pre-built index first. It answers None when it
+    # cannot know (build failed, no digest) -- NEVER confuse that with an
+    # empty candidate list, which means "I looked at every feature". The
+    # candidates come best-first, and every one of them is still verified
+    # live below: the index is a pre-filter, never a proof.
+    if geom_index is not None:
+        try:
+            candidates = geom_index.candidate_fids(geom)
+        except Exception as exc:  # noqa: BLE001 - never block on the index
+            flog(f"_find_existing_by_snapshot: index failed: {exc}", "WARNING")
+            candidates = None
+        if candidates is not None:
+            for fid in candidates:
+                try:
+                    feat = layer.getFeature(fid)
+                except (AttributeError, RuntimeError):
+                    continue
+                if feat is None or not feat.isValid():
+                    continue
+                if _feature_geometry_matches(feat, geom):
+                    return fid
+            return None
     try:
         from qgis.core import QgsFeatureRequest
         request = QgsFeatureRequest()
