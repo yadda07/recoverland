@@ -22,7 +22,9 @@ from .geometry_utils import (
 )
 from .identity import get_identity_strength_for_layer
 from .support_policy import IdentityStrength
-from .serialization import is_layer_audit_field, iter_mapped_attributes
+from .serialization import (
+    deserialize_value, is_layer_audit_field, iter_mapped_attributes,
+)
 from .logger import flog
 from ..compat import QgisCompat
 
@@ -41,9 +43,32 @@ def _qgis_vals_equal(actual, expected) -> bool:
     provider returns the same instant in a different timeSpec (e.g. UTC vs
     OffsetFromUTC), naive toString produces different digits for the same
     instant.  We try UTC-normalized comparison as fallback.
+
+    Binary fields (BL-SER-P0-01): the write side of this module decodes
+    every restored value through ``iter_mapped_attributes`` /
+    ``deserialize_value``, so a restored blob sits in the layer as the
+    QByteArray it always was, while the event still carries the ``b64:``
+    text of those same bytes. Comparing the two raw says "different" on
+    two identical values, and every lookup built on this function goes
+    blind on any layer holding an attachment: the idempotence guard of
+    ``restore_deleted_feature`` stops recognising the feature it just
+    wrote (replay adds a copy), the attribute rescue scan finds nothing,
+    and the strict snapshot scan falls through to its lenient branch,
+    which accepts a candidate it could not prove. So the journal side is
+    decoded with the SAME decoder the write side uses -- driven here by
+    the runtime type of the live value, the only type information a
+    comparison has -- before being compared.
     """
     if actual == expected:
         return True
+    decoded = _decoded_like(expected, actual)
+    if decoded is not expected:
+        try:
+            if actual == decoded:
+                return True
+        except (TypeError, ValueError):
+            # Benign: two types the provider never puts side by side.
+            pass
     try:
         from qgis.PyQt.QtCore import QDate, QDateTime, QTime
         if isinstance(actual, QDate) and not isinstance(actual, QDateTime):
@@ -65,6 +90,30 @@ def _qgis_vals_equal(actual, expected) -> bool:
     except ImportError:
         pass
     return False
+
+
+def _decoded_like(value, actual):
+    """Journal *value* decoded into the runtime type of *actual*.
+
+    ``deserialize_value`` keys on a type NAME, and the names it accepts
+    include the Python/Qt ones (``QByteArray``, ``QDateTime``, ``str``,
+    ``int``...), so the live value read from the layer can stand in for
+    the field metadata a bare comparison does not carry.
+
+    Returns *value* itself when nothing was decoded (unknown type, value
+    already in that type, decoder refusal), which the caller uses as the
+    signal to skip the extra comparison. Never raises: a comparison that
+    explodes would abort a scan and lose a restore, and an undecodable
+    payload is exactly what the caller's raw comparison already covers.
+    """
+    if value is None or actual is None:
+        return value
+    try:
+        return deserialize_value(value, type(actual).__name__)
+    except (TypeError, ValueError, OverflowError) as exc:
+        flog(f"_decoded_like: decode failed for {type(actual).__name__}: "
+             f"{exc}", "DEBUG")
+        return value
 
 
 def _qdatetime_matches_str(dt, s) -> bool:

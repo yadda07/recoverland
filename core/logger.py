@@ -193,6 +193,18 @@ _KV_QUOTE_TRIGGERS = (" ", "=", '"', "'", "\n", "\t")
 # path already present in the log for no gain.
 _KV_LINE_BREAKS = (("\r\n", "\\n"), ("\n", "\\n"), ("\r", "\\r"))
 
+# A value carrying BOTH quote characters cannot be wrapped as it is: the
+# reference parser (`scripts/validation/parse_log._KV_RE`) closes its
+# capture on the first raw delimiter found inside the value, and putting a
+# backslash in front of that delimiter does not help since the parser
+# never unescapes. It then cuts the value short AND reads the leftover
+# tail as key=value pairs, so a layer name quoting an `eid=999` rewrites
+# the real `eid` of the line. Emitting the double quote as its unicode
+# escape leaves no quote character inside the wrapper, so only the writer
+# can close it: the value comes back whole and the other pairs of the
+# line keep their real values.
+_KV_DQUOTE_ESCAPE = "\\u0022"
+
 
 def _escape_line_breaks(s: str) -> str:
     for raw, escaped in _KV_LINE_BREAKS:
@@ -214,8 +226,9 @@ def _format_kv_value(value) -> str:
         - no special character        -> bare token
         - contains double quote only  -> wrapped in single quotes
         - contains single quote only  -> wrapped in double quotes
-        - contains both quote types   -> wrapped in double quotes with
-          backslash escape (unambiguous but requires a tolerant parser)
+        - contains both quote types   -> wrapped in double quotes, inner
+          double quotes emitted as \\u0022 so nothing inside the value can
+          close the wrapper
         - other special character     -> wrapped in double quotes
     """
     s = _escape_line_breaks(str(value))
@@ -228,8 +241,10 @@ def _format_kv_value(value) -> str:
     if has_double and not has_single:
         return f"'{s}'"
     if has_double and has_single:
-        s = s.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{s}"'
+        # Backslashes are left alone here on purpose, as everywhere else
+        # in this module: doubling them would rewrite every Windows path
+        # of the log, and they are no longer used as an escape character.
+        return '"{}"'.format(s.replace('"', _KV_DQUOTE_ESCAPE))
     return f'"{s}"'
 
 

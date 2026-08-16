@@ -98,6 +98,79 @@ def _flog_events(label: str, events, trace_id: str = "") -> None:
              f"identity={(e.feature_identity_json or '')[:80]}")
 
 
+def _restore_buckets(result, partial_n: int = 0, report=None) -> dict:
+    """Bucket a finished restore the way CYCLE_SUMMARY buckets it.
+
+    RLU-055. Measured on a real rewind (2026-08-12), the plan carried 73
+    actions: 6 entities came back, 3 were already at the target state, 5
+    were refused for geometry drift and 59 had no target left. The log
+    line said exactly that; the dialog, built from `total_ok` and
+    `total_fail`, said "14 restauree(s), 59 echouee(s)".
+
+    Both numbers were wrong in the direction that hurts: `total_ok`
+    counts everything the provider did not reject (the 6 writes plus the
+    3 skips plus the 5 refusals), so it announces 14 entities restored
+    when 6 came back; `total_fail` counts only the actions that reached
+    the writer, so it hides 5 of the 64 failures. And 14 + 59 = 73 by
+    coincidence, which is what made the line look complete.
+
+    So the message is built from the same buckets as the log line, and
+    from nothing else:
+
+        applied + applied_partial + skipped + failed (+ cancelled)
+            == the plan
+
+    `report` is ``runner.apply_report()``: the only source that knows the
+    plan size, the partial writes and the actions a cancel never
+    attempted. Without it (the runner was already released) the buckets
+    are rebuilt from the emitted result, which carries every failure
+    category but no plan base -- `plan_known` tells the caller which of
+    the two it is reading, so a partial count is never displayed as a
+    plan.
+    """
+    if report:
+        applied = int(report.get("applied", 0) or 0)
+        partial = int(report.get("applied_partial", 0) or 0)
+        skipped = int(report.get("apply_skipped", 0) or 0)
+        # `apply_fail` is the failure TOTAL; the residual bucket that the
+        # runner also publishes under the short name `failed` is only one
+        # of its three parts (see restore_runner._apply_counters).
+        failed_total = int(report.get("apply_fail", 0) or 0)
+        absent = int(report.get("failed_target_absent", 0) or 0)
+        drift = int(report.get("failed_geometry_drift", 0) or 0)
+        other = int(report.get("failed_other", 0) or 0)
+        cancelled = int(report.get("cancelled", 0) or 0)
+        planned = int(report.get("plan_actions", 0) or 0)
+        plan_known = True
+    else:
+        applied = int(getattr(result, "applied", 0) or 0)
+        partial = int(partial_n or 0)
+        skipped = int(getattr(result, "skipped_idempotent", 0) or 0)
+        absent = int(getattr(result, "failed_target_absent", 0) or 0)
+        drift = int(getattr(result, "failed_geometry_drift", 0) or 0)
+        # `GroupedRestoreResult.failed` is the RESIDUAL bucket, not the
+        # total: the contract in core/workflow_service.py says so, and
+        # displaying it as the total is the defect this function exists
+        # to close.
+        other = int(getattr(result, "failed", 0) or 0)
+        failed_total = absent + drift + other
+        cancelled = 0
+        planned = applied + partial + skipped + failed_total
+        plan_known = False
+    return {
+        "applied": applied,
+        "applied_partial": partial,
+        "skipped": skipped,
+        "failed_total": failed_total,
+        "failed_absent": absent,
+        "failed_drift": drift,
+        "failed_other": other,
+        "cancelled": cancelled,
+        "planned": planned,
+        "plan_known": plan_known,
+    }
+
+
 class RecoverDialog(QDialog, LoggerMixin):
     """Main dialog for RecoverLand plugin."""
 
@@ -221,6 +294,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._restore_started_at = 0.0
         self._pending_restore_feedback = None
         self._restore_runner = None
+        # RLU-055: a cancelled runner still finishes; the dialog keeps it
+        # here so the end-of-run message reads its buckets instead of
+        # falling back to raw totals.
+        self._cancelled_restore_runner = None
         self._last_restore_events = None
         self._last_restore_by_ds = None
         self._pending_rewind_events = None
@@ -3659,9 +3736,14 @@ class RecoverDialog(QDialog, LoggerMixin):
         # RLU-053: read the partial bucket off the runner BEFORE dropping
         # the reference; it is the only place that knows which captured
         # fields the buffer had to abandon on the way in.
-        partial_n, partial_fields = self._partial_restore_report(
-            self._restore_runner)
+        # RLU-055: `_cancelled_restore_runner` is the runner a cancel
+        # already detached; it keeps running to its own _finish, and its
+        # report is the only truthful account of what the user got.
+        runner = self._restore_runner or self._cancelled_restore_runner
+        partial_n, partial_fields = self._partial_restore_report(runner)
+        apply_report = self._runner_apply_report(runner)
         self._restore_runner = None
+        self._cancelled_restore_runner = None
         cleanup_temp_layers()
         self._smooth_set_progress(100)
         self._stop_logo_activity()
@@ -3696,23 +3778,24 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         detail_lines = self._build_restore_summary(result.by_ds)
         partial_line = self._format_partial_restore(partial_n, partial_fields)
-        if result.total_fail == 0 and not result.errors and not partial_line:
-            summary = self.tr("{count} entite(s) restauree(s) avec succes.").format(count=result.total_ok)
-            qlog(summary + detail_lines)
-        elif result.total_fail == 0 and not result.errors:
-            # RLU-053: nothing failed, yet some features came back without
-            # every captured field. "avec succes" would send the user away
-            # convinced his entities are back as they were, when part of
-            # them still carries today's values.
-            summary = self.tr(
-                "{count} entite(s) restauree(s), dont {partial} incomplete(s)."
-            ).format(count=result.total_ok, partial=partial_n)
-            qlog(summary + partial_line + detail_lines, "WARNING")
-        else:
-            msg = self.tr("{ok} restauree(s), {fail} echouee(s).").format(ok=result.total_ok, fail=result.total_fail)
-            if result.errors:
-                msg += " | " + " | ".join(result.errors[:5])
-            qlog(msg + partial_line + detail_lines, "WARNING")
+        # RLU-055: the same buckets as the CYCLE_SUMMARY line of this run.
+        # `total_ok` / `total_fail` describe neither the entities that came
+        # back nor the failures: see `_restore_buckets`.
+        buckets = _restore_buckets(result, partial_n=partial_n,
+                                   report=apply_report)
+        msg = self._format_restore_outcome(buckets)
+        clean = (buckets["failed_total"] == 0 and buckets["cancelled"] == 0
+                 and not result.errors and not partial_line)
+        if result.errors:
+            msg += " | " + " | ".join(result.errors[:5])
+        qlog(msg + partial_line + detail_lines,
+             "INFO" if clean else "WARNING")
+        flog(f"[{trace_id}] recover_version: report planned={buckets['planned']} "
+             f"applied={buckets['applied']} "
+             f"partial={buckets['applied_partial']} "
+             f"skipped={buckets['skipped']} failed={buckets['failed_total']} "
+             f"cancelled={buckets['cancelled']} "
+             f"plan_known={buckets['plan_known']}")
 
         if result.total_ok > 0:
             flog(f"recover_version: refreshing canvas for {result.total_ok} ok")
@@ -3787,6 +3870,26 @@ class RecoverDialog(QDialog, LoggerMixin):
             return (0, ())
         return (int(count or 0), tuple(fields or ()))
 
+    def _runner_apply_report(self, runner):
+        """RLU-055: the buckets the runner just published, or ``None``.
+
+        Asked in the ``finished`` slot, before the reference is dropped,
+        so the message the user reads carries the numbers of the
+        CYCLE_SUMMARY line of the same run. ``None`` for a runner that
+        classifies nothing per action (undo): inventing zeroed buckets
+        for it would read as "no failure", which is exactly the lie this
+        whole path is closing.
+        """
+        reader = getattr(runner, "apply_report", None)
+        if not callable(reader):
+            return None
+        try:
+            report = dict(reader())
+        except Exception as exc:  # noqa: BLE001 - a report never crashes
+            flog(f"apply_report: unreadable: {exc}", "WARNING")
+            return None
+        return report
+
     def _format_partial_restore(self, count: int, fields: tuple) -> str:
         """One line naming the fields a rewind could not put back.
 
@@ -3807,6 +3910,70 @@ class RecoverDialog(QDialog, LoggerMixin):
             "{count} entite(s) reecrite(s) sans tous leurs champs captures "
             "(le schema de la couche a change depuis la capture)."
         ).format(count=count)
+
+    def _format_restore_outcome(self, buckets: dict) -> str:
+        """The end-of-run message: one bucket per outcome, totalling the plan.
+
+        RLU-055. The buckets come from `_restore_buckets`, i.e. from the
+        report the runner published, never from `total_ok`/`total_fail`:
+        the run measured on 2026-08-12 planned 73 actions, brought 6
+        entities back and was announced as "14 restauree(s), 59
+        echouee(s)". Named one by one, the same run reads:
+
+            73 action(s) planifiee(s) : 6 restauree(s), 3 deja a l'etat
+            cible, 64 echouee(s) (59 sans cible, 5 refusee(s) pour
+            derive de geometrie).
+
+        A skip is not a failure and never joins the failure count: the
+        entity is already in the state the user asked for. It is not a
+        restoration either, so it stays out of "restauree(s)" as well -
+        that is why the two numbers are printed side by side instead of
+        being merged into one reassuring total.
+        """
+        applied = buckets["applied"]
+        planned = buckets["planned"]
+        if buckets["plan_known"] and planned and applied == planned:
+            return self.tr(
+                "{count} entite(s) restauree(s) avec succes."
+            ).format(count=applied)
+
+        parts = [self.tr("{count} restauree(s)").format(count=applied)]
+        if buckets["applied_partial"]:
+            parts.append(self.tr("{count} incomplete(s)").format(
+                count=buckets["applied_partial"]))
+        if buckets["skipped"]:
+            parts.append(self.tr("{count} deja a l'etat cible").format(
+                count=buckets["skipped"]))
+        if buckets["failed_total"]:
+            reasons = []
+            if buckets["failed_absent"]:
+                reasons.append(self.tr("{count} sans cible").format(
+                    count=buckets["failed_absent"]))
+            if buckets["failed_drift"]:
+                reasons.append(
+                    self.tr("{count} refusee(s) pour derive de geometrie")
+                    .format(count=buckets["failed_drift"]))
+            if buckets["failed_other"]:
+                reasons.append(self.tr("{count} pour une autre raison").format(
+                    count=buckets["failed_other"]))
+            failed_text = self.tr("{count} echouee(s)").format(
+                count=buckets["failed_total"])
+            if reasons:
+                failed_text += " (" + ", ".join(reasons) + ")"
+            parts.append(failed_text)
+        if buckets["cancelled"]:
+            parts.append(self.tr("{count} annulee(s) avant tentative").format(
+                count=buckets["cancelled"]))
+
+        details = ", ".join(parts)
+        if buckets["plan_known"]:
+            return self.tr("{planned} action(s) planifiee(s) : {details}.").format(
+                planned=planned, details=details)
+        # No plan base available (the runner was released before the
+        # report could be read): state what was accounted for, and do not
+        # pass that sum off as the size of the plan.
+        return self.tr("{total} action(s) comptabilisee(s) : {details}.").format(
+            total=planned, details=details)
 
     def _build_restore_summary(self, by_ds: dict) -> str:
         """Build per-layer operation breakdown from by_ds event groups."""
@@ -3898,22 +4065,33 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._flush_deferred("_pending_restore_feedback", self._display_restore_feedback)
 
     def _display_restore_feedback(self, feedback) -> None:
-        total_ok, total_fail, errors = feedback
+        """RLU-055: report an event restore by its buckets, like the log."""
+        buckets, errors = feedback
         self.progress_bar.setVisible(False)
         self._stop_logo_activity()
         self.restore_button.setEnabled(bool(self.selected_rows))
         self.recover_button.setEnabled(True)
 
-        if total_ok > 0 and total_fail == 0 and not errors:
-            qlog(self.tr("{count} entite(s) restauree(s) avec succes.").format(count=total_ok))
-        elif total_ok > 0:
-            msg = self.tr("{ok} restauree(s), {fail} echouee(s).").format(ok=total_ok, fail=total_fail)
+        written = buckets["applied"] + buckets["applied_partial"]
+        failed = buckets["failed_total"]
+        if buckets["planned"] == 0 and errors:
+            # Nothing was even attempted: the errors are the whole story.
+            qlog("Restauration: " + " | ".join(errors[:5]), "ERROR")
+        else:
+            msg = self._format_restore_outcome(buckets)
             if errors:
                 msg += " | " + " | ".join(errors[:5])
-            qlog(msg, "WARNING")
-        else:
-            qlog("Restauration: " + " | ".join(errors[:5]), "ERROR")
-        if total_ok > 0:
+            if written == 0 and (failed or errors):
+                # Nothing came back: severity of the previous message,
+                # kept on a count the user can act on.
+                level = "ERROR"
+            elif failed or errors or buckets["applied_partial"] \
+                    or buckets["cancelled"]:
+                level = "WARNING"
+            else:
+                level = "INFO"
+            qlog(msg, level)
+        if written > 0:
             self.iface.mapCanvas().refreshAllLayers()
 
     def _populate_results_table(self, events, total: int) -> None:
@@ -4097,6 +4275,11 @@ class RecoverDialog(QDialog, LoggerMixin):
             by_ds = dict(getattr(self._restore_runner, '_by_ds', {}))
             is_strict = isinstance(self._restore_runner, StrictRestoreRunner)
             self._restore_runner.cancel()
+            # RLU-055: cancel() only asks; the runner still walks to its
+            # own _finish and emits `finished`. Keeping it reachable is
+            # what lets the final message count the actions the user
+            # cancelled as cancelled, and not as failures.
+            self._cancelled_restore_runner = self._restore_runner
             self._restore_runner = None
             self._restore_in_progress = False
             self._stop_logo_activity()
@@ -4355,7 +4538,12 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _on_event_restore_done(self, result) -> None:
         trace_id = self._active_restore_trace_id
         self._restore_in_progress = False
+        # RLU-055: read the buckets before the reference goes, exactly
+        # like the rewind path does.
+        runner = self._restore_runner or self._cancelled_restore_runner
+        apply_report = self._runner_apply_report(runner)
         self._restore_runner = None
+        self._cancelled_restore_runner = None
         cleanup_temp_layers()
         self._smooth_set_progress(100)
         if trace_id:
@@ -4378,7 +4566,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         if result.total_ok > 0:
             self._open_attribute_tables_if_requested(result.by_ds, "event")
 
-        feedback = (result.total_ok, result.total_fail, tuple(result.errors))
+        # RLU-055: the deferred feedback carries the buckets, not the two
+        # totals it used to carry: the message built from `total_ok` /
+        # `total_fail` announced entities that never came back and hid
+        # part of the failures (see `_restore_buckets`).
+        buckets = _restore_buckets(result, report=apply_report)
+        feedback = (buckets, tuple(result.errors))
         elapsed = time.monotonic() - self._restore_started_at
         remaining = _MIN_RESTORE_ANIMATION_SEC - elapsed
         if remaining > 0:
@@ -4944,6 +5137,8 @@ class RecoverDialog(QDialog, LoggerMixin):
                 if self._tracker is not None and self._tracker.is_suppressed:
                     self._tracker.force_unsuppress()
                 self._restore_runner = None
+            # The dialog is going away: nobody will read that report.
+            self._cancelled_restore_runner = None
 
             # Stop progress timer
             if hasattr(self, 'progress_timer') and self.progress_timer.isActive():

@@ -65,6 +65,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -168,6 +169,73 @@ def _open_journal(tmpdir: str):
     return jm, wq
 
 
+def _journal_row_count(jm) -> int:
+    """Number of rows currently visible in `audit_event`, -1 if unreadable."""
+    try:
+        conn = jm.create_read_connection()
+    except Exception:  # noqa: BLE001 - journal not readable yet
+        return -1
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM audit_event").fetchone()
+        return int(row[0]) if row else 0
+    except Exception:  # noqa: BLE001 - schema not ready yet
+        return -1
+    finally:
+        conn.close()
+
+
+class _WriteQueueBarrier:
+    """Deterministic barrier on the WriteQueue, in place of a fixed delay.
+
+    Sleeping a fixed 100 ms after a commit raced with the writer thread,
+    which idles up to 0.1 s between two drains: the second edit was
+    counted on three runs out of four and missed on the fourth. Polling
+    `pending_count == 0` is not a barrier either -- the writer removes a
+    batch from the queue BEFORE committing it, so the queue reads empty
+    while the rows are still not in the journal.
+
+    The exact condition is: every event the tracker handed over and the
+    queue ACCEPTED (`enqueue` returned True) is visible in `audit_event`.
+    `enqueue` is wrapped to count the hand-over, the journal itself is
+    polled for the arrival.
+
+    This relaxes nothing. The barrier waits for what the CAPTURE side
+    acknowledged, never for what the assertions expect: if the plugin
+    files the second edit under another fingerprint, the row lands, the
+    barrier releases at once, and `all_edits_land_under_one_fingerprint`
+    fails exactly as it did before. If the plugin captures nothing at
+    all, the barrier has nothing to wait for and returns immediately.
+    """
+
+    def __init__(self, wq):
+        self._lock = threading.Lock()
+        self._accepted = 0
+        self._inner_enqueue = wq.enqueue
+        wq.enqueue = self._enqueue
+
+    def _enqueue(self, events):
+        ok = self._inner_enqueue(events)
+        if ok:
+            with self._lock:
+                self._accepted += len(events)
+        return ok
+
+    @property
+    def accepted(self) -> int:
+        with self._lock:
+            return self._accepted
+
+    def wait(self, jm, timeout_s: float = 10.0) -> bool:
+        """Block until the journal holds every accepted event."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if _journal_row_count(jm) >= self.accepted:
+                return True
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.01)
+
+
 def _events_for(jm, fingerprint: str, expected_min: int = 0,
                 timeout_s: float = 5.0):
     from recoverland.core.audit_backend import SearchCriteria
@@ -251,6 +319,10 @@ def _phase_filter_split(ctx) -> dict:
         out["state_before"] = _state(layer)
 
         jm, wq = _open_journal(jrnl)
+        # Wrap enqueue BEFORE the tracker exists so every hand-over is
+        # counted. Deliberately not the flush callback: activate() below
+        # registers the tracker's own and would overwrite ours.
+        barrier = _WriteQueueBarrier(wq)
         tracker = EditSessionTracker(wq, jm)
         tracker.activate()
         tracker.connect_layer(layer)
@@ -264,6 +336,7 @@ def _phase_filter_split(ctx) -> dict:
         fp_bare = compute_datasource_fingerprint(layer)
         out["fp_bare"] = fp_bare
         out["edit_bare_ok"] = _rename(layer, "ALPHA", "EDIT_NU")
+        out["queue_drained_t1"] = barrier.wait(jm)
         out["events_bare_after_t1"] = len(
             _events_for(jm, fp_bare, expected_min=1))
 
@@ -278,6 +351,11 @@ def _phase_filter_split(ctx) -> dict:
 
         # --- t3 : edition sur la couche filtree --------------------------
         out["edit_filtered_ok"] = _rename(layer, "GAMMA", "EDIT_FILTRE")
+        # The journal now holds every event the queue accepted: the two
+        # counts below and the rewind at t4 all read a settled journal.
+        out["queue_drained_t3"] = barrier.wait(jm)
+        out["events_accepted"] = barrier.accepted
+        out["events_in_journal"] = _journal_row_count(jm)
         out["events_filtered_fp"] = len(
             _events_for(jm, fp_filtered,
                         expected_min=0 if out["fp_identical"] else 1))
@@ -300,6 +378,9 @@ def _phase_filter_split(ctx) -> dict:
         flog(
             f"tx_prov_fingerprint_split phase_filter: "
             f"fp_identical={out['fp_identical']} "
+            f"queue_drained={out['queue_drained_t1']}/{out['queue_drained_t3']} "
+            f"accepted={out['events_accepted']} "
+            f"in_journal={out['events_in_journal']} "
             f"events_bare={out['events_bare_fp']} "
             f"events_filtered={out['events_filtered_fp']} "
             f"rewind={out.get('rewind')} restored={out['fully_restored']} "
