@@ -12,13 +12,14 @@ from .restore_contracts import (
     RestorePlan, AtomicityPolicy, PreflightVerdict,
     RestoreSession,
 )
+from .constants import MAKEVALID_DRIFT_TOLERANCE
 from .restore_planner import preflight_check
 from .restore_service import restore_batch, build_restore_trace_event
 from .search_service import reconstruct_attributes
 from .schema_drift import (
     safe_field_mapping, field_mapping_report, format_dropped_fields,
 )
-from .constants import MAKEVALID_DRIFT_TOLERANCE
+
 from .geometry_utils import (
     rebuild_geometry, is_geometry_present,
     feature_matches_geometry, get_feature_source,
@@ -699,6 +700,7 @@ def _buffer_update(layer, event: AuditEvent,
     """
     from .restore_service import (
         _parse_identity, _find_target_feature, _verify_update_target,
+        _target_already_at_old,
     )
 
     identity = _parse_identity(event.feature_identity_json)
@@ -743,6 +745,20 @@ def _buffer_update(layer, event: AuditEvent,
                      f"fid={target_fid}→fallback={fallback_fid} "
                      f"post_chk=recovered")
                 target_fid = fallback_fid
+            elif _target_already_at_old(layer, target_fid, event, mapping):
+                # BL-RW-P5-28: the proof asks "does it still carry NEW?".
+                # A feature already rolled back to OLD answers no, and the
+                # rewind refused to do nothing. There is no corruption
+                # surface in writing OLD over OLD, so this is a skip.
+                flog(f"BUF_UPD eid={event.event_id} fid={target_fid} "
+                     f"already_at_old status=SKIPPED_IDEMPOTENT")
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "status": "SKIPPED_IDEMPOTENT",
+                    "reason_code": "already_at_old",
+                    "message": "Already at the pre-edit state; nothing to do",
+                }
             else:
                 flog(f"BUF_UPD eid={event.event_id} fid={target_fid} "
                      f"unverified reason={why} no_fallback status=refused "
@@ -818,6 +834,11 @@ def _buffer_update(layer, event: AuditEvent,
                 "reason_code": "rebuilt_empty",
                 "message": "Geometry rebuilt empty",
             }
+        # BL-RW-P5-28 deferred writing the captured bytes as-is: the
+        # provider does NOT refuse a geometry it cannot store, it truncates
+        # at commit (tx_geom_makevalid_shape_swap). The guard below is what
+        # stands between the user and a silent amputation until a
+        # post-commit read-back exists.
         if not geom.isGeosValid():
             geom_before_makevalid = geom
             repaired = geom.makeValid()
@@ -1069,13 +1090,29 @@ def _find_existing_by_snapshot(layer, geom):
 
 
 def _find_update_target_by_post_state(layer, event):
+    """FID of the feature that still carries this event's NEW state.
+
+    Geometry first when the event captured one. BL-RW-P5-28: an
+    attribute-only edit used to return None here without reading a single
+    feature, so a pure attribute UPDATE had NO relocation path at all --
+    6 refusals on the user's run of 2026-08-14 whose target was sitting
+    in the layer under a shifted FID. `_find_by_attrs_only` already does
+    exactly this job for the DELETE path, ambiguity refusal included.
+    """
+    from .restore_service import _find_by_attrs_only
+    from .search_service import reconstruct_new_attributes
+
     new_wkb = getattr(event, "new_geometry_wkb", None)
-    if new_wkb is None:
+    if new_wkb is not None:
+        geom = rebuild_geometry(new_wkb)
+        if not is_geometry_present(geom):
+            return None
+        return _find_existing_by_snapshot(layer, geom)
+
+    new_attrs = reconstruct_new_attributes(event)
+    if not new_attrs:
         return None
-    geom = rebuild_geometry(new_wkb)
-    if not is_geometry_present(geom):
-        return None
-    return _find_existing_by_snapshot(layer, geom)
+    return _find_by_attrs_only(layer, event, expected_attrs=new_attrs)
 
 
 def _target_matches_update_post_state(layer, fid: int, event) -> bool:

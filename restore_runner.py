@@ -16,7 +16,9 @@ from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 from .core.audit_backend import AuditEvent
 from .core.restore_service import (
     restore_batch,
-    undo_restore_batch,
+    undo_prepare,
+    undo_apply_one,
+    UndoBatchContext,
     build_fid_cache,
     build_restore_trace_event,
 )
@@ -44,6 +46,13 @@ _CHUNK_SIZE = 5
 # when actions are cheap.
 _CHUNK_BUDGET_MS = 40.0
 _CHUNK_MAX_ACTIONS = 50
+
+# Threshold above which a single chunk is suspected of freezing the UI
+# thread (Windows reports "(Ne repond pas)" around 5 s, but the animation
+# visibly stutters from ~150-200 ms onwards). Shared by the strict runner
+# and the undo runner: both bound their ticks the same way, so both must
+# name the layer that blew the budget the same way.
+_CHUNK_SLOW_MS = 200
 
 
 def _chunk_should_yield(elapsed_ms: float, n_done: int,
@@ -918,11 +927,6 @@ class StrictRestoreRunner(QObject):
             self._errors.append(f"Internal error: {exc}")
             self._rollback_strict(prefix, "internal_crash")
 
-    # Threshold above which a single chunk is suspected of freezing the
-    # UI thread (Windows reports "(Ne repond pas)" around 5 s, but the
-    # animation visibly stutters from ~150-200 ms onwards).
-    _CHUNK_SLOW_MS = 200
-
     def _process_strict_chunk_inner(self) -> None:
         """Inner chunk logic, called by _process_strict_chunk with crash guard."""
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
@@ -1036,7 +1040,7 @@ class StrictRestoreRunner(QObject):
         self.progress.emit(self._processed, len(self._events))
 
         chunk_elapsed_ms = (time.monotonic() - chunk_t0) * 1000.0
-        if chunk_elapsed_ms > self._CHUNK_SLOW_MS:
+        if chunk_elapsed_ms > _CHUNK_SLOW_MS:
             flog(f"{prefix}CHUNK_SLOW layer={self._strict_layer_name!r} "
                  f"actions={start}..{end} n={end - start} "
                  f"elapsed_ms={chunk_elapsed_ms:.0f}", "WARNING")
@@ -1382,6 +1386,17 @@ class UndoRunner(QObject):
         self._failed_eids: List[int] = []
         self._processed = 0
 
+        # Per-layer chunk state (BL-RW-P5-27), reset at every
+        # _process_next_group and consumed by _process_undo_chunk.
+        self._undo_layer = None
+        self._undo_layer_name = ""
+        self._undo_group: List[AuditEvent] = []
+        self._undo_context: Optional[UndoBatchContext] = None
+        self._undo_action_idx = 0
+        self._undo_ok = 0
+        self._undo_fail = 0
+        self._undo_count_before = -1
+
     def start(self) -> None:
         total_events = sum(len(g) for g in self._by_ds.values())
         flog(f"UndoRunner: start layers={len(self._groups)} "
@@ -1398,6 +1413,7 @@ class UndoRunner(QObject):
         self._cancelled = True
 
     def _process_next_group(self) -> None:
+        """Open the next layer group, then hand over to the chunk loop."""
         if self._cancelled or self._group_idx >= len(self._groups):
             self._finish()
             return
@@ -1406,9 +1422,15 @@ class UndoRunner(QObject):
         layer_name_hint = group[0].layer_name_snapshot if group else '?'
         flog(f"UndoRunner: process_group idx={self._group_idx} "
              f"layer={layer_name_hint!r} n_events={len(group)}")
-        for e in group:
-            flog(f"  UndoRunner event: op={e.operation_type} eid={e.event_id} "
-                 f"identity={(e.feature_identity_json or '')[:80]}")
+        # BL-RW-P5-27: this dump cost 130 ms of frozen UI for 1340 events
+        # BEFORE any useful work (measured, trace a1517527). The aggregated
+        # line above says how many; the detail is worth an opt-in, not a
+        # freeze.
+        if heavy_diag_enabled():
+            for e in group:
+                flog(f"  UndoRunner event: op={e.operation_type} "
+                     f"eid={e.event_id} "
+                     f"identity={(e.feature_identity_json or '')[:80]}")
         layer, errors = _resolve_runner_layer(
             self._find_layer_fn, group, fp,
             runner_name="UndoRunner",
@@ -1423,42 +1445,218 @@ class UndoRunner(QObject):
             QTimer.singleShot(0, self._process_next_group)
             return
 
-        count_before = layer.featureCount()
-        report = undo_restore_batch(layer, group)
-        self._total_ok += len(report.succeeded)
-        self._total_fail += len(report.failed)
-        for eid, msg in report.failed.items():
-            self._errors.append(f"Evt {eid}: {msg}")
-            self._failed_eids.append(eid)
-        if report.succeeded:
-            layer.reload()
-            if heavy_diag_enabled():
-                import json as _json
-                geom_check = {}
-                for ev in group:
-                    if getattr(ev, 'new_geometry_wkb', None) is not None:
-                        try:
-                            fid = _json.loads(ev.feature_identity_json).get('fid')
-                            if fid is not None:
-                                geom_check[fid] = feature_geom_short_repr(layer, fid)
-                        except Exception:
-                            pass
-                flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
-                     f"geom_after_reload={geom_check}")
-            else:
-                flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
-                     f"geom_after_reload=diag_off "
-                     f"(set RECOVERLAND_HEAVY_DIAG=1 to enable)")
-        count_after = layer.featureCount()
-        flog(f"UndoRunner: group_done layer={layer_name_hint!r} "
-             f"ok={len(report.succeeded)} fail={len(report.failed)} "
-             f"feat_before={count_before} feat_after={count_after}")
-        layer.triggerRepaint()
+        context = undo_prepare(layer, group)
+        if context.layer_error:
+            flog(f"UndoRunner: layer refused layer={layer_name_hint!r} "
+                 f"reason={context.layer_error}", "ERROR")
+            for event in group:
+                eid = event.event_id or 0
+                self._errors.append(f"Evt {eid}: {context.layer_error}")
+                self._failed_eids.append(eid)
+            self._total_fail += len(group)
+            self._processed += len(group)
+            self.progress.emit(self._processed, self._total_events)
+            self._group_idx += 1
+            QTimer.singleShot(0, self._process_next_group)
+            return
 
-        self._processed += len(group)
-        self.progress.emit(self._processed, self._total_events)
-        self._group_idx += 1
-        QTimer.singleShot(0, self._process_next_group)
+        # Per-layer state, built once and carried across every tick of this
+        # group: rebuilding `ordered` or `fid_cache` mid-group would change
+        # the result, not just the cost (see UndoBatchContext).
+        self._undo_layer = layer
+        self._undo_layer_name = layer_name_hint
+        self._undo_group = group
+        self._undo_context = context
+        self._undo_action_idx = 0
+        self._undo_ok = 0
+        self._undo_fail = 0
+        self._undo_count_before = layer.featureCount()
+        QTimer.singleShot(0, self._process_undo_chunk)
+
+    def _process_undo_chunk(self) -> None:
+        """Apply a time-bounded slice of the current layer group."""
+        try:
+            self._process_undo_chunk_inner()
+        except Exception as exc:  # noqa: BLE001 - a crash must not wedge the run
+            flog(f"UndoRunner: CRASH in chunk: {exc}", "CRITICAL")
+            self._errors.append(f"Internal error: {exc}")
+            if self._undo_context is not None:
+                self._finish_undo_group()
+            else:
+                # The group closed itself before raising, and its `finally`
+                # already advanced the cursor and armed the next step.
+                # Closing again would skip a layer and put two chains on
+                # the same runner.
+                flog("UndoRunner: crash after group close, chain already armed",
+                     "WARNING")
+
+    def _process_undo_chunk_inner(self) -> None:
+        layer = self._undo_layer
+        context = self._undo_context
+        ordered = context.ordered
+        start = self._undo_action_idx
+        chunk_t0 = time.monotonic()
+
+        if self._cancelled:
+            # Stop where we are: what is already written stays written, and
+            # the untouched tail is reported as unprocessed by _finish.
+            flog(f"UndoRunner: cancel_requested "
+                 f"layer={self._undo_layer_name!r} "
+                 f"applied={self._undo_ok} of {len(ordered)}")
+            self._finish_undo_group()
+            return
+
+        # The layer was cleared by `_resolve_runner_layer` and
+        # `undo_prepare` before the FIRST tick only. Chunking is what makes
+        # QGIS answer during the run, so the user can now open an edit
+        # session on this very layer between two ticks -- and the writes
+        # below go straight to the provider, under his buffer: his next
+        # Save would replay his values over what we just reverted, on a
+        # layer this runner reports as fully undone.
+        if hasattr(layer, 'isEditable') and layer.isEditable():
+            msg = ("Couche passee en edition pendant l'annulation ; "
+                   "evenements restants abandonnes")
+            flog(f"UndoRunner: layer became editable mid-group "
+                 f"layer={self._undo_layer_name!r} "
+                 f"applied={self._undo_ok} of {len(ordered)}", "ERROR")
+            for event in ordered[self._undo_action_idx:]:
+                eid = event.event_id or 0
+                self._undo_fail += 1
+                self._errors.append(f"Evt {eid}: {msg}")
+                self._failed_eids.append(eid)
+            self._undo_action_idx = len(ordered)
+            self._finish_undo_group()
+            return
+
+        i = start
+        while i < len(ordered):
+            elapsed_ms = (time.monotonic() - chunk_t0) * 1000.0
+            if _chunk_should_yield(elapsed_ms, i - start):
+                break
+            event = ordered[i]
+            i += 1
+            result = undo_apply_one(layer, event, context)
+            eid = event.event_id or 0
+            if result["success"]:
+                self._undo_ok += 1
+            else:
+                self._undo_fail += 1
+                self._errors.append(
+                    f"Evt {eid}: {result.get('message', 'echec non decrit')}")
+                self._failed_eids.append(eid)
+
+        n_done = i - start
+        self._undo_action_idx = i
+        chunk_ms = (time.monotonic() - chunk_t0) * 1000.0
+        if chunk_ms >= _CHUNK_SLOW_MS:
+            # One action alone can blow the budget (the budget is only
+            # tested BETWEEN actions); saying so names the layer that needs
+            # an index rather than leaving a silent stall.
+            flog(f"UndoRunner: CHUNK_SLOW layer={self._undo_layer_name!r} "
+                 f"actions={start}..{i} n={n_done} "
+                 f"elapsed_ms={int(chunk_ms)} "
+                 f"feat_count={self._undo_count_before}", "WARNING")
+
+        # Progress is emitted per CHUNK, not per layer: one emission per
+        # layer left the bar frozen for 118 s on the user's run.
+        self.progress.emit(self._processed + self._undo_action_idx,
+                           self._total_events)
+
+        if self._undo_action_idx >= len(ordered):
+            self._finish_undo_group()
+            return
+        QTimer.singleShot(0, self._process_undo_chunk)
+
+    def _finish_undo_group(self) -> None:
+        """Close the current layer: reload, repaint, account, advance.
+
+        Two hard rules, both learned the hard way.
+
+        1. The group state is CLAIMED on entry, before the first call that
+           can raise, so this method is idempotent. It runs inside the
+           ``try`` of `_process_undo_chunk`, whose crash guard calls it
+           again: a second pass would credit the same events twice and
+           raise a second time, this time out of a QTimer slot. The chain
+           would die there -- and with it `_finish()`, whose ``finally``
+           is the only thing that releases the edit tracker.
+        2. Every QGIS call is guarded and the advance sits in a
+           ``finally``, so no provider failure can stop the run before
+           `_finish()`. This mirrors `_rollback_strict`, which always ends
+           on `QTimer.singleShot(0, self._advance_group)`.
+
+        `layer.reload()` lands HERE and nowhere else: dropped between two
+        chunks it would invalidate the provider FIDs the remaining events
+        of this same group still resolve against.
+        """
+        layer = self._undo_layer
+        layer_name_hint = self._undo_layer_name
+        group = self._undo_group
+        context = self._undo_context
+        n_ok, n_fail = self._undo_ok, self._undo_fail
+        # Claimed before anything fallible runs.
+        self._undo_layer = None
+        self._undo_context = None
+        self._undo_group = []
+        self._undo_ok = 0
+        self._undo_fail = 0
+
+        try:
+            if context is None or layer is None:
+                flog("UndoRunner: finish_group called with no open group, "
+                     "advancing", "WARNING")
+                return
+            ordered = context.ordered
+
+            self._total_ok += n_ok
+            self._total_fail += n_fail
+
+            count_after = -1
+            try:
+                if n_ok:
+                    layer.reload()
+                    if heavy_diag_enabled():
+                        import json as _json
+                        geom_check = {}
+                        for ev in group:
+                            if getattr(ev, 'new_geometry_wkb', None) is not None:
+                                try:
+                                    fid = _json.loads(
+                                        ev.feature_identity_json).get('fid')
+                                    if fid is not None:
+                                        geom_check[fid] = feature_geom_short_repr(
+                                            layer, fid)
+                                except Exception:
+                                    pass
+                        flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
+                             f"geom_after_reload={geom_check}")
+                    else:
+                        flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
+                             f"geom_after_reload=diag_off "
+                             f"(set RECOVERLAND_HEAVY_DIAG=1 to enable)")
+                count_after = layer.featureCount()
+                layer.triggerRepaint()
+            except Exception as exc:  # noqa: BLE001 - layer may be gone
+                # The writes already landed; only the refresh failed. Say
+                # so and keep going -- the alternative is a dead chain.
+                flog(f"UndoRunner: post-apply refresh failed "
+                     f"layer={layer_name_hint!r}: {exc}", "ERROR")
+                self._errors.append(
+                    f"Couche '{layer_name_hint}' non rafraichie: {exc}")
+
+            flog(f"UndoRunner: group_done layer={layer_name_hint!r} "
+                 f"ok={n_ok} fail={n_fail} "
+                 f"processed={self._undo_action_idx}/{len(ordered)} "
+                 f"feat_before={self._undo_count_before} "
+                 f"feat_after={count_after}")
+
+            # A cancelled group leaves a tail nobody applied; it must still
+            # be accounted, otherwise _processed never reaches
+            # _total_events and the bar stops short of the end.
+            self._processed += len(group)
+            self.progress.emit(self._processed, self._total_events)
+        finally:
+            self._group_idx += 1
+            QTimer.singleShot(0, self._process_next_group)
 
     def _finish(self) -> None:
         _finish_runner(

@@ -18,6 +18,7 @@ from .geometry_utils import (
     rebuild_geometry, is_geometry_present,
     feature_matches_geometry, get_feature_source,
     geometry_for_layer_crs, extract_crs_authid,
+    heavy_diag_enabled,
 )
 from .identity import get_identity_strength_for_layer
 from .support_policy import IdentityStrength
@@ -674,10 +675,57 @@ def _find_by_snapshot(
     return None
 
 
+def _target_already_at_old(layer, fid: int, event: AuditEvent,
+                           field_mapping: Dict[str, str]) -> bool:
+    """True when feature *fid* ALREADY carries this event's OLD state.
+
+    BL-RW-P5-28. Writing OLD onto a feature that is already at OLD is a
+    no-op by definition, so it has no corruption surface -- and the
+    rewind used to answer "target_unverifiable" to it, because the proof
+    it demands is that the feature still carries the NEW state, which a
+    feature already rolled back does not. 16 of the 59 refusals on the
+    user's run of 2026-08-14 were this: the rewind refusing to do nothing,
+    and reporting it as a failure.
+
+    Both sides must agree: every mapped OLD attribute, and the OLD
+    geometry when the event captured one. Silent on anything it cannot
+    compare -- an unprovable "already done" must not become a skip.
+    """
+    from .restore_executor import _current_geom_matches
+
+    feature = layer.getFeature(fid)
+    if feature is None or not feature.isValid():
+        return False
+
+    old_attrs = reconstruct_attributes(event)
+    fields = layer.fields()
+    compared = 0
+    for hist_name, cur_name in (field_mapping or {}).items():
+        if hist_name not in old_attrs:
+            continue
+        if fields.indexFromName(cur_name) < 0:
+            continue
+        compared += 1
+        if not _qgis_vals_equal(feature[cur_name], old_attrs[hist_name]):
+            return False
+
+    old_wkb = getattr(event, "geometry_wkb", None)
+    if old_wkb is not None:
+        geom = rebuild_geometry(old_wkb)
+        if not is_geometry_present(geom):
+            return False
+        if not _current_geom_matches(layer, fid, geom):
+            return False
+        compared += 1
+
+    return compared > 0
+
+
 def _find_by_attrs_only(
     layer, event: AuditEvent,
     exclude_fids: Optional[set] = None,
     min_attrs: int = 2,
+    expected_attrs: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
     """Attribute-only rescue scan (BL-RW-P1-25).
 
@@ -690,10 +738,16 @@ def _find_by_attrs_only(
     Returns the FID of the unique match. Multiple matches are refused
     (no geometry available to bound the risk), fewer than *min_attrs*
     comparable attributes make the event non-discriminant and return None.
+
+    *expected_attrs* overrides the state to look for. It defaults to the
+    event's OLD state, which is what the DELETE path wants; the UPDATE
+    relocation passes the NEW state instead, because the feature it is
+    hunting for is the one that still carries the post-edit values.
     """
     from qgis.core import QgsFeatureRequest
 
-    expected_attrs = reconstruct_attributes(event)
+    if expected_attrs is None:
+        expected_attrs = reconstruct_attributes(event)
     fields = layer.fields()
     pk_field_indices = set(layer.dataProvider().pkAttributeIndexes())
     relevant = [
@@ -770,7 +824,18 @@ def _diagnose_snapshot_miss(layer, event: AuditEvent) -> None:
     Used immediately after a snapshot lookup miss to expose the cause
     (typical: trigger-altered fields, NULL vs None, datetime serialization)
     without changing resolution logic.
+
+    Gated on RECOVERLAND_HEAVY_DIAG: this is a THIRD full scan of the
+    layer, after the FID lookup and the snapshot scan already missed, and
+    it runs on the GUI thread. Measured on trace a1517527: 0.648 s for a
+    single miss on zone_mkt_rip, i.e. a quarter of a second of freeze per
+    event on exactly the layers where misses come in runs.
     """
+    if not heavy_diag_enabled():
+        flog(f"_diagnose_snapshot_miss: eid={event.event_id} skipped "
+             f"(set RECOVERLAND_HEAVY_DIAG=1 to diagnose the miss)")
+        return
+
     from qgis.core import QgsFeatureRequest
 
     expected_geom = rebuild_geometry(event.geometry_wkb) \
@@ -1133,10 +1198,24 @@ def _classify_restore_result(result: Dict[str, Any]) -> str:
         # counted next to the complete ones.
         if reason_code == "applied_partial":
             return "applied_partial"
+        # BL-RW-P5-28: "already at the pre-edit state" is work already
+        # done, not a failure -- same reasoning as insert_target_gone.
+        if reason_code == "already_at_old":
+            return "skipped_idempotent"
         # target_unverifiable (BL-RW-P1-25) is a refusal that returns
         # BEFORE any buffer mutation: classifying it "failed" made the
         # strict runner roll back whole layers (134 events lost on the
         # 2026-07-05 run). Soft-classify with target_absent.
+        #
+        # BL-RW-P5-28 measured what that shared name costs a reader: told
+        # "59 features absent", the user had 58 present and merely
+        # unprovable. The distinction belongs in the REPORT, not here --
+        # renaming the class breaks `rw_apply_perf::unverifiable_is_soft`,
+        # which pins this contract precisely because the softness matters
+        # more than the wording. The precise cause is already carried by
+        # `result["message"]` ("...could not be verified (post_geom_
+        # mismatch)"); surfacing it up to CYCLE_SUMMARY needs its own
+        # bucket in the six-way breakdown, and that is its own change.
         if reason_code in ("target_absent", "identity_mismatch_fid_only",
                            "target_unverifiable"):
             return "target_absent"
@@ -1240,58 +1319,108 @@ def restore_batch(layer, events: List[AuditEvent],
     )
 
 
-def undo_restore_batch(layer, events: List[AuditEvent]) -> RestoreReport:
-    """Undo a previous restore by reversing each operation.
+class UndoBatchContext(NamedTuple):
+    """Per-layer state an undo needs, built once and reused across chunks.
 
-    UPDATE  -> re-apply post-edit ('new') attribute values + new_geometry_wkb
-    DELETE  -> delete the feature that was re-inserted by the restore
-    INSERT  -> re-insert the feature that was deleted by the restore
+    Split out of `undo_restore_batch` so a runner can spread one layer over
+    several event-loop ticks (BL-RW-P5-27) without rebuilding this state at
+    every tick -- rebuilding it would not merely cost time, it would change
+    the RESULT:
 
-    Events are reversed before processing (RW-16): the Rewind applies
-    compensations in reverse-chronological order; the undo must unwind
-    them in forward-chronological order so that a re-INSERT precedes
-    the UPDATE that depends on its existence.
+    - `ordered` is the RW-16 unwind order: the Rewind applies compensations
+      newest-first, so the undo must walk them oldest-first, otherwise an
+      UPDATE lands before the re-INSERT it depends on.
+    - `fid_cache` maps the events to the FIDs observed BEFORE the first
+      write of the batch. Rebuilt mid-batch it would see the FIDs the batch
+      itself has just moved, and resolve later events onto the wrong rows.
+    - `layer_error` is non-None when preflight refused the layer; the whole
+      group then fails with that single message and nothing is applied.
+    """
+
+    ordered: List[AuditEvent]
+    fid_cache: Dict
+    layer_error: Optional[str] = None
+
+
+def undo_prepare(layer, events: List[AuditEvent]) -> UndoBatchContext:
+    """Build the per-layer context an undo batch needs. Writes nothing.
+
+    Called ONCE per layer, before the first `undo_apply_one`.
     """
     layer_error = validate_restore_layer_state(layer)
     if layer_error:
-        failed = {(e.event_id or 0): layer_error for e in events}
-        return RestoreReport([], failed, len(events), ())
-    succeeded = []
-    failed = {}
+        return UndoBatchContext(ordered=[], fid_cache={},
+                                layer_error=layer_error)
 
     ordered_events = list(reversed(events))
     fid_cache = build_fid_cache(layer, ordered_events)
 
     layer_name = layer.name() if layer and hasattr(layer, 'name') else '?'
-    flog(f"undo_restore_batch: layer={layer_name!r} n_events={len(ordered_events)} "
+    flog(f"undo_prepare: layer={layer_name!r} n_events={len(ordered_events)} "
          f"fid_cache_size={len(fid_cache)}")
-    for event in ordered_events:
-        eid = event.event_id or 0
-        try:
-            identity_short = (event.feature_identity_json or '')[:80]
-            flog(f"undo_restore_batch: dispatch op={event.operation_type} "
-                 f"eid={eid} identity={identity_short}")
-            op = event.operation_type
-            if op == "UPDATE":
-                result = _undo_update_restore(layer, event, fid_cache)
-            elif op == "DELETE":
-                result = restore_inserted_feature(layer, event, fid_cache)
-            elif op == "INSERT":
-                result = _undo_insert_restore(layer, event)
-            else:
-                result = _unsupported_result(op)
+    return UndoBatchContext(ordered=ordered_events, fid_cache=fid_cache,
+                            layer_error=None)
 
-            skipped = result.get('skipped', False)
-            flog(f"undo_restore_batch: result op={event.operation_type} eid={eid} "
-                 f"success={result['success']} skipped={skipped} "
-                 f"msg={result.get('message', '')!r}")
-            if result["success"]:
-                succeeded.append(eid)
-            else:
-                failed[eid] = result["message"]
-        except Exception as e:
-            failed[eid] = str(e)
-            flog(f"undo_restore_batch: error on event {eid}: {e}", "ERROR")
+
+def undo_apply_one(layer, event: AuditEvent,
+                   context: UndoBatchContext) -> Dict[str, Any]:
+    """Reverse ONE previously restored event. Never raises.
+
+    UPDATE  -> re-apply post-edit ('new') attribute values + new_geometry_wkb
+    DELETE  -> delete the feature that was re-inserted by the restore
+    INSERT  -> re-insert the feature that was deleted by the restore
+
+    Returns the usual ``{"success", "message", ...}`` dict; an exception is
+    turned into a failure for THIS event so one bad row cannot abort the
+    rest of the layer -- the isolation `undo_restore_batch` always had.
+    """
+    eid = event.event_id or 0
+    try:
+        identity_short = (event.feature_identity_json or '')[:80]
+        flog(f"undo_apply_one: dispatch op={event.operation_type} "
+             f"eid={eid} identity={identity_short}")
+        op = event.operation_type
+        if op == "UPDATE":
+            result = _undo_update_restore(layer, event, context.fid_cache)
+        elif op == "DELETE":
+            result = restore_inserted_feature(layer, event, context.fid_cache)
+        elif op == "INSERT":
+            result = _undo_insert_restore(layer, event)
+        else:
+            result = _unsupported_result(op)
+
+        flog(f"undo_apply_one: result op={event.operation_type} eid={eid} "
+             f"success={result['success']} skipped={result.get('skipped', False)} "
+             f"msg={result.get('message', '')!r}")
+        return result
+    except Exception as e:  # noqa: BLE001 - per-event isolation, by contract
+        flog(f"undo_apply_one: error on event {eid}: {e}", "ERROR")
+        return {"success": False, "message": str(e)}
+
+
+def undo_restore_batch(layer, events: List[AuditEvent]) -> RestoreReport:
+    """Undo a previous restore by reversing each operation, in one call.
+
+    Kept as the synchronous entry point for the callers that legitimately
+    want the whole layer at once (workflow_service, validation scenarios).
+    `UndoRunner` no longer uses it: holding the GUI thread for a whole
+    layer froze QGIS for 118 s on a 108-event group (BL-RW-P5-27); it
+    drives `undo_prepare` + `undo_apply_one` on a time budget instead.
+    """
+    context = undo_prepare(layer, events)
+    if context.layer_error:
+        failed = {(e.event_id or 0): context.layer_error for e in events}
+        return RestoreReport([], failed, len(events), ())
+
+    succeeded = []
+    failed = {}
+    for event in context.ordered:
+        eid = event.event_id or 0
+        result = undo_apply_one(layer, event, context)
+        if result["success"]:
+            succeeded.append(eid)
+        else:
+            failed[eid] = result["message"]
 
     return RestoreReport(
         succeeded=succeeded,
