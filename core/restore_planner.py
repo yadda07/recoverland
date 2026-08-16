@@ -115,6 +115,35 @@ def check_retention_coverage(
     return None
 
 
+def _purged_horizon_reason(plan: RestorePlan) -> Optional[str]:
+    """Blocking reason when a purge removed the date the plan asks for.
+
+    Second half of the coverage guard, for the callers that cannot pass
+    `oldest_event_date` because they hold no connection. `retention`
+    records, PER DATASOURCE, the newest date each purge deleted; a cutoff
+    at or below that horizon names a state the journal cannot serve any
+    more. Per datasource is the whole point: a horizon shared by every
+    layer turned one purge into a refusal of every older rewind, on layers
+    the purge had not touched at all.
+    """
+    cutoff = plan.cutoff
+    if cutoff is None or cutoff.cutoff_type != CutoffType.BY_DATE:
+        return None
+    if not isinstance(cutoff.value, str):
+        return None
+    # Local import: retention imports this module for its own coverage
+    # helper, so the dependency only exists at call time.
+    from .retention import purged_horizon
+
+    horizon = purged_horizon(plan.datasource_fingerprint)
+    if not horizon or cutoff.value > horizon:
+        return None
+    return (
+        f"History purged for this layer up to {horizon}, "
+        f"requested: {cutoff.value}"
+    )
+
+
 def preflight_check(
     plan: RestorePlan, oldest_event_date: Optional[str] = None,
 ) -> PreflightReport:
@@ -126,8 +155,13 @@ def preflight_check(
     retention.check_journal_coverage which wraps both). When it is supplied
     and the requested date predates it, the plan is BLOCKED: replaying only
     what survived a purge produces a state the layer never had, announced
-    as a success. The planner has no journal access of its own, so a caller
-    that omits the argument gets no coverage guard.
+    as a success.
+
+    The planner has no journal access of its own, so a caller that omits
+    the argument used to get no coverage guard at all -- and the automatic
+    purge that runs at QGIS startup is exactly the caller-free path that
+    creates the hole. `_purged_horizon_reason` closes it from the other
+    end, with what the purge itself recorded for THIS layer.
     """
     blocking: List[str] = []
     warnings: List[str] = []
@@ -142,14 +176,17 @@ def preflight_check(
         cutoff_err = validate_cutoff(plan.cutoff)
         if cutoff_err:
             blocking.append(f"Invalid cutoff: {cutoff_err}")
+        coverage_err = None
         if oldest_event_date:
             coverage_err = check_retention_coverage(
                 plan.cutoff, oldest_event_date)
-            if coverage_err:
-                flog(f"restore_planner: retention coverage refused "
-                     f"datasource={plan.datasource_fingerprint} "
-                     f"{coverage_err}", "WARNING")
-                blocking.append(f"Retention coverage: {coverage_err}")
+        if coverage_err is None:
+            coverage_err = _purged_horizon_reason(plan)
+        if coverage_err:
+            flog(f"restore_planner: retention coverage refused "
+                 f"datasource={plan.datasource_fingerprint} "
+                 f"{coverage_err}", "WARNING")
+            blocking.append(f"Retention coverage: {coverage_err}")
 
     for conflict in plan.conflicts:
         if conflict.severity == "blocking":

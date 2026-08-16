@@ -73,17 +73,29 @@ def _entity_key(event: AuditEvent) -> str:
 
 def _detect_fid_recycle(
     events: List[AuditEvent],
-) -> Tuple[Dict[str, int], List[Tuple[str, int, int]]]:
+) -> Tuple[Dict[tuple, tuple], List[Tuple[str, int, int]]]:
     """Detect FID-recycle patterns within a single fp lifeline.
 
     Pattern of interest (BL-RW-P1-07, CR-1):
-        INSERT(fp=X, eid=A) -> DELETE(fp=X, eid=B>A) -> INSERT(fp=X, eid=C>B)
+        INSERT(fp=X, t=A) -> DELETE(fp=X, t=B>A) -> INSERT(fp=X, t=C>B)
 
     Two distinct logical entities share entity_fingerprint='fid:X'
     because OGR/GPKG recycles the FID after the first DELETE. Without
     splitting, both end up in the same dedup bucket.
 
-    Walks events ordered ASC by event_id and runs a per-fp state machine:
+    Walks events in CHRONOLOGICAL order -- ``_order_key``, i.e.
+    (created_at, event_id) -- and runs a per-fp state machine. Ordering on
+    event_id alone was a silent disagreement with the rest of the pipeline
+    (the SQL window and the span logic both order on created_at first): an
+    event held back in the pending file and re-inserted after a crash
+    receives a RECENT event_id although it happened first, and the state
+    machine then read that entity's life BACKWARDS. A create-then-delete
+    pair replayed as DELETE->INSERT looked like a recycled FID, the
+    lifeline was split in two buckets, the pair no longer cancelled, and
+    the rewind RESURRECTED a feature the user had created and destroyed
+    after the cutoff (scenario tx_rewind_clock_ties, cases T3/T4).
+
+    The state machine:
         None          --INSERT--> open
         None          --DELETE--> closed       (pre-existing entity deleted)
         None          --UPDATE--> pre_existing (pre-existing entity modified)
@@ -105,15 +117,17 @@ def _detect_fid_recycle(
             entity_fingerprint are skipped (defensive).
 
     Returns:
-        fp_split_eid: dict {fp -> event_id of the most recent SPLIT}.
+        fp_split: dict {(datasource, fp) -> (order_key, event_id) of the
+            most recent SPLIT}. The order key is what the rewrite below
+            compares against, for the same chronological reason.
         splits: list of (fp, first_eid, second_eid) for logging.
     """
-    fp_split_eid: Dict[tuple, int] = {}
+    fp_split: Dict[tuple, tuple] = {}
     splits: List[Tuple[str, int, int]] = []
     sorted_events = sorted(
         [e for e in events
          if e.event_id is not None and e.entity_fingerprint],
-        key=lambda e: e.event_id,
+        key=_order_key,
     )
     fp_state: Dict[tuple, str] = {}
     fp_first_eid: Dict[tuple, int] = {}
@@ -130,7 +144,7 @@ def _detect_fid_recycle(
         state = fp_state.get(fp_key)
         if op == "INSERT":
             if state in ("closed", "pre_existing"):
-                fp_split_eid[fp_key] = e.event_id
+                fp_split[fp_key] = (_order_key(e), e.event_id)
                 splits.append((e.entity_fingerprint,
                                fp_first_eid.get(fp_key), e.event_id))
                 fp_first_eid[fp_key] = e.event_id
@@ -145,18 +159,18 @@ def _detect_fid_recycle(
                 fp_state[fp_key] = "pre_existing"
                 fp_first_eid[fp_key] = e.event_id
             elif state == "closed":
-                fp_split_eid[fp_key] = e.event_id
+                fp_split[fp_key] = (_order_key(e), e.event_id)
                 splits.append((e.entity_fingerprint,
                                fp_first_eid.get(fp_key), e.event_id))
                 fp_first_eid[fp_key] = e.event_id
                 fp_state[fp_key] = "pre_existing"
             # state "open" or "pre_existing": no change
-    return fp_split_eid, splits
+    return fp_split, splits
 
 
 def _apply_fid_recycle_rewrite(
     events: List[AuditEvent],
-    fp_split_eid: Dict[tuple, int],
+    fp_split: Dict[tuple, tuple],
 ) -> List[AuditEvent]:
     """Rewrite entity_fingerprint to fp@<split_eid> for events on or
     after a detected FID-recycle split.
@@ -165,19 +179,28 @@ def _apply_fid_recycle_rewrite(
     detected in one layer never touches the identically-numbered feature of
     another layer.
 
+    "On or after" is chronological (``_order_key``), like the detection
+    itself: an event re-inserted from the pending file carries a recent
+    event_id for an old edit, and comparing raw event_ids moved it into
+    the recycled entity's bucket -- the two halves of the split then no
+    longer matched the lifelines the state machine had seen.
+
+    The label keeps the split event_id: it is what the log line names, and
+    what makes the rewritten fingerprint readable in a diagnostic.
+
     Returns a new list; input is not mutated. Events without a matching
     split are returned unchanged.
     """
-    if not fp_split_eid:
+    if not fp_split:
         return events
     rewritten: List[AuditEvent] = []
     for e in events:
         fp = e.entity_fingerprint
         fp_key = (e.datasource_fingerprint, fp)
-        split_eid = fp_split_eid.get(fp_key)
-        if (fp and split_eid is not None and e.event_id is not None
-                and e.event_id >= split_eid):
-            new_fp = f"{fp}@{split_eid}"
+        split = fp_split.get(fp_key)
+        if (fp and split is not None and e.event_id is not None
+                and _order_key(e) >= split[0]):
+            new_fp = f"{fp}@{split[1]}"
             rewritten.append(e._replace(entity_fingerprint=new_fp))
         else:
             rewritten.append(e)
@@ -261,15 +284,15 @@ def collapse_rewind_events_with_stats(
         if _is_trace(e) and not _is_invalidated(e)
         and e.restored_from_event_id is not None
     }
-    fp_split_eid, fid_recycle_splits = _detect_fid_recycle([
+    fp_split, fid_recycle_splits = _detect_fid_recycle([
         e for e in events
         if not _is_trace(e) and e.event_id not in compensated_eids
     ])
     for fp, first_eid, second_eid in fid_recycle_splits:
         flog(f"rewind_dedup: fid_recycle_detected fp={fp} splits=2 "
              f"first_eid={first_eid} second_eid={second_eid}")
-    if fp_split_eid:
-        events = _apply_fid_recycle_rewrite(events, fp_split_eid)
+    if fp_split:
+        events = _apply_fid_recycle_rewrite(events, fp_split)
 
     # USER events only. The compensated span below is anchored on the event a
     # trace says it compensated, and that anchor is only meaningful if it is a
@@ -282,6 +305,13 @@ def collapse_rewind_events_with_stats(
         e.event_id: e for e in events
         if e.event_id is not None and not _is_trace(e)
     }
+    # Every event_id the window holds, traces included: it is what tells a
+    # trace whose source is PRESENT but is itself a trace (chained rewind)
+    # from a trace whose source is nowhere to be seen.
+    window_eids = {e.event_id for e in events if e.event_id is not None}
+    # Oldest position the window can name. Used as the low bound of the
+    # compensated interval of an orphan trace, never wider.
+    window_floor = min((_order_key(e) for e in events), default=("", 0))
 
     neutralised_user_eids: set = set()
     # Per entity: the compensated WINDOWS, not the whole entity (I-8).
@@ -315,15 +345,37 @@ def collapse_rewind_events_with_stats(
             # alone is not enough to neutralise the whole compensated
             # chain -- hence the span rather than a bare eid set.
             src = by_eid.get(ref)
-            if src is None:
-                # Source purged by retention, belonging to another
-                # datasource, or itself a trace. Degenerate span [trace,
-                # trace]: only the exact event_id stays neutralised, nothing
-                # is swallowed by range. Erring wide here re-opens the hole.
+            if src is not None:
+                lo = _order_key(src)
+            elif ref in window_eids:
+                # The source is here but is not a user edit: a trace
+                # referencing another trace (chained rewinds). Degenerate
+                # span [trace, trace]: only the exact event_id stays
+                # neutralised, nothing is swallowed by range. Stretching
+                # from the older trace to this one neutralised every user
+                # edit made BETWEEN the two rewinds although nothing had
+                # ever compensated them.
+                lo = _order_key(event)
                 flog(f"rewind_dedup: trace eid={event.event_id} references "
                      f"eid={ref} which is not a user event in this window; "
                      f"span narrowed to the trace itself", "WARNING")
-            lo = _order_key(src if src is not None else event)
+            else:
+                # ORPHAN trace: the referenced event is not in the window at
+                # all. `event_stream_repository._cutoff_where` only hands
+                # over such a trace when its source has left the JOURNAL --
+                # a retention purge -- and a purge deletes by date from the
+                # oldest, so every surviving event is NEWER than the event
+                # that disappeared, hence inside the interval that rewind
+                # compensated. The low bound is therefore the oldest
+                # position the window can name, and never wider: a source
+                # merely older than the cutoff keeps its trace out of the
+                # window (the case above), because there nothing proves the
+                # user edits in between were ever compensated.
+                lo = window_floor
+                flog(f"rewind_dedup: orphan trace eid={event.event_id} "
+                     f"references eid={ref}, purged from the journal; "
+                     f"compensated span opened to the surviving history",
+                     "WARNING")
             hi = _order_key(event)
             compensated_span.setdefault(key, []).append((lo, hi))
             continue

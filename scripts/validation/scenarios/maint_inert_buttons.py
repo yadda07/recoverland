@@ -100,6 +100,18 @@ def setup(ctx):
 def run(ctx):
     """Invoke the new maintenance functions on the isolated journal."""
     path = ctx.data["journal_path"]
+
+    from recoverland.core.integrity import check_journal_integrity
+
+    # Sample integrity BEFORE the purge. purge_old_events_with_options is now
+    # driven with PurgeOptions(orphan_traces=True), so it deletes the very
+    # orphan trace that _check_orphan_restored_events is meant to flag; a
+    # sample taken after the purge can only ever observe a repaired journal
+    # and reports issues=[] under a name that promises the pre-purge state.
+    # The guarantee under test is unchanged (core.integrity detects a trace
+    # event whose source event is missing) -- only the moment it is read.
+    ctx.data["integrity_before"] = check_journal_integrity(path)
+
     conn = sqlite3.connect(path)
     from recoverland.core.sqlite_schema import apply_pragmas
     apply_pragmas(conn)
@@ -110,7 +122,6 @@ def run(ctx):
         PurgeOptions,
         RetentionPolicy,
     )
-    from recoverland.core.integrity import check_journal_integrity
 
     ctx.data["garbage_before"] = count_logical_garbage_events(conn)
     policy = RetentionPolicy(retention_days=365, max_events=1_000_000)
@@ -122,7 +133,6 @@ def run(ctx):
     )
     ctx.data["purge_result"] = purge_old_events_with_options(conn, policy, options)
     ctx.data["garbage_after"] = count_logical_garbage_events(conn)
-    ctx.data["integrity_before"] = check_journal_integrity(path)
 
     conn.close()
 

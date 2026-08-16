@@ -42,7 +42,9 @@ import os
 import re
 from typing import Optional, Dict, List, Any, Tuple
 
-from .support_policy import IdentityStrength, refine_ogr_identity
+from .support_policy import (
+    IdentityStrength, get_provider_policy, refine_ogr_identity,
+)
 
 # BL-RW-P2-13 (CR-1): portable fingerprints across machines.
 #
@@ -625,22 +627,35 @@ def compute_entity_fingerprint(identity_json: Optional[str]) -> Optional[str]:
 
 
 def get_identity_strength_for_layer(layer) -> IdentityStrength:
-    """Determine identity strength for a specific layer."""
-    provider_name = layer.dataProvider().name()
+    """Identity strength of a layer, as the support matrix declares it.
 
-    if provider_name in ("postgres", "spatialite", "mssql", "oracle"):
-        return IdentityStrength.STRONG
+    This is the gate `core.restore_service` consults before it writes
+    into a layer: its three call sites all refuse on
+    `IdentityStrength.NONE`. The function used to carry its OWN
+    hard-coded provider list ending in a blanket `return MEDIUM`, so it
+    drifted from `support_policy` on exactly the layers where the answer
+    decides whether the plugin writes:
 
+      * `virtual`: the matrix declares NONE / restore=False, this
+        returned MEDIUM, so the restore gate never fired on a derived
+        layer that has no primary source to write back to;
+      * any provider ABSENT from the matrix (a third-party provider, a
+        newer QGIS one): the default policy refuses it, this returned
+        MEDIUM and let a restore write into it.
+
+    Both directions now read the same matrix: what the tracker refuses
+    to capture is exactly what the restore refuses to write. The OGR
+    refinement stays, because that single provider spans formats from
+    GeoPackage (STRONG) to KML (WEAK).
+
+    A layer whose provider is gone answers NONE -- refuse -- rather than
+    raising on `None.name()`.
+    """
+    provider = layer.dataProvider()
+    provider_name = provider.name() if provider is not None else ""
     if provider_name == "ogr":
         return refine_ogr_identity(layer.source())
-
-    if provider_name == "memory":
-        return IdentityStrength.NONE
-
-    if provider_name == "delimitedtext":
-        return IdentityStrength.WEAK
-
-    return IdentityStrength.MEDIUM
+    return get_provider_policy(provider_name).identity_strength
 
 
 def compute_project_fingerprint() -> str:

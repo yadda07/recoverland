@@ -142,6 +142,38 @@ def _apply_counters(breakdown: Dict[str, int]) -> Dict[str, int]:
     return out
 
 
+def build_apply_report(
+    breakdown: Dict[str, int], plan_actions: Optional[int] = None,
+) -> Dict[str, int]:
+    """The buckets a finished run publishes, for the log AND for the dialog.
+
+    RLU-055: `_apply_counters` fixed the CYCLE_SUMMARY line but the fix
+    stopped one layer short. The dialog kept building its end-of-run
+    message from `total_ok`/`total_fail`, so the same rewind was
+    announced twice with two different stories:
+
+        CYCLE_SUMMARY ... plan_actions=73 apply_ok=6 apply_skipped=3
+                          apply_fail=64 failed_target_absent=59
+        dialog        ... "14 restauree(s), 59 echouee(s)."
+
+    73 planned actions, 6 entities actually back, and the user was told
+    14 came back and 59 failed out of a total he could not compute.
+    Everything a report shows now goes through this one function, so the
+    message and the line cannot tell two different stories again.
+
+    `plan_actions` is the base the buckets must add up to. ``None`` when
+    the caller has no plan (a report rebuilt from an emitted result):
+    the buckets then define their own base and the caller must say so
+    rather than pass the sum off as a plan.
+    """
+    report = _apply_counters(breakdown)
+    report["plan_actions"] = (
+        int(plan_actions) if plan_actions is not None
+        else report["outcome_sum"] + report["cancelled"]
+    )
+    return report
+
+
 def _assert_bucket_conservation(
     runner_name: str, trace_id: str, counters: Dict[str, int],
     total_ok: int, total_fail: int, plan_actions: Optional[int],
@@ -580,11 +612,35 @@ class RestoreRunner(QObject):
         else:
             QTimer.singleShot(0, self._process_chunk)
 
+    def _cancelled_actions(self) -> int:
+        """Events a cancel left unprocessed: never attempted, never failed."""
+        return max(len(self._events) - self._processed, 0)
+
+    def _outcome_breakdown(self) -> Dict[str, int]:
+        """The outcome buckets, single source for the log and the dialog."""
+        return {
+            "applied": self._applied,
+            "skipped_idempotent": self._skipped_idempotent,
+            "failed": self._failed_other,
+            "failed_target_absent": self._failed_target_absent,
+            "failed_geometry_drift": self._failed_geometry_drift,
+            "cancelled": self._cancelled_actions(),
+        }
+
+    def apply_report(self) -> Dict[str, int]:
+        """RLU-055: the buckets the dialog must display, plan base included.
+
+        Read by the dialog in the ``finished`` slot, i.e. on the numbers
+        this runner has just published on CYCLE_SUMMARY, and derived by
+        the very same function: the message and the line say the same
+        thing or neither does.
+        """
+        return build_apply_report(self._outcome_breakdown(), len(self._events))
+
     def _finish(self) -> None:
         # RLU-054: one event yields exactly one result here, so the plan
         # base is the event count and whatever a cancellation left
         # unprocessed is `cancelled` -- never silently a failure.
-        cancelled = max(len(self._events) - self._processed, 0)
         _finish_runner(
             self,
             runner_name="RestoreRunner",
@@ -598,14 +654,7 @@ class RestoreRunner(QObject):
             tracker=self._tracker,
             trace_id=self._trace_id,
             plan_actions=len(self._events),
-            breakdown={
-                "applied": self._applied,
-                "skipped_idempotent": self._skipped_idempotent,
-                "failed": self._failed_other,
-                "failed_target_absent": self._failed_target_absent,
-                "failed_geometry_drift": self._failed_geometry_drift,
-                "cancelled": cancelled,
-            },
+            breakdown=self._outcome_breakdown(),
         )
 
 
@@ -748,6 +797,46 @@ class StrictRestoreRunner(QObject):
         runners; extending it belongs to the module that owns it.
         """
         return (self._applied_partial, tuple(self._partial_dropped))
+
+    def _cancelled_actions(self) -> int:
+        """Actions of the layers a cancel left untouched.
+
+        Never attempted, so never a failure: a layer the user cancelled
+        before it started has not lost anything, and counting it as
+        failed sends him hunting a breakdown that did not happen.
+        """
+        return sum(
+            len(group) for _fp, group in self._groups[self._group_idx:]
+        )
+
+    def _outcome_breakdown(self) -> Dict[str, int]:
+        """The outcome buckets, single source for the log and the dialog."""
+        return {
+            "applied": self._applied,
+            "applied_partial": self._applied_partial,
+            "skipped_idempotent": self._skipped_idempotent,
+            "failed": self._failed_other,
+            "failed_target_absent": self._failed_target_absent,
+            "failed_geometry_drift": self._failed_geometry_drift,
+            "cancelled": self._cancelled_actions(),
+        }
+
+    def apply_report(self) -> Dict[str, int]:
+        """RLU-055: the buckets the dialog must display, plan base included.
+
+        Read by the dialog in the ``finished`` slot, i.e. on the numbers
+        this runner has just published on CYCLE_SUMMARY, and derived by
+        the very same function: the message the user re-reads and the
+        line he greps say the same thing or neither does.
+
+        Kept on the runner rather than in ``GroupedRestoreResult`` for
+        the reason `partial_restore_report` gives above: that contract
+        lives in core/workflow_service.py.
+        """
+        cancelled = self._cancelled_actions()
+        return build_apply_report(
+            self._outcome_breakdown(), self._plan_actions + cancelled,
+        )
 
     @staticmethod
     def _merge_dropped(target: List[str], names) -> None:
@@ -1313,9 +1402,8 @@ class StrictRestoreRunner(QObject):
         # totalled the plan: 73 actions came out as 14+67+59 = 140
         # results. It stays a log line about the undo scope, which is
         # what it measures; the summary now publishes the buckets.
-        cancelled = sum(
-            len(group) for _fp, group in self._groups[self._group_idx:]
-        )
+        breakdown = self._outcome_breakdown()
+        cancelled = breakdown["cancelled"]
         if cancelled:
             flog(f"StrictRestoreRunner: cancelled "
                  f"actions_never_attempted={cancelled} "
@@ -1345,15 +1433,7 @@ class StrictRestoreRunner(QObject):
             status_label=status,
             extra_stats=merged_extra,
             plan_actions=self._plan_actions + cancelled,
-            breakdown={
-                "applied": self._applied,
-                "applied_partial": self._applied_partial,
-                "skipped_idempotent": self._skipped_idempotent,
-                "failed": self._failed_other,
-                "failed_target_absent": self._failed_target_absent,
-                "failed_geometry_drift": self._failed_geometry_drift,
-                "cancelled": cancelled,
-            },
+            breakdown=breakdown,
         )
 
 

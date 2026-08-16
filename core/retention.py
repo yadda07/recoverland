@@ -6,12 +6,19 @@ All purge operations are explicit and confirmed; never implicit.
 import sqlite3
 import threading
 from datetime import datetime, timezone, timedelta
-from typing import NamedTuple, Optional, Callable
+from typing import Dict, NamedTuple, Optional, Callable
 
 from .logger import flog, timed_op
 
 _vacuum_lock = threading.Lock()
 _PURGE_BATCH_SIZE = 5000
+
+# Newest date a purge of this session removed, PER DATASOURCE.
+# Per datasource and not per journal: a single global horizon made one
+# purge refuse every rewind older than the oldest surviving event of ANY
+# layer, including layers the purge had never touched.
+_purge_horizon_lock = threading.Lock()
+_purge_horizon: Dict[str, str] = {}
 
 
 class PurgeResult(NamedTuple):
@@ -113,6 +120,70 @@ def _count_orphan_traces(conn: sqlite3.Connection) -> int:
     return int(row[0] if row else 0)
 
 
+def purged_horizon(datasource_fp: str) -> Optional[str]:
+    """Newest date a purge removed for *datasource_fp*, or None.
+
+    A purge is the only thing that makes a past state unreachable, and it
+    is the only thing that knows it: once the rows are deleted, nothing in
+    the journal says a date used to be covered. This horizon is what the
+    rewind preflight (`restore_planner.preflight_check`) reads to refuse a
+    date the journal cannot serve any more instead of replaying what
+    survived and reporting success.
+
+    Session memory, not journal memory: it only holds what THIS process
+    purged. The durable guard is the oldest surviving event of the layer
+    (`check_journal_coverage`), which callers pass to `preflight_check` as
+    `oldest_event_date`; this one covers the case the plugin creates
+    itself, the automatic purge at QGIS startup followed by a rewind in
+    the same session.
+    """
+    if not datasource_fp:
+        return None
+    with _purge_horizon_lock:
+        return _purge_horizon.get(datasource_fp)
+
+
+def _record_purge_horizon(conn: sqlite3.Connection, before_date: str) -> None:
+    """Record, per datasource, the newest date about to be deleted.
+
+    Must run BEFORE the DELETE, while the rows are still readable.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT datasource_fingerprint, MAX(created_at) FROM audit_event"
+            " WHERE created_at < ? GROUP BY datasource_fingerprint",
+            (before_date,),
+        ).fetchall()
+    except sqlite3.Error as e:
+        flog(f"retention: purge horizon capture failed: {e}", "WARNING")
+        return
+    if not rows:
+        return
+    from .datasource_alias import expand_fingerprints
+
+    horizons: Dict[str, str] = {}
+    for fingerprint, newest in rows:
+        if not fingerprint or not newest:
+            continue
+        # The rewind names a layer by its canonical fingerprint while the
+        # purged rows may carry an obsolete one. Recording the horizon for
+        # the whole alias family is what keeps the guard from missing the
+        # layer it is meant to protect.
+        family = set(expand_fingerprints(conn, fingerprint))
+        family.add(fingerprint)
+        for member in family:
+            if newest > horizons.get(member, ""):
+                horizons[member] = newest
+    if not horizons:
+        return
+    with _purge_horizon_lock:
+        for fingerprint, newest in horizons.items():
+            if newest > _purge_horizon.get(fingerprint, ""):
+                _purge_horizon[fingerprint] = newest
+    flog(f"retention: purge horizon recorded before {before_date} for "
+         f"{len(horizons)} datasource fingerprint(s)")
+
+
 def purge_old_events(conn: sqlite3.Connection,
                      policy: RetentionPolicy,
                      trace_id: str = "") -> PurgeResult:
@@ -144,6 +215,7 @@ def purge_old_events_with_options(conn: sqlite3.Connection,
         with timed_op("purge_old_events_with_options", trace_id):
             if options.retention:
                 cutoff = _compute_cutoff(policy.retention_days)
+                _record_purge_horizon(conn, cutoff)
                 while True:
                     with conn:
                         cursor = conn.execute(
@@ -225,6 +297,16 @@ def _excess_cut_boundary(conn: sqlite3.Connection, to_delete: int) -> Optional[s
     return row[0] if row and row[0] else None
 
 
+def _next_commit_boundary(conn: sqlite3.Connection,
+                          boundary: str) -> Optional[str]:
+    """created_at of the first commit strictly after *boundary*, or None."""
+    row = conn.execute(
+        "SELECT MIN(created_at) FROM audit_event WHERE created_at > ?",
+        (boundary,),
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
     """Internal: delete oldest events that exceed max_events (batched).
 
@@ -237,6 +319,16 @@ def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
     boundary falls inside a commit the whole commit is kept, so the cap is
     a target, not a promise: purging a bit less is always preferable to
     amputating a commit.
+
+    One exception, and only to keep the cap from becoming decorative: when
+    the aligned cut would delete NOTHING (the boundary lands inside the
+    oldest commit), the run steps up to the next commit. Otherwise every
+    later run recomputes the same boundary, deletes nothing again, and the
+    journal grows past the user's cap for ever.
+
+    The dates about to disappear are recorded per datasource
+    (`_record_purge_horizon`) before the delete: that horizon is what lets
+    the rewind preflight refuse a date the journal no longer covers.
     """
     if max_events <= 0:
         return 0
@@ -249,6 +341,28 @@ def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
         boundary = _excess_cut_boundary(conn, to_delete)
         if boundary is None:
             return 0
+        oldest_row = conn.execute(
+            "SELECT MIN(created_at) FROM audit_event").fetchone()
+        oldest = oldest_row[0] if oldest_row else None
+        if oldest is not None and boundary <= oldest:
+            # The aligned cut falls inside the OLDEST commit: nothing is
+            # strictly older than it, so this purge would delete zero rows
+            # and the next one would recompute the same boundary and delete
+            # zero again -- the cap would never be enforced on a journal
+            # that keeps growing. Step to the next commit so the run always
+            # makes progress; the straddling commit goes whole, which
+            # removes at most one commit more than asked.
+            stepped = _next_commit_boundary(conn, boundary)
+            if stepped is None:
+                flog(
+                    f"retention: excess purge kept the whole journal: its "
+                    f"{total} events form a single commit and the cap of "
+                    f"{max_events} cannot be honoured without splitting it",
+                    "WARNING",
+                )
+                return 0
+            boundary = stepped
+        _record_purge_horizon(conn, boundary)
         while True:
             with conn:
                 cursor = conn.execute(

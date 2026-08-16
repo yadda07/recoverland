@@ -544,7 +544,8 @@ def _cutoff_where(
     all layers.
     When *include_traces* is True, restore_trace_events whose original
     event falls within the window are included (with invalidated_at IS NULL
-    to exclude soft-deleted traces).
+    to exclude soft-deleted traces), plus the ORPHAN traces described
+    below.
     Returns (where_clause, params) or (None, []) if cutoff type is invalid.
     """
     if isinstance(datasource_fps, str):
@@ -592,16 +593,31 @@ def _cutoff_where(
         "(restored_from_event_id IS NULL AND ",
         cutoff_col, " ", op, " ?)",
     ))
+    # Second disjunct: the ORPHAN trace. A trace is the journal's memory
+    # that an entity has already been compensated, and chain fusion makes
+    # one trace stand for several events -- it references only the OLDEST
+    # of the fused chain. When retention purges that referenced event, the
+    # membership test above stops matching and the trace becomes invisible
+    # although its row is still there (PurgeOptions.orphan_traces defaults
+    # to False). The next rewind then re-compensates the same DELETE, and
+    # the compensation of a DELETE is an INSERT: the feature comes back a
+    # SECOND time. Such a trace is read on its own date, and only when its
+    # source is gone from the journal ENTIRELY -- not merely older than the
+    # cutoff, which is the ordinary case where the trace must stay out.
+    # `NOT EXISTS` on the primary key, one lookup per trace row.
     trace_clause = "".join((
         "(restored_from_event_id IS NOT NULL",
         " AND invalidated_at IS NULL",
-        " AND restored_from_event_id IN (",
+        " AND (restored_from_event_id IN (",
         "SELECT event_id FROM audit_event WHERE ",
         ds_cond, cutoff_col, " ", op, " ?",
-        "))",
+        ") OR (", cutoff_col, " ", op, " ?",
+        " AND NOT EXISTS (SELECT 1 FROM audit_event src",
+        " WHERE src.event_id = audit_event.restored_from_event_id))))",
     ))
     clause = "".join((
         ds_cond, "(", user_clause, " OR ", trace_clause, ")",
     ))
-    params = ds_params + [cutoff.value] + ds_params + [cutoff.value]
+    params = (ds_params + [cutoff.value] + ds_params
+              + [cutoff.value, cutoff.value])
     return clause, params

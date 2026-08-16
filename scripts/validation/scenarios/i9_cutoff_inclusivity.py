@@ -20,11 +20,30 @@ Scenario:
     3. Build a cutoff at exactly T with both inclusive=False and True.
     4. Fetch events for both cases through the production code path
        (core.event_stream_repository.fetch_events_after_cutoff).
-    5. Inspect the source of the two production call sites
-       (recover_dialog.py and scripts/validate_rewind.py) to detect
-       the pathological default `inclusive=False`.
+    5. Inspect the shipped source for any call site that builds a
+       pathological strict window (`inclusive=False`).
     6. Inspect the produced log for the structured signature that the
        patch is expected to emit.
+
+Call-site anchoring (2026-08 re-anchor, guarantee unchanged)
+    Step 5 used to read two hard-coded line numbers: recover_dialog.py:~1688
+    and scripts/validate_rewind.py:~183. Both anchors rotted:
+
+    * the UI rewind call site moved to `_recover_version_mode`
+      (recover_dialog.py:~3060) and still reads `inclusive=True`;
+    * scripts/validate_rewind.py -- a developer auto-rewind harness, never
+      shipped behaviour -- was deleted whole in commit b3c12ed
+      ("production cleanup - remove test/dev artefacts from repo").
+
+    The guarantee those two checks encoded is not "these two files exist",
+    it is "no shipped caller narrows the rewind window to a strict `>`
+    and silently drops the events committed on the cutoff second". That
+    guarantee is now asserted over the whole shipped tree instead of over
+    two frozen line numbers: every `RestoreCutoff(...)` construction outside
+    scripts/ must be provably non-strict, and at least one must exist so the
+    scan can never pass by finding nothing. The scenario tree is excluded on
+    purpose -- this very file builds `inclusive=False` at step 3 to prove the
+    mechanism it is testing.
 
 This scenario does NOT touch any QGIS state. It runs equally from the
 QGIS Python console (preferred) or from a plain Python interpreter,
@@ -168,19 +187,93 @@ def run(ctx):
     )
 
 
-def _read_call_site_default(file_relpath: str, line_hint: int,
-                            search_window: int = 3) -> str | None:
-    """Return the line that contains 'inclusive=...' near line_hint."""
-    path = _PLUGIN_ROOT / file_relpath
-    if not path.is_file():
-        return None
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    start = max(0, line_hint - 1 - search_window)
-    end = min(len(lines), line_hint - 1 + search_window + 1)
-    for line in lines[start:end]:
-        if "inclusive=" in line and "RestoreCutoff" in line:
-            return line.strip()
-    return None
+# Directories that are not shipped rewind behaviour: the validation tree
+# (which builds strict cutoffs on purpose), packaging and vendored code.
+_NON_PRODUCT_DIRS = frozenset({
+    "scripts", "tests", "docs", "build", "_vendor", "__pycache__", ".git",
+})
+
+
+def _iter_product_sources():
+    """Yield (relpath, text) for every shipped .py file of the plugin."""
+    for path in sorted(_PLUGIN_ROOT.rglob("*.py")):
+        rel = path.relative_to(_PLUGIN_ROOT)
+        if _NON_PRODUCT_DIRS.intersection(rel.parts):
+            continue
+        yield rel.as_posix(), path.read_text(encoding="utf-8", errors="replace")
+
+
+def _iter_cutoff_calls(text: str):
+    """Yield (line_no, call_source) for every RestoreCutoff(...) construction.
+
+    Scans by parenthesis balance so a construction wrapped over several
+    lines is captured whole rather than missed by a line-oriented match.
+    """
+    for match in re.finditer(r"(?<![\w.])RestoreCutoff\s*\(", text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        # `class RestoreCutoff(_RestoreCutoffBase)` is the declaration, not
+        # a call site: skip it or restore_contracts.py counts as a caller.
+        if text[line_start:match.start()].lstrip().startswith("class "):
+            continue
+        depth = 0
+        for i in range(match.end() - 1, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    yield (text.count("\n", 0, match.start()) + 1,
+                           " ".join(text[match.start():i + 1].split()))
+                    break
+
+
+def _split_top_level_args(call_src: str):
+    """Split the argument list of a call, ignoring nested brackets."""
+    inner = call_src[call_src.index("(") + 1:call_src.rindex(")")]
+    args, depth, current = [], 0, []
+    for ch in inner:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            args.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    tail = "".join(current).strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def _cutoff_window_kind(call_src: str) -> str:
+    """Classify the read window a construction asks for.
+
+    Returns 'inclusive' (literal True), 'strict' (literal False),
+    'default' (flag omitted, so the constructor default applies) or
+    'undecidable' (a non-literal expression -- treated as a violation,
+    because a shipped rewind window must be provably non-strict).
+    """
+    keyword = re.search(r"inclusive\s*=\s*([A-Za-z_][\w.]*)", call_src)
+    if keyword:
+        return {"True": "inclusive", "False": "strict"}.get(
+            keyword.group(1), "undecidable")
+    args = _split_top_level_args(call_src)
+    if len(args) >= 3:
+        return {"True": "inclusive", "False": "strict"}.get(
+            args[2], "undecidable")
+    return "default"
+
+
+def _scan_product_cutoff_calls():
+    """Return [(relpath, line_no, call_source, kind)] over shipped code."""
+    found = []
+    for relpath, text in _iter_product_sources():
+        for line_no, call_src in _iter_cutoff_calls(text):
+            found.append((relpath, line_no, call_src,
+                          _cutoff_window_kind(call_src)))
+    return found
 
 
 def assertions(ctx):
@@ -205,18 +298,30 @@ def assertions(ctx):
         f"delta={delta} expected=3 (3 events on the second boundary)",
     ))
 
-    ui_line = _read_call_site_default("recover_dialog.py", 1688)
+    # Call-site anchoring: see the module docstring. The UI rewind entry
+    # point moved from recover_dialog.py:~1688 to _recover_version_mode, so
+    # the whole file is scanned instead of a frozen line window.
+    calls = _scan_product_cutoff_calls()
+    ui_calls = [c for c in calls if c[0] == "recover_dialog.py"]
     out.append((
         "recover_dialog_uses_inclusive_true",
-        ui_line is not None and "inclusive=True" in ui_line,
-        f"recover_dialog.py:~1688 -> {ui_line!r}",
+        bool(ui_calls) and all(c[3] == "inclusive" for c in ui_calls),
+        "recover_dialog.py cutoff call sites -> " + (
+            "; ".join(f"L{ln}:{kind}:{src}" for _, ln, src, kind in ui_calls)
+            or "NONE FOUND"),
     ))
 
-    auto_line = _read_call_site_default("scripts/validate_rewind.py", 183)
+    # Replaces the scripts/validate_rewind.py:~183 anchor, deleted with that
+    # dev harness in b3c12ed. Same guarantee, widened to every shipped
+    # caller: none may narrow the window to a strict '>'.
+    strict_calls = [c for c in calls if c[3] != "inclusive" and c[3] != "default"]
     out.append((
-        "validate_rewind_uses_inclusive_true",
-        auto_line is not None and "inclusive=True" in auto_line,
-        f"scripts/validate_rewind.py:~183 -> {auto_line!r}",
+        "no_product_call_site_is_strict",
+        bool(calls) and not strict_calls,
+        "product cutoff call sites={n} strict/undecidable={bad}".format(
+            n=len(calls),
+            bad="; ".join(f"{f}:L{ln}:{kind}" for f, ln, _, kind in strict_calls)
+            or "none"),
     ))
 
     contracts = (_PLUGIN_ROOT / "core" / "restore_contracts.py").read_text(
