@@ -32,6 +32,7 @@ from .core import (
     fetch_events_by_session, count_events_by_session,
     _BLOB_MARKER,
 )
+from .core.geometry_utils import heavy_diag_enabled
 from .core.observability import log_state_transition
 from .journal_info_bar import JournalInfoBar, SmartBarState, SmartBarTileState
 from .journal_maintenance import JournalMaintenanceDialog
@@ -73,6 +74,30 @@ _MIN_RECOVER_ANIMATION_SEC = 3.0
 _MIN_RESTORE_ANIMATION_SEC = 1.8
 
 
+def _flog_events(label: str, events, trace_id: str = "") -> None:
+    """Log a rewind event set: one aggregated line, detail on opt-in.
+
+    These dumps run on the GUI thread, one line per event, and every line
+    is formatted and flushed to two file handlers. On the run that
+    prompted this (trace a1517527) the four dump sites cost ~270 ms of
+    frozen interface before any useful work, and the per-event detail was
+    only ever read while chasing a defect. The aggregated line is kept
+    unconditionally so a run stays identifiable in the log; the detail is
+    behind RECOVERLAND_HEAVY_DIAG, like EDIT_START and RELOAD_CHECK.
+    """
+    prefix = f"[{trace_id}] " if trace_id else ""
+    if not heavy_diag_enabled():
+        ops: dict = {}
+        for e in events:
+            ops[e.operation_type] = ops.get(e.operation_type, 0) + 1
+        flog(f"{prefix}events[{label}]: n={len(events)} ops={ops} "
+             f"detail=diag_off (set RECOVERLAND_HEAVY_DIAG=1 to enable)")
+        return
+    for e in events:
+        flog(f"  -> {label} eid={e.event_id} op={e.operation_type} "
+             f"identity={(e.feature_identity_json or '')[:80]}")
+
+
 class RecoverDialog(QDialog, LoggerMixin):
     """Main dialog for RecoverLand plugin."""
 
@@ -91,12 +116,76 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def __setattr__(self, name: str, value):
         if name in type(self)._WATCHED_ATTRS:
+            old = self.__dict__.get(name, "<unset>")
             try:
-                old = self.__dict__.get(name, "<unset>")
                 log_state_transition("RecoverDialog", name, old, value)
             except Exception:  # pragma: no cover - logging never breaks setters
                 pass
+            # A run has ~25 exit paths, each resetting this flag. Hooking
+            # the transition itself is the only way to guarantee the canvas
+            # is unfrozen and the refresh timer restarted on every one of
+            # them -- a canvas left frozen would be worse than a slow run.
+            # `old is "<unset>"` is the initial assignment in __init__, not
+            # a transition: acting on it would thaw and REFRESH the canvas
+            # every time the dialog is built.
+            if (name == "_is_recovering" and old != "<unset>"
+                    and bool(old) != bool(value)):
+                try:
+                    self._set_ui_quiet_period(bool(value))
+                except Exception:  # pragma: no cover - never break a setter
+                    pass
         super().__setattr__(name, value)
+
+    def _set_ui_quiet_period(self, active: bool) -> None:
+        """Stop the periodic UI work that competes with a running operation.
+
+        Measured on trace b3d06716: the 10 s journal-status timer fired 8
+        times DURING the run, each tick rebuilding the layer stats cache
+        (23 layers, 3109 events) and then, on the GUI thread, the layer
+        combo, the scope list and the 2215 steps of the slider.
+
+        This is hooked on `_is_recovering`, which covers the three modes,
+        so it must stay harmless for the read-only ones (Review, Event):
+        stopping a refresh timer is. Freezing the CANVAS is not -- it
+        would blank the map during a plain journal search -- so that lives
+        in `_freeze_canvas_for_write`, armed only where writing starts.
+        """
+        timer = getattr(self, "_layer_refresh_timer", None)
+        if timer is not None:
+            if active:
+                timer.stop()
+            elif self.isVisible():
+                # Only a visible dialog needs the periodic refresh;
+                # hideEvent stops it on purpose.
+                timer.start()
+        if not active:
+            self._freeze_canvas_for_write(False)
+        flog(f"ui_quiet_period: active={active} "
+             f"refresh_timer={'stopped' if active else 'resumed'}")
+
+    def _freeze_canvas_for_write(self, active: bool) -> None:
+        """Hold the canvas still while a run WRITES to the layers.
+
+        A rewind fires layer.reload() + triggerRepaint() per group; on a
+        23-layer project the repaints alone cost ~18 s of frozen UI, which
+        is why core/snapshot_overlay_session.py already freezes the canvas
+        the same way. Thawing is idempotent and only refreshes when we are
+        the ones who froze, so a plain search never repaints the project
+        for nothing, and a canvas frozen by another tool is left alone.
+        """
+        if bool(getattr(self, "_canvas_frozen_by_run", False)) == bool(active):
+            return
+        canvas = None
+        iface = getattr(self, "iface", None)
+        if iface is not None and hasattr(iface, "mapCanvas"):
+            canvas = iface.mapCanvas()
+        if canvas is None or not hasattr(canvas, "freeze"):
+            return
+        canvas.freeze(active)
+        self._canvas_frozen_by_run = bool(active)
+        if not active and hasattr(canvas, "refresh"):
+            canvas.refresh()
+        flog(f"canvas_freeze_for_write: {'frozen' if active else 'thawed'}")
 
     def __init__(self, iface, journal=None, tracker=None,
                  write_queue=None):
@@ -3214,9 +3303,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         flog(f"[{trace_id}] on_version_fetch_done: raw={raw_count} "
              f"collapsed={total_count} "
              f"prior_rewind={prior_rewind} prior_events={prior_count}")
-        for e in events:
-            flog(f"  -> active eid={e.event_id} op={e.operation_type} "
-                 f"identity={(e.feature_identity_json or '')[:80]}")
+        _flog_events("active", events, trace_id)
 
         if total_count == 0:
             if self._last_restore_by_ds:
@@ -3331,12 +3418,25 @@ class RecoverDialog(QDialog, LoggerMixin):
         """Silently undo the previous Rewind, then apply the pending new one."""
         by_ds = self._last_restore_by_ds
         total_undo = sum(len(v) for v in by_ds.values()) if by_ds else 0
-        flog(f"auto_undo_for_rewind: START layers={len(by_ds) if by_ds else 0} "
+        n_layers = len(by_ds) if by_ds else 0
+        flog(f"auto_undo_for_rewind: START layers={n_layers} "
              f"events_to_undo={total_undo}")
-        for fp, evts in (by_ds or {}).items():
-            for e in evts:
-                flog(f"  undo op={e.operation_type} eid={e.event_id} "
-                     f"identity={(e.feature_identity_json or '')[:80]}")
+        # Until now this phase was invisible: the label still read
+        # "{n} evenement(s) a analyser" from the fetch, and the user watched
+        # a 139 s undo of a run he had not asked for, described as something
+        # else entirely (measured, trace a1517527).
+        self.update_phase(self.tr(
+            "Annulation du Rewind precedent : {count} evenement(s) "
+            "sur {layers} couche(s)"
+        ).format(count=total_undo, layers=n_layers))
+        # From here on the run writes to the layers; the thaw is driven by
+        # the `_is_recovering` transition, which every exit path performs.
+        self._freeze_canvas_for_write(True)
+        if heavy_diag_enabled():
+            for fp, evts in (by_ds or {}).items():
+                for e in evts:
+                    flog(f"  undo op={e.operation_type} eid={e.event_id} "
+                         f"identity={(e.feature_identity_json or '')[:80]}")
         self._undo_counts_before = self._rewind_count_snapshot(
             "before_undo", by_ds)
         self._last_restore_events = None
@@ -3483,9 +3583,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._pending_cycle_stats = dict(dedup_stats)
         flog(f"[{trace_id}] on_post_undo_fetch_done: raw={raw_count} "
              f"collapsed={len(events)}")
-        for e in events:
-            flog(f"  -> active eid={e.event_id} op={e.operation_type} "
-                 f"identity={(e.feature_identity_json or '')[:80]}")
+        _flog_events("active", events, trace_id)
 
         if not events:
             flog("on_post_undo_fetch_done: no active events after re-dedup "
@@ -3520,9 +3618,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         cutoff = self._version_restore_cutoff
         flog(f"[{trace_id}] execute_version_restore: "
              f"n={len(events)} cutoff={'set' if cutoff else 'MISSING'}")
-        for e in events:
-            flog(f"  -> restore eid={e.event_id} op={e.operation_type} "
-                 f"identity={(e.feature_identity_json or '')[:80]}")
+        _flog_events("restore", events, trace_id)
+        n_layers = len({e.datasource_fingerprint for e in events})
+        self.update_phase(self.tr(
+            "Application : {count} evenement(s) sur {layers} couche(s)"
+        ).format(count=len(events), layers=n_layers))
+        self._freeze_canvas_for_write(True)
         events_by_ds_preview: dict = {}
         read_conn = self._get_dialog_read_conn()
         for e in events:

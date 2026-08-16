@@ -358,6 +358,13 @@ def collapse_rewind_events_with_stats(
          f"({len(neutralised_user_eids)} by eid, "
          f"{len(compensated_span)} compensated spans, "
          f"{len(dropped)} total neutralised)")
+    # Deliberately NOT gated behind RECOVERLAND_HEAVY_DIAG, unlike the
+    # other per-event dumps: `rw_dedup_post_trace_edit` asserts on
+    # `rewind_dedup: neutralised eid=<n>`, so these lines are a contract,
+    # not diagnostics. The cost is bounded by the number of ALREADY
+    # COMPENSATED events (`dropped` is empty on a first rewind) and was
+    # measured in the tens of ms -- it is not part of the freeze this
+    # invariant is about.
     for e in dropped:
         flog(f"rewind_dedup: neutralised eid={e.event_id} "
              f"op={e.operation_type} "

@@ -491,23 +491,75 @@ def is_geometry_present(geom) -> bool:
     return True
 
 
-def feature_matches_geometry(feature, expected_geom, expected_wkb=None) -> bool:
+def _canonical_rings(geom):
+    """Canonical, GEOS-free shape signature, or None when unavailable.
+
+    Rebuilds the geometry as sorted rings of sorted vertices, dropping
+    each ring's closing vertex. That makes the signature invariant to the
+    three things OGR rewrites when it repacks a shapefile -- ring
+    orientation, starting vertex, part order -- while staying an EXACT
+    comparison of coordinates: no repair, no tolerance, no GEOS.
+
+    The closing vertex has to go: rotating a ring moves which vertex is
+    duplicated, so a raw vertex multiset differs for the same shape.
+
+    Falls back to the flat vertex multiset for non-polygonal geometries.
+    """
+    try:
+        if geom.isMultipart():
+            parts = geom.asMultiPolygon()
+        else:
+            poly = geom.asPolygon()
+            parts = [poly] if poly else []
+    except (AttributeError, RuntimeError, TypeError):
+        parts = []
+
+    if parts:
+        out = []
+        for rings in parts:
+            canon = []
+            for ring in rings:
+                pts = [(p.x(), p.y()) for p in ring]
+                if len(pts) > 1 and pts[0] == pts[-1]:
+                    pts = pts[:-1]
+                canon.append(tuple(sorted(pts)))
+            out.append(tuple(sorted(canon)))
+        return tuple(sorted(out)) if out else None
+
+    try:
+        pts = [(v.x(), v.y()) for v in geom.vertices()]
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    return tuple(sorted(pts)) if pts else None
+
+
+def feature_matches_geometry(feature, expected_geom, expected_wkb=None,
+                             allow_repair: bool = False) -> bool:
     """Return True when *feature*'s geometry matches *expected_geom*.
 
     Comparison shared between the snapshot scanners in restore_service
-    and the buffer ops in restore_executor (DUP-10):
+    and the buffer ops in restore_executor (DUP-10). Ordered by cost:
+
       0. Bounding-box fast reject (BL-RW-P1-26): two geometries with
-         different exact bounding boxes cannot be equal, and the bbox
-         compare avoids both the WKB byte copy and the GEOS ``equals``
-         construction that dominated the rewind apply phase on heavy
-         polygons (measured 55s/59s on zone_mkt_rip, 2026-07-05).
-         Encoding variants of the same shape (ring orientation,
-         redundant Z) share the same vertices hence the same bbox, so
-         they still reach the equals() fallback.
+         different bounding boxes cannot be equal, and the bbox compare
+         avoids both the WKB byte copy and the GEOS construction that
+         dominated the rewind apply phase on heavy polygons (measured
+         55s/59s on zone_mkt_rip, 2026-07-05). Tolerant, see _bbox_close.
       1. Byte-for-byte WKB equality (fast path; the audit pipeline
          re-serialises geometries the same way QGIS does).
-      2. ``QgsGeometry.equals`` fallback for the cases where two valid
-         WKB encodings represent the same shape.
+      2. Canonical ring signature (BL-RW-P5-28). Byte equality and
+         ``equals()`` are BOTH sensitive to ring orientation and starting
+         vertex, which OGR rewrites whenever it repacks a shapefile. On
+         the user's run of 2026-08-14 that cost 16 refusals on features
+         that were sitting in the layer, unchanged, under a different
+         encoding of the same vertices.
+      3. ``makeValid`` on both sides then ``isGeosEqual`` -- last resort,
+         only when *allow_repair* is set. It costs ~900 ms per pair on a
+         500 KB multipolygon, which is affordable to verify ONE candidate
+         and ruinous inside a 200-feature scan; hence the opt-in rather
+         than a default. ``equals()`` alone is not a substitute: these
+         geometries are GEOS-invalid at the source and it answers False
+         on two encodings of the same shape.
 
     *expected_wkb* lets per-event scan loops serialise the expected
     geometry ONCE instead of once per scanned feature.
@@ -526,8 +578,22 @@ def feature_matches_geometry(feature, expected_geom, expected_wkb=None) -> bool:
         expected_wkb = bytes(expected_geom.asWkb())
     if geometries_equal(bytes(current.asWkb()), expected_wkb):
         return True
-    if hasattr(current, "equals"):
-        return bool(current.equals(expected_geom))
+
+    cur_sig = _canonical_rings(current)
+    if cur_sig is not None and cur_sig == _canonical_rings(expected_geom):
+        return True
+
+    if hasattr(current, "equals") and bool(current.equals(expected_geom)):
+        return True
+
+    if allow_repair:
+        try:
+            a, b = current.makeValid(), expected_geom.makeValid()
+            if (is_geometry_present(a) and is_geometry_present(b)
+                    and a.isGeosEqual(b)):
+                return True
+        except (AttributeError, RuntimeError, TypeError):
+            pass
     return False
 
 
