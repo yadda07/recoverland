@@ -18,6 +18,7 @@ ctx is a SimpleNamespace populated by the runner:
 from __future__ import annotations
 
 import json
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -28,6 +29,17 @@ from .assert_log import AssertionSummary, summarize
 from .parse_log import LogRecord, log_file_size, read_records
 
 _HERE = Path(__file__).resolve().parent
+
+# Scenarios import their helpers as ``scripts.validation.assert_log``, which
+# needs the PLUGIN ROOT on sys.path. headless_run.py puts it there; the QGIS
+# Python console does not, so calling run_scenario() from the console failed
+# with ModuleNotFoundError halfway through -- after setup() and run() had
+# already written to disk. Doing it here makes the runner work from any entry
+# point, which is the point of a test harness.
+_PLUGIN_ROOT = _HERE.parents[1]
+for _extra in (str(_PLUGIN_ROOT), str(_PLUGIN_ROOT.parent)):
+    if _extra not in sys.path:
+        sys.path.insert(0, _extra)
 _REPORTS_DIR = _HERE / "reports"
 _REGRESSION_DIR = _HERE / "scenarios" / "regression"
 
