@@ -1581,10 +1581,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         desel = menu.addAction(self.tr("Tout deselectionner"))
         desel.triggered.connect(self.select_none_rows)
         global_pos = self.table_widget.viewport().mapToGlobal(pos)
-        if hasattr(menu, 'exec'):
-            menu.exec(global_pos)
-        else:
-            menu.exec_(global_pos)
+        # exec() only: measured present on Qt5 (QGIS 3.40.15) as well as Qt6,
+        # while exec_() is ABSENT on Qt6. The old else-branch could therefore
+        # never run on any supported runtime, and only PyQt6 could ever need it.
+        menu.exec(global_pos)
 
     def _copy_selected_to_clipboard(self) -> None:
         """Copy selected rows to clipboard in tab-separated format."""
@@ -1624,10 +1624,7 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _open_maintenance(self) -> None:
         """UX-D01: Open the journal maintenance dialog."""
         dlg = JournalMaintenanceDialog(self._journal, parent=self)
-        if hasattr(dlg, 'exec'):
-            dlg.exec()
-        else:
-            dlg.exec_()
+        dlg.exec()  # exec_() is absent on Qt6; exec() exists on both. See above.
         self._stats_cache.invalidate()
         self._close_dialog_read_conn()
         self._refresh_journal_status()
