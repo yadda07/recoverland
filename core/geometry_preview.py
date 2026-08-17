@@ -236,8 +236,10 @@ class GeometryPreviewManager:
             fill.setAlpha(70)
             try:
                 band.setFillColor(fill)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                flog("GeometryPreview._apply_layer_style: rubberband refused "
+                     f"setFillColor, preview stays outline-only ({exc!r})",
+                     "DEBUG")
         band.setWidth(2)
         band.setLineStyle(QtCompat.DASH_LINE)
         self._flash_base_color = primary

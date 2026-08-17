@@ -330,8 +330,9 @@ class SnapshotRebuildWorker(QThread):
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"[{tid}] snap_worker: read connection close failed "
+                         f"({exc!r})", "DEBUG")
 
     @staticmethod
     def _filter_changed_after(result, changed_after: dict, tid: str):
@@ -357,57 +358,6 @@ class SnapshotRebuildWorker(QThread):
             "INFO",
         )
         return result._replace(features=filtered, n_entities=n_kept)
-
-
-def _filter_by_bbox(events: list, bbox) -> list:
-    """Keep only events whose post-event geometry intersects bbox.
-
-    Events without geometry are kept (non-spatial layers, geometry-less ops).
-    On any decoding error the event is kept (fail-open).
-    bbox must be a QgsRectangle in the layer's own CRS.
-    """
-    try:
-        from qgis.core import QgsGeometry  # noqa: PLC0415
-    except ImportError:
-        return events
-
-    result = []
-    _diag_done = False
-    for ev in events:
-        wkb = ev.new_geometry_wkb or ev.geometry_wkb
-        if not wkb:
-            if not _diag_done:
-                flog(
-                    f"bbox_filter_diag: first_ev op={ev.operation_type} "
-                    f"geom_wkb={type(ev.geometry_wkb).__name__}:"
-                    f"{len(ev.geometry_wkb) if ev.geometry_wkb else 0} "
-                    f"new_geom_wkb={type(ev.new_geometry_wkb).__name__}:"
-                    f"{len(ev.new_geometry_wkb) if ev.new_geometry_wkb else 0} "
-                    "no_wkb_kept",
-                    "DEBUG",
-                )
-                _diag_done = True
-            result.append(ev)
-            continue
-        try:
-            geom = QgsGeometry.fromWkb(wkb)
-            is_null = geom.isNull()
-            intersects = (not is_null) and geom.boundingBox().intersects(bbox)
-            if not _diag_done:
-                flog(
-                    f"bbox_filter_diag: first_ev op={ev.operation_type} "
-                    f"wkb_len={len(wkb)} geom_null={is_null} intersects={intersects}",
-                    "DEBUG",
-                )
-                _diag_done = True
-            if is_null or intersects:
-                result.append(ev)
-        except Exception as _exc:  # noqa: BLE001
-            if not _diag_done:
-                flog(f"bbox_filter_diag: fromWkb_exception={_exc!r}", "DEBUG")
-                _diag_done = True
-            result.append(ev)
-    return result
 
 
 def filter_snapshot_by_bbox(result, bbox_per_layer: dict):
@@ -498,8 +448,9 @@ def query_snapshot_date_range(journal, layer_infos: List[dict]) -> tuple:
         if conn is not None:
             try:
                 conn.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                flog(f"snapshot_date_range: read connection close failed "
+                     f"({exc!r})", "DEBUG")
 
     today = journal_today().isoformat()
     return (

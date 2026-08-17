@@ -140,7 +140,10 @@ class JournalManager:
     def __init__(self):
         self._conn: Optional[sqlite3.Connection] = None
         self._path: Optional[str] = None
-        self._unsaved_session_token: Optional[str] = None
+        # Not a credential: a per-session discriminant that gives an
+        # unsaved project its own journal filename (see
+        # _journal_for_unsaved_project).
+        self._unsaved_session_key: Optional[str] = None
         self._lock_acquired: bool = False
         self._reconciliation = None
 
@@ -192,11 +195,11 @@ class JournalManager:
         writer lock for this journal (multi-writer protection).
         """
         self.close()
-        unsaved_token = ""
+        unsaved_key = ""
         if not (project_path and os.path.isfile(project_path)):
-            self._unsaved_session_token = uuid.uuid4().hex[:16]
-            unsaved_token = self._unsaved_session_token
-        journal_path = _resolve_journal_path(project_path, profile_path, unsaved_token)
+            self._unsaved_session_key = uuid.uuid4().hex[:16]
+            unsaved_key = self._unsaved_session_key
+        journal_path = _resolve_journal_path(project_path, profile_path, unsaved_key)
         self._ensure_directory(journal_path)
         self._acquire_writer_lock(journal_path)
         try:
@@ -227,7 +230,7 @@ class JournalManager:
                 self._release_writer_lock(self._path)
             self._conn = None
             self._path = None
-            self._unsaved_session_token = None
+            self._unsaved_session_key = None
             self._lock_acquired = False
             self._reconciliation = None
 
@@ -418,11 +421,15 @@ class JournalManager:
 
 def _resolve_journal_path(project_path: str,
                           profile_path: str,
-                          unsaved_token: str = "") -> str:
-    """Determine the journal file path based on project save state."""
+                          unsaved_key: str = "") -> str:
+    """Determine the journal file path based on project save state.
+
+    `unsaved_key` is a filename discriminant, not a credential: it only
+    separates the journals of two unsaved projects in the same profile.
+    """
     if project_path and os.path.isfile(project_path):
         return _journal_for_saved_project(project_path)
-    return _journal_for_unsaved_project(profile_path, project_path, unsaved_token)
+    return _journal_for_unsaved_project(profile_path, project_path, unsaved_key)
 
 
 def _journal_for_saved_project(project_path: str) -> str:
@@ -433,10 +440,17 @@ def _journal_for_saved_project(project_path: str) -> str:
 
 def _journal_for_unsaved_project(profile_path: str,
                                  hint: str,
-                                 session_token: str = "") -> str:
+                                 session_key: str = "") -> str:
+    """Build the journal path of an unsaved project.
+
+    `hint` (the project's would-be path) wins; `session_key` is the
+    per-session fallback discriminant, and a fresh uuid the last resort.
+    Neither is secret: both are hashed only to get a stable, filesystem
+    -safe filename out of arbitrary text.
+    """
     base_dir = os.path.join(profile_path, _UNSAVED_SUBDIR, _AUDIT_SUBDIR)
     if not hint:
-        hint = session_token or uuid.uuid4().hex
+        hint = session_key or uuid.uuid4().hex
     fingerprint = hashlib.sha256(hint.encode("utf-8")).hexdigest()[:16]
     filename = f"audit_{fingerprint}.sqlite"
     return os.path.join(base_dir, filename)

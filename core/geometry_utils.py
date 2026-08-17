@@ -678,7 +678,19 @@ def wkb_short_repr(wkb_data: Optional[bytes]) -> str:
             if geom.type() == 0:  # Point
                 p = geom.asPoint()
                 return f"POINT({p.x():.3f} {p.y():.3f})"
-        except Exception:
+        except Exception:  # nosec B110 # justification below
+            # Deliberately silent, and it must stay that way:
+            #  1. this module keeps no module-level logger import so it
+            #     stays importable without QGIS (every qgis/logger import
+            #     here is function-local), and importing flog from inside
+            #     this handler would raise on the very environments the
+            #     handler exists to survive;
+            #  2. this function is a log-message formatter whose contract
+            #     is to never raise -- emitting a log line while a caller
+            #     is building a log line inverts the record order.
+            # Nothing is lost: the caller logs our return value, and the
+            # fallthrough is visible in it (CENTROID(...)/WKB(len=...)
+            # instead of POINT(...)).
             pass
         try:
             c = geom.centroid().asPoint()

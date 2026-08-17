@@ -192,7 +192,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             old = self.__dict__.get(name, "<unset>")
             try:
                 log_state_transition("RecoverDialog", name, old, value)
-            except Exception:  # pragma: no cover - logging never breaks setters
+            except Exception:  # nosec B110 # pragma: no cover
+                # No log line here, deliberately: this handler guards the
+                # state-transition logger itself, so if that logger is what
+                # failed, logging from the handler fails the same way. And
+                # __setattr__ runs on every assignment to a watched flag --
+                # a raise here would break the setters that gate the whole
+                # run. Logging never breaks setters.
                 pass
             # A run has ~25 exit paths, each resetting this flag. Hooking
             # the transition itself is the only way to guarantee the canvas
@@ -205,7 +211,14 @@ class RecoverDialog(QDialog, LoggerMixin):
                     and bool(old) != bool(value)):
                 try:
                     self._set_ui_quiet_period(bool(value))
-                except Exception:  # pragma: no cover - never break a setter
+                except Exception:  # nosec B110 # pragma: no cover
+                    # Same rule as the handler above: no log line inside a
+                    # setter guard. _set_ui_quiet_period stops timers and
+                    # touches the canvas, so when it fails the logger may
+                    # be inside the same broken teardown -- and a raise
+                    # here would abort the assignment to _is_recovering
+                    # that all ~25 exit paths depend on. Never break a
+                    # setter.
                     pass
         super().__setattr__(name, value)
 
@@ -654,8 +667,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         if self._dialog_read_conn is not None:
             try:
                 self._dialog_read_conn.close()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                flog(f"_close_dialog_read_conn: dialog read connection close "
+                     f"failed, handle dropped anyway ({exc!r})", "DEBUG")
             self._dialog_read_conn = None
 
     def _on_layer_changed(self, _index=None) -> None:
@@ -1232,7 +1246,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         shortcut_button_width = 90
         shortcut_button_height = 28
 
-        clock_icon = QgsApplication.getThemeIcon('/mIconClock.svg')
+        # /mIconClock.svg is absent from the QGIS icon resource on 3.40 AND on
+        # 4.x, so this yielded a null icon on every supported version.
+        clock_icon = QgsApplication.getThemeIcon('/mActionHistory.svg')
 
         min10_btn = QPushButton("10 min")
         min10_btn.setIcon(clock_icon)
@@ -2209,7 +2225,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             try:
                 if compute_datasource_fingerprint(lyr) == fingerprint:
                     return lyr
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # `continue` stays: an unfingerprintable layer cannot match,
+                # and skipping it lets the search reach the next candidate.
+                # No lyr.id() in the message -- the usual cause is a deleted
+                # C++ wrapper, whose id() would raise inside this handler.
+                flog(f"_resolve_layer_by_fingerprint: fingerprint failed, "
+                     f"candidate layer skipped ({exc!r})", "DEBUG")
                 continue
         return None
 
@@ -2531,15 +2553,18 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self.iface.mapCanvas().mapCanvasRefreshed.disconnect(
                     self._review_date_bar.raise_safe
                 )
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Benign and expected when the connection was never made.
+                flog(f"review: date_bar raise_safe disconnect skipped "
+                     f"({exc!r})", "DEBUG")
             self._review_date_bar.cleanup()
             self._review_date_bar = None
             flog("review: date_bar cleaned up", "INFO")
             try:
                 self.iface.mapCanvas().update()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                flog(f"review: canvas update after date_bar removal failed, "
+                     f"the bar may stay painted ({exc!r})", "DEBUG")
         else:
             flog("review: date_bar was already None", "WARNING")
         if self._review_snap_session is not None:
@@ -3001,8 +3026,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         try:
             status_bar = self.iface.mainWindow().statusBar()
             status_bar.removeWidget(self._review_status_widget)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # WARNING: three of the four callers do not destroy the widget
+            # afterwards, so a failure here leaves the Review pill in the
+            # status bar telling the user he is still in Review mode.
+            flog(f"review: status_bar removeWidget failed, the Review pill "
+                 f"may stay visible ({exc!r})", "WARNING")
 
     def _teardown_review_status_bar(self) -> None:
         """Destroy the Review status widget entirely."""
@@ -5120,8 +5149,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # WARNING: this is the write connection used for the
+                    # invalidation UPDATE. A handle that will not close can
+                    # hold the journal lock against the next writer.
+                    flog(f"_invalidate_trace_events: write connection close "
+                         f"failed, journal lock may be held ({exc!r})",
+                         "WARNING")
 
     def reset_undo_state(self) -> None:
         """Drop the last-restore memory (called by the plugin on project switch).

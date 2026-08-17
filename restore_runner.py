@@ -1729,8 +1729,15 @@ class UndoRunner(QObject):
                                     if fid is not None:
                                         geom_check[fid] = feature_geom_short_repr(
                                             layer, fid)
-                                except Exception:
-                                    pass
+                                except Exception as exc:  # noqa: BLE001
+                                    # Per-event, but only reachable with
+                                    # RECOVERLAND_HEAVY_DIAG on, so the
+                                    # volume is opt-in. The missing fid is
+                                    # simply absent from RELOAD_CHECK below.
+                                    flog(f"UndoRunner: RELOAD_CHECK probe "
+                                         f"skipped for eid="
+                                         f"{getattr(ev, 'event_id', '?')} "
+                                         f"({exc!r})", "DEBUG")
                         flog(f"RELOAD_CHECK layer={layer_name_hint!r} "
                              f"geom_after_reload={geom_check}")
                     else:

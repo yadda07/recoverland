@@ -201,8 +201,12 @@ class RecoverPlugin:
         try:
             self.dlg.close()
             self.dlg.deleteLater()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Still swallowed on purpose -- unload must finish removing the
+            # plugin from the UI. But a dialog that refused to close is how
+            # a widget survives an unload and reappears after a reload.
+            flog(f"RecoverPlugin.unload: dlg close/deleteLater failed, the "
+                 f"widget may outlive the unload ({exc!r})", "WARNING")
         self.dlg = None
         flog("RecoverPlugin.unload: dialog cleaned", "INFO")
 

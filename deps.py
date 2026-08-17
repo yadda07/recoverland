@@ -35,9 +35,16 @@ def _is_importable(name: str) -> bool:
 
 
 def _ensure_vendor_on_path() -> None:
-    """Add plugin-local vendor dir to sys.path if present."""
+    """Add plugin-local vendor dir to sys.path if present.
+
+    append, NOT insert(0): sys.path is process-wide. Prepending made every
+    vendored package win over the system copy for QGIS itself and for every
+    other plugin, for the whole session — measured, defusedxml resolved to
+    ``recoverland/_vendor`` instead of site-packages. The vendor dir is a
+    last-resort fallback and must lose to an installed copy.
+    """
     if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
-        sys.path.insert(0, _VENDOR_DIR)
+        sys.path.append(_VENDOR_DIR)
 
 
 def _install_inprocess(pip_name: str) -> bool:
@@ -137,9 +144,18 @@ def _notify_user(failures: list) -> None:
                 bar = iface.messageBar()
                 if bar:
                     bar.pushWarning("RecoverLand", msg)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # flog is out of reach here: deps runs from classFactory
+                # before the package is set up, so this module's own stdlib
+                # _log is the trace, as in the two installer helpers above.
+                _log.warning(
+                    "RecoverLand.deps: message bar push failed, the user is "
+                    "not told that %s is missing: %s", names, exc,
+                )
 
         QTimer.singleShot(3000, _show)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _log.debug(
+            "RecoverLand.deps: cannot schedule the user notification "
+            "(no Qt/iface at load time): %s", exc,
+        )
