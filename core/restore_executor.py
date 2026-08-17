@@ -25,6 +25,7 @@ from .geometry_utils import (
     feature_matches_geometry, get_feature_source,
     wkb_short_repr, feature_geom_short_repr_diag,
     heavy_diag_enabled,
+    geometry_for_layer_crs, extract_crs_authid,
     _compute_makevalid_drift,
 )
 from .serialization import iter_mapped_attributes
@@ -277,11 +278,21 @@ def _buffer_insert(layer, event: AuditEvent,
     event's snapshot). If rewinds are repeated, users must rollback
     compensatory inserts explicitly via the strict runner, not rely on
     silent merging here.
+
+    The captured WKB is expressed in the CRS of the capture, so it goes
+    through `_geometry_in_layer_crs` before it reaches the buffer: a
+    compensatory INSERT on a layer reprojected since then would otherwise
+    recreate the feature thousands of kilometres away.
     """
     from qgis.core import QgsFeature
 
     attrs = reconstruct_attributes(event)
     geom = rebuild_geometry(event.geometry_wkb)
+    if geom is not None:
+        geom, crs_error = _geometry_in_layer_crs(
+            layer, geom, event, trace_id=trace_id)
+        if crs_error is not None:
+            return crs_error
     mapping, dropped = _field_mapping_report(layer, event, attrs)
 
     feature = QgsFeature(layer.fields())
@@ -685,18 +696,65 @@ def _target_matches_insert_snapshot(layer, fid: int, event: AuditEvent) -> bool:
     return False
 
 
-def _buffer_update(layer, event: AuditEvent,
-                   fid_remap: Optional[Dict] = None,
-                   trace_id: str = "") -> dict:
-    """Revert attributes and geometry via editing buffer.
+def _geometry_in_layer_crs(layer, geom, event: AuditEvent,
+                           trace_id: str = "") -> tuple:
+    """Express *geom* in the CRS of *layer*, or refuse to write it.
 
-    Safety: when identity is FID-only (no PK captured) and the captured NEW
-    geometry does not match what is currently at the historical FID, the
-    shapefile has reorganised its FIDs since capture. Falling through would
-    rewrite an unrelated feature with the OLD geometry of the original.
-    Resolution: locate the genuine target by scanning for the captured NEW
-    geometry (post-edit state). On failure, refuse rather than mutate the
-    wrong feature.
+    Returns ``(geom, None)`` when the geometry may reach the buffer, and
+    ``(None, refusal)`` when it may not -- *refusal* being a
+    ready-to-return result dict.
+
+    The journal stores the WKB verbatim, hence in the raw coordinates of
+    ``event.crs_authid``: the CRS the layer had AT CAPTURE TIME. When the
+    layer has been reprojected since, or when a wrongly declared CRS has
+    been corrected, writing those coordinates back as they are teleports
+    the feature -- (2.35, 48.85) degrees dropped into an EPSG:2154 layer
+    lands ~6900 km away -- while the rewind still reports a success (I-3).
+    The read side (Time Lens, geometry preview) already reprojects; the
+    write side must reproject too, or refuse.
+
+    Same helper as the event-by-event path
+    (`restore_service._geometry_for_write`), so both engines share one
+    definition of where a restored geometry belongs. A capture made in the
+    CRS the layer still has costs nothing: `geometry_for_layer_crs`
+    returns the geometry untouched, byte for byte.
+    """
+    aligned, crs_status = geometry_for_layer_crs(
+        geom, event.crs_authid, layer, trace_id=trace_id)
+    if crs_status in ("reprojected", "transform_failed"):
+        flog(f"BUF_CRS eid={event.event_id} crs_mismatch "
+             f"event_crs={event.crs_authid} "
+             f"layer_crs={extract_crs_authid(layer)} action={crs_status}",
+             "WARNING")
+    if aligned is None:
+        return None, {
+            "success": False,
+            "status": "FAILED",
+            "reason_code": "crs_mismatch",
+            "message": (
+                f"Geometry captured in {event.crs_authid} cannot be "
+                f"converted to {extract_crs_authid(layer)}; nothing written"
+            ),
+        }
+    return aligned, None
+
+
+def _settle_update_target(layer, event: AuditEvent,
+                          fid_remap: Optional[Dict],
+                          mapping: dict) -> tuple:
+    """Decide which feature this UPDATE is allowed to write to.
+
+    Returns ``(fid, refusal)``: *refusal* is None once a target is
+    settled, otherwise it is a ready-to-return result dict and nothing
+    must be written.
+
+    Safety: when identity is FID-only (no PK captured) and the captured
+    NEW geometry does not match what is currently at the historical FID,
+    the shapefile has reorganised its FIDs since capture. Falling through
+    would rewrite an unrelated feature with the OLD geometry of the
+    original. Resolution: locate the genuine target by scanning for the
+    captured NEW geometry (post-edit state). On failure, refuse rather
+    than mutate the wrong feature.
     """
     from .restore_service import (
         _parse_identity, _find_target_feature, _verify_update_target,
@@ -709,7 +767,8 @@ def _buffer_update(layer, event: AuditEvent,
     remap_verdict = 'none'
     if remapped is not None:
         if not _target_matches_update_post_state(layer, remapped, event):
-            flog(f"REMAP_GUARD eid={event.event_id} fp={fp} remap={remapped}→discarded", "WARNING")
+            flog(f"REMAP_GUARD eid={event.event_id} fp={fp} "
+                 f"remap={remapped}→discarded", "WARNING")
             remapped = None
             remap_verdict = 'discarded'
         else:
@@ -721,9 +780,6 @@ def _buffer_update(layer, event: AuditEvent,
     trusted = remapped is not None or has_pk
     flog(f"BUF_UPD eid={event.event_id} fp={fp} remap={remap_verdict} "
          f"target={target_fid} trusted={trusted}", "DEBUG")
-
-    old_attrs = reconstruct_attributes(event)
-    mapping, dropped = _field_mapping_report(layer, event, old_attrs)
 
     if target_fid is not None and not trusted:
         # Same proof rule as the event-by-event restore path: one definition
@@ -752,7 +808,7 @@ def _buffer_update(layer, event: AuditEvent,
                 # surface in writing OLD over OLD, so this is a skip.
                 flog(f"BUF_UPD eid={event.event_id} fid={target_fid} "
                      f"already_at_old status=SKIPPED_IDEMPOTENT")
-                return {
+                return None, {
                     "success": True,
                     "skipped": True,
                     "status": "SKIPPED_IDEMPOTENT",
@@ -763,7 +819,7 @@ def _buffer_update(layer, event: AuditEvent,
                 flog(f"BUF_UPD eid={event.event_id} fid={target_fid} "
                      f"unverified reason={why} no_fallback status=refused "
                      f"(FID may point at an unrelated feature)", "ERROR")
-                return {
+                return None, {
                     "success": False,
                     "status": "FAILED",
                     "reason_code": "target_unverifiable",
@@ -789,7 +845,7 @@ def _buffer_update(layer, event: AuditEvent,
                 f"identity_keys={list(identity.keys())}",
                 "WARNING",
             )
-            return {
+            return None, {
                 "success": False,
                 "status": "FAILED",
                 "reason_code": "target_absent",
@@ -798,14 +854,28 @@ def _buffer_update(layer, event: AuditEvent,
     if remapped is not None:
         flog(f"_buffer_update: using fid_remap "
              f"eid={event.event_id} fid={target_fid}")
+    return target_fid, None
+
+
+def _buffer_update(layer, event: AuditEvent,
+                   fid_remap: Optional[Dict] = None,
+                   trace_id: str = "") -> dict:
+    """Revert attributes and geometry via editing buffer.
+
+    Target resolution lives in `_settle_update_target`, geometry alignment
+    in `_geometry_in_layer_crs`; what stays here is the write itself,
+    geometry first and attributes last.
+    """
+    old_attrs = reconstruct_attributes(event)
+    mapping, dropped = _field_mapping_report(layer, event, old_attrs)
+
+    target_fid, refusal = _settle_update_target(
+        layer, event, fid_remap, mapping)
+    if refusal is not None:
+        return refusal
 
     fields = layer.fields()
 
-    # Geometry decides AND writes first; attributes follow at the end of
-    # the function. Every refusal below (corrupt WKB, empty rebuild, drift
-    # beyond tolerance, buffer rejection) used to fire with the restored
-    # attributes already in the buffer -- and the drift guard returns
-    # success/skipped, so the runner committed that half-written feature.
     geom_status = "no_geom_in_event"
     if event.geometry_wkb is not None:
         wkb_len = len(event.geometry_wkb)
@@ -831,11 +901,10 @@ def _buffer_update(layer, event: AuditEvent,
                 "reason_code": "rebuilt_empty",
                 "message": "Geometry rebuilt empty",
             }
-        # BL-RW-P5-28 deferred writing the captured bytes as-is: the
-        # provider does NOT refuse a geometry it cannot store, it truncates
-        # at commit (tx_geom_makevalid_shape_swap). The guard below is what
-        # stands between the user and a silent amputation until a
-        # post-commit read-back exists.
+        geom, crs_error = _geometry_in_layer_crs(
+            layer, geom, event, trace_id=trace_id)
+        if crs_error is not None:
+            return crs_error
         if not geom.isGeosValid():
             geom_before_makevalid = geom
             repaired = geom.makeValid()
@@ -885,6 +954,13 @@ def _buffer_update(layer, event: AuditEvent,
                      f"applying as-is eid={event.event_id} fid={target_fid} "
                      f"(RW-19a: trust original WKB)", "WARNING")
 
+        # Why the drift block above refuses instead of writing the captured
+        # bytes as-is (BL-RW-P5-28): the provider does NOT refuse a geometry
+        # it cannot store, it truncates at commit
+        # (tx_geom_makevalid_shape_swap). That guard is what stands between
+        # the user and a silent amputation until a post-commit read-back
+        # exists.
+
         # TRACE_RESTORE: forensic snapshot of the buffer state around the
         # changeGeometry call. Costs 1 provider getFeatures and 3 WKB
         # serializations per UPDATE event; gated to keep the rewind
@@ -930,8 +1006,13 @@ def _buffer_update(layer, event: AuditEvent,
                  f"eid={event.event_id} fid={target_fid}")
             geom_status = f"applied wkb_len={wkb_len}"
 
-    # Attributes last: reached only once the geometry is settled, so a
-    # geometry refusal above leaves the feature exactly as it was found.
+    # Attributes last, and that ordering is the fix, not a style choice:
+    # every geometry refusal above (corrupt WKB, empty rebuild, CRS that
+    # cannot be converted, drift beyond tolerance, buffer rejection) used to
+    # fire with the restored attributes already in the buffer -- and the
+    # drift guard returns success/skipped, so the runner committed that
+    # half-written feature. Reached only once the geometry is settled, a
+    # refusal now leaves the feature exactly as it was found.
     attr_ok = 0
     attr_fail = 0
     for idx, value in iter_mapped_attributes(mapping, old_attrs, fields):
@@ -1072,7 +1153,7 @@ def _find_existing_by_identity(layer, event):
         return None
 
 
-def _find_existing_by_snapshot(layer, geom, geom_index=None):
+def _find_existing_by_snapshot(layer, geom):
     """Find a feature already present whose geometry matches.
 
     Used for INSERT idempotence and UPDATE post-state recovery. Geometry
@@ -1082,29 +1163,15 @@ def _find_existing_by_snapshot(layer, geom, geom_index=None):
     on top tends to cause false negatives (QVariant NULL vs None,
     trigger-altered fields, datetime serialization), which then leads to
     duplicate inserts on repeated rewinds.
+
+    A `geom_index=` pre-filter branch (BL-RW-P5-29) used to sit here,
+    consulting `layer_geom_index.LayerGeomIndex` before the provider scan.
+    No caller ever passed an index, so the branch was unreachable: an
+    untested candidate loop inside a write path, which is exactly the kind
+    of remedy this plugin has already paid for four times. Removed. If the
+    provider scan ever needs a pre-filter, wire it from the call site in
+    the same change.
     """
-    # BL-RW-P5-29: ask the pre-built index first. It answers None when it
-    # cannot know (build failed, no digest) -- NEVER confuse that with an
-    # empty candidate list, which means "I looked at every feature". The
-    # candidates come best-first, and every one of them is still verified
-    # live below: the index is a pre-filter, never a proof.
-    if geom_index is not None:
-        try:
-            candidates = geom_index.candidate_fids(geom)
-        except Exception as exc:  # noqa: BLE001 - never block on the index
-            flog(f"_find_existing_by_snapshot: index failed: {exc}", "WARNING")
-            candidates = None
-        if candidates is not None:
-            for fid in candidates:
-                try:
-                    feat = layer.getFeature(fid)
-                except (AttributeError, RuntimeError):
-                    continue
-                if feat is None or not feat.isValid():
-                    continue
-                if _feature_geometry_matches(feat, geom):
-                    return fid
-            return None
     try:
         from qgis.core import QgsFeatureRequest
         request = QgsFeatureRequest()
