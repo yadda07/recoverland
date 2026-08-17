@@ -95,8 +95,13 @@ def _run_stats(journal, criteria, trace_id, is_cancelled):
         if conn is not None:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # This finally also runs while the `raise` above propagates.
+                # flog is proven usable on that path (it just logged the
+                # error) and logging swallows handler failures, so the
+                # pending exception still reaches the caller untouched.
+                flog(f"{prefix}stats_thread: read connection close failed "
+                     f"({exc!r})", "DEBUG")
 
 
 def _run_stats_task(task, journal, criteria, trace_id):

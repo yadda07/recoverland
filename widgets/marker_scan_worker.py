@@ -183,5 +183,6 @@ class MarkerScanWorker(QThread):
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"[{tid}] marker_scan: read connection close failed "
+                         f"({exc!r})", "DEBUG")

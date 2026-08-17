@@ -22,11 +22,15 @@ Exit codes::
     2  metadata.txt missing or unparsable
     3  required runtime file missing in stage (sanity check)
     4  git not available or repo error
+    5  staged .qm is not a usable catalogue, or Qt is unavailable to prove it
 """
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import glob
+import importlib
+import os
 import re
 import shutil
 import subprocess
@@ -66,6 +70,17 @@ EXCLUDE_FILES = frozenset({
     # Validation/QA helper script moved to scripts/validation/; excluded
     # here as defense-in-depth in case it was ever tracked at root.
     "validate_zip.py",
+    # The .ts -> .qm compiler is a DEV tool and must not ship. It stays in the
+    # repo as the maintainer's way to regenerate a catalogue -- and only that:
+    # measured, no scenario and no other module imports it. Shipping it was what
+    # let classFactory recompile at runtime and overwrite a correct .qm with a
+    # dead one (339/339 messages resolving before, 18/339 after). It also carries
+    # every bandit finding of the package (B404/B405/B603), 3 of 3.
+    "i18n/compile_translations.py",
+    # The source catalogue is a build input, not a runtime asset: nothing in the
+    # plugin reads a .ts. It was also the second half of the removed branch's
+    # trigger, which fired when a .ts sat next to a missing .qm.
+    "i18n/recoverland_en.ts",
 })
 
 # Glob patterns matched against the full relative POSIX path.
@@ -96,9 +111,30 @@ REQUIRED_STAGE_FILES = (
     "recover_dialog.py",
     "icon.svg",
     "LICENSE",
-    # Imported lazily by __init__.py:22 to compile .ts -> .qm on first run.
-    "i18n/compile_translations.py",
+    # The compiled English catalogue is the ONLY translation artefact the plugin
+    # loads at runtime, and it is never regenerated on the user's machine.
+    "i18n/recoverland_en.qm",
 )
+
+# Sample of (context, source, expected_english) taken verbatim from
+# scripts/validation/scenarios/i18n_runtime_qgis.py, which proves these pairs
+# against a live QGIS. Every entry has expected != source, so a catalogue that
+# fails to resolve cannot pass by accident: QTranslator returns the source
+# string on a miss, and the old dead .qm scored exactly 0 here. All four
+# translated contexts are represented.
+QM_SAMPLE = (
+    ("ReviewStatusWidget", "Desactiver Review", "Disable Review"),
+    ("ReviewStatusWidget", "Inactif", "Inactive"),
+    ("ReviewStatusWidget", "Review — Recherche des modifications",
+     "Review — Searching for modifications"),
+    ("ReviewSegmentedSwitch", "Présent", "Present"),
+    ("AppleToggleSwitch", "Enregistrement actif", "Recording active"),
+    ("CanvasDateBar", "Aujourd'hui", "Today"),
+    ("CanvasDateBar", "Exporter le snapshot vers GeoPackage",
+     "Export snapshot to GeoPackage"),
+)
+
+QM_STAGE_REL = "i18n/recoverland_en.qm"
 
 VERSION_RE = re.compile(r"^version\s*=\s*(\S+)\s*$", re.MULTILINE)
 
@@ -223,6 +259,147 @@ def verify_required(stage_root: Path) -> None:
         raise SystemExit(3)
 
 
+def _import_qtcore():
+    """Return a Qt QtCore module, or None if this interpreter has no Qt."""
+    for name in ("qgis.PyQt.QtCore", "PyQt6.QtCore", "PyQt5.QtCore"):
+        try:
+            return importlib.import_module(name)
+        except Exception:
+            continue
+    return None
+
+
+def check_qm_content(qm_path: Path) -> tuple[bool, str]:
+    """Load ``qm_path`` in a QTranslator and resolve a sample of known strings.
+
+    The check is on CONTENT only: never on a timestamp, never on mere presence.
+    A file can exist, load, and report isEmpty() False while translating
+    nothing at all -- that is precisely the dead catalogue the pure-Python
+    fallback used to write -- so the verdict is the sample resolution.
+
+    Returns ``(ok, detail)``. Requires Qt in THIS interpreter; callers handle
+    the Qt-less case.
+    """
+    qtcore = _import_qtcore()
+    if qtcore is None:
+        return False, "qt_unavailable"
+    if not qm_path.is_file():
+        return False, f"missing:{qm_path}"
+
+    # QCoreApplication.translate() is the lookup the plugin's self.tr() actually
+    # goes through, and unlike QTranslator.translate() it handles non-ASCII
+    # sources on this PyQt build. It needs a live application object.
+    app = qtcore.QCoreApplication.instance() or qtcore.QCoreApplication([])
+    translator = qtcore.QTranslator()
+    if not translator.load(str(qm_path)):
+        return False, "load_failed"
+    if translator.isEmpty():
+        return False, "catalogue_empty"
+
+    app.installTranslator(translator)
+    try:
+        failures = []
+        for context, source, expected in QM_SAMPLE:
+            got = qtcore.QCoreApplication.translate(context, source)
+            if got != expected or got == source:
+                failures.append(f"{context}/{ascii(source)}->{ascii(got)}")
+    finally:
+        app.removeTranslator(translator)
+
+    n = len(QM_SAMPLE)
+    if failures:
+        return False, f"resolved={n - len(failures)}/{n} failed={';'.join(failures[:3])}"
+    return True, f"resolved={n}/{n}"
+
+
+def _qt_capable_interpreter() -> str | None:
+    """Find an interpreter that can import Qt, for the .qm content check.
+
+    Deliberate design: this script is normally run by a bare `python` that has
+    no Qt at all (measured: C:\\Python314 imports none of qgis.PyQt, PyQt6,
+    PyQt5). A check that quietly disables itself there would be the same class
+    of lie we are removing from classFactory, so the build instead borrows a
+    Qt-capable interpreter, and FAILS (exit 5) when it cannot find one. Set
+    RECOVERLAND_QT_PYTHON to point at one explicitly.
+
+    Unrelated to lrelease: nothing here compiles anything, so the absence of
+    lrelease -- which is not shipped with QGIS 4.0.3 or OSGeo4W -- can never
+    weaken or skip the check.
+    """
+    explicit = os.environ.get("RECOVERLAND_QT_PYTHON")
+    if explicit and Path(explicit).exists():
+        return explicit
+    found = shutil.which("python-qgis.bat") or shutil.which("python-qgis")
+    if found:
+        return found
+    # Linux: a distro QGIS puts qgis.PyQt in the system python3, which a venv
+    # building the release would not see. If that python3 has no Qt either, the
+    # child reports qt_unavailable and the build still fails loudly.
+    if not sys.platform.startswith("win"):
+        system_python = shutil.which("python3")
+        if system_python and Path(system_python).resolve() != Path(sys.executable).resolve():
+            return system_python
+    for pattern in (
+        "C:/Program Files/QGIS */bin/python-qgis.bat",
+        "C:/OSGeo4W/bin/python-qgis.bat",
+    ):
+        matches = sorted(glob.glob(pattern), reverse=True)
+        if matches:
+            return matches[0]
+    return None
+
+
+def verify_qm(stage_root: Path) -> None:
+    """Abort the build unless the STAGED .qm is a usable catalogue."""
+    qm_path = stage_root / QM_STAGE_REL
+
+    if _import_qtcore() is not None:
+        ok, detail = check_qm_content(qm_path)
+        log(
+            "INFO" if ok else "CRITICAL",
+            "qm_content_checked" if ok else "qm_content_rejected",
+            path=str(qm_path), mode="in_process", detail=detail,
+        )
+        if not ok:
+            raise SystemExit(5)
+        return
+
+    interpreter = _qt_capable_interpreter()
+    if interpreter is None:
+        log(
+            "CRITICAL",
+            "qm_content_unverifiable",
+            reason="no Qt in this interpreter and no Qt-capable interpreter found",
+            hint="set RECOVERLAND_QT_PYTHON to a python that can import PyQt",
+        )
+        raise SystemExit(5)
+
+    result = subprocess.run(  # nosec B603 - fixed argv, interpreter path from env/known locations
+        [interpreter, str(Path(__file__).resolve()), "--check-qm", str(qm_path)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    tail = (result.stdout or "").strip().splitlines()
+    if result.returncode == 0:
+        event = "qm_content_checked"
+    elif "qt_unavailable" in (result.stdout or ""):
+        # The borrowed interpreter had no Qt either: nothing was proven about the
+        # catalogue. Report that, do not dress it up as a verdict on the file.
+        event = "qm_content_unverifiable"
+    else:
+        event = "qm_content_rejected"
+    log(
+        "INFO" if result.returncode == 0 else "CRITICAL",
+        event,
+        path=str(qm_path), mode="subprocess", interpreter=interpreter,
+        returncode=result.returncode,
+        detail=(tail[-1] if tail else (result.stderr or "").strip()[-300:]),
+    )
+    if result.returncode != 0:
+        raise SystemExit(5)
+
+
 def build_zip(stage_root: Path, zip_path: Path) -> tuple[int, int]:
     """Zip ``stage_root`` into ``zip_path``. Returns ``(n_entries, size_bytes)``."""
     if zip_path.exists():
@@ -299,6 +476,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     verify_required(stage_root)
+    # Content gate BEFORE the ZIP is written: a rejected catalogue must leave no
+    # artefact behind that anyone could mistake for a release.
+    verify_qm(stage_root)
 
     zip_path = DIST_DIR / f"{PLUGIN_NAME}.zip"
     n_entries, size_bytes = build_zip(stage_root, zip_path)
@@ -317,5 +497,24 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def check_qm_cli(qm_path: str) -> int:
+    """`--check-qm <path>` entry point, run in a Qt-capable interpreter."""
+    ok, detail = check_qm_content(Path(qm_path))
+    if ok:
+        event = "qm_content_checked"
+    elif detail == "qt_unavailable":
+        # Distinct from a rejected catalogue: we learned nothing about the file.
+        # Still a build failure -- an unverifiable guarantee is not a guarantee.
+        event = "qm_content_unverifiable"
+    else:
+        event = "qm_content_rejected"
+    log("INFO" if ok else "CRITICAL", event, path=qm_path, mode="child", detail=detail)
+    return 0 if ok else 5
+
+
 if __name__ == "__main__":
+    # Hidden sub-invocation used by verify_qm() when the building interpreter has
+    # no Qt. Kept out of argparse so the normal CLI stays unchanged.
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-qm":
+        sys.exit(check_qm_cli(sys.argv[2]))
     sys.exit(main())

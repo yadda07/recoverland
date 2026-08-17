@@ -79,7 +79,18 @@ def _get_qgis_profile_name() -> Optional[str]:
                 name = parts[-1]
                 if name and name != "default":
                     return name
-    except Exception:
+    except Exception:  # nosec B110 # justification below
+        # Deliberately silent, and it must stay that way. This module is
+        # imported before anything else needs an identity and carries no
+        # logger import on purpose: every QGIS symbol it touches is
+        # function-local so the module stays importable without QGIS.
+        # Importing flog from inside this handler would raise ImportError
+        # on exactly the environments this handler exists to survive (no
+        # qgis.core), and that exception would escape
+        # _resolve_from_sources -> resolve_user_name and break identity
+        # resolution, i.e. break capture. The profile name is the 4th of
+        # 5 fallbacks; losing it is invisible because the resolved user
+        # name is itself recorded on every audit event.
         pass
     return None
 

@@ -138,7 +138,11 @@ class JournalMaintenanceDialog(QDialog):
         tools_row = QHBoxLayout()
         tools_row.setSpacing(6)
         integrity_btn = QPushButton(self.tr("Integrite"))
-        integrity_btn.setIcon(QgsApplication.getThemeIcon('/mActionCheckGeometry.svg'))
+        # /mActionCheckGeometry.svg does not exist in the QGIS icon resource on
+        # either supported version; this one does.
+        integrity_btn.setIcon(
+            QgsApplication.getThemeIcon('/algorithms/mAlgorithmCheckGeometry.svg')
+        )
         integrity_btn.setToolTip(self.tr("Lancer une verification d'integrite du journal"))
         integrity_btn.clicked.connect(self._check_integrity)
         export_btn = QPushButton(self.tr("Exporter"))
@@ -250,8 +254,9 @@ class JournalMaintenanceDialog(QDialog):
             if conn:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"_refresh_stats: stats read connection close "
+                         f"failed ({exc!r})", "DEBUG")
 
         settings = QgsSettings()
         self._retention_days_spin.setValue(
@@ -311,8 +316,9 @@ class JournalMaintenanceDialog(QDialog):
             if conn:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"_purge_events: purgeable-count read connection "
+                         f"close failed ({exc!r})", "DEBUG")
         if total_purgeable == 0:
             QMessageBox.information(self, self.tr("Purge"), self.tr("Aucun evenement a purger."))
             return
@@ -535,8 +541,9 @@ class JournalMaintenanceDialog(QDialog):
             if conn:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"_count_logical_garbage: read connection close "
+                         f"failed ({exc!r})", "DEBUG")
 
     def _flash_size_change(self, before_str: str, after_str: str) -> None:
         """Animate the size label to show the before→after transition."""
@@ -589,13 +596,19 @@ class JournalMaintenanceDialog(QDialog):
             if dst_conn:
                 try:
                     dst_conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # WARNING: the success dialog has already been shown,
+                    # so an unflushed destination means the user keeps an
+                    # export he believes is complete.
+                    flog(f"_export_journal: destination connection close "
+                         f"failed, exported file may be incomplete "
+                         f"({exc!r})", "WARNING")
             if src_conn:
                 try:
                     src_conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"_export_journal: source read connection close "
+                         f"failed ({exc!r})", "DEBUG")
 
     def _analyze_journal(self) -> None:
         """Run BL-OPT-08 diagnostic and display the report."""
@@ -639,8 +652,9 @@ class JournalMaintenanceDialog(QDialog):
             if conn:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"_analyze_journal: diagnostics read connection "
+                         f"close failed ({exc!r})", "DEBUG")
 
     def _open_journal_folder(self) -> None:
         if not self._journal or not self._journal.path:

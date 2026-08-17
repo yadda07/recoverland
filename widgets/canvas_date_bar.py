@@ -73,12 +73,19 @@ def _purge_stale_bars(canvas) -> None:
                 w.hide()
                 w.deleteLater()
                 destroyed += 1
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # WARNING: a bar that refuses to tear down stays painted on
+                # the canvas as a ghost, still filtering events.
+                flog(f"canvas_date_bar: stale bar teardown failed, ghost bar "
+                     f"may remain ({exc!r})", "WARNING")
         if destroyed:
             flog(f"canvas_date_bar: purged stale_bars n={destroyed}", "WARNING")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # Swallowed on purpose: this runs from CanvasDateBar.__init__ and a
+        # raise here would cost Review its date bar entirely. The message
+        # carries nothing but exc!r, so it cannot raise in turn.
+        flog(f"canvas_date_bar: stale bar purge aborted, leftovers from a "
+             f"previous load may remain ({exc!r})", "WARNING")
 
 
 class CanvasDateBar(QWidget):
@@ -151,22 +158,43 @@ class CanvasDateBar(QWidget):
 
         self._total_days = max(1, (self._end_date - self._base_date).days)
         today = journal_today()
-        self._date_edit.setMinimumDate(
-            QDate(self._base_date.year, self._base_date.month, self._base_date.day)
-        )
-        self._date_edit.setMaximumDate(
-            QDate(today.year, today.month, today.day)
-        )
 
+        # Capture the cursor BEFORE touching the bounds. Moving them makes Qt
+        # clamp the displayed date, which emits dateChanged and re-enters
+        # _on_date_edit_changed; reading the cursor afterwards would preserve
+        # the clamped value instead of the user's. The guard must cover the
+        # bounds mutation for the same reason, and the clamp may still have
+        # armed the debounce, so disarm it.
         current_iso = self._timeline.current_date_iso() if preserve_cursor else None
+        self._syncing = True
+        try:
+            self._date_edit.setMinimumDate(
+                QDate(self._base_date.year, self._base_date.month, self._base_date.day)
+            )
+            self._date_edit.setMaximumDate(
+                QDate(today.year, today.month, today.day)
+            )
+        finally:
+            self._syncing = False
+        self._debounce.stop()
+
         self._timeline.set_range(first_iso, last_iso)
         if preserve_cursor and current_iso:
+            # Clamp into the new span: otherwise the QDateEdit bounds re-clamp
+            # the value and the handle and the editors diverge again.
+            lo = f"{self._base_date.isoformat()}T00:00:00"
+            hi = f"{self._end_date.isoformat()}T23:59:59"
+            current_iso = min(max(current_iso, lo), hi)
             self._syncing = True
             try:
                 self._timeline.set_value_iso(current_iso)
-                self._on_timeline_date_changed(current_iso)
+                # _apply_iso_to_editors, not _on_timeline_date_changed: the
+                # latter returns immediately while _syncing is True, so the
+                # editors were never moved back onto the preserved cursor.
+                self._apply_iso_to_editors(current_iso)
             finally:
                 self._syncing = False
+            self._debounce.stop()
         else:
             self._go_today()
         flog(
@@ -296,7 +324,10 @@ class CanvasDateBar(QWidget):
 
     def _maybe_zoom_timeline(self, event) -> bool:
         """Forward a viewport wheel event to the timeline when it is on top of it."""
-        if self._closing or self._timeline is None:
+        # isVisible(): a hidden-but-not-closing bar would otherwise keep
+        # swallowing wheel events over its stale timeline rect, leaving a dead
+        # zone where the map refuses to zoom.
+        if self._closing or self._timeline is None or not self.isVisible():
             return False
         try:
             gp = event.globalPosition().toPoint()
@@ -474,11 +505,13 @@ class CanvasDateBar(QWidget):
             "DEBUG",
         )
 
-    def _on_timeline_date_changed(self, iso: str) -> None:
-        """Sync QDateEdit + QTimeEdit when user drags / zooms the timeline."""
-        if self._syncing:
-            return
-        self._syncing = True
+    def _apply_iso_to_editors(self, iso: str) -> None:
+        """Move QDateEdit + QTimeEdit onto *iso*, without touching _syncing.
+
+        Guard-free on purpose: callers that already hold the _syncing guard
+        (set_range) need the write to happen, and _on_timeline_date_changed
+        owns the guard for the interactive path.
+        """
         try:
             d = parse_iso_date(iso)
             self._date_edit.setDate(QDate(d.year, d.month, d.day))
@@ -489,6 +522,14 @@ class CanvasDateBar(QWidget):
                 pass
         except (ValueError, TypeError):
             pass
+
+    def _on_timeline_date_changed(self, iso: str) -> None:
+        """Sync QDateEdit + QTimeEdit when user drags / zooms the timeline."""
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self._apply_iso_to_editors(iso)
         finally:
             self._syncing = False
         self._debounce.start()

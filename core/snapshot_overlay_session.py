@@ -192,8 +192,14 @@ class SnapshotOverlaySession:
             if canvas is not None:
                 try:
                     canvas.freeze(False)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # WARNING: the canvas is left frozen, so the map stops
+                    # repainting for the rest of the session.
+                    flog(
+                        f"[{self.trace_id}] snapshot_overlay: thaw failed, "
+                        f"canvas may stay frozen ({exc!r})",
+                        "WARNING",
+                    )
             if model is not None and original_flags is not None:
                 try:
                     model.setFlags(original_flags)
@@ -201,8 +207,14 @@ class SnapshotOverlaySession:
                         f"[{self.trace_id}] snapshot_overlay: legend_defer restored",
                         "DEBUG",
                     )
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # WARNING: the legend keeps the deferred flags, so it
+                    # stops reflecting later layer changes.
+                    flog(
+                        f"[{self.trace_id}] snapshot_overlay: legend flag "
+                        f"restore failed, legend stays deferred ({exc!r})",
+                        "WARNING",
+                    )
 
         last_end = [time.monotonic()]
 
@@ -280,8 +292,13 @@ class SnapshotOverlaySession:
                     root = QgsProject.instance().layerTreeRoot()
                     if root is not None:
                         group = root.findGroup(_GROUP_NAME)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: legend handles "
+                f"unresolved for the refresh probe, per-layer legend timing "
+                f"will be missing from the log ({exc!r})",
+                "DEBUG",
+            )
 
         # Build layer_id->name dict once
         layer_id_to_name = {ovl.layer_id: ovl.layer_name for ovl in self._overlays.values()}
@@ -398,8 +415,14 @@ class SnapshotOverlaySession:
             from qgis.utils import iface  # noqa: PLC0415
             if iface is not None:
                 iface.mapCanvas().refresh()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # WARNING: the overlays hold the snapshot but the map still
+            # paints the previous cutoff.
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: canvas refresh failed "
+                f"after update, map may show the previous cutoff ({exc!r})",
+                "WARNING",
+            )
         return {"n_entities": n_ent, "n_features": total_feats, "elapsed_ms": elapsed_ms}
 
     def update_async(self, snapshot_result, on_done=None) -> None:
@@ -447,8 +470,15 @@ class SnapshotOverlaySession:
                     from qgis.utils import iface  # noqa: PLC0415
                     if iface is not None:
                         iface.mapCanvas().refresh()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # WARNING: the overlays hold the snapshot but the map
+                    # still paints the previous cutoff.
+                    flog(
+                        f"[{self.trace_id}] snapshot_overlay: canvas refresh "
+                        f"failed after updated_async, map may show the "
+                        f"previous cutoff ({exc!r})",
+                        "WARNING",
+                    )
                 if on_done is not None:
                     on_done({"n_entities": n_ent, "n_features": total_feats[0],
                              "elapsed_ms": elapsed_ms})
@@ -709,8 +739,14 @@ class SnapshotOverlaySession:
             from qgis.utils import iface  # noqa: PLC0415
             if iface is not None:
                 iface.mapCanvas().refresh()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # WARNING: the overlay layers are gone from the project but the
+            # canvas may keep painting them, which reads as live data.
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: canvas refresh failed "
+                f"after teardown, removed overlays may stay painted ({exc!r})",
+                "WARNING",
+            )
 
     def overlay_layer_ids(self) -> List[str]:
         """Return QGIS layer IDs for all current overlay layers."""
@@ -732,8 +768,13 @@ class SnapshotOverlaySession:
         ctx = QgsCoordinateTransformContext()
         try:
             ctx = project.transformContext()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: export falls back to an "
+                f"empty transform context, project datum shifts will not be "
+                f"applied ({exc!r})",
+                "WARNING",
+            )
 
         n_layers = 0
         n_features = 0
@@ -882,23 +923,40 @@ class SnapshotOverlaySession:
             base_code = raw_wkb % 1000
             if base_code in _WKB_MULTI_CODES:
                 is_multi = True
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # WARNING: losing Multi detection is the data-loss path this
+            # method's docstring describes -- a "Point" memory layer drops
+            # every MultiPoint feature silently.
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: wkbType probe failed, "
+                f"Multi detection lost for this overlay ({exc!r})",
+                "WARNING",
+            )
 
         try:
             gtype = int(source_layer.geometryType())
             family = (_MULTI if is_multi else _BASE).get(gtype)
             if family:
                 return family
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: geometryType probe "
+                f"failed, trying QgsWkbTypes ({exc!r})",
+                "DEBUG",
+            )
 
         try:
             from qgis.core import QgsWkbTypes  # noqa: PLC0415
             gtype = int(QgsWkbTypes.geometryType(source_layer.wkbType()))
             return (_MULTI if is_multi else _BASE).get(gtype)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # WARNING: returning None means no overlay layer for this
+            # source, so its snapshot features are simply not shown.
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: QgsWkbTypes fallback "
+                f"failed, no geometry family for this overlay ({exc!r})",
+                "WARNING",
+            )
         return None
 
 

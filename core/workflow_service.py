@@ -216,7 +216,16 @@ def find_target_layer(event: AuditEvent, read_conn=None) -> object:
             continue
         try:
             current = compute_datasource_fingerprint(layer)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            # `continue` is the intended behaviour: an unfingerprintable
+            # layer cannot be matched, and skipping it lets the search
+            # reach the next candidate. Only the log line is new -- and it
+            # holds no layer.id() call on purpose: the usual cause here is
+            # a deleted C++ wrapper, whose id() would raise too and turn
+            # this handler into the crash it exists to absorb. exc!r
+            # already names that case.
+            flog(f"find_target_layer: datasource fingerprint failed, "
+                 f"candidate layer skipped ({exc!r})", "DEBUG")
             continue
         if current in scope:
             return layer

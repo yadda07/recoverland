@@ -180,6 +180,14 @@ class ActionButtonBar(QWidget):
     def _logical_index_at(self, x):
         if not self._visible:
             return -1
+        # Reject outside the bar instead of wrapping. min() clamped only the
+        # top: for x < 0, int() truncates toward zero to -1 or lower and
+        # self._visible[visual] wrapped round to the LAST segment. Mouse
+        # coordinates do go negative during the implicit grab after a press,
+        # so dragging out of the bar and releasing still fired the action --
+        # and on the wrong, possibly destructive, segment.
+        if x < 0 or x >= self._SEGMENT_W * len(self._visible):
+            return -1
         visual = min(int(x / self._SEGMENT_W), len(self._visible) - 1)
         return self._visible[visual]
 

@@ -189,12 +189,39 @@ def setup(ctx):
 
     tracker.committed_features.connect(_rec)
 
-    ctx["data"]["signal_slot"] = _rec
+    ctx.data["signal_slot"] = _rec
 
     def _wait_flush(timeout=2.0):
+        """Wait for a flush, PUMPING the Qt event queue while we wait.
+
+        Sleeping alone was not enough and hid seven assertions for as long as
+        this scenario existed. Under a real QGIS this module's offline shim
+        never installs (import qgis succeeds), so real Qt plays: the
+        WriteQueue calls its flush callback from the writer thread while the
+        signal bridge is a QObject of the main thread. The connection therefore
+        resolves to QUEUED, the emit is posted to the main thread's queue --
+        and nothing here ever drained it. The signal was never lost, only
+        deferred; measured A/B, pumping takes this scenario from 10/17 to 17/17
+        and moves exactly the seven emit assertions, nothing else.
+
+        WHAT THE ORDERING ASSERTIONS DO NOT PROVE: _obs below appends
+        ("flush", n) BEFORE calling the product callback that emits, so
+        flush-before-emit cannot fail once any emit is observed -- it is
+        imposed by this wrapper, not measured on the product. Read those four
+        as "the emit was delivered", never as proof of commit ordering. The
+        real invariant (BL-RVW-P1-03: the row is committed before the
+        notification) needs an INDEPENDENT SQLite connection reading at
+        callback time; that assertion is still missing here.
+        """
         start = time.time()
         initial_len = len(ordered_events)
+        try:  # real QGIS: drain the queue. Offline shim: no Qt, none needed.
+            from qgis.PyQt.QtCore import QCoreApplication
+        except Exception:  # noqa: BLE001 - offline fake signals are synchronous
+            QCoreApplication = None
         while time.time() - start < timeout:
+            if QCoreApplication is not None and QCoreApplication.instance():
+                QCoreApplication.processEvents()
             if len(ordered_events) > initial_len:
                 for i in range(initial_len, len(ordered_events)):
                     if ordered_events[i][0] == "flush":
@@ -202,13 +229,13 @@ def setup(ctx):
             time.sleep(0.02)
         return False
 
-    ctx["data"]["wq"] = wq
-    ctx["data"]["tracker"] = tracker
-    ctx["data"]["db_path"] = db_path
-    ctx["data"]["tmpdir"] = tmpdir
-    ctx["data"]["ordered_events"] = ordered_events
-    ctx["data"]["AuditEvent"] = AuditEvent
-    ctx["data"]["_wait_flush"] = _wait_flush
+    ctx.data["wq"] = wq
+    ctx.data["tracker"] = tracker
+    ctx.data["db_path"] = db_path
+    ctx.data["tmpdir"] = tmpdir
+    ctx.data["ordered_events"] = ordered_events
+    ctx.data["AuditEvent"] = AuditEvent
+    ctx.data["_wait_flush"] = _wait_flush
 
 
 def _make_event(event_id, ts, AuditEvent):
@@ -238,11 +265,11 @@ def _make_event(event_id, ts, AuditEvent):
 
 
 def run(ctx):
-    wq = ctx["data"]["wq"]
-    tracker = ctx["data"]["tracker"]
-    ordered_events = ctx["data"]["ordered_events"]
-    AuditEvent = ctx["data"]["AuditEvent"]
-    _wait_flush = ctx["data"]["_wait_flush"]
+    wq = ctx.data["wq"]
+    tracker = ctx.data["tracker"]
+    ordered_events = ctx.data["ordered_events"]
+    AuditEvent = ctx.data["AuditEvent"]
+    _wait_flush = ctx.data["_wait_flush"]
 
     results = {}
 
@@ -311,7 +338,7 @@ def run(ctx):
         results["P4_AT_double_order_2"] = False
 
     ordered_events.clear()
-    signal_slot = ctx["data"]["signal_slot"]
+    signal_slot = ctx.data["signal_slot"]
     tracker.committed_features.disconnect(signal_slot)
     wq.enqueue([event1])
     _wait_flush()
@@ -323,11 +350,16 @@ def run(ctx):
     except TypeError:
         results["P5_AT_disconnect_double_error"] = True
 
+    # runner.py discards what run() returns -- ctx IS the channel. This
+    # scenario was written against a runner that captured the return value,
+    # so assertions() read an empty dict and 16 of its 17 checks reported
+    # FAIL on a product that was behaving correctly. Stash before returning.
+    ctx.data["run_results"] = results
     return results
 
 
 def assertions(ctx):
-    run_results = ctx["data"].get("run_results", {})
+    run_results = ctx.data.get("run_results", {})
     assertions_list = []
 
     def _assert(name, condition, message):
@@ -384,7 +416,7 @@ def main():
     try:
         setup(ctx)
         run_results = run(ctx)
-        ctx["data"]["run_results"] = run_results
+        ctx.data["run_results"] = run_results
         assertions_list = assertions(ctx)
 
         passed = sum(1 for _, ok, _ in assertions_list if ok)
@@ -424,11 +456,11 @@ def main():
         return 0 if verdict == "PASS" else 1
 
     finally:
-        if "wq" in ctx["data"]:
-            ctx["data"]["wq"].stop()
-        if "tmpdir" in ctx["data"]:
+        if "wq" in ctx.data:
+            ctx.data["wq"].stop()
+        if "tmpdir" in ctx.data:
             import shutil
-            shutil.rmtree(ctx["data"]["tmpdir"], ignore_errors=True)
+            shutil.rmtree(ctx.data["tmpdir"], ignore_errors=True)
 
 
 if __name__ == "__main__":

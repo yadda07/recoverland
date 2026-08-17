@@ -31,6 +31,33 @@ from .geometry_utils import is_geometry_present, get_feature_source
 _BBOX_PRECISION = 9
 
 
+def _md5_digest(payload: bytes) -> bytes:
+    """MD5 of `payload` as a CONTENT fingerprint -- never a secret.
+
+    `usedforsecurity=False` states that intent to hashlib: no security
+    decision rests on this digest, it only answers "are these two WKB
+    blobs the same bytes?". It also lets the index work on a FIPS-enabled
+    OpenSSL, where the bare md5 constructor refuses to run at all.
+
+    The keyword reached hashlib in Python 3.9, which is the floor QGIS
+    3.40 still ships on some Linux packages, so the plain call is kept as
+    a fallback for anything older. Both branches return the SAME bytes:
+    the flag selects an implementation policy, not the algorithm. That
+    equality is load-bearing -- digests computed off-thread by
+    layer_index_thread are compared against digests computed here.
+    """
+    try:
+        return hashlib.md5(payload, usedforsecurity=False).digest()
+    except TypeError:
+        # Python < 3.9 has no such keyword. A TypeError caused instead by
+        # a payload of the wrong type re-raises identically below, so the
+        # caller sees the same exception it always did.
+        # B324 is suppressed on the next line only: same fingerprint role
+        # as above, and the keyword that would express it is unavailable
+        # precisely on the interpreters this branch exists for.
+        return hashlib.md5(payload).digest()  # nosec B324
+
+
 def _geom_digest(geom) -> Optional[Tuple[bytes, Tuple]]:
     """Return (md5_of_wkb, rounded_bbox_tuple) or None if geom is absent."""
     if not is_geometry_present(geom):
@@ -48,7 +75,7 @@ def _geom_digest(geom) -> Optional[Tuple[bytes, Tuple]]:
         flog(f"layer_geom_index: digest_failed type={type(exc).__name__} "
              f"msg={exc}", "WARNING")
         return None
-    return hashlib.md5(wkb).digest(), bbox
+    return _md5_digest(wkb), bbox
 
 
 class LayerGeomIndex:
@@ -156,7 +183,7 @@ class LayerGeomIndex:
             return None
         if expected_wkb is not None and is_geometry_present(expected_geom):
             try:
-                exp_md5 = hashlib.md5(expected_wkb).digest()
+                exp_md5 = _md5_digest(expected_wkb)
                 rect = expected_geom.boundingBox()
                 exp_bbox = (
                     round(rect.xMinimum(), _BBOX_PRECISION),

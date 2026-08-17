@@ -5,8 +5,19 @@ contract. Everything under ``scenarios/`` uses the other contract
 (``setup(ctx) / run(ctx) / assertions(ctx)`` consumed by ``runner.py``) and
 had no headless entry point at all: the scenarios could only be run one by
 one from the QGIS Python console, which is why several of them rotted
-unnoticed. This module runs any number of them in one go and exits non-zero
-if a single assertion fails.
+unnoticed. This module runs any number of them in one go.
+
+Exit codes, kept distinct on purpose
+------------------------------------
+0  every scenario this runner can drive passed
+1  at least one scenario RAN and failed (assertion) or crashed (error)
+2  nothing was run -- unknown scenario name, or no scenario found
+
+Conflating 2 with 1 is what makes a test harness untrustworthy: a typo in an
+argument, or a contract this runner cannot drive, then reads exactly like a
+regression in the code under test. Scenarios on the ``run() -> dict``
+contract are reported as NOT RUN -- never as PASS, since unproven is not
+proven, and never as FAIL, since they were never executed.
 
 Why the QGIS_CUSTOM_CONFIG_PATH dance
 -------------------------------------
@@ -59,21 +70,83 @@ def _resolve_config_root() -> str:
     return ""
 
 
-def _collect(argv) -> list:
+def _collect(argv) -> tuple:
+    """Resolve CLI targets to scenario files.
+
+    Returns ``(paths, unresolved)``. Keeping the two apart matters: an
+    unresolved target means the suite did NOT run, which is a different
+    verdict from a scenario that ran and failed. Folding the first into the
+    second -- as this function used to, by appending a non-existent path and
+    letting run_scenario raise FileNotFoundError -- makes a typo in an
+    argument look exactly like a regression in the code under test.
+
+    A bare scenario id (``rw_apply_perf``) resolves against scenarios/, which
+    is how scenarios are named everywhere else (SCENARIO_ID, reports, CI
+    lists); requiring ``scenarios/rw_apply_perf.py`` from the plugin root was
+    a trap, since the same word works in the QGIS console.
+    """
     if not argv:
-        return sorted(p for p in _SCENARIOS_DIR.glob("*.py")
-                      if not p.name.startswith("_"))
+        return (sorted(p for p in _SCENARIOS_DIR.glob("*.py")
+                       if not p.name.startswith("_")), [])
     out = []
+    unresolved = []
     for target in argv:
-        path = Path(target)
-        if not path.is_absolute():
-            path = (Path.cwd() / target).resolve()
-        if path.is_dir():
-            out.extend(sorted(p for p in path.glob("*.py")
-                              if not p.name.startswith("_")))
+        candidates = []
+        raw = Path(target)
+        if raw.is_absolute():
+            candidates.append(raw)
         else:
-            out.append(path)
-    return out
+            candidates.append(Path.cwd() / target)
+            candidates.append(_PLUGIN_ROOT / target)
+            if not target.endswith(".py"):
+                candidates.append(_SCENARIOS_DIR / f"{target}.py")
+                candidates.append(_SCENARIOS_DIR / target)
+        for cand in candidates:
+            if cand.is_dir():
+                out.extend(sorted(p for p in cand.glob("*.py")
+                                  if not p.name.startswith("_")))
+                break
+            if cand.is_file():
+                out.append(cand.resolve())
+                break
+        else:
+            unresolved.append(target)
+    return (out, unresolved)
+
+
+def _contract_mismatch(module) -> str:
+    """Return why ``module`` is not this runner's contract, or "" if it is.
+
+    Two scenario contracts coexist under scenarios/: ``setup(ctx)/run(ctx)/
+    assertions(ctx)`` driven by runner.py, and ``run() -> dict`` driven by
+    ci_run.py. This runner can only drive the first. Detecting the second
+    BEFORE running it is what keeps the report honest: those scenarios used
+    to be executed anyway, raise ``TypeError: run() takes 0 positional
+    arguments``, and land in the FAILURES list -- which inflated 5 real
+    failures into 11 and made every reader believe six subsystems were
+    broken when in truth they had never been run here at all.
+
+    Reported as "not run", never as PASS: a scenario this runner cannot drive
+    is unproven, and claiming otherwise would be the same lie in the other
+    direction.
+    """
+    import inspect
+
+    run = getattr(module, "run", None)
+    if not callable(run):
+        return "no run() at all"
+    if not callable(getattr(module, "assertions", None)):
+        return "no assertions(ctx) -- ci_run.py contract"
+    try:
+        params = [
+            p for p in inspect.signature(run).parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+    except (TypeError, ValueError):  # builtins / C callables: let it run
+        return ""
+    if not params:
+        return "run() takes no ctx -- ci_run.py contract"
+    return ""
 
 
 def main(argv) -> int:
@@ -94,22 +167,59 @@ def main(argv) -> int:
     app.initQgis()
     print(f"[headless] settings_dir={QgsApplication.qgisSettingsDirPath()}")
 
-    from scripts.validation.runner import run_scenario
+    from scripts.validation.runner import _load_module, run_scenario
 
-    scenarios = _collect(argv)
+    scenarios, unresolved = _collect(argv)
+    if unresolved:
+        print(f"[headless] unknown scenario(s): {', '.join(unresolved)}",
+              file=sys.stderr)
+        print(f"[headless] looked under {_SCENARIOS_DIR}", file=sys.stderr)
+        print("[headless] nothing was run -- exit 2 (could not run), "
+              "not exit 1 (ran and failed)", file=sys.stderr)
+        return 2
     if not scenarios:
         print("[headless] no scenario found", file=sys.stderr)
         return 2
 
     failures = []
+    errors = []
+    skipped = []
     try:
         for path in scenarios:
             try:
-                verdict = run_scenario(str(path))
-            except Exception as exc:  # noqa: BLE001 - a broken scenario is a failure
+                module = _load_module(str(path))
+            except AttributeError as exc:
+                # A THIRD shape exists: a top-level script that runs its own
+                # checks at import and prints its own verdict (i18n_runtime_qgis
+                # does, 36/36, driven from the QGIS console by exec(compile(..))).
+                # runner._load_module rejects it for having no run(); that is not
+                # a defect, so do not call it one. Its own output stands in the
+                # log next to ours.
+                if "has no run" in str(exc):
+                    skipped.append((path.stem,
+                                    "self-reporting script -- prints its own "
+                                    "verdict at import, see [i18n-runtime]-style "
+                                    "lines above"))
+                    continue
                 import traceback
                 traceback.print_exc()
-                failures.append((path.stem, repr(exc)))
+                errors.append((path.stem, f"load failed: {exc!r}"))
+                continue
+            except Exception as exc:  # noqa: BLE001 - unloadable is a real defect
+                import traceback
+                traceback.print_exc()
+                errors.append((path.stem, f"load failed: {exc!r}"))
+                continue
+            reason = _contract_mismatch(module)
+            if reason:
+                skipped.append((path.stem, reason))
+                continue
+            try:
+                verdict = run_scenario(module)
+            except Exception as exc:  # noqa: BLE001 - a broken scenario is a defect
+                import traceback
+                traceback.print_exc()
+                errors.append((path.stem, repr(exc)))
                 continue
             if verdict.get("verdict") != "PASS":
                 failures.append((path.stem, verdict.get("failed")))
@@ -119,12 +229,25 @@ def main(argv) -> int:
         except Exception:  # noqa: BLE001
             pass
 
+    n_ran = len(scenarios) - len(skipped)
+    n_pass = n_ran - len(failures) - len(errors)
+
     print()
-    print(f"[headless] {len(scenarios) - len(failures)}/{len(scenarios)} scenario(s) PASS")
+    print(f"[headless] {n_pass}/{n_ran} scenario(s) PASS")
+    if skipped:
+        print(f"[headless] {len(skipped)} NOT RUN by this runner "
+              f"(other contract -- see ci_run.py), so neither PASS nor FAIL:")
+        for name, detail in skipped:
+            print(f"  ~ {name}: {detail}")
+    if errors:
+        print("[headless] ERRORS (ran and crashed):")
+        for name, detail in errors:
+            print(f"  ! {name}: {detail}")
     if failures:
-        print("[headless] FAILURES:")
+        print("[headless] FAILURES (ran, assertions failed):")
         for name, detail in failures:
-            print(f"  - {name}: {detail}")
+            print(f"  - {name}: {detail} assertion(s)")
+    if failures or errors:
         return 1
     print("[headless] ALL GREEN")
     return 0
