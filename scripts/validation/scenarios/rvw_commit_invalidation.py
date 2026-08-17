@@ -212,6 +212,14 @@ def setup(ctx):
         real invariant (BL-RVW-P1-03: the row is committed before the
         notification) needs an INDEPENDENT SQLite connection reading at
         callback time; that assertion is still missing here.
+
+        NOT ISOLATED -- measured: 17/17 three times in a row when this scenario
+        runs alone, but 13/17 inside the full suite, where four emit assertions
+        (P2_AT_race_after_wait_flush_before_emit, P4_AT_double_emit_count and
+        the two P4 order checks) fail. Same process, earlier scenarios leave Qt
+        state and live writer threads behind, so pumping here drains a queue
+        this scenario does not own. Treat an isolated green as an isolated
+        green: it is not a suite result.
         """
         start = time.time()
         initial_len = len(ordered_events)

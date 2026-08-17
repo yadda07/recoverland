@@ -790,17 +790,15 @@ class SnapshotOverlaySession:
             opts.driverName = "GPKG"
             opts.layerName = ovl.layer_name or fp[:16]
             if first:
+                # Scoped form only: ActionOnExistingFile is present on Qt5
+                # (QGIS 3.40.15) and Qt6, same value 0. Measured, not assumed.
                 opts.actionOnExistingFile = (
                     QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteFile
-                    if hasattr(QgsVectorFileWriter, 'ActionOnExistingFile')
-                    else QgsVectorFileWriter.CreateOrOverwriteFile
                 )
                 first = False
             else:
                 opts.actionOnExistingFile = (
                     QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteLayer
-                    if hasattr(QgsVectorFileWriter, 'ActionOnExistingFile')
-                    else QgsVectorFileWriter.CreateOrOverwriteLayer
                 )
 
             _err, msg, _new_file, _new_layer = (

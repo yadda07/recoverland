@@ -261,22 +261,20 @@ class QgisCompat:
     """Namespace for cross-version QGIS enum constants."""
 
     # --- QgsFeatureRequest flags ---
-    try:
-        NO_GEOMETRY = QgsFeatureRequest.Flag.NoGeometry
-    except AttributeError:
-        NO_GEOMETRY = QgsFeatureRequest.NoGeometry
+    # Scoped form only. The unscoped fallback that used to sit here was dead
+    # code: measured on QGIS 3.40.15/Qt5 AND 4.0.3/Qt6, the scoped attribute
+    # exists on both and denotes the same value (1). qgisMinimumVersion is 3.40,
+    # so there is no supported runtime that needs the short form -- while PyQt6
+    # is dropping it, and the QGIS repo's Qt6 checker flags it on sight.
+    NO_GEOMETRY = QgsFeatureRequest.Flag.NoGeometry
 
     # --- QgsVectorDataProvider.Capability ---
-    try:
-        CAP_ADD_FEATURES = QgsVectorDataProvider.Capability.AddFeatures
-        CAP_DELETE_FEATURES = QgsVectorDataProvider.Capability.DeleteFeatures
-        CAP_CHANGE_ATTRIBUTE_VALUES = QgsVectorDataProvider.Capability.ChangeAttributeValues
-        CAP_CHANGE_GEOMETRIES = QgsVectorDataProvider.Capability.ChangeGeometries
-    except AttributeError:
-        CAP_ADD_FEATURES = QgsVectorDataProvider.AddFeatures
-        CAP_DELETE_FEATURES = QgsVectorDataProvider.DeleteFeatures
-        CAP_CHANGE_ATTRIBUTE_VALUES = QgsVectorDataProvider.ChangeAttributeValues
-        CAP_CHANGE_GEOMETRIES = QgsVectorDataProvider.ChangeGeometries
+    # Scoped form only, same measurement as NO_GEOMETRY above: the four values
+    # are 1 / 2 / 4 / 256 under Qt5 and Qt6 alike.
+    CAP_ADD_FEATURES = QgsVectorDataProvider.Capability.AddFeatures
+    CAP_DELETE_FEATURES = QgsVectorDataProvider.Capability.DeleteFeatures
+    CAP_CHANGE_ATTRIBUTE_VALUES = QgsVectorDataProvider.Capability.ChangeAttributeValues
+    CAP_CHANGE_GEOMETRIES = QgsVectorDataProvider.Capability.ChangeGeometries
 
     # --- Qgis.MessageLevel (scoped in 3.34+/4.0, short in 3.x) ---
     MSG_INFO = _resolve_enum(Qgis, 'MessageLevel', 'Info')

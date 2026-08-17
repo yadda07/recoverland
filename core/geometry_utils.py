@@ -169,7 +169,9 @@ def extract_geometry_type(layer) -> str:
 
         try:
             from qgis.core import QgsWkbTypes
-            if hasattr(QgsWkbTypes, 'NoGeometry') and wkb_type == QgsWkbTypes.NoGeometry:
+            # QgsWkbTypes.Type.NoGeometry, scoped: measured == 100 on Qt5 and
+            # Qt6 alike, so the hasattr guard on the short name bought nothing.
+            if wkb_type == QgsWkbTypes.Type.NoGeometry:
                 return "NoGeometry"
             if hasattr(QgsWkbTypes, 'displayString'):
                 return QgsWkbTypes.displayString(wkb_type)
