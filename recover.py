@@ -150,6 +150,18 @@ class RecoverPlugin:
                 self.iface.removePluginMenu("RecoverLand", self.action)
             return
 
+        # The dialog goes first, and that order is the whole point. Its
+        # background readers (stats, version fetch) hold the journal, and
+        # its restore runner still has trace events to enqueue. Shutting
+        # the backend down first closed the journal under a worker that
+        # was still reading it, and stopped the write queue under a
+        # restore that was still writing: the layer edits landed, their
+        # trace events did not, and the next rewind replayed them.
+        # cleanup_resources() joins the workers and cancels the runner,
+        # which is exactly what closeEvent() does while everything is
+        # still alive.
+        self._release_dialog()
+
         self._shutdown_local_backend()
 
         try:
@@ -169,19 +181,30 @@ class RecoverPlugin:
             self._themed_action_icon = None
         self.iface.removePluginMenu("RecoverLand", self.action)
         self.iface.removeToolBarIcon(self.action)
-        if self.dlg is not None:
-            try:
-                self.dlg._review_wants_persist = False
-                self.dlg.cleanup_resources()
-            except Exception as exc:  # noqa: BLE001
-                flog(f"RecoverPlugin.unload: dlg cleanup error: {exc}", "WARNING")
-            try:
-                self.dlg.close()
-                self.dlg.deleteLater()
-            except Exception:  # noqa: BLE001
-                pass
-            self.dlg = None
-            flog("RecoverPlugin.unload: dialog cleaned", "INFO")
+
+    def _release_dialog(self) -> None:
+        """Tear the dialog down while the journal is still open.
+
+        Called before _shutdown_local_backend so the dialog's background
+        readers are joined and its restore runner cancelled before the
+        write queue stops and the journal closes. Never raises: unload
+        must finish removing the plugin from the UI whatever the dialog
+        does on its way out.
+        """
+        if self.dlg is None:
+            return
+        try:
+            self.dlg._review_wants_persist = False
+            self.dlg.cleanup_resources()
+        except Exception as exc:  # noqa: BLE001
+            flog(f"RecoverPlugin.unload: dlg cleanup error: {exc}", "WARNING")
+        try:
+            self.dlg.close()
+            self.dlg.deleteLater()
+        except Exception:  # noqa: BLE001
+            pass
+        self.dlg = None
+        flog("RecoverPlugin.unload: dialog cleaned", "INFO")
 
     def run(self):
         if self._duplicate_of is not None:

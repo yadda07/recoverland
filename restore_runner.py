@@ -668,11 +668,19 @@ class StrictRestoreRunner(QObject):
     Usage:
         runner = StrictRestoreRunner(events, resolver, cutoff, ...)
         runner.progress.connect(on_progress)
+        runner.layer_started.connect(on_layer)
         runner.finished.connect(on_done)
         runner.start()
     """
 
     progress = pyqtSignal(int, int)
+    # RLU-057: (layer_name, index_1based, n_layers, n_events) at the
+    # moment a layer group opens. Measured cycles of 95 s and 283 s left
+    # the phase label on the text written before the run started, so the
+    # only sign of life was a bar creeping over an unnamed total. Naming
+    # the layer being written is what tells the user the run is alive and
+    # where it currently is.
+    layer_started = pyqtSignal(str, int, int, int)
     finished = pyqtSignal(object)
 
     def __init__(
@@ -858,6 +866,13 @@ class StrictRestoreRunner(QObject):
         fp, group = self._groups[self._group_idx]
         self._group_idx += 1
         prefix = f"[{self._trace_id}] " if self._trace_id else ""
+        # RLU-057: announce the layer BEFORE the work that can hold the
+        # thread for minutes, so the label names what is running and not
+        # what has just finished.
+        name_hint = (group[0].layer_name_snapshot or fp) if group else fp
+        self.layer_started.emit(
+            name_hint, self._group_idx, len(self._groups), len(group),
+        )
 
         layer, errors = _resolve_runner_layer(
             self._find_layer_fn, group, fp,
@@ -1441,6 +1456,10 @@ class UndoRunner(QObject):
     """Stepped undo executor (same pattern as RestoreRunner)."""
 
     progress = pyqtSignal(int, int)
+    # RLU-057: same contract as StrictRestoreRunner.layer_started. The
+    # 139 s auto-undo the user watched was described by the label of the
+    # phase before it; the layer names are what make the wait readable.
+    layer_started = pyqtSignal(str, int, int, int)
     finished = pyqtSignal(object)
 
     def __init__(
@@ -1502,6 +1521,11 @@ class UndoRunner(QObject):
         layer_name_hint = group[0].layer_name_snapshot if group else '?'
         flog(f"UndoRunner: process_group idx={self._group_idx} "
              f"layer={layer_name_hint!r} n_events={len(group)}")
+        # RLU-057: name the layer before the writes start, not after.
+        self.layer_started.emit(
+            layer_name_hint or fp, self._group_idx + 1,
+            len(self._groups), len(group),
+        )
         # BL-RW-P5-27: this dump cost 130 ms of frozen UI for 1340 events
         # BEFORE any useful work (measured, trace a1517527). The aggregated
         # line above says how many; the detail is worth an opt-in, not a

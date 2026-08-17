@@ -302,6 +302,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._last_restore_by_ds = None
         self._pending_rewind_events = None
         self._pending_cycle_stats = None
+        # RLU-056: the layers whose feature count does not match the state
+        # the last rewind transition asked for. Filled by
+        # `_rewind_count_snapshot`, drained by `_report_state_mismatches`.
+        self._state_mismatches: list = []
         self._active_search_trace_id = ""
         self._active_restore_trace_id = ""
         self._dialog_read_conn = None
@@ -3527,6 +3531,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
         runner.progress.connect(self._on_restore_runner_progress)
+        runner.layer_started.connect(self._on_restore_runner_layer)
         runner.finished.connect(self._on_auto_undo_then_rewind)
         self._restore_runner = runner
         runner.start()
@@ -3550,6 +3555,11 @@ class RecoverDialog(QDialog, LoggerMixin):
         before = getattr(self, '_undo_counts_before', {})
         self._rewind_count_snapshot("after_undo", undo_by_ds, before=before)
         self._undo_counts_before = {}
+        # RLU-056: this auto-undo is the phase that produced
+        # `apply_ok=273 apply_fail=0` next to two [MISMATCH] layers. The
+        # counts were already compared here; now the user is told, before
+        # the new rewind is stacked on top of a state nobody verified.
+        self._report_state_mismatches()
         flog(f"on_auto_undo_then_rewind: undo_ok={result.total_ok} "
              f"undo_fail={result.total_fail} "
              f"pending_events_stale={len(events) if events else 0} "
@@ -3583,7 +3593,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._restore_in_progress = False
             self._is_recovering = False
             self._stop_logo_activity()
-            self.progress_bar.setVisible(False)
+            self._end_progress_ui()
             self.enable_controls(True)
             self.recover_button.setEnabled(True)
             if result.total_ok > 0:
@@ -3722,6 +3732,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         # Consume the stash; subsequent runs must repopulate it.
         self._pending_cycle_stats = None
         runner.progress.connect(self._on_restore_runner_progress)
+        runner.layer_started.connect(self._on_restore_runner_layer)
         runner.finished.connect(self._on_version_restore_done)
         self._restore_runner = runner
         runner.start()
@@ -3729,6 +3740,31 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _on_restore_runner_progress(self, done: int, total: int) -> None:
         if total > 0:
             self._smooth_set_progress(int(done / total * 100))
+
+    def _end_progress_ui(self) -> None:
+        """Bar and phase label off: this cycle is over.
+
+        RLU-057: the phase label now follows the run layer by layer, so
+        leaving it up after the last layer would keep claiming a write in
+        progress on a cycle that has already reported.
+        """
+        self.progress_bar.setVisible(False)
+        self.progress_phase_label.setVisible(False)
+
+    def _on_restore_runner_layer(self, layer_name: str, index: int,
+                                 n_layers: int, n_events: int) -> None:
+        """RLU-057: name the layer currently being written.
+
+        Cycles of 95 s and 283 s were measured on the graphics thread
+        (one died in flight at 282 s). The work still runs there, so the
+        only thing that can be promised is that the wait is legible: the
+        phase label follows the run layer by layer instead of keeping the
+        text written before it started.
+        """
+        self.update_phase(self.tr(
+            "Couche {index}/{total} : {name} ({count} evenement(s))"
+        ).format(index=index, total=n_layers, name=layer_name,
+                 count=n_events))
 
     def _on_version_restore_done(self, result) -> None:
         trace_id = self._active_restore_trace_id
@@ -3784,25 +3820,33 @@ class RecoverDialog(QDialog, LoggerMixin):
         buckets = _restore_buckets(result, partial_n=partial_n,
                                    report=apply_report)
         msg = self._format_restore_outcome(buckets)
+        # RLU-056: a rewind whose actions all reported success and whose
+        # layers do not hold the expected number of entities is not a
+        # success. The snapshot above already measured it; peek before the
+        # report is graded, then say it out loud right after.
+        state_mismatch = bool(self._state_mismatches)
         clean = (buckets["failed_total"] == 0 and buckets["cancelled"] == 0
-                 and not result.errors and not partial_line)
+                 and not result.errors and not partial_line
+                 and not state_mismatch)
         if result.errors:
             msg += " | " + " | ".join(result.errors[:5])
         qlog(msg + partial_line + detail_lines,
              "INFO" if clean else "WARNING")
+        self._report_state_mismatches()
         flog(f"[{trace_id}] recover_version: report planned={buckets['planned']} "
              f"applied={buckets['applied']} "
              f"partial={buckets['applied_partial']} "
              f"skipped={buckets['skipped']} failed={buckets['failed_total']} "
              f"cancelled={buckets['cancelled']} "
-             f"plan_known={buckets['plan_known']}")
+             f"plan_known={buckets['plan_known']} "
+             f"state_mismatch={state_mismatch}")
 
         if result.total_ok > 0:
             flog(f"recover_version: refreshing canvas for {result.total_ok} ok")
             self.iface.mapCanvas().refresh()
             self._open_attribute_tables_if_requested(restore_by_ds, "version")
 
-        self.progress_bar.setVisible(False)
+        self._end_progress_ui()
         self.enable_controls(True)
         self.recover_button.setEnabled(True)
 
@@ -3813,12 +3857,29 @@ class RecoverDialog(QDialog, LoggerMixin):
         Returns {fp: feat_count} for later comparison.
         For undo:    expected_delta = +1 per DELETE orig, -1 per INSERT orig
         For restore: expected_delta = +1 per DELETE event, -1 per INSERT event
+
+        RLU-056: when ``before`` is supplied, every layer whose measured
+        delta contradicts the expected one is also pushed onto
+        `_state_mismatches`, for `_report_state_mismatches` to tell the
+        user. Until now the comparison was computed, printed as
+        ``[MISMATCH]`` in the log file and then dropped, so the run that
+        produced
+
+            CYCLE_SUMMARY cycle=undo apply_ok=273 apply_fail=0
+            REWIND_STATE [after_undo] zone_mkt_rip expected_delta=+5
+                                      actual_delta=+9 [MISMATCH]
+
+        was announced to the user as a complete success while two layers
+        were left in a state he never asked for. A count that does not
+        match means the layer is NOT at the requested state, whatever the
+        number of actions that reported success.
         """
         if not by_ds:
             return {}
         read_conn = self._get_dialog_read_conn()
         counts = {}
         is_undo = 'undo' in label
+        mismatches = []
         flog(f"=== REWIND_STATE [{label}] ===")
         for fp, evts in by_ds.items():
             if not evts:
@@ -3841,15 +3902,103 @@ class RecoverDialog(QDialog, LoggerMixin):
             line = (f"  layer={layer_name!r} feat={feat_now} "
                     f"n={len(evts)} ({ops_str}) expected_delta={exp_delta:+d}")
             if before is not None and fp in before:
-                actual_delta = feat_now - before[fp]
-                match = "OK" if actual_delta == exp_delta else "MISMATCH"
-                line += (f" actual_delta={actual_delta:+d} [{match}]")
-                if match == "MISMATCH":
-                    missing = exp_delta - actual_delta
-                    line += f" missing={missing:+d}"
+                feat_before = before[fp]
+                if feat_now < 0 or feat_before < 0:
+                    # An unresolved layer or a provider that does not know
+                    # its own count yields -1. Comparing it would invent a
+                    # mismatch out of a missing measurement, and a warning
+                    # the user cannot check is worse than silence: say the
+                    # comparison could not be made.
+                    line += (f" actual_delta=? [UNKNOWN] "
+                             f"feat_before={feat_before}")
+                else:
+                    actual_delta = feat_now - feat_before
+                    match = "OK" if actual_delta == exp_delta else "MISMATCH"
+                    line += (f" actual_delta={actual_delta:+d} [{match}]")
+                    if match == "MISMATCH":
+                        missing = exp_delta - actual_delta
+                        line += f" missing={missing:+d}"
+                        mismatches.append({
+                            "layer": layer_name,
+                            "expected_delta": exp_delta,
+                            "actual_delta": actual_delta,
+                            "missing": missing,
+                            "feat_before": feat_before,
+                            "feat_after": feat_now,
+                        })
             flog(line)
         flog(f"=== END REWIND_STATE [{label}] ===")
+        if before is not None:
+            self._state_mismatches = mismatches
         return counts
+
+    def _format_state_mismatches(self, mismatches: list) -> str:
+        """Name the layers left off the requested state, one per line.
+
+        Empty string when every layer landed where it was asked to, so
+        the caller can test the result directly.
+
+        ``missing > 0`` means entities the plan expected to be there are
+        absent; ``missing < 0`` means the layer carries more entities
+        than the plan asked for. Both are stated as such: "4 entites
+        manquantes" and "4 entites en trop" send the user to two very
+        different places in his data.
+        """
+        if not mismatches:
+            return ""
+        lines = []
+        for item in mismatches:
+            missing = int(item["missing"])
+            if missing > 0:
+                gap = self.tr("{count} entite(s) manquante(s)").format(
+                    count=missing)
+            else:
+                gap = self.tr("{count} entite(s) en trop").format(
+                    count=-missing)
+            lines.append(self.tr(
+                "  - {layer} : {gap} (attendu {expected:+d}, mesure "
+                "{actual:+d} ; {before} -> {after} entite(s))"
+            ).format(layer=item["layer"], gap=gap,
+                     expected=int(item["expected_delta"]),
+                     actual=int(item["actual_delta"]),
+                     before=int(item["feat_before"]),
+                     after=int(item["feat_after"])))
+        head = self.tr(
+            "Etat non conforme : {count} couche(s) ne sont pas dans l'etat "
+            "demande."
+        ).format(count=len(mismatches))
+        tail = self.tr(
+            "Le nombre d'entites mesure sur la couche ne correspond pas au "
+            "plan applique. Verifiez ces couches avant de continuer a "
+            "travailler dessus."
+        )
+        return head + "\n" + "\n".join(lines) + "\n" + tail
+
+    def _report_state_mismatches(self) -> bool:
+        """Tell the user about the mismatches the last snapshot measured.
+
+        Returns True when at least one layer was reported, so the caller
+        can downgrade its own end-of-run message: a rewind that counted
+        zero failed actions and still left a layer off its target is not
+        a success, and this is the single most important thing the plugin
+        can say after a rewind.
+
+        Drains `_state_mismatches`: the same measurement must never be
+        announced twice, and the next transition refills it.
+        """
+        mismatches = list(self._state_mismatches or [])
+        self._state_mismatches = []
+        if not mismatches:
+            return False
+        for item in mismatches:
+            flog(f"STATE_MISMATCH layer={item['layer']!r} "
+                 f"expected_delta={int(item['expected_delta']):+d} "
+                 f"actual_delta={int(item['actual_delta']):+d} "
+                 f"missing={int(item['missing']):+d} "
+                 f"feat_before={item['feat_before']} "
+                 f"feat_after={item['feat_after']}", "WARNING")
+        qlog(self._format_state_mismatches(mismatches), "WARNING")
+        return True
 
     def _partial_restore_report(self, runner) -> tuple:
         """RLU-053: ``(n_features, field_names)`` restored incompletely.
@@ -4067,7 +4216,7 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _display_restore_feedback(self, feedback) -> None:
         """RLU-055: report an event restore by its buckets, like the log."""
         buckets, errors = feedback
-        self.progress_bar.setVisible(False)
+        self._end_progress_ui()
         self._stop_logo_activity()
         self.restore_button.setEnabled(bool(self.selected_rows))
         self.recover_button.setEnabled(True)
@@ -4795,6 +4944,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
         runner.progress.connect(self._on_restore_runner_progress)
+        runner.layer_started.connect(self._on_restore_runner_layer)
         runner.finished.connect(self._on_undo_session_done)
         self._restore_runner = runner
         runner.start()
@@ -4828,7 +4978,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             qlog(self.tr("Annulation partielle : {ok} OK, {fail} echec(s).").format(
                 ok=result.total_ok, fail=result.total_fail), "WARNING")
 
-        self.progress_bar.setVisible(False)
+        self._end_progress_ui()
         self.enable_controls(True)
         self.recover_button.setEnabled(True)
         self.restore_button.setEnabled(True)
@@ -4878,6 +5028,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
         runner.progress.connect(self._on_restore_runner_progress)
+        runner.layer_started.connect(self._on_restore_runner_layer)
         runner.finished.connect(self._on_undo_done)
         self._restore_runner = runner
         runner.start()
@@ -4890,7 +5041,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         self._smooth_set_progress(100)
         self._stop_logo_activity()
-        self.progress_bar.setVisible(False)
+        self._end_progress_ui()
         self.enable_controls(True)
         self.recover_button.setEnabled(True)
 
