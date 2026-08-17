@@ -40,6 +40,38 @@ _PLUGIN_ROOT = _HERE.parents[1]
 for _extra in (str(_PLUGIN_ROOT), str(_PLUGIN_ROOT.parent)):
     if _extra not in sys.path:
         sys.path.insert(0, _extra)
+
+
+def _alias_scripts_package() -> None:
+    """Bind ``scripts.validation`` to this very package in sys.modules.
+
+    Extending sys.path is not enough inside a live QGIS: something else has
+    already imported a top-level ``scripts`` (QGIS ships one), so the name is
+    bound in sys.modules and Python never re-resolves it -- the path entry is
+    simply ignored and the scenario dies on ModuleNotFoundError, after setup()
+    and run() have already written to disk.
+
+    Aliasing is safe both ways round: when ``scripts.validation`` already
+    resolves to us, nothing is touched.
+    """
+    import importlib
+
+    try:
+        mod = importlib.import_module("scripts.validation")
+        if Path(getattr(mod, "__file__", "") or "").resolve().parent == _HERE:
+            return
+    except Exception:  # noqa: BLE001 - absent or foreign, both handled below
+        pass
+    try:
+        pkg = importlib.import_module(__package__ or "recoverland.scripts.validation")
+        parent_name = (__package__ or "recoverland.scripts.validation").rsplit(".", 1)[0]
+        sys.modules["scripts"] = importlib.import_module(parent_name)
+        sys.modules["scripts.validation"] = pkg
+    except Exception as exc:  # noqa: BLE001 - never break a run over this
+        print(f"[validation] could not alias scripts.validation: {exc!r}")
+
+
+_alias_scripts_package()
 _REPORTS_DIR = _HERE / "reports"
 _REGRESSION_DIR = _HERE / "scenarios" / "regression"
 
