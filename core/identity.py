@@ -535,7 +535,7 @@ def _normalize_source_uri(provider_name: str, raw_source: str) -> str:
 # Token that names the connection SERVICE of a DB fingerprint. It LEADS the
 # profile so the `table=` token stays the tail (datasource_alias reads it
 # with rfind).
-SERVICE_TOKEN = "service="
+SERVICE_TOKEN = "service="  # nosec B105: URI prefix key, not a secret
 
 
 def _normalize_db_source(raw: str, profile, with_service: bool = True) -> str:
