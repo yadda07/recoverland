@@ -12,9 +12,9 @@ from qgis.PyQt.QtWidgets import (
     QSpinBox, QGroupBox, QMessageBox, QFileDialog,
     QProgressBar, QCheckBox,
 )
-from qgis.PyQt.QtCore import QTimer, QUrl, QElapsedTimer
+from qgis.PyQt.QtCore import QTimer, QUrl, QElapsedTimer, QObject, pyqtSignal
 from qgis.PyQt.QtGui import QDesktopServices
-from qgis.core import QgsApplication, QgsSettings
+from qgis.core import QgsSettings
 
 from .compat import QtCompat
 from .core import (
@@ -29,6 +29,18 @@ from .core.health_monitor import (
     format_integrity_message,
 )
 from .core.time_format import compute_history_span
+from .core.long_paths import plain, when_needed
+from .widgets.icons import theme_icon
+from .widgets.theme import (
+    HAUTEUR_COMPACTE, ICONE_XS, RAYON_CONTROLE,
+    build_dialog_stylesheet, resolve_theme, rgba_css,
+)
+
+
+class _VacuumBridge(QObject):
+    """Carries the end of an async VACUUM back to the GUI thread."""
+
+    finished = pyqtSignal(bool)
 
 
 class JournalMaintenanceDialog(QDialog):
@@ -47,26 +59,32 @@ class JournalMaintenanceDialog(QDialog):
         self._setup_ui()
         self._refresh_stats()
 
-    def _setup_ui(self) -> None:
-        layout = QVBoxLayout()
-        layout.setSpacing(10)
-        layout.setContentsMargins(14, 14, 14, 14)
-
+    def _build_info_group(self, t) -> QGroupBox:
         info_group = QGroupBox(self.tr("Journal"))
         info_layout = QVBoxLayout()
-        info_layout.setSpacing(4)
+        info_layout.setSpacing(6)
         self._path_label = QLabel("")
         self._path_label.setWordWrap(True)
         self._path_label.setTextInteractionFlags(QtCompat.TEXT_SELECTABLE_BY_MOUSE)
+        self._path_label.setStyleSheet(
+            f"font-family: '{t.police_mono}'; font-size: 11px; color: {t.secondaire.name()};"
+        )
+        pill_css = (
+            f"font-family: '{t.police_titre}'; font-size: 11px; font-weight: 700; "
+            f"color: {t.texte.name()}; background-color: {t.surface_douce.name()}; "
+            f"border: 1px solid {t.ligne.name()}; border-radius: 10px; padding: 2px 8px;"
+        )
         self._size_label = QLabel("")
         self._events_label = QLabel("")
         self._span_label = QLabel("")
         self._schema_label = QLabel("")
+        for pill in (self._size_label, self._events_label, self._span_label, self._schema_label):
+            pill.setStyleSheet(pill_css)
         self._health_label = QLabel("")
         self._health_label.setWordWrap(True)
         info_layout.addWidget(self._path_label)
         row1 = QHBoxLayout()
-        row1.setSpacing(16)
+        row1.setSpacing(8)
         row1.addWidget(self._size_label)
         row1.addWidget(self._events_label)
         row1.addWidget(self._span_label)
@@ -75,10 +93,12 @@ class JournalMaintenanceDialog(QDialog):
         info_layout.addLayout(row1)
         info_layout.addWidget(self._health_label)
         info_group.setLayout(info_layout)
+        return info_group
 
+    def _build_retention_group(self, t) -> QGroupBox:
         retention_group = QGroupBox(self.tr("Retention"))
         retention_layout = QVBoxLayout()
-        retention_layout.setSpacing(6)
+        retention_layout.setSpacing(8)
         self._retention_days_spin = QSpinBox()
         self._retention_days_spin.setRange(7, 3650)
         self._retention_days_spin.setSuffix(self.tr(" jours"))
@@ -100,25 +120,55 @@ class JournalMaintenanceDialog(QDialog):
         save_row = QHBoxLayout()
         save_row.setSpacing(8)
         self._save_retention_btn = QPushButton(self.tr("Enregistrer"))
-        self._save_retention_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSave.svg'))
+        self._save_retention_btn.setIcon(theme_icon("save", color=t.texte, size=ICONE_XS))
+        self._save_retention_btn.setMinimumHeight(HAUTEUR_COMPACTE)
+        self._save_retention_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
         self._save_retention_btn.clicked.connect(self._save_retention)
         save_row.addWidget(self._auto_purge_check)
         save_row.addStretch()
         save_row.addWidget(self._save_retention_btn)
         retention_layout.addLayout(save_row)
         retention_group.setLayout(retention_layout)
+        return retention_group
 
+    def _build_tools_row(self, t) -> QHBoxLayout:
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(6)
+        specs = (
+            (self.tr("Integrite"), "shield-check", t.acheve,
+             self.tr("Lancer une verification d'integrite du journal"), self._check_integrity),
+            (self.tr("Exporter"), "download", t.texte,
+             self.tr("Copier le fichier journal vers un emplacement choisi"), self._export_journal),
+            (self.tr("Analyser"), "search", t.texte,
+             self.tr("Mesurer la distribution, les doublons et le potentiel d'optimisation"), self._analyze_journal),
+            (self.tr("Dossier"), "folder-open", t.texte,
+             self.tr("Ouvrir le dossier contenant le journal"), self._open_journal_folder),
+        )
+        for label, ic_name, col, tip, slot in specs:
+            btn = QPushButton(label)
+            btn.setIcon(theme_icon(ic_name, color=col, size=ICONE_XS))
+            btn.setMinimumHeight(HAUTEUR_COMPACTE)
+            btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            tools_row.addWidget(btn)
+        return tools_row
+
+    def _build_actions_group(self, t) -> QGroupBox:
         actions_group = QGroupBox(self.tr("Actions"))
         actions_layout = QVBoxLayout()
-        actions_layout.setSpacing(6)
+        actions_layout.setSpacing(8)
 
         purge_row = QHBoxLayout()
         purge_row.setSpacing(8)
         self._purge_btn = QPushButton(self.tr("Purger"))
-        self._purge_btn.setIcon(QgsApplication.getThemeIcon('/mActionDeleteSelected.svg'))
+        self._purge_btn.setIcon(theme_icon("delete", color=t.erreur, size=ICONE_XS))
+        self._purge_btn.setMinimumHeight(HAUTEUR_COMPACTE)
+        self._purge_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
         self._purge_btn.setToolTip(self.tr("Supprimer les evenements hors politique de retention"))
         self._purge_btn.clicked.connect(self._purge_events)
         self._purge_info = QLabel("")
+        self._purge_info.setStyleSheet(f"color: {t.secondaire.name()}; font-size: 11px;")
         purge_row.addWidget(self._purge_btn)
         purge_row.addWidget(self._purge_info, 1)
         actions_layout.addLayout(purge_row)
@@ -126,7 +176,9 @@ class JournalMaintenanceDialog(QDialog):
         vacuum_row = QHBoxLayout()
         vacuum_row.setSpacing(8)
         self._vacuum_btn = QPushButton(self.tr("Compacter (VACUUM)"))
-        self._vacuum_btn.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
+        self._vacuum_btn.setIcon(theme_icon("refresh", color=t.accent, size=ICONE_XS))
+        self._vacuum_btn.setMinimumHeight(HAUTEUR_COMPACTE)
+        self._vacuum_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
         self._vacuum_btn.setToolTip(self.tr("Recuperer l'espace disque apres une purge"))
         self._vacuum_btn.clicked.connect(self._vacuum_journal)
         self._vacuum_status = QLabel("")
@@ -134,48 +186,30 @@ class JournalMaintenanceDialog(QDialog):
         vacuum_row.addWidget(self._vacuum_btn)
         vacuum_row.addWidget(self._vacuum_status, 1)
         actions_layout.addLayout(vacuum_row)
-
-        tools_row = QHBoxLayout()
-        tools_row.setSpacing(6)
-        integrity_btn = QPushButton(self.tr("Integrite"))
-        # /mActionCheckGeometry.svg does not exist in the QGIS icon resource on
-        # either supported version; this one does.
-        integrity_btn.setIcon(
-            QgsApplication.getThemeIcon('/algorithms/mAlgorithmCheckGeometry.svg')
-        )
-        integrity_btn.setToolTip(self.tr("Lancer une verification d'integrite du journal"))
-        integrity_btn.clicked.connect(self._check_integrity)
-        export_btn = QPushButton(self.tr("Exporter"))
-        export_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSaveAs.svg'))
-        export_btn.setToolTip(self.tr("Copier le fichier journal vers un emplacement choisi"))
-        export_btn.clicked.connect(self._export_journal)
-        analyze_btn = QPushButton(self.tr("Analyser"))
-        analyze_btn.setIcon(QgsApplication.getThemeIcon('/mActionIdentify.svg'))
-        analyze_btn.setToolTip(
-            self.tr("Mesurer la distribution, les doublons et le potentiel d'optimisation"))
-        analyze_btn.clicked.connect(self._analyze_journal)
-        open_folder_btn = QPushButton(self.tr("Dossier"))
-        open_folder_btn.setIcon(QgsApplication.getThemeIcon('/mActionFileOpen.svg'))
-        open_folder_btn.setToolTip(self.tr("Ouvrir le dossier contenant le journal"))
-        open_folder_btn.clicked.connect(self._open_journal_folder)
-        tools_row.addWidget(integrity_btn)
-        tools_row.addWidget(export_btn)
-        tools_row.addWidget(analyze_btn)
-        tools_row.addWidget(open_folder_btn)
-        actions_layout.addLayout(tools_row)
-
+        actions_layout.addLayout(self._build_tools_row(t))
         actions_group.setLayout(actions_layout)
+        return actions_group
+
+    def _setup_ui(self) -> None:
+        t = resolve_theme(self)
+        self.setStyleSheet(build_dialog_stylesheet(t))
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
 
         self._progress = QProgressBar()
         self._progress.setVisible(False)
         self._progress.setMaximumHeight(6)
 
         close_btn = QPushButton(self.tr("Fermer"))
+        close_btn.setIcon(theme_icon("close", color=t.texte, size=ICONE_XS))
+        close_btn.setMinimumHeight(HAUTEUR_COMPACTE)
+        close_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
         close_btn.clicked.connect(self.accept)
 
-        layout.addWidget(info_group)
-        layout.addWidget(retention_group)
-        layout.addWidget(actions_group)
+        layout.addWidget(self._build_info_group(t))
+        layout.addWidget(self._build_retention_group(t))
+        layout.addWidget(self._build_actions_group(t))
         layout.addWidget(self._progress)
         layout.addStretch()
         layout.addWidget(close_btn, 0, QtCompat.ALIGN_RIGHT)
@@ -184,7 +218,9 @@ class JournalMaintenanceDialog(QDialog):
     def _refresh_stats(self) -> None:
         """Refresh all displayed journal statistics."""
         path = self._journal.path if self._journal and self._journal.is_open else ""
-        self._path_label.setText(path or self.tr("Aucun journal actif"))
+        # Shown without the extended-length prefix of a journal past
+        # MAX_PATH (core/long_paths): the user must be able to paste it.
+        self._path_label.setText(plain(path) or self.tr("Aucun journal actif"))
         if not path:
             self._size_label.setText("")
             self._events_label.setText("")
@@ -212,19 +248,25 @@ class JournalMaintenanceDialog(QDialog):
             version = get_schema_version(conn)
             self._schema_label.setText(f"v{version}")
 
+            t = resolve_theme(self)
             health = evaluate_journal_health(size_bytes, total, oldest, newest)
             if health.level == HealthLevel.HEALTHY:
                 self._health_label.setText(self.tr("Sain"))
-                self._health_label.setStyleSheet("color: #2ecc71; font-weight: 600;")
+                h_col = t.acheve
             elif health.level == HealthLevel.INFO:
                 self._health_label.setText(self.tr("Information : ") + health.message)
-                self._health_label.setStyleSheet("color: #4285f4; font-weight: 600;")
+                h_col = t.accent
             elif health.level == HealthLevel.WARNING:
                 self._health_label.setText(self.tr("Attention : ") + health.message)
-                self._health_label.setStyleSheet("color: #ff9800; font-weight: 600;")
+                h_col = t.ambre
             else:
                 self._health_label.setText(self.tr("Critique : ") + health.message)
-                self._health_label.setStyleSheet("color: #db4437; font-weight: 600;")
+                h_col = t.erreur
+            self._health_label.setStyleSheet(
+                f"color: {h_col.name()}; background: {rgba_css(h_col, 22)}; "
+                f"border: 1px solid {rgba_css(h_col, 85)}; border-radius: {RAYON_CONTROLE}px; "
+                f"padding: 3px 8px; font-weight: 600;"
+            )
 
             policy = self._load_retention_policy()
             old_purgeable = count_purgeable_events(conn, policy)
@@ -284,17 +326,19 @@ class JournalMaintenanceDialog(QDialog):
 
     def _flash_save_confirm(self) -> None:
         """Briefly show success state on the save button (icon + text + color)."""
+        t = resolve_theme(self)
         btn = self._save_retention_btn
         btn.setText(self.tr("Enregistre"))
-        btn.setIcon(QgsApplication.getThemeIcon('/mIconSuccess.svg'))
-        btn.setStyleSheet("color: #2ecc71; font-weight: 600;")
+        btn.setIcon(theme_icon("check-circle", color=t.acheve, size=ICONE_XS))
+        btn.setStyleSheet(f"color: {t.acheve.name()}; font-weight: 600;")
         btn.setEnabled(False)
         QTimer.singleShot(2000, self._reset_save_btn)
 
     def _reset_save_btn(self) -> None:
+        t = resolve_theme(self)
         btn = self._save_retention_btn
         btn.setText(self.tr("Enregistrer"))
-        btn.setIcon(QgsApplication.getThemeIcon('/mActionFileSave.svg'))
+        btn.setIcon(theme_icon("save", color=t.texte, size=ICONE_XS))
         btn.setStyleSheet("")
         btn.setEnabled(True)
 
@@ -303,11 +347,16 @@ class JournalMaintenanceDialog(QDialog):
             return
         policy = self._load_retention_policy()
         conn = None
+        impact = None
         try:
             conn = self._journal.create_read_connection()
             old_purgeable = count_purgeable_events(conn, policy)
             garbage = count_logical_garbage_events(conn)
             total_purgeable = old_purgeable + garbage.total
+            # What each purge would take away from the rewind, read BEFORE
+            # the user chooses: the dialog says it next to each box.
+            from .core.retention import logical_purge_impact
+            impact = logical_purge_impact(conn)
         except Exception:
             old_purgeable = 0
             garbage = None
@@ -322,7 +371,9 @@ class JournalMaintenanceDialog(QDialog):
         if total_purgeable == 0:
             QMessageBox.information(self, self.tr("Purge"), self.tr("Aucun evenement a purger."))
             return
-        options = self._ask_purge_options(old_purgeable, garbage)
+        from .core.retention import retention_cutoff
+        options = self._ask_purge_options(
+            old_purgeable, garbage, impact, retention_cutoff(policy))
         if options is None:
             return
         conn = None
@@ -353,34 +404,93 @@ class JournalMaintenanceDialog(QDialog):
                         "Consultez le journal de logs."))
         self._refresh_stats()
 
-    def _ask_purge_options(self, old_purgeable: int, garbage) -> Optional[PurgeOptions]:
-        """Show a dialog to choose purge scope. Returns None if cancelled."""
-        from qgis.PyQt.QtWidgets import QDialog, QVBoxLayout, QCheckBox, QDialogButtonBox
+    def _ask_purge_options(self, old_purgeable: int, garbage, impact=None,
+                           retention_before: str = "") -> Optional[PurgeOptions]:
+        """Show a dialog to choose purge scope. Returns None if cancelled.
+
+        Every purge takes dates away from the rewind, and each box says
+        which ones (*impact*: ``retention.logical_purge_impact``;
+        *retention_before*: the date the retention purge deletes before).
+        The logical purges are UNCHECKED by default: they delete rows the
+        rewind still reads, and a default click used to make dates of the
+        layer unreachable without the user being told. The retention purge
+        stays checked: it applies the retention period the user set.
+        """
+        from qgis.PyQt.QtWidgets import (
+            QDialog, QVBoxLayout, QCheckBox, QDialogButtonBox, QLabel,
+        )
+        from .core.time_format import format_full_timestamp
+        t = resolve_theme(self)
         dlg = QDialog(self)
+        dlg.setStyleSheet(build_dialog_stylesheet(t))
         dlg.setWindowTitle(self.tr("Options de purge"))
-        dlg.setMinimumWidth(360)
+        dlg.setMinimumWidth(380)
         lay = QVBoxLayout(dlg)
+        intro = QLabel(self.tr(
+            "Chaque purge retire des dates a l'historique de rewind. Les "
+            "purges decochees conservent ces dates ; ne cochez que ce que "
+            "vous acceptez de ne plus pouvoir rembobiner."))
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
         checks = []
+
+        def _cost(text):
+            label = QLabel(text)
+            label.setWordWrap(True)
+            label.setStyleSheet(f"color: {t.ambre.name()}; margin-left: 22px;")
+            lay.addWidget(label)
+
+        def _interval_cost(intervals):
+            if not intervals:
+                return ""
+            return self.tr(
+                "Les rewinds tombant dans {count} intervalle(s) compris "
+                "entre le {start} et le {end}, sur {layers} couche(s), "
+                "seront refuses ; en dehors de ces intervalles, ils restent "
+                "possibles.").format(
+                    start=format_full_timestamp(min(i[1] for i in intervals)),
+                    end=format_full_timestamp(max(i[2] for i in intervals)),
+                    count=len(intervals),
+                    layers=len({i[0] for i in intervals}))
+
         if old_purgeable:
             chk = QCheckBox(self.tr("Evenements anciens ({count})").format(count=old_purgeable))
             chk.setChecked(True)
             lay.addWidget(chk)
             checks.append(("retention", chk))
+            if retention_before:
+                _cost(self.tr(
+                    "Les rewinds a une date anterieure au {date} seront "
+                    "refuses.").format(date=format_full_timestamp(retention_before)))
         if garbage and garbage.invalidated_events:
             chk = QCheckBox(self.tr("Traces invalidées ({count})").format(count=garbage.invalidated_events))
-            chk.setChecked(True)
+            chk.setChecked(False)
             lay.addWidget(chk)
             checks.append(("invalidated", chk))
+            text = _interval_cost(impact.invalidated if impact else [])
+            if text:
+                _cost(text)
         if garbage and garbage.insert_delete_pairs:
             chk = QCheckBox(self.tr("Paires INSERT/DELETE ({count})").format(count=garbage.insert_delete_pairs))
-            chk.setChecked(True)
+            chk.setChecked(False)
             lay.addWidget(chk)
             checks.append(("insert_delete_pairs", chk))
+            text = _interval_cost(impact.insert_delete_pairs if impact else [])
+            if text:
+                _cost(text)
         if garbage and garbage.orphan_traces:
             chk = QCheckBox(self.tr("Traces orphelines ({count})").format(count=garbage.orphan_traces))
-            chk.setChecked(True)
+            chk.setChecked(False)
             lay.addWidget(chk)
             checks.append(("orphan_traces", chk))
+            orphans = impact.orphan_traces if impact else []
+            if orphans:
+                _cost(self.tr(
+                    "Sur {layers} couche(s), les rewinds a une date "
+                    "anterieure ou egale a celle de leur trace orpheline (au "
+                    "plus tard le {date}) seront refuses.").format(
+                        date=format_full_timestamp(max(o[1] for o in orphans)),
+                        layers=len({o[0] for o in orphans})))
         if not checks:
             return None
         bbox = QDialogButtonBox(QtCompat.BUTTON_OK | QtCompat.BUTTON_CANCEL, dlg)
@@ -407,12 +517,13 @@ class JournalMaintenanceDialog(QDialog):
 
         free_pages, page_size = self._get_freelist_info(path)
         reclaimable = free_pages * page_size
+        t = resolve_theme(self)
         if free_pages == 0:
             garbage = self._count_logical_garbage()
             if garbage and garbage.total > 0:
                 self._vacuum_status.setText(
-                    self.tr("{count} donnees mortes — purger d'abord").format(count=garbage.total))
-                self._vacuum_status.setStyleSheet("color: #ff9800; font-weight: 600;")
+                    self.tr("{count} donnees mortes ; purger d'abord").format(count=garbage.total))
+                self._vacuum_status.setStyleSheet(f"color: {t.ambre.name()}; font-weight: 600;")
                 QMessageBox.information(
                     self, self.tr("Compactage inutile"),
                     self.tr(
@@ -424,7 +535,7 @@ class JournalMaintenanceDialog(QDialog):
                 flog(f"vacuum: skipped, freelist_count=0 logical_garbage={garbage.total}", "INFO")
                 return
             self._vacuum_status.setText(self.tr("Deja compacte"))
-            self._vacuum_status.setStyleSheet("color: #4285f4; font-weight: 600;")
+            self._vacuum_status.setStyleSheet(f"color: {t.accent.name()}; font-weight: 600;")
             QMessageBox.information(
                 self, self.tr("Compactage inutile"),
                 self.tr(
@@ -457,17 +568,17 @@ class JournalMaintenanceDialog(QDialog):
         self._vacuum_btn.setEnabled(False)
         self._vacuum_timer.start()
         self._vacuum_status.setText(self.tr("Compactage en cours..."))
-        self._vacuum_status.setStyleSheet("color: #ff9800; font-weight: 600;")
+        self._vacuum_status.setStyleSheet(f"color: {t.ambre.name()}; font-weight: 600;")
         self._progress.setRange(0, 0)
         self._progress.setVisible(True)
         flog(f"vacuum: user initiated, size_before={size_before}", "INFO")
 
-        def on_done(success):
-            QTimer.singleShot(0, lambda: self._on_vacuum_finished(success))
-
-        vacuum_async(path, callback=on_done)
+        self._vacuum_bridge = _VacuumBridge(self)
+        self._vacuum_bridge.finished.connect(self._on_vacuum_finished)
+        vacuum_async(path, callback=self._vacuum_bridge.finished.emit)
 
     def _on_vacuum_finished(self, success: bool) -> None:
+        t = resolve_theme(self)
         elapsed_ms = self._vacuum_timer.elapsed()
         self._progress.setVisible(False)
         self._vacuum_running = False
@@ -493,11 +604,16 @@ class JournalMaintenanceDialog(QDialog):
             self._vacuum_status.setText(
                 self.tr("Termine ({time:.1f}s) - {saved} recupere(s)").format(
                     time=elapsed_s, saved=saved_str))
-            self._vacuum_status.setStyleSheet("color: #2ecc71; font-weight: 600;")
+            self._vacuum_status.setStyleSheet(f"color: {t.acheve.name()}; font-weight: 600;")
 
             flog(f"vacuum: done elapsed_ms={elapsed_ms} "
                  f"size_before={self._vacuum_size_before} "
-                 f"size_after={size_after} saved={saved}", "INFO")
+                 f"size_after={size_after} saved={saved}",
+                 "INFO" if saved > 0 else "WARNING")
+            if saved <= 0:
+                flog("vacuum: the journal did not shrink; another process "
+                     "may keep it mapped in memory or hold a read "
+                     "transaction on its WAL", "WARNING")
 
             QMessageBox.information(
                 self, self.tr("Compactage termine"), result_msg)
@@ -505,7 +621,7 @@ class JournalMaintenanceDialog(QDialog):
             self._flash_size_change(before_str, after_str)
         else:
             self._vacuum_status.setText(self.tr("Echec du compactage"))
-            self._vacuum_status.setStyleSheet("color: #db4437; font-weight: 600;")
+            self._vacuum_status.setStyleSheet(f"color: {t.erreur.name()}; font-weight: 600;")
             flog(f"vacuum: failed elapsed_ms={elapsed_ms}", "ERROR")
             QMessageBox.warning(
                 self, self.tr("Echec du compactage"),
@@ -517,14 +633,18 @@ class JournalMaintenanceDialog(QDialog):
 
     def _get_freelist_info(self, path: str) -> tuple:
         """Return (freelist_count, page_size) from SQLite PRAGMAs."""
+        conn = None
         try:
             conn = sqlite3.connect(path)
             free = conn.execute("PRAGMA freelist_count").fetchone()[0]
             psize = conn.execute("PRAGMA page_size").fetchone()[0]
-            conn.close()
             return (free, psize)
-        except (sqlite3.Error, TypeError):
+        except (sqlite3.Error, TypeError) as exc:
+            flog(f"vacuum: free pages of {path} unreadable ({exc})", "WARNING")
             return (0, 4096)
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _count_logical_garbage(self):
         """Return LogicalGarbageCount for the active journal, or None on error."""
@@ -546,14 +666,23 @@ class JournalMaintenanceDialog(QDialog):
                          f"failed ({exc!r})", "DEBUG")
 
     def _flash_size_change(self, before_str: str, after_str: str) -> None:
-        """Animate the size label to show the before→after transition."""
-        self._size_label.setText(f"{before_str}  →  {after_str}")
+        """Animate the size label to show the before->after transition."""
+        t = resolve_theme(self)
+        self._size_label.setText(f"{before_str}  ->  {after_str}")
         self._size_label.setStyleSheet(
-            "color: #2ecc71; font-weight: 700; font-size: 13px;")
+            f"font-family: '{t.police_titre}'; color: {t.acheve.name()}; "
+            f"background-color: {t.acheve_doux.name()}; border: 1px solid {t.acheve.name()}; "
+            f"border-radius: 10px; padding: 2px 8px; font-weight: 700; font-size: 12px;"
+        )
         QTimer.singleShot(4000, self._reset_size_label_style)
 
     def _reset_size_label_style(self) -> None:
-        self._size_label.setStyleSheet("")
+        t = resolve_theme(self)
+        self._size_label.setStyleSheet(
+            f"font-family: '{t.police_titre}'; font-size: 11px; font-weight: 700; "
+            f"color: {t.texte.name()}; background-color: {t.surface_douce.name()}; "
+            f"border: 1px solid {t.ligne.name()}; border-radius: 10px; padding: 2px 8px;"
+        )
 
     def _check_integrity(self) -> None:
         if not self._journal or not self._journal.path:
@@ -629,16 +758,24 @@ class JournalMaintenanceDialog(QDialog):
                 "INFO",
             )
             from qgis.PyQt.QtWidgets import QTextEdit
+            t = resolve_theme(self)
             dlg = QDialog(self)
+            dlg.setStyleSheet(build_dialog_stylesheet(t))
             dlg.setWindowTitle(self.tr("Diagnostic du journal"))
-            dlg.setMinimumSize(520, 400)
+            dlg.setMinimumSize(540, 420)
             lay = QVBoxLayout(dlg)
             te = QTextEdit(dlg)
             te.setReadOnly(True)
-            te.setFontFamily("Consolas, monospace")
+            te.setStyleSheet(
+                f"QTextEdit {{ background-color: {t.surface_douce.name()}; "
+                f"color: {t.texte.name()}; border: 1px solid {t.ligne.name()}; "
+                f"border-radius: {RAYON_CONTROLE}px; padding: 8px; "
+                f"font-family: '{t.police_mono}'; font-size: 12px; }}"
+            )
             te.setPlainText(text)
             lay.addWidget(te)
             btn = QPushButton(self.tr("Fermer"), dlg)
+            btn.setIcon(theme_icon("close", color=t.texte, size=ICONE_XS))
             btn.clicked.connect(dlg.accept)
             lay.addWidget(btn, 0, QtCompat.ALIGN_RIGHT)
             dlg.exec()
@@ -659,9 +796,21 @@ class JournalMaintenanceDialog(QDialog):
     def _open_journal_folder(self) -> None:
         if not self._journal or not self._journal.path:
             return
-        folder = os.path.realpath(os.path.dirname(self._journal.path))
+        # A journal past MAX_PATH is held in its extended-length spelling
+        # (core/long_paths): right for a Win32 file call, not for an
+        # address. QUrl made it a share on a host named "?", and the click
+        # opened nothing. The folder is checked in the spelling that
+        # reaches it, opened and named in the plain one.
+        folder = os.path.realpath(when_needed(os.path.dirname(self._journal.path)))
+        shown = plain(folder)
         if not os.path.isdir(folder):
+            why = "folder not found"
+        elif QDesktopServices.openUrl(QUrl.fromLocalFile(shown)):
             return
-        url = QUrl.fromLocalFile(folder)
-        if not QDesktopServices.openUrl(url):
-            flog(f"journal_maintenance: cannot open folder {folder}", "WARNING")
+        else:
+            why = "the desktop did not open it"
+        flog(f"journal_maintenance: cannot open folder {shown} ({why})", "WARNING")
+        QMessageBox.warning(
+            self, self.tr("Dossier du journal"),
+            self.tr("Le dossier du journal n'a pas pu etre ouvert. "
+                    "Il se trouve ici :\n{folder}").format(folder=shown))

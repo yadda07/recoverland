@@ -108,6 +108,8 @@ class QtCompat:
     EVENT_ENTER = _resolve_enum(QEvent, 'Type', 'Enter')
     EVENT_LEAVE = _resolve_enum(QEvent, 'Type', 'Leave')
     EVENT_PALETTE_CHANGE = _resolve_enum(QEvent, 'Type', 'PaletteChange')
+    EVENT_APP_PALETTE_CHANGE = _resolve_enum(QEvent, 'Type', 'ApplicationPaletteChange')
+    EVENT_APP_FONT_CHANGE = _resolve_enum(QEvent, 'Type', 'ApplicationFontChange')
     EVENT_RESIZE = _resolve_enum(QEvent, 'Type', 'Resize')
     EVENT_MOVE = _resolve_enum(QEvent, 'Type', 'Move')
     EVENT_LAYOUT_REQUEST = _resolve_enum(QEvent, 'Type', 'LayoutRequest')
@@ -115,6 +117,7 @@ class QtCompat:
 
     # --- QEasingCurve.Type ---
     EASE_IN_OUT_QUAD = _resolve_enum(QEasingCurve, 'Type', 'InOutQuad')
+    EASE_OUT_CUBIC = _resolve_enum(QEasingCurve, 'Type', 'OutCubic')
 
     # --- Qt.AlignmentFlag (additional) ---
     ALIGN_LEFT = _resolve_enum(Qt, 'AlignmentFlag', 'AlignLeft')
@@ -179,10 +182,26 @@ class QtCompat:
     # --- QPainter.CompositionMode ---
     COMPOSITION_SCREEN = _resolve_enum(QPainter, 'CompositionMode', 'CompositionMode_Screen')
 
-    # --- QPalette.ColorRole ---
+    # --- QPalette.ColorRole / ColorGroup ---
+    PALETTE_WINDOW = _resolve_enum(QPalette, 'ColorRole', 'Window')
     PALETTE_WINDOW_TEXT = _resolve_enum(QPalette, 'ColorRole', 'WindowText')
+    PALETTE_BASE = _resolve_enum(QPalette, 'ColorRole', 'Base')
+    PALETTE_ALT_BASE = _resolve_enum(QPalette, 'ColorRole', 'AlternateBase')
+    PALETTE_TEXT = _resolve_enum(QPalette, 'ColorRole', 'Text')
     PALETTE_HIGHLIGHT = _resolve_enum(QPalette, 'ColorRole', 'Highlight')
+    PALETTE_HIGHLIGHTED_TEXT = _resolve_enum(QPalette, 'ColorRole', 'HighlightedText')
     PALETTE_MID = _resolve_enum(QPalette, 'ColorRole', 'Mid')
+    PALETTE_SHADOW = _resolve_enum(QPalette, 'ColorRole', 'Shadow')
+    PALETTE_ACTIVE = _resolve_enum(QPalette, 'ColorGroup', 'Active')
+
+    # --- Qt.FocusPolicy ---
+    FOCUS_STRONG = _resolve_enum(Qt, 'FocusPolicy', 'StrongFocus')
+    FOCUS_TAB = _resolve_enum(Qt, 'FocusPolicy', 'TabFocus')
+    FOCUS_NONE = _resolve_enum(Qt, 'FocusPolicy', 'NoFocus')
+
+    # --- Qt.PenCapStyle / PenJoinStyle ---
+    CAP_ROUND = _resolve_enum(Qt, 'PenCapStyle', 'RoundCap')
+    JOIN_ROUND = _resolve_enum(Qt, 'PenJoinStyle', 'RoundJoin')
 
     # --- QMessageBox.StandardButton ---
     MSG_YES = _resolve_enum(QMessageBox, 'StandardButton', 'Yes')

@@ -553,9 +553,20 @@ def assertions(ctx):
         f"le disque et definitivement absentes du journal. Le rewind ne "
         f"pourra jamais les annuler.",
     ))
+    # Hypothesis revised (v7): this assertion assumed the capture of an
+    # over-budget commit was TRUNCATED, and then required that the tracker
+    # stop or that the announced count reveal the gap. The capture now
+    # always runs to completion (P5_updates_survive_buffer_pressure) and the
+    # sticky pause was removed on purpose (it lost every later commit of a
+    # layer kept in edit mode). With nothing truncated, the announced count
+    # must simply equal what was captured; a truncation (UPDATEs missing)
+    # still has to be either stopped or revealed, exactly as before.
+    no_truncation = (len(p5_upd) == n_mod
+                     and ctx.data.get("p5_reported_event_count") == len(p5))
     out.append((
         "P5_truncation_is_not_silent",
-        ctx.data.get("p5_tracker_still_active") is False
+        no_truncation
+        or ctx.data.get("p5_tracker_still_active") is False
         or ctx.data.get("p5_reported_event_count") == len(p5) + n_mod,
         f"tracker_actif={ctx.data.get('p5_tracker_still_active')} "
         f"evenements annonces a l'interface="

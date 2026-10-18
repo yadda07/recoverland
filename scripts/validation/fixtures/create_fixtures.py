@@ -233,7 +233,7 @@ def _write_golden_logs() -> None:
     }
     for name, lines in patterns.items():
         target = GOLDEN_DIR / name
-        body = ["# RecoverLand golden log patterns — BL-RW-P2-11"]
+        body = ["# RecoverLand golden log patterns - BL-RW-P2-11"]
         body.append(
             "# One regex per line, must match at least once in the "
             "scenario log slice."
@@ -296,7 +296,7 @@ def _antithese_determinism_check() -> dict:
     else:
         out["fails"] += 1
         out["details"].append(
-            f"points5: DRIFT — run1={rows1_p!r} run2={rows2_p!r}"
+            f"points5: DRIFT - run1={rows1_p!r} run2={rows2_p!r}"
         )
     if rows1_g == rows2_g:
         out["passes"] += 1
@@ -304,7 +304,7 @@ def _antithese_determinism_check() -> dict:
     else:
         out["fails"] += 1
         out["details"].append(
-            f"polygons3: DRIFT — run1={rows1_g!r} run2={rows2_g!r}"
+            f"polygons3: DRIFT - run1={rows1_g!r} run2={rows2_g!r}"
         )
 
     return out

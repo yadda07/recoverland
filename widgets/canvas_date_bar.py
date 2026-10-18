@@ -1,10 +1,10 @@
-"""Canvas date bar widget — slim overlay anchored to bottom of QGIS map canvas.
+"""Canvas date bar widget - slim overlay anchored to bottom of QGIS map canvas.
 
 Architecture:
     CanvasDateBar is a QWidget with parent=iface.mapCanvas().
     It overlays the canvas at y = canvas.height() - BAR_HEIGHT.
     Canvas resize events are caught via an installEventFilter on the canvas.
-    Slider ↔ QDateEdit are kept in sync via a _syncing guard (no signal loop).
+    Slider <-> QDateEdit are kept in sync via a _syncing guard (no signal loop).
 
 Public API::
 
@@ -31,9 +31,11 @@ from qgis.PyQt.QtWidgets import (
 from ..compat import QtCompat
 from ..core.logger import flog
 from ..core.time_format import journal_now, journal_today, parse_iso_date
+from .icons import theme_icon, theme_pixmap
 from .temporal_timeline_widget import TemporalTimelineWidget
+from .theme import ICONE_SM, ICONE_XS, RAYON_CONTROLE, resolve_theme, rgba_css
 
-_BAR_HEIGHT = 46
+_BAR_HEIGHT = 48
 
 _CANVAS_EVENT_TYPES = frozenset({int(QtCompat.EVENT_RESIZE), int(QtCompat.EVENT_MOVE)})
 
@@ -204,44 +206,159 @@ class CanvasDateBar(QWidget):
             "DEBUG",
         )
 
-    def set_stats(self, n_entities: int, n_total: int = -1) -> None:
+    def set_stats(self, n_entities: int, n_total: int = -1,
+                  n_born_after: int = 0, n_unresolved: int = 0,
+                  n_null_geometry: int = 0,
+                  n_trace_ref_missing: int = 0,
+                  n_identity_unproven: int = 0,
+                  n_unsaved_edits: int = 0) -> None:
         """Update right-side status indicator after a successful reconstruction.
 
         Uses compact icons to avoid layout shifts:
-        - ``∅``       — no data at this date
-        - ``◎ N ↗``   — N entities outside viewport (orange)
-        - ``✦ N``     — N entities visible (blue)
+        - ``∅``       : no entity differs from the current layers at this date
+        - ``◎ N ↗``   : N entities outside viewport (orange)
+        - ``✦ N``     : N entities visible (blue)
 
-        Full description is available via tooltip.
+        Full description is available via tooltip, including what the
+        overlays cannot show: entities created after the date (still drawn
+        by the current layers) and entities whose state at the date is
+        partly unknown.
 
         Args:
             n_entities: entities visible in the current viewport.
             n_total: entities globally at this date (-1 = unknown/same as n_entities).
+            n_born_after: entities absent at this date that exist now.
+            n_unresolved: entities whose state at this date is partly unknown.
+            n_null_geometry: entities that had no geometry at this date
+                (known state: listed without shape, the current layers may
+                draw a geometry added since).
+            n_trace_ref_missing: among the unresolved ones, entities whose
+                state depends on a rewind whose source event was purged.
+            n_identity_unproven: entities changed after the date that no
+                entity at the date can be tied to (fids renumbered by a
+                deletion: Shapefile, GeoJSON). Not among the entities
+                counted: with none of those, the date is NOT "nothing
+                differs" (``∅``), the status says what is missing.
         """
         if n_total < 0:
             n_total = n_entities
-        if n_entities == 0 and n_total == 0:
+        notes = []
+        if n_born_after:
+            notes.append(self.tr(
+                "{n} entité(s) créée(s) après cette date restent affichées "
+                "par les couches actuelles").format(n=n_born_after))
+        if n_null_geometry:
+            notes.append(self.tr(
+                "{n} entité(s) sans géométrie à cette date (aucune forme "
+                "dessinée ; les couches actuelles montrent la géométrie "
+                "reçue depuis, s'il y en a une)").format(n=n_null_geometry))
+        if n_unresolved:
+            notes.append(self.tr(
+                "{n} entité(s) dont l'état à cette date n'est pas "
+                "entièrement connu (non dessinée(s) ou incomplète(s))"
+            ).format(n=n_unresolved))
+        if n_trace_ref_missing:
+            notes.append(self.tr(
+                "dont {n} modifiée(s) après cette date par un retour arrière "
+                "dont l'événement source a été purgé du journal"
+            ).format(n=n_trace_ref_missing))
+        if n_identity_unproven:
+            notes.append(self.tr(
+                "{n} entité(s) modifiée(s) après cette date sans identité "
+                "prouvée à cette date (fid renumérotés par une suppression : "
+                "Shapefile, GeoJSON) : leur état à cette date n'est pas "
+                "montré"
+            ).format(n=n_identity_unproven))
+        if n_unsaved_edits:
+            notes.append(self.tr(
+                "{n} modification(s) non enregistrée(s) en cours d'édition "
+                "sont affichées par les couches actuelles (hors journal)"
+            ).format(n=n_unsaved_edits))
+        suffix = "".join("\n" + note for note in notes)
+        if n_entities == 0 and n_total == 0 and (n_identity_unproven or n_unsaved_edits):
+            count_warn = n_identity_unproven or n_unsaved_edits
+            self._status_state = "unproven" if n_identity_unproven else "unsaved"
+            self._lbl_status.setText(f"? {count_warn}")
+            self._lbl_status.setToolTip(self.tr(
+                "Des entités ont changé depuis cette date, mais aucune n'a pu "
+                "être reconstituée") + suffix)
+            self._style_status_pill("warning")
+        elif n_entities == 0 and n_total == 0:
+            self._status_state = "empty"
             self._lbl_status.setText("∅")
-            self._lbl_status.setToolTip(self.tr("Aucune entité à cette date"))
-            self._lbl_status.setStyleSheet("color: #888888; font-size: 13px;")
+            self._lbl_status.setToolTip(self.tr(
+                "Aucune entité ne diffère de l'état actuel à cette date") + suffix)
+            self._style_status_pill("idle")
         elif n_entities == 0 and n_total > 0:
+            self._status_state = "outside"
             self._lbl_status.setText(f"◎ {n_total} ↗")
             self._lbl_status.setToolTip(
                 self.tr("{n} entité(s) hors de l'emprise actuelle").format(n=n_total)
+                + suffix
             )
-            self._lbl_status.setStyleSheet("color: #ffaa44; font-size: 12px;")
+            self._style_status_pill("warning")
         else:
+            self._status_state = "entities"
             self._lbl_status.setText(f"✦ {n_entities}")
             self._lbl_status.setToolTip(
                 self.tr("{n} entité(s) reconstituée(s)").format(n=n_entities)
+                + suffix
             )
-            self._lbl_status.setStyleSheet("color: #80c8ff; font-size: 12px;")
+            self._style_status_pill("accent")
 
-    def set_loading(self) -> None:
-        """Show loading indicator while the rebuild worker is running."""
+    def set_loading(self, done: int = 0, total: int = 0) -> None:
+        """Show loading indicator while the date is being rebuilt.
+
+        *done* / *total*: the journal geometries placed so far by the CRS
+        verdict, when the live completion of the date has them to place
+        (it runs across event-loop turns and can take seconds).
+        """
+        self._status_state = "loading"
         self._lbl_status.setText("⟳")
-        self._lbl_status.setToolTip(self.tr("Reconstruction en cours…"))
-        self._lbl_status.setStyleSheet("color: #ffcc44; font-size: 14px;")
+        tip = self.tr("Reconstruction en cours…")
+        if total:
+            tip += "\n" + self.tr(
+                "{done} / {total} géométrie(s) placée(s) dans le SCR de la "
+                "couche").format(done=done, total=total)
+        self._lbl_status.setToolTip(tip)
+        self._style_status_pill("warning")
+
+    def set_error(self, message: str) -> None:
+        """Show that the reconstruction FAILED, never as an empty result.
+
+        The empty-set symbol means "nothing differs at this date", a valid
+        answer. A failed read is the absence of an answer: rendering it as
+        ``∅`` told the user that nothing had changed.
+        """
+        self._status_state = "error"
+        self._lbl_status.setText("⚠")
+        self._lbl_status.setToolTip(self.tr(
+            "Reconstruction impossible à cette date : {msg}\n"
+            "La carte ne montre PAS l'état à cette date."
+        ).format(msg=message))
+        self._style_status_pill("error")
+
+    def _style_status_pill(self, tone: str) -> None:
+        t = resolve_theme(self)
+        if tone == "accent":
+            fg, bg, bd = t.accent, t.accent_doux, t.accent
+        elif tone == "warning":
+            fg, bg, bd = t.ambre, t.ambre_doux, t.ambre
+        elif tone == "error":
+            fg, bg, bd = t.erreur, t.erreur_douce, t.erreur
+        else:
+            fg, bg, bd = t.secondaire, t.surface_douce, t.ligne
+        style = (
+            f"font-family: '{t.police_titre}'; font-size: 12px; font-weight: 700; "
+            f"color: {fg.name()}; background-color: {bg.name()}; "
+            f"border: 1px solid {bd.name()}; border-radius: 10px; padding: 2px 8px;"
+        )
+        if self._lbl_status.styleSheet() != style:
+            self._lbl_status.setStyleSheet(style)
+
+    def status_state(self) -> str:
+        """"empty" | "outside" | "entities" | "loading" | "error" | ""."""
+        return getattr(self, "_status_state", "")
 
     def current_date_iso(self) -> str:
         """Return selected date+time as ISO 8601 string."""
@@ -299,12 +416,23 @@ class CanvasDateBar(QWidget):
         flog(f"canvas_date_bar: hideEvent stack={stack!r}", "WARNING")
 
     def closeEvent(self, event) -> None:
-        """Ignore OS-level close — only cleanup() may close the bar."""
+        """Ignore OS-level close - only cleanup() may close the bar."""
         if not self._closing:
             flog("canvas_date_bar: closeEvent ignored (not from cleanup)", "WARNING")
             event.ignore()
             return
         super().closeEvent(event)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if getattr(self, "_refreshing_style", False):
+            return
+        if event.type() == QtCompat.EVENT_PALETTE_CHANGE:
+            self._refreshing_style = True
+            try:
+                self._apply_style()
+            finally:
+                self._refreshing_style = False
 
     def eventFilter(self, obj, event) -> bool:
         """Reposition after viewport resize/move; steal wheel over the timeline.
@@ -350,22 +478,23 @@ class CanvasDateBar(QWidget):
 
     def _build_ui(self) -> None:
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 2, 8, 2)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 4, 12, 4)
+        layout.setSpacing(8)
 
-        self._lbl_icon = QLabel("🕐", self)
-        self._lbl_icon.setFixedWidth(22)
+        self._lbl_icon = QLabel("", self)
+        self._lbl_icon.setFixedSize(20, 20)
+        self._lbl_icon.setStyleSheet("background: transparent; border: none;")
         layout.addWidget(self._lbl_icon)
 
         self._date_edit = QDateEdit(self)
         self._date_edit.setCalendarPopup(True)
         self._date_edit.setDisplayFormat("dd/MM/yyyy")
-        self._date_edit.setFixedWidth(100)
+        self._date_edit.setFixedWidth(104)
         layout.addWidget(self._date_edit)
 
         self._time_edit = QTimeEdit(self)
         self._time_edit.setDisplayFormat("HH:mm")
-        self._time_edit.setFixedWidth(58)
+        self._time_edit.setFixedWidth(64)
         layout.addWidget(self._time_edit)
 
         self._timeline = TemporalTimelineWidget(self)
@@ -382,16 +511,19 @@ class CanvasDateBar(QWidget):
         self._timeline.date_changed.connect(self._on_timeline_date_changed)
 
         self._btn_today = QPushButton(self.tr("Aujourd'hui"), self)
-        self._btn_today.setFixedWidth(90)
+        self._btn_today.setFixedWidth(100)
+        self._btn_today.setCursor(QtCompat.POINTING_HAND_CURSOR)
         layout.addWidget(self._btn_today)
 
         self._btn_export = QPushButton(self.tr("Export"), self)
-        self._btn_export.setFixedWidth(60)
+        self._btn_export.setFixedWidth(80)
+        self._btn_export.setCursor(QtCompat.POINTING_HAND_CURSOR)
         self._btn_export.setToolTip(self.tr("Exporter le snapshot vers GeoPackage"))
         layout.addWidget(self._btn_export)
 
         self._lbl_status = QLabel("", self)
-        self._lbl_status.setFixedWidth(72)
+        self._lbl_status.setMinimumWidth(68)
+        self._lbl_status.setAlignment(QtCompat.ALIGN_CENTER)
         layout.addWidget(self._lbl_status)
 
         self._date_edit.dateChanged.connect(self._on_date_edit_changed)
@@ -400,24 +532,35 @@ class CanvasDateBar(QWidget):
         self._btn_export.clicked.connect(self.export_requested)
 
     def _apply_style(self) -> None:
+        t = resolve_theme(self)
+        pm = theme_pixmap("history", color=t.accent, size=ICONE_SM)
+        if not pm.isNull():
+            self._lbl_icon.setPixmap(pm)
+        self._btn_today.setIcon(theme_icon("calendar", color=t.texte, size=ICONE_XS))
+        self._btn_export.setIcon(theme_icon("download", color=t.texte, size=ICONE_XS))
         self.setStyleSheet(
-            "CanvasDateBar {"
-            "  background-color: rgba(28,28,28,215);"
-            "  border-top: 1px solid rgba(85,85,85,180);"
-            "}"
-            "QLabel { color: #dcdcdc; font-size: 12px; }"
-            "QPushButton {"
-            "  color: #dcdcdc; background: rgba(55,55,55,200);"
-            "  border: 1px solid #555; border-radius: 3px;"
-            "  padding: 2px 6px; font-size: 11px;"
-            "}"
-            "QPushButton:hover { background: rgba(80,80,80,220); }"
-            "QDateEdit {"
-            "  color: #dcdcdc; background: rgba(45,45,45,200);"
-            "  border: 1px solid #555; border-radius: 3px;"
-            "  padding: 1px 4px; font-size: 12px;"
-            "}"
-            "QDateEdit::drop-down { border: none; width: 16px; }"
+            f"CanvasDateBar {{"
+            f"  background-color: {rgba_css(t.fond, 238)};"
+            f"  border-top: 1px solid {t.ligne_controle.name()};"
+            f"}}"
+            f"QLabel {{ color: {t.texte.name()}; font-size: 12px; }}"
+            f"QPushButton {{"
+            f"  color: {t.texte.name()}; background: {t.surface.name()};"
+            f"  border: 1px solid {t.ligne_controle.name()}; "
+            f"  border-radius: {RAYON_CONTROLE}px;"
+            f"  padding: 3px 8px; font-size: 11px; font-weight: 600;"
+            f"}}"
+            f"QPushButton:hover {{"
+            f"  background: {t.surface_survol.name()}; "
+            f"  border-color: {t.accent.name()};"
+            f"}}"
+            f"QDateEdit, QTimeEdit {{"
+            f"  color: {t.texte.name()}; background: {t.surface_champ.name()};"
+            f"  border: 1px solid {t.ligne_controle.name()}; "
+            f"  border-radius: {RAYON_CONTROLE}px;"
+            f"  padding: 2px 6px; font-size: 12px;"
+            f"}}"
+            f"QDateEdit::drop-down {{ border: none; width: 16px; }}"
         )
 
     def _reposition(self) -> None:

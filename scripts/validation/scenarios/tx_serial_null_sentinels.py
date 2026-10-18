@@ -223,7 +223,20 @@ def _edit_and_restore(ctx, conn, layer, fid: int, field: str, new_value,
     event = get_event_by_id(conn, eid)
     out["event_id"] = eid
     out["journal_post_state"] = reconstruct_new_attributes(event).get(field)
-    out["restore_result"] = restore_updated_feature(layer, event)
+    # Hypothesis revised (v7): the restore used to be called without the
+    # journal. Since v7 a key is an identity only when its content
+    # corroborates it or the journal proves it never changed hands
+    # (restore_service._key_continuity), and 'flag: False -> True' on a
+    # GeoPackage where every other row is True has no rare content: without
+    # the journal the restore is (rightly) refused, because nothing tells
+    # this layer from one where key 3 was given to another feature
+    # (rs_key_continuity_journal J2/J3). The fixture already holds that
+    # journal (the in-memory `conn` the event was read from); handing it
+    # over is what every caller holding it does (the runners, see
+    # rs_journal_entry_points). The assertions are unchanged: FALSE must
+    # come back, and the proof it rests on is stronger, not weaker.
+    out["restore_result"] = restore_updated_feature(layer, event,
+                                                    journal=conn)
     layer.reload()
     feat3 = _feature_by_fid(layer, fid)
     out["restored"] = feat3[field] if feat3 is not None else "<entite absente>"

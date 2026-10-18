@@ -87,6 +87,41 @@ def _event(eid, ts, op, attrs, entity_fp, geom=None):
     )
 
 
+def _net_after_plan(active, datasource, cutoff):
+    """Hypothesis revised (v7): what the plan WRITES, entity by entity.
+
+    Schema 7 no longer fuses a chain into one synthetic event (its trace
+    could not say which events it covered; see core/rewind_dedup). The
+    cutoff state is therefore no longer read on ONE synthetic row but on
+    the net effect of the whole plan: the compensations are replayed in
+    the order the REAL planner applies them (Phase 0 re-inserts, Phase 1
+    UPDATEs newest first, Phase 2 deletes) on one dict per entity. A
+    re-insert writes the row's full snapshot, an UPDATE compensation the
+    OLD side of its delta (and its OLD geometry), a delete removes the
+    entity. Returns {entity_fingerprint: attrs dict, or None when absent};
+    the geometry rides under the key "_geom".
+    """
+    from recoverland.core.restore_planner import plan_temporal_restore
+    from recoverland.core.search_service import reconstruct_attributes
+    plan = plan_temporal_restore(active, datasource, "sim", cutoff)
+    by_id = {e.event_id: e for e in active}
+    state = {}
+    for action in plan.actions:
+        ev = by_id[action.event_id]
+        key = ev.entity_fingerprint
+        if action.compensatory_op == "INSERT":
+            state[key] = dict(reconstruct_attributes(ev), _geom=ev.geometry_wkb)
+        elif action.compensatory_op == "DELETE":
+            state[key] = None
+        else:
+            cur = state.get(key) or {}
+            cur.update(reconstruct_attributes(ev))
+            if ev.geometry_wkb is not None:
+                cur["_geom"] = ev.geometry_wkb
+            state[key] = cur
+    return state
+
+
 # Full state of the feature at deletion time (case A).
 _STATE_AT_DELETE = {
     "name": "N1", "status": "B", "code": "C1", "note": "X1",
@@ -165,6 +200,11 @@ def run(ctx):
     # --- Case A ----------------------------------------------------------
     active_a, stats_a = collapse_rewind_events_with_stats(ctx.data["chain_a"])
     ctx.data["active_a_ops"] = [e.operation_type for e in active_a]
+    ctx.data["active_a_ids"] = [e.event_id for e in active_a]
+    net_a = _net_after_plan(active_a, _DS_FP, None).get("fid:11")
+    ctx.data["a_net_attrs"] = (
+        {k: v for k, v in net_a.items() if k != "_geom"} if net_a else net_a)
+    ctx.data["a_net_geom"] = net_a.get("_geom") if net_a else None
     if len(active_a) == 1:
         syn = active_a[0]
         ctx.data["a_restored_attrs"] = reconstruct_attributes(syn)
@@ -177,6 +217,7 @@ def run(ctx):
     # --- Case B ----------------------------------------------------------
     active_b, stats_b = collapse_rewind_events_with_stats(ctx.data["chain_b"])
     ctx.data["active_b_count"] = len(active_b)
+    ctx.data["active_b_ids"] = sorted(e.event_id for e in active_b)
     reverted = {}
     for ev in active_b:
         try:
@@ -204,47 +245,62 @@ def assertions(ctx):
 
     out = []
 
-    # ===== Case A: fusion happened as designed ==========================
+    # ===== Case A: the chain is planned whole, every row exact =========
+    # Hypothesis revised (v7): "UPDATE->DELETE fuses into one synthetic
+    # DELETE" was the MEANS of restoring the cutoff state. That synthetic
+    # row reused the UPDATE's event_id with another payload, so the trace
+    # written for it named an event it had not compensated (findings
+    # span-neutralises-uncompensated / forward-hop-real-vs-synthetic).
+    # Schema 7 plans both real rows, each with its own id; the goal (the
+    # whole feature back at its cutoff state) is checked below on what the
+    # plan really writes, which is stronger than reading one row.
     out.append((
-        "a_fused_into_single_delete",
-        ctx.data.get("active_a_ops") == ["DELETE"],
-        f"active_a_ops={ctx.data.get('active_a_ops')} expected=['DELETE'] "
-        f"(UPDATE->DELETE chain fuses into one synthetic DELETE)",
+        "a_chain_planned_whole_with_real_ids",
+        sorted(ctx.data.get("active_a_ids") or []) == [1, 2]
+        and sorted(ctx.data.get("active_a_ops") or []) == ["DELETE", "UPDATE"],
+        f"active_a={ctx.data.get('active_a_ids')} ops="
+        f"{ctx.data.get('active_a_ops')} expected the real UPDATE (1) and "
+        f"DELETE (2): a synthetic row reusing a real id gets a trace that "
+        f"does not say what it covered",
     ))
 
     # ===== Case A: the whole feature must come back =====================
-    attrs_a = ctx.data.get("a_restored_attrs")
+    attrs_a = ctx.data.get("a_net_attrs")
     out.append((
         "a_restores_every_field",
         attrs_a == _STATE_AT_CUTOFF,
-        f"restored={attrs_a} expected={_STATE_AT_CUTOFF}. The synthetic "
-        f"DELETE feeds _buffer_insert, which only writes the fields present "
-        f"in all_attributes: any missing field comes back NULL on the "
-        f"re-inserted feature.",
+        f"after the plan={attrs_a} expected={_STATE_AT_CUTOFF}. The re-insert "
+        f"only writes the fields present in all_attributes, and the UPDATE "
+        f"compensation must then bring the edited field back: any missing "
+        f"field comes back NULL, any field left edited is silent data loss.",
     ))
     missing_a = ([] if not isinstance(attrs_a, dict)
                  else sorted(set(_STATE_AT_CUTOFF) - set(attrs_a)))
     out.append((
         "a_no_field_dropped",
-        not missing_a,
-        f"fields lost by the fusion: {missing_a}",
+        isinstance(attrs_a, dict) and not missing_a,
+        f"fields lost by the plan: {missing_a} (after the plan={attrs_a})",
     ))
     out.append((
         "a_geometry_is_cutoff_geometry",
-        ctx.data.get("a_restored_geom") == _GEOM_AT_CUTOFF,
-        f"geom={ctx.data.get('a_restored_geom')!r} "
+        ctx.data.get("a_net_geom") == _GEOM_AT_CUTOFF,
+        f"geom={ctx.data.get('a_net_geom')!r} "
         f"expected={_GEOM_AT_CUTOFF!r} (old geometry of the oldest UPDATE, "
         f"not the geometry the feature had when it was deleted)",
     ))
 
     # ===== Case B: long chain keeps every field it must revert ==========
+    # Hypothesis revised (v7): "fusion must trigger beyond 10 events" was
+    # a cap on the number of writes, paid with a trace that named one event
+    # for eleven. Schema 7 keeps every event with its own compensation; the
+    # three field checks below (every field back to its cutoff value) are
+    # unchanged and now read every row of the chain.
     out.append((
-        "b_chain_was_fused",
-        (ctx.data.get("chain_b_len") or 0) > 10
-        and (ctx.data.get("active_b_count") or 0) < ctx.data.get("chain_b_len"),
+        "b_chain_kept_whole",
+        ctx.data.get("active_b_ids") == list(range(101, 112)),
         f"chain_len={ctx.data.get('chain_b_len')} "
-        f"active={ctx.data.get('active_b_count')} "
-        f"(fusion must trigger beyond _MAX_CHAIN=10)",
+        f"active={ctx.data.get('active_b_ids')} expected the 11 real events "
+        f"(101..111), each compensated on its own",
     ))
     reverted = ctx.data.get("b_reverted") or {}
     expected_b = {"f_old": "old0", "f_mid": "mid0", "f_new": "new0"}

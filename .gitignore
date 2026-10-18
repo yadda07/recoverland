@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.log
+recoverland_debug.log.*
+# Structured forensic log (JSON Lines), written beside recoverland_debug.log
+recoverland_events.jsonl
+recoverland_events.jsonl.*
 flake8_report.txt
 flake8_report.md
 flake8_clean*.txt
@@ -39,8 +43,10 @@ docs/dead_code_audit.md
 docs/compat_audit_*.md
 docs/manual_test_runbook.md
 docs/support_policy.md
+docs/orchestrator*.json
 
 # Cascade workflows (local-only, never in public repo)
+.claude/
 .windsurf/
 .devin/
 

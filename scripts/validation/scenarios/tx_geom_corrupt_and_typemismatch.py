@@ -424,16 +424,29 @@ def assertions(ctx):
 
     # ===== UPDATE: blob de longueur zero ================================
     after_zero = ctx.data.get("pt_after_zero") or (None, "?")
+    # The event under test has event_schema_version=2. The zero-length
+    # BLOB is core.constants.GEOMETRY_NULL_MARKER only since schema 7, the
+    # capture that writes it (core.constants.is_null_geometry_marker); no
+    # earlier capture ever wrote one, so here it is corruption and the
+    # original expectation holds: the restore must not report success. A
+    # v7 revision of this check accepted "success + geometry removed",
+    # i.e. the live point wiped on the faith of a corrupt v2 row; it is
+    # withdrawn. The check below is the original one made stronger: a
+    # failure (the original's first branch, without the message-text
+    # escape hatch), AND the live point left where it was (read back).
+    # The marker semantics of v7 events are covered by
+    # rs_geom_null_event_restore and rs_null_marker_versioned.
     out.append((
         "zero_length_wkb_is_not_silently_ignored",
         zero_res.get("success") is False
-        or "geom" in str(zero_res.get("message", "")).lower(),
-        f"result={zero_res} etat_geom={after_zero}: l'evenement annonce une "
-        f"geometrie (geometry_wkb non NULL) mais le blob est vide; "
-        f"rebuild_geometry rend None, l'ecriture de geometrie est sautee "
-        f"sans un mot, et la restauration est rapportee reussie. "
-        f"L'utilisateur croit son etat precedent entierement retabli alors "
-        f"que seuls les attributs sont revenus.",
+        and after_zero == ctx.data.get("pt2_before"),
+        f"result={zero_res} etat_geom={after_zero} avant="
+        f"{ctx.data.get('pt2_before')}: l'evenement (schema 2) annonce une "
+        f"geometrie (geometry_wkb non NULL) mais le blob est vide; avant le "
+        f"schema 7 c'est une corruption. La restauration doit echouer et "
+        f"laisser le point en place: effacer la geometrie, ou sauter son "
+        f"ecriture sans un mot, fait croire a l'utilisateur que son etat "
+        f"precedent est entierement retabli.",
     ))
 
     # ===== DELETE: pas de fantome sans geometrie ========================
@@ -498,9 +511,16 @@ def assertions(ctx):
     # ===== Le produit sait deja refuser: cote REWIND =====================
     exe = (_PLUGIN_ROOT / "core" / "restore_executor.py").read_text(
         encoding="utf-8", errors="replace")
+    # Hypothesis revised (v7): `_buffer_update` no longer refuses an EMPTY
+    # geometry (``rebuilt_empty``): a typed EMPTY geometry is a captured
+    # state that the rewind must give back (tx_geom_null_transitions, G3).
+    # What the guard protects against -- a blob that does not decode, or
+    # decodes to a NULL geometry -- is still refused, under ``corrupt_wkb``
+    # ("Geometry rebuild failed (null after decode)"). Same guard, checked
+    # under its v7 name.
     out.append((
         "rewind_path_still_guards_rebuilt_empty",
-        "rebuilt_empty" in exe and "corrupt_wkb" in exe,
+        "corrupt_wkb" in exe and "null after decode" in exe,
         "le garde-fou du chemin REWIND (reason_code=rebuilt_empty / "
         "corrupt_wkb) a disparu de restore_executor: plus rien ne protege la "
         "restauration en masse",

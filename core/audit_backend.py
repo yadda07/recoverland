@@ -29,6 +29,12 @@ class AuditEvent(NamedTuple):
     event_schema_version: Optional[int] = None
     new_geometry_wkb: Optional[bytes] = None
     invalidated_at: Optional[str] = None
+    # Schema v7. event_uid: identity of this event, assigned at capture, so
+    # the writer and an outbox replay cannot both insert it. commit_id: the
+    # QGIS commit attempt it belongs to (created_at is a clock reading, not
+    # a transaction identity).
+    event_uid: Optional[str] = None
+    commit_id: Optional[str] = None
 
 
 class SearchCriteria(NamedTuple):
@@ -81,6 +87,13 @@ class RestoreReport(NamedTuple):
     skipped_idempotent: List[int] = []
     failed_target_absent: List[int] = []
     failed_geometry_drift: List[int] = []
+    # v7: events in `failed` whose write nevertheless reached the file (the
+    # read-back contradicts it, a refused write could not be reverted, a
+    # commit left part of the batch on disk). The data changed: the restore
+    # paths journal a trace for each (the undo journals none, as for its
+    # successes). A subset of `failed`, never of `succeeded`; empty for
+    # producers that write nothing or do not know.
+    landed: List[int] = []
 
 
 class AuditBackend(ABC):

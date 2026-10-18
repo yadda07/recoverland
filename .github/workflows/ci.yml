@@ -75,7 +75,7 @@ jobs:
       # Explicit list rather than a glob: the directory also holds scenarios
       # that do not start (incompatible contract) or whose source assertions
       # point at lines that have since moved. Adding a scenario here means
-      # committing to keeping it green — grow the list, never silently drop
+      # committing to keeping it green: grow the list, never silently drop
       # a name from it.
       - name: Run rewind regression suite (headless)
         working-directory: recoverland

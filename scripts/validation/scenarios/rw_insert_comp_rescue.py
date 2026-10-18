@@ -6,8 +6,9 @@ Offline proof (qgis shim + fake layer) that:
      d8933d22: SNAP_SCAN scanned=22 matches=0 diffs=[]).
   2. Antitheses: ambiguity refused, non-discriminant events refused,
      feature-side NULL is a mismatch, exclude_fids respected.
-  3. REAL _occupant_shares_evidence: an occupant sharing nothing with the
-     event is rejected (RW-11 narrowed); sharing one attribute passes.
+  3. REAL delete-target classifier: an occupant sharing nothing with the
+     event is rejected (RW-11 narrowed). v7: an occupant sharing ONE value
+     is not a delete target either (WEAK), the full snapshot is (MEDIUM).
   4. restore_executor no longer blind-trusts the direct FID (source check,
      FAILS on pre-patch source).
 """
@@ -37,14 +38,20 @@ class FakeFields:
 
 
 class FakeProvider:
-    def __init__(self, pk_indexes=()):
+    def __init__(self, pk_indexes=(), features=()):
         self._pk = list(pk_indexes)
+        self._features = list(features)
 
     def pkAttributeIndexes(self):
         return self._pk
 
     def name(self):
         return "ogr"
+
+    def getFeatures(self, request=None):
+        # v7: the identity lookup reads the provider. Like the layer, the
+        # fake ignores the request: the readers check the returned ids.
+        return iter(self._features)
 
 
 class FakeFeature:
@@ -66,7 +73,7 @@ class FakeLayer:
     def __init__(self, field_names, features, pk_indexes=()):
         self._fields = FakeFields(field_names)
         self._features = features
-        self._provider = FakeProvider(pk_indexes)
+        self._provider = FakeProvider(pk_indexes, features)
 
     def fields(self):
         return self._fields
@@ -116,7 +123,6 @@ def setup(ctx):
 
 def run(ctx):
     rs = ctx.data["rs"]
-    rx = ctx.data["rx"]
     stress_attrs = {
         "sro": "stress_fddf4652", "zs_refpm": "stress_5bf53cfc",
         "commentair": None, "exe": 3608,
@@ -153,14 +159,25 @@ def run(ctx):
     ctx.data["excluded"] = rs._find_by_attrs_only(
         layer, event, exclude_fids={12})
 
-    # 6. Occupant evidence: fid 16 shares nothing -> False;
-    #    fid 12 shares attrs -> True.
-    ctx.data["occupant_none"] = rx._occupant_shares_evidence(
+    # 6. Occupant evidence, through the classifier `_buffer_delete` now
+    #    relies on (restore_service._classify_insert_candidate): fid 16
+    #    shares nothing -> not the target; fid 16 sharing ONE value
+    #    (exe=3608) -> WEAK, not deletable; the drifted feature carrying
+    #    the whole snapshot -> deletable.
+    ctx.data["occupant_none"] = rs._classify_insert_candidate(
         FakeLayer(_FIELDS, [FakeFeature(16, ["63398/OTHER", "PM99", "x", 250])]),
-        16, event)
-    ctx.data["occupant_attr"] = rx._occupant_shares_evidence(
+        16, event, "fid")
+    ctx.data["occupant_attr"] = rs._classify_insert_candidate(
         FakeLayer(_FIELDS, [FakeFeature(16, ["63398/OTHER", "PM99", "x", 3608])]),
-        16, event)
+        16, event, "fid")
+    ctx.data["occupant_full"] = rs._classify_insert_candidate(
+        layer, 12, event, "fid")
+
+    # 7. The resolver `_buffer_delete` calls, end to end on the nominal
+    #    layer: the historical FID 16 holds a stranger, the rescue finds
+    #    the drifted feature at 12.
+    ctx.data["resolved"] = rs._resolve_insert_target(
+        layer, event, context="rw_insert_comp_rescue")
 
 
 def assertions(ctx):
@@ -181,19 +198,42 @@ def assertions(ctx):
         ("neg_exclude_fids_respected",
          ctx.data["excluded"] is None,
          f"excluded={ctx.data['excluded']} expected None (fid 12 excluded)"),
+        # Hypothesis revised (v7): the occupant checks used to run on
+        # `_occupant_shares_evidence`, which `_buffer_delete` no longer
+        # calls; they now run on the classifier it does call. Same inputs.
         ("occupant_no_evidence_rejected",
-         ctx.data["occupant_none"] is False,
-         f"occupant_none={ctx.data['occupant_none']} expected False"),
-        ("occupant_shared_attr_accepted",
-         ctx.data["occupant_attr"] is True,
-         f"occupant_attr={ctx.data['occupant_attr']} expected True (exe=3608)"),
+         ctx.data["occupant_none"][0] not in ("STRONG", "MEDIUM")
+         and ctx.data["occupant_none"][1] == "occupant_unrelated",
+         f"occupant_none={ctx.data['occupant_none']} expected "
+         f"UNRESOLVABLE/occupant_unrelated"),
+        # Hypothesis revised (v7): "sharing one attribute passes" was the
+        # rule the v7 audit proved destructive (weak-identity-destructive-
+        # fallbacks): after a repack, the stranger at the inserted
+        # feature's former FID was deleted because it sat in the same
+        # commune. One shared value is now WEAK, a named refusal, and the
+        # full snapshot is still a delete target (stronger check).
+        ("occupant_shared_attr_is_weak_not_deletable",
+         ctx.data["occupant_attr"][0] == "WEAK",
+         f"occupant_attr={ctx.data['occupant_attr']} expected WEAK "
+         f"(exe=3608 alone must not designate a feature to delete)"),
+        ("occupant_full_snapshot_is_deletable",
+         ctx.data["occupant_full"][0] == "MEDIUM",
+         f"occupant_full={ctx.data['occupant_full']} expected MEDIUM"),
         ("executor_blind_trust_removed",
          "INSERT FID trustworthy: subsequent rounds modified attrs RW-11" not in src,
          "restore_executor.py must not blind-trust the direct FID on snap "
          "mismatch (pre-patch RW-11 string must be gone)"),
+        # Hypothesis revised (v7): the rescue moved from restore_executor
+        # into the resolver shared by the rewind, the event restore and the
+        # undo (restore_service._resolve_insert_target, phase attr_rescue).
+        # Checked on behaviour now, not only on text: the resolver
+        # `_buffer_delete` calls must find the drifted feature.
         ("executor_rescue_wired",
-         "attr_rescue" in src and "_find_by_attrs_only" in src,
-         "restore_executor.py must call _find_by_attrs_only (attr_rescue)"),
+         "_resolve_insert_target" in src
+         and (ctx.data["resolved"].fid, ctx.data["resolved"].level)
+         == (12, "MEDIUM"),
+         f"resolved={ctx.data['resolved']} expected fid=12 MEDIUM, and "
+         f"_buffer_delete must call _resolve_insert_target"),
         ("executor_unverifiable_fails",
          "target_unverifiable" in src,
          "restore_executor.py must FAIL with target_unverifiable instead of "

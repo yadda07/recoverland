@@ -53,6 +53,22 @@ Plan du scenario (vrai GeoPackage EPSG:2154, vrai buffer d'edition QGIS):
             couche en edition, puis commit et relecture cote provider.
 
 Verdict attendu si le produit est sain: PASS.
+
+Hypotheses revisees (v7)
+------------------------
+Le produit ne repare plus jamais une geometrie qu'il restaure :
+`_buffer_update` ecrit la geometrie CAPTUREE telle quelle, refuse
+(SKIPPED_GEOMETRY_DRIFT, reason geometry_not_storable) celles que la couche
+ne peut pas stocker sans perte (multi-parties dans une couche mono-partie,
+courbe dans une couche lineaire, perte de Z ou de M), et la relecture
+post-commit (core.commit_guard) tranche le reste. Trois familles
+d'assertions supposaient que makeValid() etait applique ; elles sont
+remplacees par des verifications au moins aussi strictes de la meme regle
+(forme rendue = forme capturee, ou refus explicite) :
+  * `*__drift_metric_sees_the_shape_change` -> `*__no_repair_replaces_the_captured_shape`
+  * `*__applied_geometry_survives_the_commit` : la geometrie "decidee" est
+    desormais la geometrie capturee, plus sa reparation ;
+  * `repair_is_logged` -> `invalid_geometry_write_is_logged`.
 """
 from __future__ import annotations
 
@@ -273,16 +289,14 @@ def run(ctx):
     for i, (key, wkt, _inv) in enumerate(_CASES):
         fid = fids[key]
         captured_geom = QgsGeometry.fromWkt(wkt)
-        # Geometrie que _buffer_update a DECIDE d'ecrire: l'originale si
-        # elle est valide, sa reparation sinon. C'est elle qui doit se
-        # retrouver sur le disque apres commit.
-        if captured_geom.isGeosValid():
-            intended = captured_geom
-        else:
-            intended = captured_geom.makeValid()
+        # Hypothesis revised (v7): the geometry _buffer_update decides to
+        # write is the CAPTURED one, valid or not; it used to be its
+        # makeValid() repair. That is what must be on disk after commit.
+        intended = captured_geom
 
         live_geom = _read_geom(layer, fid)
         live_wkb = bytes(live_geom.asWkb()) if live_geom is not None else None
+        live_measure = _measure(live_geom)
         event = _event(fid, _wkb(wkt), live_wkb, event_id=300 + i)
 
         layer.startEditing()
@@ -296,6 +310,7 @@ def run(ctx):
             "result": dict(result) if isinstance(result, dict) else result,
             "committed": bool(committed),
             "after": _measure(after),
+            "live": live_measure,
             "intended": _measure(intended),
             "after_equals_captured_wkb": (
                 after is not None and bytes(after.asWkb()) == _wkb(wkt)
@@ -335,7 +350,6 @@ def assertions(ctx):
     out = []
     captured = ctx.data.get("captured") or {}
     outcomes = ctx.data.get("outcomes") or {}
-    drift = _drift_log(ctx.records)
 
     # ===== Sanity: les geometries tordues le sont vraiment ==============
     for key, _wkt, must_be_invalid in _CASES:
@@ -348,27 +362,39 @@ def assertions(ctx):
             f"n'emprunte pas la branche makeValid",
         ))
 
-    # ===== Le trou: la mesure de derive ne voit pas le changement =======
+    # ===== Aucune reparation ne remplace la forme capturee ==============
+    # Hypothesis revised (v7): this block asserted that the makeValid drift
+    # metric, blind to shape changes that keep the bounding box, refused
+    # them. makeValid() is no longer applied to a restored geometry at all.
+    # The invariant it protected (the user never silently gets a repaired
+    # shape instead of his own) is now checked directly on the file: for
+    # every invalid capture whose repair would keep the bounding box, the
+    # file holds the captured shape, or the action was refused and the
+    # feature left as it was.
     for key, _wkt, must_be_invalid in _CASES:
         if not must_be_invalid:
             continue
         info = captured.get(key, {})
         if not info.get("bbox_identical"):
             continue
-        rep = info.get("repaired") or {}
+        rep_m = info.get("repaired") or {}
         mes = info.get("measure") or {}
-        eid = (outcomes.get(key) or {}).get("eid")
-        logged = drift.get(eid)
+        oc = outcomes.get(key) or {}
+        res = oc.get("result") or {}
+        after = oc.get("after") or {}
+        same_shape = (oc.get("after_equals_captured_wkb") is True
+                      or oc.get("after_equals_captured_geos") is True)
+        refused_untouched = (res.get("status") == "SKIPPED_GEOMETRY_DRIFT"
+                             and after.get("wkt") == (oc.get("live") or {}).get("wkt"))
         out.append((
-            f"{key}__drift_metric_sees_the_shape_change",
-            logged is not None and logged[1] == "SKIPPED_GEOMETRY_DRIFT",
-            f"{key}: makeValid change la forme (aire {mes.get('area')} -> "
-            f"{rep.get('area')}, type {mes.get('type')} -> {rep.get('type')}) "
-            f"en conservant la boite englobante au bit pres. Le journal "
-            f"enregistre drift_units={logged[0] if logged else '?'} "
-            f"status={logged[1] if logged else 'aucun log'}: la mesure de "
-            f"derive ne compare que des boites, elle ne peut pas voir une "
-            f"reorganisation interne.",
+            f"{key}__no_repair_replaces_the_captured_shape",
+            (res.get("status") == "APPLIED" and same_shape) or refused_untouched,
+            f"{key}: capture {mes.get('type')} aire={mes.get('area')} ; "
+            f"sa reparation serait {rep_m.get('type')} aire={rep_m.get('area')} "
+            f"a boite englobante identique. status={res.get('status')} "
+            f"disque={after.get('type')} aire={after.get('area')} "
+            f"[{after.get('wkt')}] : le fichier doit contenir la forme "
+            f"capturee, ou rester intact sur un refus explicite.",
         ))
 
     # ===== La regle: forme rendue = forme capturee, ou refus ============
@@ -440,11 +466,14 @@ def assertions(ctx):
         f"wkb_identique={ctrl.get('after_equals_captured_wkb')}",
     ))
 
-    # ===== La reparation doit au moins etre tracee ======================
+    # ===== L'ecriture d'une geometrie invalide est tracee ==============
+    # Hypothesis revised (v7): no repair exists any more, so none can be
+    # logged. What must be traceable instead is that a GEOS-invalid shape
+    # was written as captured (and is then verified after commit).
     out.append(assert_log_contains(
         ctx.records,
-        r"makevalid_drift: eid=\d+",
-        name="repair_is_logged",
+        r"geometry_write: eid=\d+ fid=\d+ geos_valid=False action=written_as_captured",
+        name="invalid_geometry_write_is_logged",
         min_count=1,
     ))
 

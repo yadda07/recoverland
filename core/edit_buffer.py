@@ -251,10 +251,10 @@ def create_snapshot_from_feature(feature, field_names: List[str],
         except (KeyError, IndexError):
             attrs[name] = None
 
-    geom = feature.geometry()
-    wkb = None
-    if geom is not None and not geom.isNull() and not geom.isEmpty():
-        wkb = bytes(geom.asWkb())
+    # Same rule as the NEW side (geometry_to_wkb): an EMPTY geometry is a
+    # real state with a real WKB, only a NULL geometry is "absent".
+    from .geometry_utils import geometry_to_wkb
+    wkb = geometry_to_wkb(feature.geometry())
 
     return FeatureSnapshot(
         fid=feature.id(),

@@ -50,9 +50,9 @@ DIST_DIR = PLUGIN_ROOT / "dist"
 # Directories whose presence anywhere in the path forbids inclusion.
 # Defense-in-depth on top of git ls-files (which already filters these).
 EXCLUDE_DIR_PARTS = frozenset({
-    ".git", ".github", ".windsurf",
-    "scripts", "tests",
-    "build", "dist",
+    ".git", ".github", ".windsurf", ".claude", ".devin",
+    "controllers", "scripts", "tests",
+    "build", "dist", "_vendor",
     "__pycache__", ".pytest_cache",
 })
 
@@ -125,8 +125,8 @@ REQUIRED_STAGE_FILES = (
 QM_SAMPLE = (
     ("ReviewStatusWidget", "Desactiver Review", "Disable Review"),
     ("ReviewStatusWidget", "Inactif", "Inactive"),
-    ("ReviewStatusWidget", "Review — Recherche des modifications",
-     "Review — Searching for modifications"),
+    ("ReviewStatusWidget", "Review : Recherche des modifications",
+     "Review: searching for modifications"),
     ("ReviewSegmentedSwitch", "Présent", "Present"),
     ("AppleToggleSwitch", "Enregistrement actif", "Recording active"),
     ("CanvasDateBar", "Aujourd'hui", "Today"),
@@ -162,9 +162,14 @@ def read_version(metadata_path: Path) -> str:
 
 def list_tracked_files(repo: Path) -> list[str]:
     """Return git-tracked files relative to ``repo``, with POSIX separators."""
+    git_cmd = shutil.which("git")
+    if not git_cmd and os.name == "nt":
+        candidate = r"C:\Program Files\Git\cmd\git.exe"
+        if os.path.isfile(candidate):
+            git_cmd = candidate
     try:
         result = subprocess.run(
-            ["git", "ls-files"],
+            [git_cmd or "git", "ls-files"],
             cwd=str(repo),
             check=True,
             capture_output=True,

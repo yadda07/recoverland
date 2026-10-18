@@ -1,7 +1,7 @@
 """Journal diagnostic metrics for RecoverLand (BL-OPT-08).
 
 Produces a structured report analyzing the audit journal's storage
-patterns and identifying optimization potential. Pure SQL — no QGIS
+patterns and identifying optimization potential. Pure SQL - no QGIS
 dependency.
 """
 from __future__ import annotations

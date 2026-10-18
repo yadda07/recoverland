@@ -1,28 +1,26 @@
-"""Apple-style animated toggle switch widget for RecoverLand."""
-from qgis.PyQt.QtCore import QVariantAnimation, QRectF, pyqtSignal
-from qgis.PyQt.QtGui import QPainter, QColor
+"""Interrupteur a bascule anime pour RecoverLand (inspire des jetons VTT)."""
+from qgis.PyQt.QtCore import QRectF, QVariantAnimation, pyqtSignal
+from qgis.PyQt.QtGui import QColor, QPainter, QPen
 from qgis.PyQt.QtWidgets import QWidget
 
 from ..compat import QtCompat
+from .theme import MICRO_DUREE, blend, resolve_theme, should_animate
 
 
 class AppleToggleSwitch(QWidget):
-    """Animated Apple-style on/off toggle switch."""
+    """Animated toggle switch styled on VTT semantic tokens."""
 
     toggled = pyqtSignal(bool)
-
-    _COLOR_ON = QColor(52, 199, 89)     # Apple system green
-    _COLOR_OFF = QColor(142, 142, 147)  # Apple system gray
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._checked = False
         self._anim_pos = 0.0  # 0.0 = OFF, 1.0 = ON
         self._anim = QVariantAnimation(self)
-        self._anim.setDuration(220)
-        self._anim.setEasingCurve(QtCompat.EASE_IN_OUT_QUAD)
+        self._anim.setDuration(MICRO_DUREE)
+        self._anim.setEasingCurve(QtCompat.EASE_OUT_CUBIC)
         self._anim.valueChanged.connect(self._update_pos)
-        self.setFixedSize(50, 28)
+        self.setFixedSize(46, 26)
         self.setCursor(QtCompat.POINTING_HAND_CURSOR)
         self.setToolTip(self.tr("Enregistrement des modifications : actif"))
 
@@ -34,7 +32,7 @@ class AppleToggleSwitch(QWidget):
             return
         self._checked = value
         target = 1.0 if value else 0.0
-        if animated:
+        if animated and should_animate():
             self._anim.stop()
             self._anim.setStartValue(float(self._anim_pos))
             self._anim.setEndValue(float(target))
@@ -46,33 +44,36 @@ class AppleToggleSwitch(QWidget):
         self.setToolTip(tip)
 
     def _update_pos(self, pos):
-        self._anim_pos = pos
+        self._anim_pos = float(pos)
         self.update()
 
     def mousePressEvent(self, event):
+        if not self.isEnabled():
+            return
         self.setChecked(not self._checked, animated=True)
         self.toggled.emit(self._checked)
 
     def paintEvent(self, _event):
+        t_tokens = resolve_theme(self)
         p = QPainter(self)
         p.setRenderHint(QtCompat.ANTIALIAS)
         w, h = self.width(), self.height()
         radius = h / 2.0
-        t = self._anim_pos
+        ratio = self._anim_pos
 
-        r = int(self._COLOR_OFF.red() + (self._COLOR_ON.red() - self._COLOR_OFF.red()) * t)
-        g = int(self._COLOR_OFF.green() + (self._COLOR_ON.green() - self._COLOR_OFF.green()) * t)
-        b = int(self._COLOR_OFF.blue() + (self._COLOR_ON.blue() - self._COLOR_OFF.blue()) * t)
-        p.setPen(QtCompat.NO_PEN)
-        p.setBrush(QColor(r, g, b))
-        p.drawRoundedRect(QRectF(0, 0, w, h), radius, radius)
+        track_color = blend(t_tokens.surface_douce, t_tokens.acheve, ratio)
+        border_color = blend(t_tokens.ligne_controle, t_tokens.acheve, ratio)
+        p.setPen(QPen(border_color, 1))
+        p.setBrush(track_color)
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), radius, radius)
 
         margin = 3.0
         knob_d = h - 2 * margin
         travel = w - 2 * margin - knob_d
-        knob_x = margin + travel * t
-        p.setBrush(QColor(0, 0, 0, 35))
-        p.drawEllipse(QRectF(knob_x, margin + 1.5, knob_d, knob_d))
+        knob_x = margin + travel * ratio
+        p.setPen(QtCompat.NO_PEN)
+        p.setBrush(QColor(0, 0, 0, 45))
+        p.drawEllipse(QRectF(knob_x, margin + 1.0, knob_d, knob_d))
 
-        p.setBrush(QColor(255, 255, 255))
+        p.setBrush(QColor("#ffffff"))
         p.drawEllipse(QRectF(knob_x, margin, knob_d, knob_d))

@@ -14,7 +14,7 @@ state. This compares content, feature by feature.
 
 Run it from the QGIS Python console, after a Rewind:
 
-    exec(open('C:/Users/yadda/AppData/Roaming/QGIS/QGIS4/profiles/default'
+    exec(open('C:/Users/<user>/AppData/Roaming/QGIS/QGIS4/profiles/default'
               '/python/plugins/recoverland/scripts/stress_verify.py').read())
 
 Matching is by CONTENT, never by FID: OGR renumbers records after a

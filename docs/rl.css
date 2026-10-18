@@ -548,7 +548,7 @@ html[data-prep] body::before{
 .arch-node:hover circle{stroke:var(--ac);stroke-width:2.2}
 .arch-node:hover text{fill:var(--ink);font-weight:700}
 
-/* when graph has an active node — fade non-related, but stay readable */
+/* when graph has an active node - fade non-related, but stay readable */
 .arch-svg.has-active .arch-node circle{opacity:.28}
 .arch-svg.has-active .arch-node text{opacity:.32}
 .arch-svg.has-active .arch-edge{opacity:.08}

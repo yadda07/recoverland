@@ -15,7 +15,7 @@
 <header class="bar">
   <a class="bar-logo" href="index.html">
     <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
-    <span class="bar-name">RecoverLand</span><span class="bar-ver">6.0.0</span>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">7.0.0</span>
   </a>
   <nav class="bar-nav">
     <a href="index.html">Overview</a>
@@ -63,7 +63,7 @@
 <!-- ============================== PHILOSOPHY ============================== -->
 <section id="vision">
 <h2>Philosophy</h2>
-<p>The audit journal grows forever by design: every INSERT, UPDATE and DELETE on every tracked layer produces an immutable event. Without maintenance, a journal used daily grows at <strong>1&ndash;5 MB/day</strong> depending on edit intensity.</p>
+<p>The audit journal grows forever by design: every INSERT, UPDATE and DELETE on every tracked layer produces an immutable event. Without maintenance, a journal used daily grows at <strong>1-5 MB/day</strong> depending on edit intensity.</p>
 <p>RecoverLand takes a conservative stance:</p>
 
 <div class="cards">
@@ -75,7 +75,7 @@
   <div class="card">
     <div class="card-tag tag-core">Non-destructive</div>
     <div class="card-t">Safe export first</div>
-    <p>The user can export a full backup before any purge. Export uses <code>sqlite3.backup()</code>&nbsp;&mdash; crash-safe, lock-free.</p>
+    <p>The user can export a full backup before any purge. Export uses <code>sqlite3.backup()</code>&nbsp;- crash-safe, lock-free.</p>
   </div>
   <div class="card">
     <div class="card-tag tag-strong">Self-diagnosing</div>
@@ -128,9 +128,9 @@
 
   <!-- Bottom: Integrity -->
   <rect x="140" y="140" width="420" height="70" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
-  <text x="350" y="165" text-anchor="middle" class="lbl" font-size="12">Integrity check (on demand or at startup)</text>
-  <text x="350" y="184" text-anchor="middle" class="dim" font-size="10.5">PRAGMA integrity_check &middot; WAL checkpoint &middot; schema version &middot; pending recovery</text>
-  <text x="350" y="200" text-anchor="middle" class="dim" font-size="10.5">Result: is_healthy + issues[] + recovered_events + rejected</text>
+  <text x="350" y="165" text-anchor="middle" class="lbl" font-size="12">Integrity check &amp; outbox replay (on demand or at startup)</text>
+  <text x="350" y="184" text-anchor="middle" class="dim" font-size="10.5">PRAGMA integrity_check &middot; WAL checkpoint &middot; schema v7 &middot; outbox &amp; crash reconciliation</text>
+  <text x="350" y="200" text-anchor="middle" class="dim" font-size="10.5">Result: is_healthy + issues[] + recovered_events + rejected + coverage horizons</text>
 
   <!-- Bottom: Diagnostics -->
   <rect x="140" y="230" width="420" height="70" rx="8" fill="var(--bg2)" stroke="var(--brd)" stroke-width="1"/>
@@ -156,33 +156,33 @@
   <!-- Size axis -->
   <text x="20" y="30" class="lbl" font-size="11">Size axis</text>
   <rect x="20" y="40" width="155" height="36" rx="4" fill="#D1FAE5" stroke="#16A34A"/>
-  <text x="97" y="62" text-anchor="middle" class="lbl-success" font-size="10">&lt; 50 MB &mdash; HEALTHY</text>
+  <text x="97" y="62" text-anchor="middle" class="lbl-success" font-size="10">&lt; 50 MB : HEALTHY</text>
   <rect x="185" y="40" width="155" height="36" rx="4" fill="var(--bg2)" stroke="var(--bl)" stroke-width="1.2"/>
-  <text x="262" y="62" text-anchor="middle" class="lbl" font-size="10">50&ndash;200 MB &mdash; INFO</text>
+  <text x="262" y="62" text-anchor="middle" class="lbl" font-size="10">50-200 MB : INFO</text>
   <rect x="350" y="40" width="165" height="36" rx="4" class="nd-warn"/>
-  <text x="432" y="62" text-anchor="middle" class="lbl-warn" font-size="10">200&ndash;500 MB &mdash; WARN</text>
+  <text x="432" y="62" text-anchor="middle" class="lbl-warn" font-size="10">200-500 MB : WARN</text>
   <rect x="525" y="40" width="175" height="36" rx="4" class="nd-danger"/>
-  <text x="612" y="62" text-anchor="middle" class="lbl-danger" font-size="10">&ge; 500 MB &mdash; CRITICAL</text>
+  <text x="612" y="62" text-anchor="middle" class="lbl-danger" font-size="10">&ge; 500 MB : CRITICAL</text>
 
   <!-- Count axis -->
   <text x="20" y="110" class="lbl" font-size="11">Event count axis</text>
   <rect x="20" y="120" width="155" height="36" rx="4" fill="#D1FAE5" stroke="#16A34A"/>
-  <text x="97" y="142" text-anchor="middle" class="lbl-success" font-size="10">&lt; 100k &mdash; HEALTHY</text>
+  <text x="97" y="142" text-anchor="middle" class="lbl-success" font-size="10">&lt; 100k : HEALTHY</text>
   <rect x="185" y="120" width="155" height="36" rx="4" fill="var(--bg2)" stroke="var(--bl)" stroke-width="1.2"/>
-  <text x="262" y="142" text-anchor="middle" class="lbl" font-size="10">100k&ndash;500k &mdash; INFO</text>
+  <text x="262" y="142" text-anchor="middle" class="lbl" font-size="10">100k-500k : INFO</text>
   <rect x="350" y="120" width="165" height="36" rx="4" class="nd-warn"/>
-  <text x="432" y="142" text-anchor="middle" class="lbl-warn" font-size="10">500k&ndash;1M &mdash; WARNING</text>
+  <text x="432" y="142" text-anchor="middle" class="lbl-warn" font-size="10">500k-1M : WARNING</text>
   <rect x="525" y="120" width="175" height="36" rx="4" class="nd-danger"/>
-  <text x="612" y="142" text-anchor="middle" class="lbl-danger" font-size="10">&ge; 1M &mdash; CRITICAL</text>
+  <text x="612" y="142" text-anchor="middle" class="lbl-danger" font-size="10">&ge; 1M : CRITICAL</text>
 
   <!-- Disk space -->
   <text x="20" y="192" class="lbl" font-size="11">Disk space</text>
   <rect x="20" y="200" width="220" height="32" rx="4" fill="#D1FAE5" stroke="#16A34A"/>
-  <text x="130" y="220" text-anchor="middle" class="lbl-success" font-size="10">&gt; 500 MB &mdash; HEALTHY</text>
+  <text x="130" y="220" text-anchor="middle" class="lbl-success" font-size="10">&gt; 500 MB : HEALTHY</text>
   <rect x="250" y="200" width="220" height="32" rx="4" class="nd-warn"/>
-  <text x="360" y="220" text-anchor="middle" class="lbl-warn" font-size="10">100&ndash;500 MB &mdash; WARNING</text>
+  <text x="360" y="220" text-anchor="middle" class="lbl-warn" font-size="10">100-500 MB : WARNING</text>
   <rect x="480" y="200" width="220" height="32" rx="4" class="nd-danger"/>
-  <text x="590" y="220" text-anchor="middle" class="lbl-danger" font-size="10">&lt; 100 MB &mdash; CRITICAL</text>
+  <text x="590" y="220" text-anchor="middle" class="lbl-danger" font-size="10">&lt; 100 MB : CRITICAL</text>
 </svg>
 </div>
 
@@ -265,8 +265,8 @@
 <div class="tw"><table>
 <thead><tr><th>Setting</th><th>Key</th><th>Default</th><th>Range</th></tr></thead>
 <tbody>
-  <tr><td><strong>Conservation</strong></td><td><code>RecoverLand/retention_days</code></td><td>365 jours</td><td>7 &ndash; 3650</td></tr>
-  <tr><td><strong>Maximum</strong></td><td><code>RecoverLand/max_events</code></td><td>1 000 000</td><td>10 000 &ndash; 10 000 000</td></tr>
+  <tr><td><strong>Conservation</strong></td><td><code>RecoverLand/retention_days</code></td><td>365 jours</td><td>7 - 3650</td></tr>
+  <tr><td><strong>Maximum</strong></td><td><code>RecoverLand/max_events</code></td><td>1 000 000</td><td>10 000 - 10 000 000</td></tr>
   <tr><td><strong>Auto-purge</strong></td><td><code>RecoverLand/auto_purge</code></td><td>False</td><td>On / Off</td></tr>
 </tbody>
 </table></div>
@@ -344,7 +344,7 @@ WHERE restored_from_event_id IS NOT NULL
 <!-- ============================== VACUUM ============================== -->
 <section id="vacuum">
 <h2>VACUUM &amp; compaction</h2>
-<p>SQLite <code>DELETE</code> does not reclaim disk space&mdash;it marks pages as free for reuse. Only <code>VACUUM</code> physically rebuilds the file. Because VACUUM rewrites the entire database, it must run in a dedicated thread.</p>
+<p>SQLite <code>DELETE</code> does not reclaim disk space-it marks pages as free for reuse. Only <code>VACUUM</code> physically rebuilds the file. Because VACUUM rewrites the entire database, it must run in a dedicated thread.</p>
 
 <div class="dia">
 <svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg">
@@ -559,7 +559,7 @@ WHERE restored_from_event_id IS NOT NULL
 </aside>
 </div>
 
-<footer>RecoverLand 6.0.0 &middot; GEODECI &middot; Technical documentation</footer>
+<footer>RecoverLand 7.0.0 &middot; GEODECI &middot; Technical documentation</footer>
 <script src="rl.js?v=18"></script>
 </body>
 </html>

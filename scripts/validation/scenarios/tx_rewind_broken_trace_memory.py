@@ -209,6 +209,45 @@ def setup(ctx):
     )
 
 
+def _net_after_plan(active, datasource, cutoff):
+    """Hypothesis revised (v7): what the plan WRITES, entity by entity.
+
+    Schema 7 no longer fuses a chain into one synthetic event (its trace
+    could not say which events it covered; see core/rewind_dedup). The
+    cutoff state is therefore no longer read on ONE synthetic row but on
+    the net effect of the whole plan: the compensations are replayed in
+    the order the REAL planner applies them (Phase 0 re-inserts, Phase 1
+    UPDATEs newest first, Phase 2 deletes) on one dict per entity. A
+    re-insert writes the row's full snapshot, an UPDATE compensation the
+    OLD side of its delta (and its OLD geometry), a delete removes the
+    entity. Returns {entity_fingerprint: attrs dict, or None when absent};
+    the geometry rides under the key "_geom".
+    """
+    from recoverland.core.restore_planner import plan_temporal_restore
+    from recoverland.core.search_service import reconstruct_attributes
+    plan = plan_temporal_restore(active, datasource, "sim", cutoff)
+    by_id = {e.event_id: e for e in active}
+    state = {}
+    for action in plan.actions:
+        ev = by_id[action.event_id]
+        key = ev.entity_fingerprint
+        if action.compensatory_op == "INSERT":
+            state[key] = dict(reconstruct_attributes(ev), _geom=ev.geometry_wkb)
+        elif action.compensatory_op == "DELETE":
+            state[key] = None
+        else:
+            cur = state.get(key) or {}
+            cur.update(reconstruct_attributes(ev))
+            if ev.geometry_wkb is not None:
+                cur["_geom"] = ev.geometry_wkb
+            state[key] = cur
+    return state
+
+
+def _is_refusal(e):
+    return (getattr(e, "commit_id", None) or "").startswith("rewind-plan:refused")
+
+
 def _collapse(ctx, ds, cutoff_dt):
     from recoverland.core.event_stream_repository import fetch_events_after_cutoff
     from recoverland.core.restore_contracts import RestoreCutoff, CutoffType
@@ -260,12 +299,19 @@ def run(ctx):
     # exactement sur le created_at de U(t+20) : fenetre inclusive.
     cutoff, events, active, stats = _collapse(
         ctx, _DS_PURGED, t0 + timedelta(seconds=20))
+    o1_plan = plan_temporal_restore(active, _DS_PURGED, "purged", cutoff)
+    o1_report = preflight_check(o1_plan)
     ctx.data["o1"] = {
         "fetched": [e.event_id for e in events],
         "active": [e.event_id for e in active],
         "active_ops": [e.operation_type for e in active],
         "restored_attrs": [reconstruct_attributes(e) for e in active],
         "stats": stats,
+        # Hypothesis revised (v7): see already_compensated_chain_not_replayed.
+        "user_active": [e.event_id for e in active if not _is_refusal(e)],
+        "refusals": [e.event_id for e in active if _is_refusal(e)],
+        "verdict": o1_report.verdict.value,
+        "blocking": list(o1_report.blocking_reasons),
     }
     ctx.data["o1_oldest_date"] = get_oldest_event_date(conn, _DS_PURGED)
     ctx.data["o1_retention_block"] = check_retention_coverage(
@@ -277,7 +323,10 @@ def run(ctx):
     cutoff2, events2, active2, stats2 = _collapse(ctx, _DS_NULLFP, t0)
     plan2 = plan_temporal_restore(active2, _DS_NULLFP, "nullfp", cutoff2)
     report2 = preflight_check(plan2)
+    net2 = _net_after_plan(active2, _DS_NULLFP, cutoff2).get(_FP_NULLFP)
     ctx.data["o2a"] = {
+        "net_attrs": ({k: v for k, v in net2.items() if k != "_geom"}
+                      if net2 else net2),
         "fetched": [e.event_id for e in events2],
         "active": [e.event_id for e in active2],
         "active_ops": [e.operation_type for e in active2],
@@ -352,11 +401,24 @@ def assertions(ctx):
         f"evenement source existe encore. Source purgee = memoire du rewind "
         f"invisible, sans aucun message pour l'utilisateur",
     ))
+    # Hypothesis revised (v7): "nothing to replay" (active == []) was taken
+    # as the right outcome. It is not: the state at the requested date had
+    # U(t+05) in effect (code B), the compensation written at t+40 undid
+    # it, and retention purged its payload. An empty plan answers "Rien a
+    # restaurer" over a layer that is NOT at that date. The chain must
+    # still not be replayed (no user event active, no DELETE), AND the
+    # rewind must refuse by name (one refusal, preflight blocked): the old
+    # check plus the refusal, never weaker.
     out.append((
         "already_compensated_chain_not_replayed",
-        (o1.get("active") or []) == [],
+        (o1.get("user_active") or []) == []
+        and o1.get("refusals") == [eids["o1_trace"]]
+        and o1.get("verdict") == "blocked"
+        and any("purged" in r for r in o1.get("blocking") or []),
         f"evenements actifs={o1.get('active')} ops={o1.get('active_ops')} "
-        f"attendu=[] : cette chaine a deja ete compensee par le rewind qui a "
+        f"refus={o1.get('refusals')} verdict={o1.get('verdict')} motifs="
+        f"{o1.get('blocking')} attendu : aucun evenement utilisateur, un refus "
+        f"nomme : cette chaine a deja ete compensee par le rewind qui a "
         f"ecrit la trace. Rejouee, la compensation du DELETE est un INSERT : "
         f"l'entite est reinseree une SECONDE fois et l'utilisateur se retrouve "
         f"avec un doublon dans sa couche",
@@ -388,19 +450,26 @@ def assertions(ctx):
     ))
 
     # ===== O2a : fingerprint NULL, meme entite ==========================
+    # Hypothesis revised (v7): the chain is no longer fused into one DELETE
+    # (its trace could not say what it covered). Sharing the bucket now
+    # shows as both real rows planned under the SAME entity fingerprint,
+    # the one the fingerprinted row proves (rewind_dedup inherits it).
     out.append((
         "nullfp_events_share_their_entity_bucket",
-        len(o2a.get("active") or []) == 1
-        and (o2a.get("active_ops") or []) == ["DELETE"],
+        sorted(o2a.get("active_ops") or []) == ["DELETE", "UPDATE"]
+        and o2a.get("active_fps") == [_FP_NULLFP, _FP_NULLFP],
         f"actifs={o2a.get('active')} ops={o2a.get('active_ops')} attendu=1 seul "
         f"DELETE fusionne : les deux evenements decrivent la MEME entite "
         f"(fid 72002). S'ils tombent dans deux seaux, la fusion UPDATE->DELETE "
         f"n'a plus lieu et l'entite revient avec la mauvaise valeur",
     ))
+    # Hypothesis revised (v7): read on what the whole plan writes (re-insert
+    # then UPDATE compensation, planner order), not on one fused row.
     out.append((
         "nullfp_restores_the_cutoff_state",
-        (o2a.get("restored_attrs") or [{}])[0] == {"code": "A", "nom": "PONT"},
-        f"etat reinsere={o2a.get('restored_attrs')} attendu="
+        o2a.get("net_attrs") == {"code": "A", "nom": "PONT"},
+        f"etat apres le plan={o2a.get('net_attrs')} (lignes="
+        f"{o2a.get('restored_attrs')}) attendu="
         f"{{'code': 'A', 'nom': 'PONT'}} : l'entite doit revenir avec la valeur "
         f"d'avant l'edition, meme quand la ligne ancienne n'a pas de "
         f"fingerprint",
@@ -463,6 +532,18 @@ def assertions(ctx):
     ))
 
     return out
+
+
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":

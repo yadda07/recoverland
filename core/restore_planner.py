@@ -16,6 +16,9 @@ from .restore_contracts import (
     PreflightReport, PreflightVerdict,
     COMPENSATORY_OPS, check_volume_limits, validate_cutoff,
 )
+from .rewind_dedup import (
+    PLAN_MARK_REFUSED, chronological_key, plan_item_kind, refusal_reason,
+)
 
 
 def plan_event_restore(
@@ -62,11 +65,15 @@ def plan_temporal_restore(
 ) -> RestorePlan:
     """Build a reverse-replay plan from events after cutoff (Mode B).
 
-    Events must be ordered by event_id DESC (most recent first).
+    Events are the collapsed rewind window (rewind_dedup). Their order in
+    the list does not matter: the plan orders them itself, on the
+    chronology the dedup uses (``rewind_dedup.chronological_key``:
+    created_at, then event_id).
     """
     actions: List[PlannedAction] = []
     conflicts: List[Conflict] = []
     entities: set = set()
+    chronology: dict = {}
 
     for event in events_after_cutoff:
         action, conflict = _build_action(event, require_fingerprint=True)
@@ -77,8 +84,11 @@ def plan_temporal_restore(
         if action is not None:
             entities.add(event.entity_fingerprint)
             actions.append(action)
+            chronology[action.event_id] = chronological_key(event)
 
-    actions.sort(key=_temporal_action_order)
+    ranks = {eid: rank for rank, eid in enumerate(
+        sorted(chronology, key=chronology.get))}
+    actions.sort(key=lambda a: _temporal_action_order(a, ranks))
 
     return RestorePlan(
         mode=RestoreMode.TEMPORAL,
@@ -115,16 +125,20 @@ def check_retention_coverage(
     return None
 
 
-def _purged_horizon_reason(plan: RestorePlan) -> Optional[str]:
+def _purged_horizon_reason(plan: RestorePlan,
+                           conn=None) -> Optional[str]:
     """Blocking reason when a purge removed the date the plan asks for.
 
     Second half of the coverage guard, for the callers that cannot pass
     `oldest_event_date` because they hold no connection. `retention`
-    records, PER DATASOURCE, the newest date each purge deleted; a cutoff
-    at or below that horizon names a state the journal cannot serve any
-    more. Per datasource is the whole point: a horizon shared by every
-    layer turned one purge into a refusal of every older rewind, on layers
-    the purge had not touched at all.
+    records, PER DATASOURCE, what each purge deleted; a cutoff it covers
+    names a state the journal cannot serve any more. Per datasource is the
+    whole point: a horizon shared by every layer turned one purge into a
+    refusal of every older rewind, on layers the purge had not touched at
+    all. And per INTERVAL for the logical purges (`retention.coverage_refusal`):
+    a purged INSERT/DELETE pair or undone compensation only loses the
+    dates between its two ends, and refusing everything before its end
+    disabled most of a layer's history after one maintenance click.
     """
     cutoff = plan.cutoff
     if cutoff is None or cutoff.cutoff_type != CutoffType.BY_DATE:
@@ -133,19 +147,14 @@ def _purged_horizon_reason(plan: RestorePlan) -> Optional[str]:
         return None
     # Local import: retention imports this module for its own coverage
     # helper, so the dependency only exists at call time.
-    from .retention import purged_horizon
+    from .retention import coverage_refusal
 
-    horizon = purged_horizon(plan.datasource_fingerprint)
-    if not horizon or cutoff.value > horizon:
-        return None
-    return (
-        f"History purged for this layer up to {horizon}, "
-        f"requested: {cutoff.value}"
-    )
+    return coverage_refusal(conn, plan.datasource_fingerprint, cutoff.value)
 
 
 def preflight_check(
     plan: RestorePlan, oldest_event_date: Optional[str] = None,
+    conn=None,
 ) -> PreflightReport:
     """Validate a restore plan and produce a preflight report.
 
@@ -181,7 +190,9 @@ def preflight_check(
             coverage_err = check_retention_coverage(
                 plan.cutoff, oldest_event_date)
         if coverage_err is None:
-            coverage_err = _purged_horizon_reason(plan)
+            # With a journal connection the horizon is the one the journal
+            # persisted (survives restarts); without, session memory only.
+            coverage_err = _purged_horizon_reason(plan, conn)
         if coverage_err:
             flog(f"restore_planner: retention coverage refused "
                  f"datasource={plan.datasource_fingerprint} "
@@ -231,6 +242,22 @@ def _build_action(
             reason="trace_event_leaked",
             severity="blocking",
             details=None,
+        )
+
+    # A refusal the rewind window named: the state at the cutoff needs
+    # what the journal no longer holds. Blocking, with its reason in the
+    # text preflight shows, so the whole layer is refused out loud instead
+    # of being rewound to a state it never had.
+    if plan_item_kind(event) == PLAN_MARK_REFUSED:
+        reason = refusal_reason(event)
+        flog(f"restore_planner: rewind refused eid={eid} "
+             f"datasource={event.datasource_fingerprint} reason={reason}",
+             "ERROR")
+        return None, Conflict(
+            event_id=eid,
+            reason=f"unrebuildable_state: {reason}",
+            severity="blocking",
+            details=reason,
         )
 
     comp_op = COMPENSATORY_OPS.get(event.operation_type)
@@ -287,24 +314,36 @@ def _build_action(
     return action, conflict
 
 
-def _temporal_action_order(action: PlannedAction) -> tuple:
+def _temporal_action_order(action: PlannedAction,
+                           ranks: Optional[dict] = None) -> tuple:
     """Order of compensatory actions for atomic temporal restore.
 
     Phase 0: INSERT compensatory (re-insert deleted features) so later
              UPDATE/DELETE actions can target them via fid_remap.
-    Phase 1: UPDATE compensatory in event_id DESC (undo most recent edit
+    Phase 1: UPDATE compensatory, newest first (undo most recent edit
              first; otherwise reverting the oldest UPDATE leaves the
              feature in an intermediate state and breaks the post-state
              fallback for subsequent UPDATEs).
-    Phase 2: DELETE compensatory in event_id ASC (delete inserted
+    Phase 2: DELETE compensatory, oldest first (delete inserted
              features last so any prior UPDATE can still target them).
+
+    Inside a phase the order is CHRONOLOGICAL: *ranks* maps each event_id
+    to its rank in (created_at, event_id), the order the fetch and the
+    dedup use. Sorting on the raw event_id disagreed with them for an
+    event re-inserted from the pending file after a crash: it keeps its
+    old created_at but receives a NEW, larger event_id. Two UPDATEs of the
+    same field, the old one re-imported, were then unwound in the wrong
+    order and the field ended on the intermediate value, both actions
+    reported applied (finding planner-eid-order-vs-timeline). Without
+    *ranks* (legacy callers) the event_id stands in for the rank.
     """
     eid = action.event_id or 0
+    rank = ranks.get(action.event_id, eid) if ranks else eid
     op = action.compensatory_op
     if op == "INSERT":
-        return (0, eid, 0)
+        return (0, rank, 0)
     if op == "UPDATE":
-        return (1, -eid, 0)
+        return (1, -rank, 0)
     if op == "DELETE":
-        return (2, eid, 0)
-    return (99, eid, 0)
+        return (2, rank, 0)
+    return (99, rank, 0)

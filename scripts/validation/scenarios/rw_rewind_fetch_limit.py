@@ -137,6 +137,41 @@ def count_events_after_cutoff(conn, datasource_fp, cutoff):
     return row[0] if row else 0
 
 
+def _net_after_plan(active, datasource, cutoff):
+    """Hypothesis revised (v7): what the plan WRITES, entity by entity.
+
+    Schema 7 no longer fuses a chain into one synthetic event (its trace
+    could not say which events it covered; see core/rewind_dedup). The
+    cutoff state is therefore no longer read on ONE synthetic row but on
+    the net effect of the whole plan: the compensations are replayed in
+    the order the REAL planner applies them (Phase 0 re-inserts, Phase 1
+    UPDATEs newest first, Phase 2 deletes) on one dict per entity. A
+    re-insert writes the row's full snapshot, an UPDATE compensation the
+    OLD side of its delta (and its OLD geometry), a delete removes the
+    entity. Returns {entity_fingerprint: attrs dict, or None when absent};
+    the geometry rides under the key "_geom".
+    """
+    from recoverland.core.restore_planner import plan_temporal_restore
+    from recoverland.core.search_service import reconstruct_attributes
+    plan = plan_temporal_restore(active, datasource, "sim", cutoff)
+    by_id = {e.event_id: e for e in active}
+    state = {}
+    for action in plan.actions:
+        ev = by_id[action.event_id]
+        key = ev.entity_fingerprint
+        if action.compensatory_op == "INSERT":
+            state[key] = dict(reconstruct_attributes(ev), _geom=ev.geometry_wkb)
+        elif action.compensatory_op == "DELETE":
+            state[key] = None
+        else:
+            cur = state.get(key) or {}
+            cur.update(reconstruct_attributes(ev))
+            if ev.geometry_wkb is not None:
+                cur["_geom"] = ev.geometry_wkb
+            state[key] = cur
+    return state
+
+
 def _init_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS audit_event (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -352,6 +387,10 @@ def run(ctx):
     ]
     ctx.data["a2_collapsed"] = collapse_rewind_events(plugin_events)
     ctx.data["a2_collapsed_len"] = len(ctx.data["a2_collapsed"])
+    ctx.data["a2_event_ids"] = sorted(e.event_id for e in a2_events)
+    ctx.data["a2_plan_ids"] = sorted(e.event_id for e in ctx.data["a2_collapsed"])
+    ctx.data["a2_net"] = _net_after_plan(
+        ctx.data["a2_collapsed"], _FP_A2, a2_cutoff).get("fid:100")
 
     ops = [e.operation_type for e in ctx.data["a2_collapsed"]]
     ctx.data["a2_ops"] = ops
@@ -402,6 +441,8 @@ def run(ctx):
     ctx.data["at1_collapsed"] = at1_collapsed
     ctx.data["at1_len"] = len(at1_collapsed)
     ctx.data["at1_ops"] = [e.operation_type for e in at1_collapsed]
+    ctx.data["at1_net"] = _net_after_plan(
+        at1_collapsed, _FP_AT1, ctx.data["at1_cutoff"]).get("fid:200")
     at1_del = None
     for e in at1_collapsed:
         if e.operation_type == "DELETE":
@@ -454,31 +495,60 @@ def assertions(ctx):
          "count={} limit={}".format(count, _MAX_EVENTS_PER_RESTORE)),
         ("a2_events_fetched", a2_events_len == 3,
          "a2_events={}".format(a2_events_len)),
-        ("a2_collapsed_to_2", a2_collapsed_len == 2,
-         "collapsed={} expected=2".format(a2_collapsed_len)),
+        # Hypothesis revised (v7): the UPDATE->DELETE chain of fid:100 is
+        # no longer fused into one synthetic DELETE (whose trace named the
+        # UPDATE while it compensated both). Each of the 3 events is
+        # planned once, with its own id: nothing dropped, nothing doubled.
+        ("a2_each_event_planned_once",
+         a2_collapsed_len == 3
+         and ctx.data.get("a2_plan_ids") == ctx.data.get("a2_event_ids"),
+         "plan={} events={}".format(ctx.data.get("a2_plan_ids"),
+                                    ctx.data.get("a2_event_ids"))),
         ("a2_has_synthetic_delete", a2_synthetic_delete is not None,
          "synthetic_delete={}".format(a2_synthetic_delete)),
-        ("a2_synthetic_has_cutoff_attrs",
-         a2_synthetic_attrs.get("name") == "Original",
-         "attrs={}".format(a2_synthetic_attrs)),
+        # Hypothesis revised (v7): the cutoff value is read on what the
+        # plan writes (re-insert, then the UPDATE compensation), not on a
+        # synthetic row: same goal, measured on the result.
+        ("a2_plan_restores_cutoff_attrs",
+         (ctx.data.get("a2_net") or {}).get("name") == "Original",
+         "fid:100 after the plan={} (synthetic attrs before v7={})".format(
+             ctx.data.get("a2_net"), a2_synthetic_attrs)),
         ("a2_synthetic_fp_not_recycled",
          "@" not in a2_synthetic_fp,
          "fp={}".format(a2_synthetic_fp)),
-        ("a2_ops_are_delete_insert",
-         a2_ops == ["DELETE", "INSERT"] or a2_ops == ["INSERT", "DELETE"],
+        # Hypothesis revised (v7): three real rows, no synthetic one.
+        ("a2_ops_are_delete_insert_update",
+         sorted(a2_ops) == ["DELETE", "INSERT", "UPDATE"],
          "ops={}".format(a2_ops)),
-        ("at1_collapsed_to_1", at1_len == 1,
-         "at1_len={} expected=1".format(at1_len)),
+        # Hypothesis revised (v7): U, U, D planned as three real rows; the
+        # oldest OLD value (V0) must be the one the plan leaves.
+        ("at1_chain_planned_whole", at1_len == 3,
+         "at1_len={} expected=3 ops={}".format(at1_len, ctx.data.get("at1_ops"))),
         ("at1_oldest_old_preserved",
-         at1_del_attrs.get("name") == "V0",
-         "at1_attrs={} expected name=V0".format(at1_del_attrs)),
+         (ctx.data.get("at1_net") or {}).get("name") == "V0",
+         "fid:200 after the plan={} expected name=V0 (synthetic before "
+         "v7={})".format(ctx.data.get("at1_net"), at1_del_attrs)),
         ("at2_delete_only_unchanged", at2_len == 1 and at2_ops == ["DELETE"],
          "at2_len={} ops={}".format(at2_len, at2_ops)),
-        ("at3_split_to_3", at3_len == 3,
-         "at3_len={} expected=3".format(at3_len)),
+        # Hypothesis revised (v7): the pre-existing lifetime (U, D) is no
+        # longer fused: 4 real rows, still split on two fingerprints.
+        ("at3_split_to_4", at3_len == 4,
+         "at3_len={} expected=4".format(at3_len)),
         ("at3_has_two_distinct_fps", len(at3_fps) == 2,
          "at3_fps={} expected 2 distinct".format(at3_fps)),
         ("at3_ops_delete_insert_update",
-         sorted(at3_ops) == ["DELETE", "INSERT", "UPDATE"],
+         sorted(at3_ops) == ["DELETE", "INSERT", "UPDATE", "UPDATE"],
          "at3_ops={}".format(at3_ops)),
     ]
+
+
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()

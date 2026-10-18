@@ -1,4 +1,4 @@
-"""Time slider widget for temporal restore mode.
+"""Time slider widget for temporal restore mode (style VTT).
 
 Horizontal QSlider mapped to a datetime range, synchronized with a
 QgsDateTimeEdit. Emits cutoffChanged(QDateTime) when the user moves
@@ -9,14 +9,15 @@ Qt5/Qt6 compatible via qgis.PyQt. Granularity adapts to range width:
 - < 30 d  : 1 minute
 - >= 30 d : 1 hour
 """
-from qgis.PyQt.QtCore import pyqtSignal, QDateTime
+from qgis.PyQt.QtCore import QDateTime, pyqtSignal
 from qgis.PyQt.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel,
+    QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget,
 )
 from qgis.gui import QgsDateTimeEdit
 
 from ..compat import QtCompat
 from ..core.logger import flog
+from .theme import resolve_theme
 
 _SECS_1H = 3600
 _SECS_24H = 86400
@@ -33,7 +34,7 @@ def _compute_granularity(range_secs: int) -> int:
 
 
 class TimeSliderWidget(QWidget):
-    """Horizontal time slider with synchronized date editor."""
+    """Horizontal time slider with synchronized date editor and VTT pastille counter."""
 
     cutoffChanged = pyqtSignal(QDateTime)
 
@@ -46,16 +47,14 @@ class TimeSliderWidget(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
+        root.setSpacing(6)
 
         slider_row = QHBoxLayout()
         slider_row.setContentsMargins(0, 0, 0, 0)
-        slider_row.setSpacing(6)
+        slider_row.setSpacing(8)
 
         self._oldest_label = QLabel("")
         self._newest_label = QLabel("")
-        self._oldest_label.setStyleSheet("font-size: 10px;")
-        self._newest_label.setStyleSheet("font-size: 10px;")
 
         self._slider = QSlider(QtCompat.HORIZONTAL, self)
         self._slider.setTickPosition(QtCompat.TICK_BELOW)
@@ -72,14 +71,14 @@ class TimeSliderWidget(QWidget):
         date_row.setSpacing(8)
 
         self._date_label = QLabel(self.tr("Revenir au :"))
-        self._date_label.setStyleSheet("font-weight: bold;")
 
         self._date_edit = QgsDateTimeEdit()
+        self._date_edit.setAllowNull(False)
         self._date_edit.setDisplayFormat("dd/MM/yyyy HH:mm:ss")
         self._date_edit.setEnabled(False)
 
         self._count_label = QLabel("")
-        self._count_label.setStyleSheet("font-size: 11px;")
+        self._count_label.setVisible(False)
 
         date_row.addWidget(self._date_label)
         date_row.addWidget(self._date_edit, 1)
@@ -90,14 +89,44 @@ class TimeSliderWidget(QWidget):
 
         self._slider.valueChanged.connect(self._on_slider_changed)
         self._date_edit.dateTimeChanged.connect(self._on_date_edited)
+        self._refresh_theme()
+
+    def _refresh_theme(self) -> None:
+        t = resolve_theme(self)
+        bound_css = (
+            f"font-family: '{t.police_titre}'; font-size: 11px; "
+            f"font-weight: 600; color: {t.secondaire.name()};"
+        )
+        self._oldest_label.setStyleSheet(bound_css)
+        self._newest_label.setStyleSheet(bound_css)
+        self._date_label.setStyleSheet(
+            f"font-family: '{t.police}'; font-weight: 600; color: {t.texte.name()};"
+        )
+        self._count_label.setStyleSheet(
+            f"font-family: '{t.police_titre}'; font-size: 11px; font-weight: 700; "
+            f"color: {t.accent.name()}; background-color: {t.accent_doux.name()}; "
+            f"border: 1px solid {t.accent.name()}; border-radius: 10px; padding: 2px 8px;"
+        )
+        self._slider.setStyleSheet(
+            f"QSlider::groove:horizontal {{"
+            f"  height: 6px; background: {t.surface_douce.name()}; "
+            f"  border: 1px solid {t.ligne.name()}; border-radius: 3px;"
+            f"}}"
+            f"QSlider::sub-page:horizontal {{"
+            f"  background: {t.accent.name()}; border-radius: 3px;"
+            f"}}"
+            f"QSlider::handle:horizontal {{"
+            f"  background: {t.surface.name()}; border: 2px solid {t.accent.name()}; "
+            f"  width: 14px; height: 14px; margin: -5px 0; border-radius: 8px;"
+            f"}}"
+            f"QSlider::handle:horizontal:disabled {{"
+            f"  background: {t.surface_douce.name()}; border: 1px solid {t.ligne.name()};"
+            f"}}"
+        )
 
     def set_bounds(self, oldest: QDateTime, newest: QDateTime,
                    initial: QDateTime = None) -> None:
-        """Configure the slider range from oldest to newest datetime.
-
-        If *initial* is provided and falls within the range, the slider
-        starts at that position instead of the oldest date.
-        """
+        """Configure the slider range from oldest to newest datetime."""
         if not oldest.isValid() or not newest.isValid():
             flog("time_slider: invalid bounds, disabling", "WARNING")
             self.disable()
@@ -116,9 +145,7 @@ class TimeSliderWidget(QWidget):
         self._oldest_secs = o_secs
         self._newest_secs = n_secs
 
-        steps = range_secs // self._granularity
-        if steps < 1:
-            steps = 1
+        steps = max(1, range_secs // self._granularity)
 
         init_step = 0
         init_dt = oldest
@@ -131,8 +158,7 @@ class TimeSliderWidget(QWidget):
         self._syncing = True
         self._slider.setMinimum(0)
         self._slider.setMaximum(steps)
-        tick_interval = max(1, steps // 10)
-        self._slider.setTickInterval(tick_interval)
+        self._slider.setTickInterval(max(1, steps // 10))
         self._slider.setPageStep(max(1, steps // 20))
         self._slider.setValue(init_step)
         self._slider.setEnabled(True)
@@ -148,7 +174,7 @@ class TimeSliderWidget(QWidget):
 
         flog(
             f"time_slider: bounds set [{oldest.toString('yyyy-MM-ddTHH:mm:ss')}"
-            f"..{newest.toString('yyyy-MM-ddTHH:mm:ss')},"
+            f"..{newest.toString('yyyy-MM-ddTHH:mm:ss')}],"
             f" granularity={self._granularity}s, steps={steps},"
             f" initial_step={init_step}"
         )
@@ -157,10 +183,12 @@ class TimeSliderWidget(QWidget):
         """Display event count that would be affected by current cutoff."""
         if count < 0:
             self._count_label.setText("")
+            self._count_label.setVisible(False)
             return
         self._count_label.setText(
             self.tr("{count} evenement(s)").format(count=count)
         )
+        self._count_label.setVisible(True)
 
     def cutoff_datetime(self) -> QDateTime:
         """Return the currently selected cutoff datetime."""
@@ -170,8 +198,7 @@ class TimeSliderWidget(QWidget):
         if self._syncing:
             return
         self._syncing = True
-        secs = self._oldest_secs + value * self._granularity
-        secs = min(secs, self._newest_secs)
+        secs = min(self._oldest_secs + value * self._granularity, self._newest_secs)
         dt = QDateTime.fromSecsSinceEpoch(secs)
         self._date_edit.setDateTime(dt)
         self._syncing = False
@@ -181,8 +208,7 @@ class TimeSliderWidget(QWidget):
         if self._syncing:
             return
         self._syncing = True
-        secs = int(dt.toSecsSinceEpoch())
-        secs = max(self._oldest_secs, min(secs, self._newest_secs))
+        secs = max(self._oldest_secs, min(int(dt.toSecsSinceEpoch()), self._newest_secs))
         step = (secs - self._oldest_secs) // self._granularity
         self._slider.setValue(step)
         self._syncing = False
@@ -196,4 +222,5 @@ class TimeSliderWidget(QWidget):
         self._oldest_label.setText("")
         self._newest_label.setText("")
         self._count_label.setText("")
+        self._count_label.setVisible(False)
         self.setToolTip(self.tr("Aucun evenement enregistre"))

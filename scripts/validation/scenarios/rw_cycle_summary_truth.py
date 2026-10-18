@@ -55,7 +55,7 @@ The fix under test
   `failed` publishes that failure total; the residual keeps the explicit
   name `failed_other`.
 * `restore_runner._assert_bucket_conservation` checks the buckets against
-  `plan_actions` — the base the reader sums against — as well as against
+  `plan_actions` - the base the reader sums against - as well as against
   the runner totals, and logs `INVARIANT_VIOLATED` (CRITICAL) plus
   `bucket_conservation=violated` on the summary itself when they drift.
 * actions never attempted (the user cancelled) go to `cancelled`, never

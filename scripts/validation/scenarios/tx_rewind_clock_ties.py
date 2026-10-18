@@ -175,6 +175,41 @@ def setup(ctx):
     )
 
 
+def _net_after_plan(active, datasource, cutoff):
+    """Hypothesis revised (v7): what the plan WRITES, entity by entity.
+
+    Schema 7 no longer fuses a chain into one synthetic event (its trace
+    could not say which events it covered; see core/rewind_dedup). The
+    cutoff state is therefore no longer read on ONE synthetic row but on
+    the net effect of the whole plan: the compensations are replayed in
+    the order the REAL planner applies them (Phase 0 re-inserts, Phase 1
+    UPDATEs newest first, Phase 2 deletes) on one dict per entity. A
+    re-insert writes the row's full snapshot, an UPDATE compensation the
+    OLD side of its delta (and its OLD geometry), a delete removes the
+    entity. Returns {entity_fingerprint: attrs dict, or None when absent};
+    the geometry rides under the key "_geom".
+    """
+    from recoverland.core.restore_planner import plan_temporal_restore
+    from recoverland.core.search_service import reconstruct_attributes
+    plan = plan_temporal_restore(active, datasource, "sim", cutoff)
+    by_id = {e.event_id: e for e in active}
+    state = {}
+    for action in plan.actions:
+        ev = by_id[action.event_id]
+        key = ev.entity_fingerprint
+        if action.compensatory_op == "INSERT":
+            state[key] = dict(reconstruct_attributes(ev), _geom=ev.geometry_wkb)
+        elif action.compensatory_op == "DELETE":
+            state[key] = None
+        else:
+            cur = state.get(key) or {}
+            cur.update(reconstruct_attributes(ev))
+            if ev.geometry_wkb is not None:
+                cur["_geom"] = ev.geometry_wkb
+            state[key] = cur
+    return state
+
+
 def _collapse(ctx, ds):
     """fetch + dedup reels pour une datasource, cutoff = t0 inclusif."""
     from recoverland.core.event_stream_repository import fetch_events_after_cutoff
@@ -226,6 +261,15 @@ def run(ctx):
         case["restored_attrs"] = [
             reconstruct_attributes(e) for e in case["active_events"]
         ]
+    # Hypothesis revised (v7): what the whole plan writes, in the order the
+    # real planner applies it (see _net_after_plan).
+    for case, ds, fp in ((t2, _DS_TIE_UD, _FP_TIE_UD),
+                         (t4, _DS_OOO_UD, _FP_OOO_UD)):
+        plan_ud = plan_temporal_restore(case["active_events"], ds, ds, cutoff)
+        case["plan_comp_ops"] = [a.compensatory_op for a in plan_ud.actions]
+        net = _net_after_plan(case["active_events"], ds, cutoff).get(fp)
+        case["net_attrs"] = (
+            {k: v for k, v in net.items() if k != "_geom"} if net else net)
 
     for name, case in (("t1", t1), ("t2", t2), ("t3", t3), ("t4", t4)):
         case.pop("events", None)
@@ -283,14 +327,21 @@ def assertions(ctx):
     ))
 
     # ===== T2 : egalite de created_at, UPDATE puis DELETE ================
+    # Hypothesis revised (v7): the fusion was the means, the risk it named
+    # is "the UPDATE compensation targets an entity not yet re-inserted".
+    # Schema 7 keeps both real rows (the synthetic DELETE reused the
+    # UPDATE's id, so its trace could not say what it covered); the risk is
+    # checked directly: the planner re-inserts FIRST (Phase 0), then
+    # compensates the UPDATE on the re-inserted feature (fid_remap).
     out.append((
-        "tie_ud_fused_into_one_delete",
-        (t2.get("active_ops") == ["DELETE"]),
-        f"active_ops={t2.get('active_ops')} attendu=['DELETE'] : la chaine "
-        f"UPDATE->DELETE doit fusionner en une seule reinsertion, sinon la "
+        "tie_ud_reinsert_before_update_comp",
+        sorted(t2.get("active_ops") or []) == ["DELETE", "UPDATE"]
+        and t2.get("plan_comp_ops") == ["INSERT", "UPDATE"],
+        f"active_ops={t2.get('active_ops')} plan={t2.get('plan_comp_ops')} "
+        f"attendu : reinsertion puis compensation de l'UPDATE, sinon la "
         f"compensation UPDATE vise une entite encore absente et echoue",
     ))
-    restored_t2 = (t2.get("restored_attrs") or [{}])[0]
+    restored_t2 = t2.get("net_attrs")
     out.append((
         "tie_ud_reinserts_the_cutoff_state",
         restored_t2 == {"code": "A", "nom": "PONT"},
@@ -325,16 +376,20 @@ def assertions(ctx):
     ))
 
     # ===== T4 : event_id a l'envers, UPDATE puis DELETE ==================
+    # Hypothesis revised (v7): same as T2. "Phase 2 re-inserts" is not the
+    # planner's order: re-inserts are Phase 0. Checked directly, with the
+    # event_ids in reverse of the chronology.
     out.append((
-        "ooo_update_delete_fused",
-        t4.get("active_ops") == ["DELETE"],
-        f"active_ops={t4.get('active_ops')} attendu=['DELETE'] : la chaine "
-        f"UPDATE->DELETE doit fusionner. Non fusionnee, la compensation UPDATE "
-        f"de phase 1 vise une entite que la phase 2 n'a pas encore reinseree "
-        f"et echoue en target_absent : le rewind se termine 'partiellement "
-        f"applique' sans que l'utilisateur sache quoi",
+        "ooo_update_delete_reinsert_first",
+        sorted(t4.get("active_ops") or []) == ["DELETE", "UPDATE"]
+        and t4.get("plan_comp_ops") == ["INSERT", "UPDATE"],
+        f"active_ops={t4.get('active_ops')} plan={t4.get('plan_comp_ops')} "
+        f"attendu : reinsertion puis compensation de l'UPDATE. Sinon la "
+        f"compensation UPDATE vise une entite pas encore reinseree et echoue "
+        f"en target_absent : le rewind se termine 'partiellement applique' "
+        f"sans que l'utilisateur sache quoi",
     ))
-    restored_t4 = (t4.get("restored_attrs") or [{}])[0]
+    restored_t4 = t4.get("net_attrs")
     out.append((
         "ooo_reinserts_the_cutoff_state",
         restored_t4 == {"code": "A", "nom": "PONT"},
@@ -368,6 +423,18 @@ def assertions(ctx):
     ))
 
     return out
+
+
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":

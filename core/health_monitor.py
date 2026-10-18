@@ -83,7 +83,7 @@ def check_disk_space(journal_path: str) -> DiskSpaceStatus:
     """Check free disk space on the volume hosting the journal.
 
     Delegates to disk_monitor.check_disk_for_path (single source of truth
-    for thresholds and disk_usage call — BL-DIAG-P1-11).
+    for thresholds and disk_usage call - BL-DIAG-P1-11).
     """
     from .disk_monitor import check_disk_for_path
 

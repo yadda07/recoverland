@@ -1,4 +1,4 @@
-"""Two-segment Review toggle — thin wrapper around SegmentedSwitch.
+"""Two-segment Review toggle - thin wrapper around SegmentedSwitch.
 
 Emits ``toggled(bool)`` when the user clicks a segment.
 Index 0 = "Présent" (unchecked), index 1 = "Review" (checked).
@@ -17,7 +17,9 @@ class ReviewSegmentedSwitch(QWidget):
         super().__init__(parent)
         self._checked = False
         self._switch = SegmentedSwitch(
-            [self.tr("Présent"), "Review"], self,
+            [self.tr("Présent"), "Review"],
+            self,
+            icons=("check-circle", "review"),
         )
         self._switch.setToolTip(self.tr("Basculer entre l'etat present et Review"))
         self._switch.segmentClicked.connect(self._on_segment)

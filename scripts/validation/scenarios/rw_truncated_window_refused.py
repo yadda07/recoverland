@@ -29,6 +29,8 @@ contract), so `count > fetched` while the cap was reached means, and only
 means, that rows were dropped. Both rewind entry points
 (`_on_version_fetch_done`, `_on_post_undo_fetch_done`) must run that check
 BEFORE collapsing, because the collapse only shrinks the list further.
+(v7: the second one went with the undo that preceded a Rewind; the check
+now covers every handler connected to a fetch thread.)
 
 Scenario layout (real schema, real repository functions, no QGIS objects):
     setup: in-memory SQLite, 12 000 events on one datasource after t0
@@ -149,7 +151,14 @@ def _handler_guarded(source: str, handler: str) -> tuple:
     start = source.find(f"def {handler}(")
     if start < 0:
         return False, f"{handler} not found in {_DIALOG}"
-    collapse = source.find("collapse_rewind_events_with_stats(events)", start)
+    # Hypothesis revised (v7): the call also hands the live layers' key
+    # columns (`key_columns=`), so it no longer reads
+    # `collapse_rewind_events_with_stats(events)` verbatim. The check is the
+    # same: the first call of the collapse on the fetched `events`.
+    import re
+    match = re.compile(
+        r"collapse_rewind_events_with_stats\(\s*events\b").search(source, start)
+    collapse = match.start() if match else -1
     if collapse < 0:
         return False, f"{handler} does not collapse events (shape changed)"
     body = source[start:collapse]
@@ -214,7 +223,22 @@ def assertions(ctx):
         bool(re.search(rf"def\s+{_GUARD}\b", source)),
         f"{_DIALOG} must define {_GUARD}",
     ))
-    for handler in ("_on_version_fetch_done", "_on_post_undo_fetch_done"):
+    # Hypothesis revised (v7): `_on_post_undo_fetch_done` was the second
+    # rewind entry point, the re-fetch after the undo that preceded a
+    # Rewind. The dialog round 3 removed that undo (the v7 window is the
+    # complete plan), and with it the re-fetch. The check is kept for the
+    # remaining entry point and made stronger: EVERY handler the dialog
+    # connects to a fetch thread's `events_ready` must run the guard before
+    # collapsing, whatever its name, and there must be at least one.
+    handlers = sorted(set(re.findall(
+        r"events_ready\.connect\(\s*self\.(\w+)\s*\)", source)))
+    out.append((
+        "fetch_handlers_found",
+        "_on_version_fetch_done" in handlers,
+        f"handlers connected to events_ready={handlers} : the rewind entry "
+        f"point _on_version_fetch_done must be one of them",
+    ))
+    for handler in handlers:
         ok, msg = _handler_guarded(source, handler)
         out.append((f"guard_before_collapse__{handler}", ok, msg))
 
@@ -233,6 +257,18 @@ def assertions(ctx):
     ))
 
     return out
+
+
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":

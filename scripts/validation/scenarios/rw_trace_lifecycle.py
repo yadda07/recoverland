@@ -220,9 +220,15 @@ def run(ctx):
     conn.execute(_INSERT_SQL, _mk_trace(
         203, "UPDATE", 7, 999, "2026-07-01T13:00:02"))
     conn.commit()
-    _, active_orphan, _ = _fetch_active_eids(
+    events_orphan, active_orphan, _ = _fetch_active_eids(
         esr, dedup, conn, "2026-07-01T09:00:00")
     ctx.data["orphan_active"] = active_orphan
+    # Hypothesis revised (v7): see the assertion. The rows of the window
+    # that are refusals the planner will block on, by event_id.
+    ctx.data["orphan_refusals"] = {
+        e.event_id for e in events_orphan
+        if (getattr(e, "commit_id", None) or "").startswith(
+            "rewind-plan:refused")}
     conn.close()
 
 
@@ -250,10 +256,29 @@ def assertions(ctx):
         ("stacked_rewind_earlier_cutoff",
          ctx.data["stacked_active"] == {100, 103},
          f"active={sorted(ctx.data['stacked_active'])} expected [100, 103]"),
+        # Hypothesis revised (v7): "harmless" meant "no crash, no user event
+        # neutralised". Both still hold and are still checked (100 and 103
+        # stay active, nothing else of theirs moves). The hidden hypothesis
+        # was "a trace whose source is gone changes nothing for this
+        # cutoff", and it is objectively false: trace 203 was written at
+        # 13:00:02, AFTER the 09:00 cutoff, and compensated event 999. If
+        # 999 happened at or before 09:00 (the only case a date purge
+        # produces), the state at 09:00 had 999 in effect and 203 removed
+        # it afterwards: reaching 09:00 needs 999 re-applied, and its
+        # payload is gone. Proceeding answers with a state that never
+        # existed and reports success. So the window adds ONE row for it,
+        # a refusal (commit_id "rewind-plan:refused", id 203) that the
+        # planner turns into a blocking conflict naming the purged event.
+        # New check = old check (on the user events) + that exact refusal.
         ("orphan_trace_harmless",
-         ctx.data["orphan_active"] == {100, 103},
-         f"active={sorted(ctx.data['orphan_active'])} expected [100, 103] "
-         f"(trace to purged eid=999 must not crash nor neutralise)"),
+         ctx.data["orphan_active"] - ctx.data.get("orphan_refusals", set())
+         == {100, 103}
+         and ctx.data.get("orphan_refusals") == {203},
+         f"active={sorted(ctx.data['orphan_active'])} refusals="
+         f"{sorted(ctx.data.get('orphan_refusals', set()))} expected user "
+         f"events [100, 103] and the refusal of 203 (trace to purged eid=999 "
+         f"must not crash nor neutralise; the state it needs is refused by "
+         f"name)"),
         ("dialog_wipe_removed",
          "_invalidate_orphan_traces_on_open" not in src,
          "recover_dialog.py must not define nor call "

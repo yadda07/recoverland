@@ -104,11 +104,45 @@ def _active_set(conn, cutoff_dt, trace_id):
         conn, _DS_FP, cutoff, trace_id=trace_id,
     )
     active, stats = collapse_rewind_events_with_stats(events)
+    # Hypothesis revised (v7): this helper read the collapse output as "the
+    # USER events to compensate". That hypothesis is objectively false
+    # since v7: the forward hop has to run in the SAME chronological pass
+    # as the compensations. Hop E proves it: the layer holds v4; undoing
+    # the traces first (re-apply U1 -> v1, U2 -> v2) and compensating U4
+    # afterwards writes U4's OLD value v0 over them, final v0 instead of
+    # v2. So the window carries the forward hop as plan items (commit_id
+    # "rewind-plan:<kind>@<toggle>") whose event_id is the TRACE they
+    # cancel: the row with id 5 seen in hop B is the re-application of U2
+    # (it cancels trace 5), not U3 coming back. The user-event list below
+    # is extracted exactly as before (plan items left out), so every
+    # original assertion keeps its value and meaning; the plan items and
+    # the order of the whole pass are asserted in addition (_ITEMS,
+    # _ORDER), never instead.
+    _ITEMS[cutoff_dt.isoformat()] = _plan_items(active)
+    _ORDER[cutoff_dt.isoformat()] = [
+        ((_plan_items([e]) or [("user",)])[0][0], e.event_id) for e in active]
     return (
-        sorted(e.event_id for e in active if e.event_id is not None),
+        sorted(e.event_id for e in active
+               if e.event_id is not None and not _plan_items([e])),
         dict(stats),
         cutoff,
     )
+
+
+_ITEMS: dict = {}
+_ORDER: dict = {}
+
+
+def _plan_items(active):
+    """(kind, event_id, values the compensation writes) of each plan item."""
+    from recoverland.core.search_service import reconstruct_attributes
+    out = []
+    for e in active:
+        mark = getattr(e, "commit_id", None) or ""
+        if mark.startswith("rewind-plan:"):
+            kind = mark.split(":", 1)[1].split("@")[0]
+            out.append((kind, e.event_id, reconstruct_attributes(e).get("v")))
+    return out
 
 
 def _reapply_set(conn, cutoff_dt, trace_id):
@@ -129,6 +163,57 @@ def _reapply_set(conn, cutoff_dt, trace_id):
     )
     return sorted(t.restored_from_event_id for t in traces
                   if t.restored_from_event_id is not None)
+
+
+def _dialog_hop(conn, cutoff_dt):
+    """Rewind to *cutoff_dt* through the dialog's real entry point.
+
+    `_recover_version_mode` with an EMPTY in-memory undo state (a QGIS
+    restart), the real window read (`version_fetch_thread._run_fetch`) on
+    a file copy of this journal; the runners are recorders. Returns what
+    the rewind was handed and whether anything was undone first.
+    """
+    import os
+    import shutil
+    import tempfile
+    import recoverland.recover_dialog as rd
+    from scripts.validation.scenarios import _undo_dialog_harness as h
+
+    tmp = tempfile.mkdtemp(prefix="rl_mhn_dialog_")
+    path = os.path.join(tmp, "journal.sqlite")
+    copy = sqlite3.connect(path)
+    try:
+        conn.backup(copy)
+    finally:
+        copy.close()
+    dlg = h.build_dialog(rd, h.Journal(path), h.RecordingWriteQueue(path),
+                         [_DS_FP], cutoff_dt=cutoff_dt)
+    undo_runners, stricts, fetches, asked = [], [], [], []
+    seams = h.Seams()
+    try:
+        seams.set(rd, "UndoRunner", h.recording_runner_class(undo_runners))
+        seams.set(rd, "StrictRestoreRunner", h.strict_runner_class(stricts))
+        seams.set(rd, "VersionFetchThread", h.real_fetch_class(fetches))
+        seams.set(rd, "QMessageBox", h.message_box_class(rd, asked))
+        seams.set(rd, "qlog", lambda *_a, **_k: None)
+        seams.set(rd, "find_target_layer",
+                  lambda _e, _c=None: h.FakeLayer("lyr_mhn", "mhn_layer"))
+        dlg._is_recovering = True
+        dlg._recover_version_mode()
+        h.pump_until(lambda: (not dlg._is_recovering
+                              and not dlg._restore_in_progress
+                              and dlg._restore_runner is None), 5.0)
+        return {
+            "undo_runners": len(undo_runners),
+            "runs": [_plan_items(s.events)
+                     + [("user", e.event_id, None) for e in s.events
+                        if not _plan_items([e])]
+                     for s in stricts],
+        }
+    finally:
+        seams.restore()
+        h.close_dialog(dlg)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def setup(ctx):
@@ -183,6 +268,7 @@ def run(ctx):
     # Cold start: nothing in RAM, only the journal.
     active_b, stats_b, _ = _active_set(conn, ctx.data["T_B"], ctx.trace_id)
     ctx.data["hop_b_active"] = active_b
+    ctx.data["hop_b_items"] = _ITEMS.get(ctx.data["T_B"].isoformat(), [])
     ctx.data["hop_b_stats"] = stats_b
     try:
         ctx.data["hop_b_reapply"] = _reapply_set(
@@ -191,6 +277,12 @@ def run(ctx):
     except Exception as exc:  # noqa: BLE001 - absence of the API is the defect
         ctx.data["hop_b_reapply"] = None
         ctx.data["hop_b_reapply_error"] = repr(exc)
+    # The same hop through the dialog's rewind entry point, cold start (no
+    # in-memory undo state), on a copy of this journal.
+    try:
+        ctx.data["hop_b_dialog"] = _dialog_hop(conn, ctx.data["T_B"])
+    except Exception as exc:  # noqa: BLE001 - a crash is a result
+        ctx.data["hop_b_dialog"] = {"crash": repr(exc)}
 
     # ---- hop C: far back to T_C (U1 still needs compensating) ----------
     active_c, stats_c, _ = _active_set(conn, ctx.data["T_C"], ctx.trace_id)
@@ -205,6 +297,7 @@ def run(ctx):
     # ---- hop D: same date again, must be a no-op -----------------------
     active_d, stats_d, _ = _active_set(conn, ctx.data["T_C"], ctx.trace_id)
     ctx.data["hop_d_active"] = active_d
+    ctx.data["hop_d_items"] = _ITEMS.get(ctx.data["T_C"].isoformat(), [])
     ctx.data["hop_d_stats"] = stats_d
     try:
         ctx.data["hop_d_reapply"] = _reapply_set(
@@ -223,6 +316,8 @@ def run(ctx):
     ctx.data["u"]["u4"] = u4
     active_e, stats_e, _ = _active_set(conn, ctx.data["T_B"], ctx.trace_id)
     ctx.data["hop_e_active"] = active_e
+    ctx.data["hop_e_items"] = _ITEMS.get(ctx.data["T_B"].isoformat(), [])
+    ctx.data["hop_e_order"] = _ORDER.get(ctx.data["T_B"].isoformat(), [])
     ctx.data["hop_e_stats"] = stats_e
     try:
         ctx.data["hop_e_reapply"] = _reapply_set(
@@ -271,6 +366,19 @@ def assertions(ctx):
         f"way to list what must be re-applied, forward navigation depends "
         f"on in-memory state and breaks after a QGIS restart.",
     ))
+    # Hypothesis revised (v7): the forward hop is part of the rewind window
+    # itself, as a compensation of U2's trace, applied in the same run as
+    # the compensations (an edit made after a rewind must be undone BEFORE
+    # that rewind's compensation is). Stronger than the journal primitive
+    # alone: the window must re-apply exactly U2, writing v2.
+    trace_a = ctx.data.get("trace_a") or [None, None]
+    out.append((
+        "hop_b_window_reapplies_u2",
+        ctx.data.get("hop_b_items") == [("reapply", trace_a[1], "v2")],
+        f"plan items at T_B={ctx.data.get('hop_b_items')} expected "
+        f"[('reapply', {trace_a[1]}, 'v2')]: re-apply U2 (write v2) by "
+        f"compensating its trace; nothing else.",
+    ))
     out.append((
         "hop_b_reapplies_u2",
         ctx.data.get("hop_b_reapply") == [u["u2"]],
@@ -302,6 +410,11 @@ def assertions(ctx):
         f"(rewinding twice to the same date must be a no-op)",
     ))
     out.append((
+        "hop_d_window_has_no_plan_item",
+        ctx.data.get("hop_d_items") == [],
+        f"plan items at T_C again={ctx.data.get('hop_d_items')} expected []",
+    ))
+    out.append((
         "hop_d_reapplies_nothing",
         ctx.data.get("hop_d_reapply") == [],
         f"hop_d_reapply={ctx.data.get('hop_d_reapply')} expected=[] "
@@ -317,6 +430,26 @@ def assertions(ctx):
         f"edit made while the layer was rewound is after T_B, so it must be "
         f"compensated -- and it must NOT be swallowed by the traces already "
         f"attached to this entity (regression rw_dedup_post_trace_edit).",
+    ))
+    trace_c = ctx.data.get("trace_c") or [None]
+    out.append((
+        "hop_e_window_reapplies_u1_and_u2_after_u4",
+        sorted(ctx.data.get("hop_e_items") or [], key=lambda x: x[1] or 0)
+        == sorted([("reapply", trace_a[1], "v2"), ("reapply", trace_c[0], "v1")],
+                  key=lambda x: x[1] or 0),
+        f"plan items at T_B after the edit={ctx.data.get('hop_e_items')} "
+        f"expected re-apply U2 (v2) and U1 (v1) in the same window as the "
+        f"compensation of U4",
+    ))
+    expected_order = [("user", u4), ("reapply", trace_c[0]),
+                      ("reapply", trace_a[1])]
+    out.append((
+        "hop_e_one_pass_newest_first",
+        ctx.data.get("hop_e_order") == expected_order,
+        f"pass at T_B={ctx.data.get('hop_e_order')} expected {expected_order}: "
+        f"U4 compensated first (v4 -> v0), then U1 re-applied (v1), then U2 "
+        f"(v2). Any other order ends on v0 or v1 while the rewind reports "
+        f"success.",
     ))
     out.append((
         "hop_e_reapplies_u1_and_u2",
@@ -337,36 +470,47 @@ def assertions(ctx):
     ))
 
     # ===== The dialog must actually use it ==============================
-    # The primitive alone changes nothing: the rewind entry point has to
-    # rebuild its undo scope from the journal when RAM is empty.
+    # The window alone changes nothing: the rewind entry point has to hand
+    # it to the rewind when RAM is empty (run below, see _dialog_hop).
     dialog = _PLUGIN_ROOT / "recover_dialog.py"
     if not dialog.is_file():
         out.append(("dialog_source_readable", False, "missing recover_dialog.py"))
         return out
-    source = dialog.read_text(encoding="utf-8", errors="replace")
 
+    # Hypothesis revised (v7): these three checks read the SOURCE for the
+    # mechanism of v6 (the dialog rebuilt an undo scope from the journal
+    # with `_reapply_set_from_journal`, assigned it to `_last_restore_by_ds`
+    # and undid it before the rewind). That mechanism is objectively gone:
+    # the v7 window carries the forward hop itself (hop_b_window_reapplies_u2
+    # above), and the undo it fed re-compensated what it had just undone
+    # (scenario rw_rewind_no_autoundo). The checks now RUN the dialog's
+    # rewind entry point (`_recover_version_mode`, real window read on a copy
+    # of this journal, cold start: no in-memory undo state) and assert what
+    # the source checks only presumed, which is stronger: the hop is not a
+    # no-op after a restart, it hands the rewind exactly the re-application
+    # of U2 (writing v2), and nothing is undone before it.
+    hop_b_dialog = ctx.data.get("hop_b_dialog") or {}
     out.append((
         "dialog_defines_reapply_set_builder",
-        bool(re.search(r"def\s+_reapply_set_from_journal\b", source)),
-        "recover_dialog.py must define _reapply_set_from_journal",
+        hop_b_dialog.get("runs") == [[("reapply", trace_a[1], "v2")]],
+        f"rewind launched by the dialog at T_B, cold start="
+        f"{hop_b_dialog}: expected one run re-applying U2 through its "
+        f"trace ({trace_a[1]}), writing v2",
     ))
-    start = source.find("def _recover_version_mode(")
-    body = source[start:start + 4000] if start >= 0 else ""
     out.append((
         "rewind_entry_point_rebuilds_undo_scope",
-        "_reapply_set_from_journal" in body,
-        "_recover_version_mode must rebuild the undo scope from the journal "
-        "before launching the fetch, otherwise a forward hop after a QGIS "
-        "restart silently does nothing",
+        bool(hop_b_dialog.get("runs")) and not hop_b_dialog.get("crash"),
+        f"dialog hop at T_B after a restart={hop_b_dialog}: with no in-memory "
+        f"undo state the forward hop must still run, otherwise it silently "
+        f"does nothing",
     ))
     out.append((
         "rebuilt_scope_feeds_the_undo_path",
-        bool(re.search(
-            r"_reapply_set_from_journal[\s\S]{0,400}?_last_restore_by_ds\s*=",
-            source,
-        )),
-        "the rebuilt scope must be assigned to _last_restore_by_ds so the "
-        "existing auto-undo path consumes it",
+        hop_b_dialog.get("undo_runners") == 0,
+        f"undo runners created before the rewind="
+        f"{hop_b_dialog.get('undo_runners')}: the forward hop is one "
+        f"chronological pass of the window; an undo before it re-compensates "
+        f"what it has just reverted",
     ))
     out.append((
         "primitive_is_the_complement_of_the_rewind_predicate",
@@ -389,6 +533,18 @@ def assertions(ctx):
     ))
 
     return out
+
+
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":

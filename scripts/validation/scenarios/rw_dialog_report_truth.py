@@ -41,6 +41,7 @@ The wiring is locked by source: a report that is never displayed is the
 failure mode this plugin has already paid for four times.
 """
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -347,7 +348,18 @@ def assertions(ctx):
     feedback_body = body("_display_restore_feedback")
     snapshot_body = body("_rewind_count_snapshot")
     outcome_body = body("_format_restore_outcome")
-    undo_rewind_body = body("_on_auto_undo_then_rewind")
+    # Hypothesis revised (v7): `_on_auto_undo_then_rewind` no longer exists
+    # (the dialog round 3 removed the undo that preceded every Rewind: the
+    # v7 window is the complete plan). The check below keeps its intent and
+    # is stronger: EVERY method that compares counts (a
+    # `_rewind_count_snapshot(..., before=...)` call) must report the
+    # mismatches, whatever it is called, and `_on_version_restore_done`
+    # must be one of them.
+    comparing_bodies = {
+        name: body(name)
+        for name in re.findall(r"\n    def (\w+)\(", rd_src)
+        if "before=" in body(name) and "_rewind_count_snapshot(" in body(name)
+    }
 
     by_name = {m["layer"]: m for m in mismatches}
     zone = by_name.get("zone_mkt_rip", {})
@@ -517,12 +529,14 @@ def assertions(ctx):
          "jetait le constat ; il doit le conserver pour que quelqu'un "
          "puisse le dire a l'utilisateur."),
         ("B_every_after_snapshot_is_followed_by_a_report",
-         all("_report_state_mismatches()" in b
-             for b in (version_body, undo_rewind_body)),
-         "les deux transitions qui comparent des comptes "
-         "(_on_version_restore_done, _on_auto_undo_then_rewind) doivent "
-         "appeler _report_state_mismatches() : un constat mesure et jamais "
-         "remonte est exactement le defaut que l'on ferme ici."),
+         "_on_version_restore_done" in comparing_bodies
+         and "_report_state_mismatches()" in version_body
+         and all("_report_state_mismatches()" in b
+                 for b in comparing_bodies.values()),
+         f"transitions qui comparent des comptes={sorted(comparing_bodies)} : "
+         "chacune doit appeler _report_state_mismatches() : un constat "
+         "mesure et jamais remonte est exactement le defaut que l'on ferme "
+         "ici."),
         ("B_mismatch_downgrades_the_success_message",
          "state_mismatch = bool(self._state_mismatches)" in version_body
          and "and not state_mismatch" in version_body,

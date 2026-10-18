@@ -210,10 +210,19 @@ def assertions(ctx):
          f"match={ctx.data['variant_match']} "
          f"geos={ctx.data['variant_used_geos']} (same bbox, different WKB "
          "must still reach equals())"),
+        # Hypothesis revised (v7): the subset used to be the NON-NULL
+        # captured fields only ([0, 1, 3]) because the rescue skipped every
+        # field captured NULL -- the vacuous-match rule the v7 audit
+        # removed (an empty capture matched any value). A NULL-captured
+        # field is now compared (NULL must match NULL), so it is read too.
+        # The perf property pinned here is unchanged and exact: no
+        # geometry, and exactly the compared columns, no others.
         ("attr_rescue_requests_no_geometry",
-         ctx.data["req_no_geometry"] and ctx.data["req_subset"] == [0, 1, 3],
+         ctx.data["req_no_geometry"]
+         and ctx.data["req_subset"] == [0, 1, 2, 3],
          f"no_geom={ctx.data['req_no_geometry']} "
-         f"subset={ctx.data['req_subset']} expected [0, 1, 3]"),
+         f"subset={ctx.data['req_subset']} expected [0, 1, 2, 3] (every "
+         f"compared column, the NULL-captured one included, and no other)"),
         ("attr_rescue_behaviour_preserved",
          ctx.data["rescue_fid"] == 12,
          f"rescue_fid={ctx.data['rescue_fid']} expected 12"),

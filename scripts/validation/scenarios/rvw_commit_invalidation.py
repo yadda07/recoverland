@@ -23,6 +23,27 @@ Honesty note on fake pyqtSignal:
   is a shared class object (not a per-instance bound-signal like real Qt). This is
   acceptable for offline testing (single tracker instance). Real Qt semantics (bound
   signals, queued inter-thread delivery) are validated at G4 runtime.
+  The shim is installed in setup() and removed at the end of run(), with every
+  module imported under it: it used to stay in sys.modules for the rest of the
+  process, so later offline scenarios skipped their own shims and shared this
+  one's class-level fake signal.
+
+Harness race (audit 2026-09-27, fixed here)
+  _wait_flush used to return on the "flush" marker. That marker is appended in
+  the WRITER thread before the product callback runs flog (file I/O) and only
+  then posts the queued emit: when the post landed after processEvents() had
+  started, the emit stayed queued, P2 saw no emit, and P4's first pump
+  delivered P2's stale emit -- exactly the 4 failures measured inside the full
+  suite (13/17), on a product behaving correctly. Now: _wait_flush waits for
+  the emits to catch up with the flushes, every phase drains before clearing,
+  P3 pumps while it watches, and _obs widens that window on purpose (50 ms)
+  so the scenario is deterministic instead of lucky. The ordering assertions
+  were imposed by the wrapper; P6 measures the real invariant with an
+  independent SQLite reader. run() stops the WriteQueue and deletes its
+  directory (P7 proves the writer is gone before the assertions), and
+  teardown(ctx) does it again if run() never got there: the writer thread,
+  its connection and its outbox file used to outlive the scenario for the
+  whole suite.
 """
 import sys
 import tempfile
@@ -49,7 +70,7 @@ def _install_qgis_shim():
     """
     try:
         import qgis  # noqa: F401
-        return
+        return False
     except ImportError:
         pass
 
@@ -117,9 +138,7 @@ def _install_qgis_shim():
     qqt_core.QObject = _FakeQObject
     _module("qgis.PyQt.QtGui")
     _module("qgis.PyQt.QtWidgets")
-
-
-_install_qgis_shim()
+    return True
 
 
 def _make_temp_db():
@@ -162,37 +181,101 @@ class _DummyJM:
     pass
 
 
+def _rows_visible(db_path) -> int:
+    """Rows an INDEPENDENT connection sees committed, -1 if unreadable."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM audit_event").fetchone()[0])
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return -1
+
+
+def _pump_once():
+    try:  # real QGIS: drain the queue. Offline shim: no Qt, none needed.
+        from qgis.PyQt.QtCore import QCoreApplication
+    except Exception:  # noqa: BLE001 - offline fake signals are synchronous
+        return
+    if QCoreApplication.instance():
+        QCoreApplication.processEvents()
+
+
 def setup(ctx):
+    ctx.data["_modules_before"] = set(sys.modules)
+    ctx.data["_shim_installed"] = _install_qgis_shim()
     from recoverland.core.write_queue import WriteQueue
     from recoverland.core.edit_tracker import EditSessionTracker
     from recoverland.core.audit_backend import AuditEvent
 
+    import threading
     db_path, tmpdir = _make_temp_db()
+    before = set(threading.enumerate())
     wq = WriteQueue()
     wq.start(db_path)
+    ctx.data["own_writers"] = [
+        t for t in threading.enumerate()
+        if t not in before and t.name == "RecoverLand-Writer"]
 
     tracker = EditSessionTracker(wq, _DummyJM())
     tracker.activate()
 
     ordered_events = []
+    # Independent readings of the journal, one per flush (writer thread,
+    # inside the callback) and one per emit (main thread, in the slot).
+    flush_rows = []
+    emit_rows = []
 
     prev_cb = tracker._on_flush_callback
 
     def _obs(n):
         ordered_events.append(("flush", n))
+        flush_rows.append(_rows_visible(db_path))
+        # Widen, on purpose, the window between this marker and the queued
+        # emit the product posts: the race the old wait lost by luck now
+        # happens every time, and the waits below must still be right.
+        time.sleep(0.05)
         prev_cb(n)
 
     wq.set_flush_callback(_obs)
 
     def _rec(n):
         ordered_events.append(("emit", n))
+        emit_rows.append(_rows_visible(db_path))
 
     tracker.committed_features.connect(_rec)
 
     ctx.data["signal_slot"] = _rec
 
-    def _wait_flush(timeout=2.0):
-        """Wait for a flush, PUMPING the Qt event queue while we wait.
+    def _counts():
+        n_flush = sum(1 for t, _ in ordered_events if t == "flush")
+        n_emit = sum(1 for t, _ in ordered_events if t == "emit")
+        return n_flush, n_emit
+
+    def _drain(timeout=2.0):
+        """Pump until every flush seen so far has its emit (or timeout).
+
+        Called before each phase clears the list: an emit still queued from
+        the previous phase would otherwise be delivered inside the next one.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _pump_once()
+            n_flush, n_emit = _counts()
+            if n_emit >= n_flush:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _wait_flush(timeout=2.0, expect_emit=True):
+        """Wait for a flush AND its emit, PUMPING the Qt event queue.
+
+        Returns once a new flush is recorded and, when *expect_emit*, once
+        the emits have caught up with the flushes. With a disconnected slot
+        (expect_emit=False) it still pumps 0.3 s after the flush, so an emit
+        that should not arrive has every chance to show up.
 
         Sleeping alone was not enough and hid seven assertions for as long as
         this scenario existed. Under a real QGIS this module's offline shim
@@ -210,32 +293,35 @@ def setup(ctx):
         imposed by this wrapper, not measured on the product. Read those four
         as "the emit was delivered", never as proof of commit ordering. The
         real invariant (BL-RVW-P1-03: the row is committed before the
-        notification) needs an INDEPENDENT SQLite connection reading at
-        callback time; that assertion is still missing here.
+        notification) is P6, measured by an INDEPENDENT SQLite connection.
 
-        NOT ISOLATED -- measured: 17/17 three times in a row when this scenario
-        runs alone, but 13/17 inside the full suite, where four emit assertions
-        (P2_AT_race_after_wait_flush_before_emit, P4_AT_double_emit_count and
-        the two P4 order checks) fail. Same process, earlier scenarios leave Qt
-        state and live writer threads behind, so pumping here drains a queue
-        this scenario does not own. Treat an isolated green as an isolated
-        green: it is not a suite result.
+        The 13/17 once measured inside the full suite was this wait's own
+        race, not the neighbours: it returned on the "flush" marker while
+        the emit could still be posted-not-delivered, and that late emit
+        leaked into P4. Waiting for the emits to catch up with the flushes
+        (and draining before every clear) closes it; _obs widens the window
+        on purpose so a regression shows every time, not by luck.
         """
         start = time.time()
         initial_len = len(ordered_events)
-        try:  # real QGIS: drain the queue. Offline shim: no Qt, none needed.
-            from qgis.PyQt.QtCore import QCoreApplication
-        except Exception:  # noqa: BLE001 - offline fake signals are synchronous
-            QCoreApplication = None
+        flushed = False
         while time.time() - start < timeout:
-            if QCoreApplication is not None and QCoreApplication.instance():
-                QCoreApplication.processEvents()
-            if len(ordered_events) > initial_len:
-                for i in range(initial_len, len(ordered_events)):
-                    if ordered_events[i][0] == "flush":
-                        return True
+            _pump_once()
+            flushed = flushed or any(
+                ordered_events[i][0] == "flush"
+                for i in range(initial_len, len(ordered_events)))
+            if flushed:
+                n_flush, n_emit = _counts()
+                if expect_emit and n_emit >= n_flush:
+                    return True
+                if not expect_emit:
+                    settle = time.time() + 0.3
+                    while time.time() < settle:
+                        _pump_once()
+                        time.sleep(0.02)
+                    return True
             time.sleep(0.02)
-        return False
+        return flushed and not expect_emit
 
     ctx.data["wq"] = wq
     ctx.data["tracker"] = tracker
@@ -244,6 +330,9 @@ def setup(ctx):
     ctx.data["ordered_events"] = ordered_events
     ctx.data["AuditEvent"] = AuditEvent
     ctx.data["_wait_flush"] = _wait_flush
+    ctx.data["_drain"] = _drain
+    ctx.data["flush_rows"] = flush_rows
+    ctx.data["emit_rows"] = emit_rows
 
 
 def _make_event(event_id, ts, AuditEvent):
@@ -278,8 +367,62 @@ def run(ctx):
     ordered_events = ctx.data["ordered_events"]
     AuditEvent = ctx.data["AuditEvent"]
     _wait_flush = ctx.data["_wait_flush"]
+    _drain = ctx.data["_drain"]
 
     results = {}
+    try:
+        _run_phases(ctx, wq, tracker, ordered_events, AuditEvent,
+                    _wait_flush, _drain, results)
+    finally:
+        _release(ctx)
+    # runner.py discards what run() returns -- ctx IS the channel. This
+    # scenario was written against a runner that captured the return value,
+    # so assertions() read an empty dict and 16 of its 17 checks reported
+    # FAIL on a product that was behaving correctly. Stash before returning.
+    ctx.data["run_results"] = results
+    return results
+
+
+def teardown(ctx):
+    """Runner hook: release what run() may not have reached (idempotent)."""
+    _release(ctx)
+
+
+def _release(ctx):
+    """Stop the writer, drop the tracker, delete the journal directory.
+
+    Called at the end of run() (P7 then measures it) and again by
+    teardown(ctx); the second call finds nothing left to release.
+    """
+    import shutil
+    if ctx.data.get("_released"):
+        return
+    ctx.data["_released"] = True
+    wq = ctx.data.get("wq")
+    if wq is not None:
+        try:
+            wq.stop()
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            ctx.data["release_error"] = repr(exc)
+    tracker = ctx.data.get("tracker")
+    if tracker is not None:
+        try:
+            tracker.deactivate()
+        except Exception as exc:  # noqa: BLE001
+            ctx.data["release_error"] = repr(exc)
+    if ctx.data.get("tmpdir"):
+        shutil.rmtree(ctx.data["tmpdir"], ignore_errors=True)
+    ctx.data["writer_alive_after_run"] = [
+        t.name for t in ctx.data.get("own_writers", []) if t.is_alive()]
+    if ctx.data.get("_shim_installed"):
+        # Offline only: forget the fake qgis modules AND everything imported
+        # on top of them, or the next offline scenario inherits them.
+        for name in set(sys.modules) - ctx.data.get("_modules_before", set()):
+            sys.modules.pop(name, None)
+
+
+def _run_phases(ctx, wq, tracker, ordered_events, AuditEvent,
+                _wait_flush, _drain, results):
 
     event1 = _make_event(1, "2024-01-01T00:00:00Z", AuditEvent)
 
@@ -299,6 +442,7 @@ def run(ctx):
         results["P1_A1_flush_before_emit"] = False
         results["P1_A1_emit_n_positive"] = False
 
+    _drain()
     ordered_events.clear()
     wq.enqueue([event1])
     pre_flush_count = len([i for i, (t, _) in enumerate(ordered_events) if t == "flush"])
@@ -321,11 +465,18 @@ def run(ctx):
     else:
         results["P2_AT_race_after_wait_flush_before_emit"] = False
 
+    _drain()
     ordered_events.clear()
-    time.sleep(0.4)
+    # Pump while watching: a stray emit sitting in the queue would stay
+    # invisible to a plain sleep, and surface inside the next phase.
+    _p3_end = time.time() + 0.4
+    while time.time() < _p3_end:
+        _pump_once()
+        time.sleep(0.02)
     results["P3_AT_empty_no_flush"] = len([t for t, _ in ordered_events if t == "flush"]) == 0
     results["P3_AT_empty_no_emit"] = len([t for t, _ in ordered_events if t == "emit"]) == 0
 
+    _drain()
     ordered_events.clear()
     event2 = _make_event(2, "2024-01-01T00:01:00Z", AuditEvent)
     wq.enqueue([event1])
@@ -345,11 +496,12 @@ def run(ctx):
         results["P4_AT_double_order_1"] = False
         results["P4_AT_double_order_2"] = False
 
+    _drain()
     ordered_events.clear()
     signal_slot = ctx.data["signal_slot"]
     tracker.committed_features.disconnect(signal_slot)
     wq.enqueue([event1])
-    _wait_flush()
+    _wait_flush(expect_emit=False)
     results["P5_AT_disconnect_no_emit"] = len([t for t, _ in ordered_events if t == "emit"]) == 0
     results["P5_AT_disconnect_has_flush"] = len([t for t, _ in ordered_events if t == "flush"]) >= 1
     try:
@@ -358,12 +510,16 @@ def run(ctx):
     except TypeError:
         results["P5_AT_disconnect_double_error"] = True
 
-    # runner.py discards what run() returns -- ctx IS the channel. This
-    # scenario was written against a runner that captured the return value,
-    # so assertions() read an empty dict and 16 of its 17 checks reported
-    # FAIL on a product that was behaving correctly. Stash before returning.
-    ctx.data["run_results"] = results
-    return results
+    # P6 -- the real invariant, measured instead of imposed by _obs: every
+    # notification comes after the commit it announces. An independent
+    # connection read the journal inside each flush callback and again in
+    # each emit slot; the emit must never see fewer rows than its flush.
+    flush_rows = ctx.data["flush_rows"]
+    emit_rows = ctx.data["emit_rows"]
+    pairs = list(zip(flush_rows, emit_rows))
+    results["P6_rows_committed_before_emit"] = bool(pairs) and all(
+        f >= 1 and e >= f for f, e in pairs)
+    results["P6_detail"] = f"flush_rows={flush_rows} emit_rows={emit_rows}"
 
 
 def assertions(ctx):
@@ -413,13 +569,27 @@ def assertions(ctx):
     _assert("P5_AT_disconnect_double_error", run_results.get("P5_AT_disconnect_double_error", False),
             "P5_AT_disconnect_double_error=True")
 
+    _assert("P6_rows_committed_before_emit",
+            run_results.get("P6_rows_committed_before_emit", False),
+            "chaque notification committed_features arrive apres que ses lignes "
+            "sont lisibles par une connexion independante ; sinon Review relit "
+            "le journal avant le commit et ne montre jamais la modification. "
+            + str(run_results.get("P6_detail", "")))
+    alive = ctx.data.get("writer_alive_after_run")
+    _assert("P7_scenario_releases_its_writer",
+            alive == [] and not ctx.data.get("release_error"),
+            f"ecrivain de ce scenario encore vivant apres run()={alive} "
+            f"erreur={ctx.data.get('release_error')} : il survivait a toute la "
+            f"suite avec sa connexion et son fichier outbox")
+
     return assertions_list
 
 
 def main():
     trace_id = uuid4().hex[:8]
     t0 = datetime.now(timezone.utc)
-    ctx = {"trace_id": trace_id, "started_at": t0, "data": {}}
+    from types import SimpleNamespace
+    ctx = SimpleNamespace(trace_id=trace_id, started_at=t0, data={})
 
     try:
         setup(ctx)
@@ -464,11 +634,7 @@ def main():
         return 0 if verdict == "PASS" else 1
 
     finally:
-        if "wq" in ctx.data:
-            ctx.data["wq"].stop()
-        if "tmpdir" in ctx.data:
-            import shutil
-            shutil.rmtree(ctx.data["tmpdir"], ignore_errors=True)
+        _release(ctx)
 
 
 if __name__ == "__main__":

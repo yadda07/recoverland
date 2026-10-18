@@ -43,6 +43,14 @@ La couche parcelles a deja ete rembobinee (elle porte une trace). Si la
 trace ou un faux recyclage de FID deborde d'une couche a l'autre, le rewind
 saute l'entite 5 du reseau en silence ou la restaure deux fois.
 
+Hypothesis revised (v7) : le schema 7 ne fusionne plus les chaines (le
+synthetique reutilisait l'event_id du plus ancien evenement avec un autre
+contenu, sa trace ne disait pas ce qu'elle couvrait). Chaque edition garde
+sa propre compensation ; les controles de M1 lisent donc ce que le PLAN
+ecrit, dans l'ordre ou le planificateur l'applique, au lieu de lire une
+ligne synthetique. Le but est inchange : chaque champ de chaque entite
+revient a SA valeur de la veille, aucune entite perdue, aucune melangee.
+
 Plan du scenario (journal SQLite reel, dedup reel, zero objet QGIS) :
     M1  ds=tx_mx_mass    500 entites x 15 UPDATE = 7500 evenements
     M2  ds=tx_mx_net / tx_mx_par / tx_mx_bat, tous avec fid:50005
@@ -71,7 +79,7 @@ _DS_PAR = "tx_mx_par"
 _DS_BAT = "tx_mx_bat"
 
 _N_ENTITIES = 500
-_N_EDITS = 15          # > _MAX_CHAIN (10) : declenche _fuse_long_chain
+_N_EDITS = 15          # > 10 : la longueur qui declenchait la fusion avant v7
 _FP_SHARED = "fid:50005"   # le meme FID dans les trois couches
 _MAX_COLLAPSE_MS = 15000
 
@@ -202,17 +210,22 @@ def run(ctx):
 
     # Pour chaque entite : les champs presents et leur valeur "old", qui est
     # exactement ce que la compensation reecrira dans la couche.
+    # Hypothesis revised (v7): accumulated over the WHOLE plan, in the order
+    # the planner applies it (a later write of a field wins), instead of
+    # read on one fused synthetic row that no longer exists.
+    plan = plan_temporal_restore(active, _DS_MASS, "mass", cutoff)
+    by_id = {e.event_id: e for e in active}
     per_entity = {}
-    for ev in active:
+    for action in plan.actions:
+        ev = by_id[action.event_id]
         payload = {}
         try:
             payload = json.loads(ev.attributes_json).get("changed_only", {})
         except (ValueError, TypeError):
             payload = {}
-        per_entity[ev.entity_fingerprint] = {
-            name: (chg.get("old"), chg.get("new"))
-            for name, chg in payload.items()
-        }
+        slot = per_entity.setdefault(ev.entity_fingerprint, {})
+        for name, chg in payload.items():
+            slot[name] = (chg.get("old"), chg.get("new"))
 
     missing_fields = []      # (entite, nb_champs)
     wrong_values = []        # (entite, champ, obtenu, attendu)
@@ -232,7 +245,6 @@ def run(ctx):
                 wrong_values.append(
                     (fp, name, None if pair is None else pair[0], expected))
 
-    plan = plan_temporal_restore(active, _DS_MASS, "mass", cutoff)
     report = preflight_check(plan)
 
     ctx.data["mass"] = {
@@ -307,13 +319,17 @@ def assertions(ctx):
         f"{_N_ENTITIES * _N_EDITS} : une fenetre tronquee invaliderait tout le "
         f"reste du cas",
     ))
+    # Hypothesis revised (v7): "one rewrite per entity" is what fusion
+    # bought, at the price of a trace naming one event for fifteen. Exact
+    # traces need one compensation per event: exactly one, none lost, none
+    # doubled (and every entity present, checked by mass_no_entity_lost).
     out.append((
-        "mass_one_action_per_entity",
-        mass.get("active") == _N_ENTITIES,
-        f"evenements actifs={mass.get('active')} attendu={_N_ENTITIES} : chaque "
-        f"entite doit se resumer a UNE reecriture. Plus, et la couche subit "
-        f"des ecritures redondantes ; moins, et des entites ne sont jamais "
-        f"restaurees",
+        "mass_one_action_per_event",
+        mass.get("active") == _N_ENTITIES * _N_EDITS,
+        f"evenements actifs={mass.get('active')} attendu="
+        f"{_N_ENTITIES * _N_EDITS} : une compensation par edition. Plus, et "
+        f"la couche subit des ecritures en double ; moins, et des editions ne "
+        f"sont jamais defaites",
     ))
     out.append((
         "mass_every_entity_keeps_all_its_fields",
@@ -342,7 +358,8 @@ def assertions(ctx):
     out.append((
         "mass_plan_is_not_refused",
         mass.get("verdict") in ("go", "go_with_warnings")
-        and mass.get("n_actions") == _N_ENTITIES,
+        and mass.get("n_actions") == _N_ENTITIES * _N_EDITS
+        and mass.get("entity_count") == _N_ENTITIES,
         f"verdict preflight={mass.get('verdict')!r} actions="
         f"{mass.get('n_actions')} entites={mass.get('entity_count')} : 500 "
         f"entites restent sous la limite de {1000}, le rewind doit partir "
@@ -407,6 +424,18 @@ def assertions(ctx):
     ))
 
     return out
+
+
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":

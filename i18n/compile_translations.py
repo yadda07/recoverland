@@ -48,14 +48,20 @@ _QM_MAGIC = (
     b"\xcd\x21\x1c\xbf\x60\xa1\xbd\xdd"
 )
 
+# Message tags, as QTranslator reads them (qtranslator.cpp, getMessage).
+# Its reader knows only End, Translation, Obsolete1, SourceText, Context and
+# Comment: a message carrying any other tag (the Qt 3 SourceText16 = 2 and
+# Context16 = 4 this compiler used to write) is refused, so every lookup
+# missed while the file still loaded and reported isEmpty() False.
 _TAG_END = 1
-_TAG_SOURCE16 = 2
 _TAG_TRANSLATION = 3
-_TAG_CONTEXT16 = 4
-_TAG_HASH = 6
+_TAG_SOURCE_TEXT = 6
+_TAG_CONTEXT = 7
+_TAG_COMMENT = 8
 
 _BLOCK_HASHES = 0x42
 _BLOCK_MESSAGES = 0x69
+_BLOCK_LANGUAGE = 0xA7
 
 
 def _elf_hash(ba: bytes) -> int:
@@ -78,26 +84,33 @@ def _pack_field(tag: int, data: bytes) -> bytes:
     return struct.pack(">BI", tag, len(data)) + data
 
 
-def _build_message_entry(context: str, source: str, translation: str) -> bytes:
-    """Build a standard Qt .qm message entry.
+def _build_message_entry(context: str, source: str, comment: str,
+                         translation: str):
+    """Build one Qt .qm message entry and its lookup hash.
 
-    Format: [Context16][SourceText16][Translation][End].
-    The hash is stored only in the separate hash table block; it must NOT be
-    written inside the message entry because Qt's QTranslator expects the
-    message block to contain only context/source/translation tags.
+    Same layout as lrelease's default (SaveEverything) output:
+    [Translation (UTF-16BE)][Comment][SourceText][Context][End], the last
+    three as UTF-8 bytes, which is what QTranslator compares them with.
+    The hash is elfHash(source + comment) in UTF-8: QTranslator computes
+    exactly that for the lookup, the context is only compared once an entry
+    of that hash is found. It lives in the hash block, never in the entry.
     """
     buf = bytearray()
-    key = (context + "\n" + source + "\n").encode("utf-8")
-    h = _elf_hash(key)
-    buf += _pack_field(_TAG_CONTEXT16, _encode_utf16be(context))
-    buf += _pack_field(_TAG_SOURCE16, _encode_utf16be(source))
+    h = _elf_hash((source + comment).encode("utf-8"))
     buf += _pack_field(_TAG_TRANSLATION, _encode_utf16be(translation))
+    buf += _pack_field(_TAG_COMMENT, comment.encode("utf-8"))
+    buf += _pack_field(_TAG_SOURCE_TEXT, source.encode("utf-8"))
+    buf += _pack_field(_TAG_CONTEXT, context.encode("utf-8"))
     buf += struct.pack(">B", _TAG_END)
     return bytes(buf), h
 
 
 def _parse_ts(ts_path: str):
-    """Yield (context, source, translation) from a .ts file."""
+    """Yield (context, source, comment, translation) from a .ts file.
+
+    Plural (numerus) messages are refused rather than written wrong: they
+    need the language's plural rules block, which only lrelease produces.
+    """
     tree = _safe_parse(ts_path)
     root = tree.getroot()
     for ctx_el in root.iter("context"):
@@ -113,7 +126,12 @@ def _parse_ts(ts_path: str):
             tr_type = tr_el.get("type", "") if tr_el is not None else ""
             if tr_type in ("vanished", "obsolete"):
                 continue
-            yield context, source, translation
+            if msg_el.get("numerus") == "yes":
+                raise ValueError(
+                    f"plural message {context}/{source[:40]!r} needs lrelease; "
+                    "the fallback compiler does not write plural rules")
+            comment = msg_el.findtext("comment") or ""
+            yield context, source, comment, translation
 
 
 def _find_lrelease() -> str | None:
@@ -149,25 +167,35 @@ def _compile_with_lrelease(ts_path: str, qm_path: str) -> int | None:
 
 
 def _compile_with_custom(ts_path: str, qm_path: str) -> int:
-    """Compile a single .ts file to .qm using the pure-Python compiler."""
+    """Compile a single .ts file to .qm using the pure-Python compiler.
+
+    Returns the number of messages written. Untranslated messages are left
+    out, as lrelease does: QTranslator then returns the source.
+    """
     messages_buf = bytearray()
     hash_entries = []
 
-    for context, source, translation in _parse_ts(ts_path):
+    for context, source, comment, translation in _parse_ts(ts_path):
         if not translation:
             continue
         offset = len(messages_buf)
-        entry_bytes, h = _build_message_entry(context, source, translation)
+        entry_bytes, h = _build_message_entry(context, source, comment, translation)
         messages_buf += entry_bytes
         hash_entries.append((h, offset))
 
-    hash_entries.sort(key=lambda e: e[0])
+    # QTranslator binary-searches this table by hash, then walks the
+    # entries of equal hash (same source in several contexts) in order.
+    hash_entries.sort()
     hashes_buf = b"".join(
         struct.pack(">II", h, off) for h, off in hash_entries
     )
+    language = (_safe_parse(ts_path).getroot().get("language") or "").encode("utf-8")
 
     with open(qm_path, "wb") as f:
         f.write(_QM_MAGIC)
+        if language:
+            f.write(struct.pack(">BI", _BLOCK_LANGUAGE, len(language)))
+            f.write(language)
         f.write(struct.pack(">BI", _BLOCK_HASHES, len(hashes_buf)))
         f.write(hashes_buf)
         f.write(struct.pack(">BI", _BLOCK_MESSAGES, len(messages_buf)))

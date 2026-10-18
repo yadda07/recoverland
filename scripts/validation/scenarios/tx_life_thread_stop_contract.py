@@ -23,7 +23,7 @@ contente de poser un drapeau Python.
 
 `wait()` ne se synchronise sur rien. Elle lit un booleen et rend la main.
 Or `_running` n'est remis a False que par `_clear_task()`, appele depuis
-`_handle_task_finished`, qui arrive par le boucle d'evenements Qt — donc
+`_handle_task_finished`, qui arrive par le boucle d'evenements Qt - donc
 jamais pendant l'appel a `wait()`, qui ne pompe pas la boucle.
 
 Consequence directe sur le code du dialogue (`recover_dialog.py`) :
@@ -38,7 +38,7 @@ Consequence directe sur le code du dialogue (`recover_dialog.py`) :
 Le developpeur a ecrit une barriere. Il n'y en a pas. `wait(500)` rend la
 main en 0 ms, la reference est mise a None, `cleanup_resources` se
 termine, et `RecoverPlugin._shutdown_local_backend` enchaine sur
-`self._journal.close()` — pendant que la fonction de la QgsTask, elle,
+`self._journal.close()` - pendant que la fonction de la QgsTask, elle,
 est encore en train d'ouvrir ou de lire une connexion sur ce journal.
 
 Le scenario d'echec concret
@@ -436,7 +436,7 @@ def assertions(ctx):
     out.append((
         "t3_no_result_emitted_after_stop",
         not d.get("t3_emissions_after_stop"),
-        f"emissions apres stop() : {d.get('t3_emissions_after_stop')} — un "
+        f"emissions apres stop() : {d.get('t3_emissions_after_stop')} - un "
         f"resultat qui arrive apres l'annulation repeuplerait la liste "
         f"d'evenements d'un REWIND que l'utilisateur a annule",
     ))
@@ -481,7 +481,7 @@ def assertions(ctx):
         "t6_stop_before_start_leaves_the_worker_usable",
         d.get("t6_error") == "" and d.get("t6_emissions") == 1,
         f"stop() avant start(): erreur={d.get('t6_error')!r} "
-        f"emissions={d.get('t6_emissions')} attendu=1 — un stop() defensif sur "
+        f"emissions={d.get('t6_emissions')} attendu=1 - un stop() defensif sur "
         f"un worker jamais lance ne doit pas le condamner",
     ))
 
@@ -492,7 +492,7 @@ def assertions(ctx):
         and not d.get("t7_error_signals"),
         f"stats sur journal ferme : erreur_start={d.get('t7_start_error')!r} "
         f"emissions={d.get('t7_emissions')} signaux_erreur="
-        f"{d.get('t7_error_signals')} — le rafraichissement des statistiques se "
+        f"{d.get('t7_error_signals')} - le rafraichissement des statistiques se "
         f"declenche par timer et peut tomber juste apres la fermeture d'un "
         f"projet ; il doit rendre un resultat vide, pas une boite d'erreur",
     ))

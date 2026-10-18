@@ -156,7 +156,10 @@ def _install_stubs(ctx):
             trace_events=(),
         )
 
-    def fake_prepare(layer, events):
+    # Hypothesis revised (v7): the runners hand the executor the journal read
+    # connection of the layer group (`journal=`, the published signature);
+    # the doubles take it like the real functions, nothing else changes.
+    def fake_prepare(layer, events, journal=None):
         """Post-patch seam: per-layer preparation, once."""
         prepared.append(len(events))
         return rr.UndoBatchContext(
