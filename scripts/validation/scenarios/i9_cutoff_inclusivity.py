@@ -1,4 +1,4 @@
-"""i9_cutoff_inclusivity — RecoverLand validation runtime.
+"""i9_cutoff_inclusivity - RecoverLand validation runtime.
 
 Invariant: I-9 (cutoff temporal inclusivity, charter §5).
 Backlog item: BL-RW-P0-01.
@@ -53,7 +53,7 @@ To run from the QGIS Python console:
 
     >>> import sys
     >>> from pathlib import Path
-    >>> P = Path(r'C:\\Users\\yadda\\AppData\\Roaming\\QGIS\\QGIS4'
+    >>> P = Path(r'C:\\Users\\<user>\\AppData\\Roaming\\QGIS\\QGIS4'
     ...          r'\\profiles\\default\\python\\plugins')
     >>> sys.path.insert(0, str(P))
     >>> from scripts.validation.runner import run_scenario
@@ -353,6 +353,18 @@ def assertions(ctx):
     ))
 
     return out
+
+
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":

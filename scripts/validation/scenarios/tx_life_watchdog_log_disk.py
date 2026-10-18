@@ -1,7 +1,7 @@
 """tx_life_watchdog_log_disk - RecoverLand validation runtime.
 
-Invariant: I-WATCHDOG (les deux surveillances du plugin — le journal de
-debogage et l'espace disque — doivent rester lisibles et honnetes sous
+Invariant: I-WATCHDOG (les deux surveillances du plugin - le journal de
+debogage et l'espace disque - doivent rester lisibles et honnetes sous
 contrainte).
 
 Pourquoi ces deux sujets dans le meme fichier
@@ -13,7 +13,7 @@ mecanisme qui coupe l'enregistrement avant que le disque ne rende
 l'ecriture impossible. Si l'un ment, le diagnostic est mort ; si l'autre
 ment, la donnee est morte.
 
-Partie A — le format cle=valeur
+Partie A - le format cle=valeur
 -------------------------------
 `core.logger.flog_kv` protege les valeurs avec `_format_kv_value` :
 espace, `=`, guillemet, tabulation et retour a la ligne declenchent un
@@ -37,7 +37,7 @@ Deux angles morts :
    suivantes : `CYCLE_SUMMARY` est justement la ligne que l'on relit en
    priorite apres un REWIND rate.
 
-Partie B — la surveillance disque
+Partie B - la surveillance disque
 ---------------------------------
 `RecoverPlugin._start_disk_monitor` interroge `check_disk_for_path`
 toutes les 5 minutes et, si `is_critical`, desactive le suivi et ecrit
@@ -407,8 +407,8 @@ def assertions(ctx):
         f"{summary_fields.get('elapsed_ms')!r}. log_cycle_summary concatene "
         f"`{{key}}={{value}}` sans passer par _format_kv_value : des qu'une "
         f"valeur contient une espace, toutes les paires suivantes sont "
-        f"decalees et la ligne de synthese d'un REWIND — celle que l'on relit "
-        f"en premier apres un incident — devient fausse.",
+        f"decalees et la ligne de synthese d'un REWIND - celle que l'on relit "
+        f"en premier apres un incident - devient fausse.",
     ))
     violation = [r for r in ctx.records
                  if "INVARIANT_VIOLATED name=tx_watch_probe" in r.raw]
@@ -419,7 +419,7 @@ def assertions(ctx):
         and violation_fields.get("eid") == "77",
         f"INVARIANT_VIOLATED relu : detail="
         f"{violation_fields.get('detail')!r} eid={violation_fields.get('eid')!r} "
-        f"— meme defaut d'echappement dans assert_invariant, sur la ligne "
+        f"- meme defaut d'echappement dans assert_invariant, sur la ligne "
         f"CRITICAL censee etre la plus exploitable du journal",
     ))
 
@@ -495,7 +495,7 @@ def assertions(ctx):
         ".activate()" in monitor or "tracking_enabled\", True" in monitor,
         "_check desactive le suivi et ecrit RecoverLand/tracking_enabled=False "
         "dans QgsSettings, mais aucune branche ne le rallume quand l'espace "
-        "revient — et le reglage est persistant. L'utilisateur libere son "
+        "revient - et le reglage est persistant. L'utilisateur libere son "
         "disque, continue a travailler, et RecoverLand n'enregistre plus rien "
         "jusqu'a ce qu'il pense a recliquer sur l'indicateur de la barre "
         "d'etat.",

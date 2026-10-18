@@ -71,6 +71,9 @@ class GroupedRestoreResult(NamedTuple):
     failed: int = 0
     failed_target_absent: int = 0
     failed_geometry_drift: int = 0
+    # The commit was accepted but reading the feature back from the
+    # provider contradicts what was written (core.commit_guard).
+    failed_postcommit_verification: int = 0
 
 
 def execute_grouped_restore(
@@ -78,6 +81,7 @@ def execute_grouped_restore(
     find_layer_fn: Callable[[AuditEvent], object],
     on_group_done: Optional[Callable[[int, int], None]] = None,
     trace_id: str = "",
+    journal_path: Optional[str] = None,
 ) -> GroupedRestoreResult:
     """Execute restore grouped by datasource fingerprint.
 
@@ -86,8 +90,18 @@ def execute_grouped_restore(
         find_layer_fn: callable(event) -> QgsVectorLayer or None.
         on_group_done: optional callback(processed_count, total_count)
             for progress updates.
-        trace_id: BL-RW-P3-17 — propagated to restore_batch so executor
+        trace_id: BL-RW-P3-17: propagated to restore_batch so executor
             logs share the rewind chain prefix.
+        journal_path: the journal *events* come from. ONE read-only
+            connection on it per group (`_open_group_journal`), handed to
+            restore_batch and closed on every path. The executor reads it
+            for two proofs: a key the journal proves continuous (without
+            it a key whose content other features share is refused
+            "key_continuity_unproven (no_journal)"), and an event a trace
+            already compensates (without it a second restore is written
+            over a later edit). A group whose journal is not given or
+            cannot be read is refused, named, before its layer is even
+            looked up: nothing is written.
 
     Returns:
         GroupedRestoreResult with totals, errors, by_ds map, and trace events.
@@ -102,26 +116,32 @@ def execute_grouped_restore(
     processed = 0
 
     for fp, group in by_ds.items():
-        layer = find_layer_fn(group[0])
-        if layer is None:
-            name = group[0].layer_name_snapshot or fp
-            errors.append(f"Couche '{name}' non trouvee dans le projet.")
-            total_fail += len(group)
-            processed += len(group)
-            if on_group_done is not None:
-                on_group_done(processed, len(events))
-            continue
+        journal, unreadable = _open_group_journal(journal_path, group[0],
+                                                  trace_id)
+        try:
+            if journal is None:
+                errors.append(_journal_refusal(group, fp, journal_path,
+                                               unreadable, "restaure"))
+                total_fail += len(group)
+            else:
+                layer = find_layer_fn(group[0])
+                if layer is None:
+                    errors.append(_missing_layer_message(group[0], fp))
+                    total_fail += len(group)
+                else:
+                    report = restore_batch(layer, group, trace_id=trace_id,
+                                           journal=journal)
+                    total_ok += len(report.succeeded)
+                    total_fail += len(report.failed)
+                    for eid, msg in report.failed.items():
+                        errors.append(f"Evt {eid}: {msg}")
+                    all_traces.extend(report.trace_events)
 
-        report = restore_batch(layer, group, trace_id=trace_id)
-        total_ok += len(report.succeeded)
-        total_fail += len(report.failed)
-        for eid, msg in report.failed.items():
-            errors.append(f"Evt {eid}: {msg}")
-        all_traces.extend(report.trace_events)
-
-        if report.succeeded:
-            layer.reload()
-        layer.triggerRepaint()
+                    if report.succeeded:
+                        layer.reload()
+                    layer.triggerRepaint()
+        finally:
+            _close_group_journal(journal)
 
         processed += len(group)
         if on_group_done is not None:
@@ -139,6 +159,7 @@ def execute_grouped_restore(
 def execute_grouped_undo(
     by_ds: Dict[str, list],
     find_layer_fn: Callable[[AuditEvent], object],
+    journal_path: Optional[str] = None,
 ) -> GroupedRestoreResult:
     """Undo a previous grouped restore.
 
@@ -146,6 +167,15 @@ def execute_grouped_undo(
         by_ds: dict mapping datasource fingerprints to event lists
             (as returned by execute_grouped_restore).
         find_layer_fn: callable(event) -> QgsVectorLayer or None.
+        journal_path: the journal the events come from. ONE read-only
+            connection on it per group, handed to undo_restore_batch and
+            closed on every path: the evidence that a key never changed
+            hands (`restore_service._key_continuity`). A journal given
+            that cannot be read refuses the group, named, before its
+            layer is looked up. None keeps the undo without it, as
+            `UndoRunner` does when given no journal: an undo never asks
+            `already_compensated`, and the executor refuses by name every
+            key it cannot prove by content alone.
 
     Returns:
         GroupedRestoreResult (trace_events always empty for undo).
@@ -154,22 +184,31 @@ def execute_grouped_undo(
     errors: List[str] = []
 
     for fp, group in by_ds.items():
-        layer = find_layer_fn(group[0])
-        if layer is None:
-            name = group[0].layer_name_snapshot or fp
-            errors.append(f"Couche '{name}' non trouvee dans le projet.")
-            total_fail += len(group)
-            continue
+        journal, unreadable = (_open_group_journal(journal_path, group[0])
+                               if journal_path else (None, ""))
+        try:
+            if journal_path and journal is None:
+                errors.append(_journal_refusal(group, fp, journal_path,
+                                               unreadable, "annule"))
+                total_fail += len(group)
+                continue
+            layer = find_layer_fn(group[0])
+            if layer is None:
+                errors.append(_missing_layer_message(group[0], fp))
+                total_fail += len(group)
+                continue
 
-        report = undo_restore_batch(layer, group)
-        total_ok += len(report.succeeded)
-        total_fail += len(report.failed)
-        for eid, msg in report.failed.items():
-            errors.append(f"Evt {eid}: {msg}")
+            report = undo_restore_batch(layer, group, journal=journal)
+            total_ok += len(report.succeeded)
+            total_fail += len(report.failed)
+            for eid, msg in report.failed.items():
+                errors.append(f"Evt {eid}: {msg}")
 
-        if report.succeeded:
-            layer.reload()
-        layer.triggerRepaint()
+            if report.succeeded:
+                layer.reload()
+            layer.triggerRepaint()
+        finally:
+            _close_group_journal(journal)
 
     return GroupedRestoreResult(
         total_ok=total_ok,
@@ -180,13 +219,80 @@ def execute_grouped_undo(
     )
 
 
+def _open_group_journal(journal_path: Optional[str], event: AuditEvent,
+                        trace_id: str = ""):
+    """ONE read-only connection on the journal, for the group starting.
+
+    Same contract as `restore_runner._open_group_journal`: ``(conn, "")``
+    when the journal answers, ``(None, reason)`` when it is not given or
+    cannot be read. Opening a URI proves nothing about its content: the
+    table the proofs read must answer. The caller closes the connection
+    (`_close_group_journal`) on every path, exceptions included.
+    """
+    prefix = f"[{trace_id}] " if trace_id else ""
+    name = event.layer_name_snapshot or event.datasource_fingerprint
+    if not journal_path:
+        flog(f"{prefix}workflow_service: no journal given for layer "
+             f"{name!r}; group refused, nothing written", "ERROR")
+        return None, "aucun journal fourni"
+    import sqlite3
+    from .journal_manager import sqlite_readonly_uri
+    conn = None
+    try:
+        conn = sqlite3.connect(sqlite_readonly_uri(journal_path), uri=True)
+        conn.execute("SELECT 1 FROM audit_event LIMIT 1").fetchall()
+    except Exception as exc:  # noqa: BLE001 - said to the caller, never silent
+        _close_group_journal(conn)
+        flog(f"{prefix}workflow_service: journal_read unavailable layer="
+             f"{name!r} ({type(exc).__name__}: {exc}); group refused, "
+             f"nothing written", "ERROR")
+        return None, f"{type(exc).__name__}: {exc}"
+    flog(f"{prefix}workflow_service: journal_read opened layer={name!r}")
+    return conn, ""
+
+
+def _close_group_journal(conn) -> None:
+    """Close a group's journal connection, if any. Never raises."""
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - a close never stops the run
+        flog(f"workflow_service: journal read connection close failed "
+             f"({exc!r})", "WARNING")
+
+
+def _journal_refusal(group: list, fp: str, journal_path: Optional[str],
+                     reason: str, done: str) -> str:
+    """Why a group was refused for its journal: layer, reason, events."""
+    name = group[0].layer_name_snapshot or fp
+    ids = ", ".join(str(e.event_id) for e in group[:10])
+    more = f" (+{len(group) - 10})" if len(group) > 10 else ""
+    if journal_path:
+        why = (f"le journal des evenements ({journal_path}) n'a pas pu etre "
+               f"lu ({reason})")
+    else:
+        why = "aucun journal des evenements n'a ete fourni"
+    return (f"Couche '{name}' refusee : {why}. Ses preuves d'identite (cle "
+            f"jamais passee a une autre entite, evenement deja restaure) "
+            f"manquent : {len(group)} evenement(s) non {done}(s) "
+            f"[{ids}{more}], rien d'ecrit.")
+
+
 def find_target_layer(event: AuditEvent, read_conn=None) -> object:
     """Find the QGIS layer matching an audit event.
 
     Search order:
-    1. Layer ID match in loaded project layers.
+    1. Layer ID match in loaded project layers, CONFIRMED by the source.
     2. Datasource EQUIVALENCE with a loaded layer.
     3. Recreate from datasource registry (if read_conn provided).
+
+    Step 1 no longer trusts the id alone: "Change Data Source" repoints a
+    layer to another table (another file, a backup copy, another service)
+    and keeps its id, so the event of ``routes`` was written into
+    ``rivieres``. The id is accepted only when the layer's current source
+    is the event's, the alias scope of the journal included; otherwise
+    the search goes on and may find the layer that does hold that source.
 
     Step 2 compares by equivalence, not by string equality: an event
     captured before the v6 canonical form (a display filter in the
@@ -195,46 +301,156 @@ def find_target_layer(event: AuditEvent, read_conn=None) -> object:
     a strict `==` the layer the user has in front of him is not
     recognised and the restore silently falls back to a temporary layer
     rebuilt from the registry -- writing to a copy while he watches the
-    original.
+    original. The equivalence stays lenient for a fingerprint written
+    before v7 without its connection service, so that capture keeps
+    following a layer tracked under a 6.x selection; a WRITE on that
+    ground alone is refused (`identity.service_match_unproven`): the
+    events may come from another database. Attaching that history
+    (`datasource_alias.attach_service_history`, or the reconciliation
+    when one service only is known) puts the service fingerprint in the
+    alias scope, and the layer is then found.
+
+    A refusal is remembered for `target_refusal_reason`, so the caller
+    can say WHY instead of "layer not found".
 
     Returns QgsVectorLayer or None.
     """
     from qgis.core import QgsProject, QgsVectorLayer
-    from .identity import (
-        compute_datasource_fingerprint, datasource_fingerprints_match,
-    )
-
-    for layer in QgsProject.instance().mapLayers().values():
-        if not isinstance(layer, QgsVectorLayer):
-            continue
-        if layer.id() == event.layer_id_snapshot:
-            return layer
 
     scope = _event_scope(event, read_conn)
-    for layer in QgsProject.instance().mapLayers().values():
-        if not isinstance(layer, QgsVectorLayer):
-            continue
-        try:
-            current = compute_datasource_fingerprint(layer)
-        except Exception as exc:  # noqa: BLE001
-            # `continue` is the intended behaviour: an unfingerprintable
-            # layer cannot be matched, and skipping it lets the search
-            # reach the next candidate. Only the log line is new -- and it
-            # holds no layer.id() call on purpose: the usual cause here is
-            # a deleted C++ wrapper, whose id() would raise too and turn
-            # this handler into the crash it exists to absorb. exc!r
-            # already names that case.
-            flog(f"find_target_layer: datasource fingerprint failed, "
-                 f"candidate layer skipped ({exc!r})", "DEBUG")
-            continue
-        if current in scope:
-            return layer
-        if any(datasource_fingerprints_match(fp, current) for fp in scope):
-            return layer
+    refusals: List[str] = []
+    layers = [layer for layer in QgsProject.instance().mapLayers().values()
+              if isinstance(layer, QgsVectorLayer)]
 
+    for layer in layers:
+        if layer.id() != event.layer_id_snapshot:
+            continue
+        proven, why = _source_matches(layer, scope)
+        if proven:
+            _forget_refusal(event)
+            return layer
+        refusals.append(why or _repointed_reason(layer, event))
+        flog(f"find_target_layer: layer id {layer.id()} matches the event but "
+             f"not its source ({refusals[-1]}); id not trusted", "WARNING")
+        break
+
+    for layer in layers:
+        proven, why = _source_matches(layer, scope)
+        if proven:
+            _forget_refusal(event)
+            return layer
+        if why and why not in refusals:
+            refusals.append(why)
+
+    if refusals:
+        flog(f"find_target_layer: eid={event.event_id} refused on "
+             f"{len(refusals)} loaded layer(s): {refusals[:3]}", "WARNING")
     if read_conn is not None:
-        return _try_restore_from_registry(event, read_conn)
+        layer = _try_restore_from_registry(event, read_conn)
+        if layer is not None:
+            _forget_refusal(event)
+            return layer
+    _remember_refusal(event, refusals)
     return None
+
+
+def _source_matches(layer, scope: set):
+    """``(proven, reason)``: does *layer* hold one of the *scope* sources?
+
+    *reason* is only set for a near miss worth telling the user: the same
+    table reached through a service the events did not record.
+    """
+    from .identity import (
+        compute_datasource_fingerprint, datasource_fingerprints_match,
+        fingerprint_service, service_match_unproven,
+    )
+    try:
+        current = compute_datasource_fingerprint(layer)
+    except Exception as exc:  # noqa: BLE001
+        # An unfingerprintable layer cannot be matched, and skipping it
+        # lets the search reach the next candidate. No layer.id() call
+        # here on purpose: the usual cause is a deleted C++ wrapper, whose
+        # id() would raise too and turn this handler into the crash it
+        # exists to absorb. exc!r already names that case.
+        flog(f"find_target_layer: datasource fingerprint failed, "
+             f"candidate layer skipped ({exc!r})", "DEBUG")
+        return False, ""
+    if current in scope:
+        return True, ""
+    unproven = ""
+    for fp in scope:
+        if not datasource_fingerprints_match(fp, current):
+            continue
+        if service_match_unproven(fp, current):
+            unproven = (
+                f"la couche '{_layer_label(layer)}' passe par le service de "
+                f"connexion '{fingerprint_service(current)}', que "
+                f"l'evenement (capture avant v7) n'a pas enregistre : il "
+                f"peut venir d'une autre base de donnees. Rattachez "
+                f"l'historique a ce service pour le restaurer ici")
+            continue
+        return True, ""
+    return False, unproven
+
+
+def _repointed_reason(layer, event: AuditEvent) -> str:
+    try:
+        from .identity import compute_datasource_fingerprint
+        current = compute_datasource_fingerprint(layer)
+    except Exception:  # noqa: BLE001 - the reason stays generic
+        current = "?"
+    return (f"la couche '{_layer_label(layer)}' porte l'identifiant de la "
+            f"couche d'origine mais pointe desormais vers une autre source "
+            f"({current}) que celle des evenements "
+            f"({event.datasource_fingerprint})")
+
+
+def _layer_label(layer) -> str:
+    try:
+        return layer.name() or "?"
+    except Exception:  # noqa: BLE001 - deleted wrapper
+        return "?"
+
+
+# Last refusal of find_target_layer per event, for the caller's message.
+# Bounded: only the most recent searches matter (GUI thread only).
+_REFUSALS: Dict[tuple, str] = {}
+_MAX_REFUSALS = 256
+
+
+def _refusal_key(event: AuditEvent) -> tuple:
+    return (event.event_id, event.datasource_fingerprint or "")
+
+
+def _remember_refusal(event: AuditEvent, refusals: List[str]) -> None:
+    key = _refusal_key(event)
+    _REFUSALS.pop(key, None)
+    if not refusals:
+        return
+    if len(_REFUSALS) >= _MAX_REFUSALS:
+        _REFUSALS.pop(next(iter(_REFUSALS)))
+    _REFUSALS[key] = "; ".join(refusals[:3])
+
+
+def _forget_refusal(event: AuditEvent) -> None:
+    _REFUSALS.pop(_refusal_key(event), None)
+
+
+def target_refusal_reason(event: AuditEvent) -> str:
+    """Why the last `find_target_layer` for *event* found no layer.
+
+    '' when no loaded layer was refused, i.e. the source is simply not
+    loaded in the project.
+    """
+    return _REFUSALS.get(_refusal_key(event), "")
+
+
+def _missing_layer_message(event: AuditEvent, fp: str) -> str:
+    name = event.layer_name_snapshot or fp
+    reason = target_refusal_reason(event)
+    if reason:
+        return f"Couche '{name}' refusee comme cible : {reason}."
+    return f"Couche '{name}' non trouvee dans le projet."
 
 
 def _event_scope(event: AuditEvent, read_conn=None) -> set:

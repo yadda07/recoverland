@@ -10,6 +10,7 @@ from qgis.PyQt.QtCore import QCoreApplication
 
 from .logger import flog
 from .health_monitor import _format_size
+from .long_paths import when_needed, plain
 
 
 def _tr(msg):
@@ -43,6 +44,8 @@ def check_disk_for_path(path: str) -> DiskStatus:
     if not path:
         # No journal open yet: nothing to watch, and no volume to blame.
         return DiskStatus(0, 0, "", False, False)
+    # A journal past MAX_PATH only exists under its extended-length form.
+    path = when_needed(path)
     target = os.path.dirname(path) if not os.path.isdir(path) else path
     if not os.path.exists(target):
         target = _find_existing_parent(target)
@@ -117,5 +120,6 @@ def _find_existing_parent(path: str) -> str:
 
 
 def _extract_volume(path: str) -> str:
-    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    # Shown to the user: the drive, not its extended-length spelling.
+    drive = os.path.splitdrive(os.path.abspath(plain(path)))[0]
     return drive if drive else "/"

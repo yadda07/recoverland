@@ -89,6 +89,20 @@ def _event(eid, ts, op, identity_json, ds=_DS, fp=None):
     )
 
 
+def _preflight(actifs, t0):
+    """(verdict, raisons bloquantes) du planificateur sur le plan *actifs*."""
+    if not actifs:
+        return ("vide", [])
+    from recoverland.core.restore_contracts import RestoreCutoff, CutoffType
+    from recoverland.core.restore_planner import (
+        plan_temporal_restore, preflight_check)
+    plan = plan_temporal_restore(
+        actifs, _DS, "couche",
+        RestoreCutoff(CutoffType.BY_DATE, t0.isoformat(), inclusive=True))
+    report = preflight_check(plan)
+    return (report.verdict.name, list(report.blocking_reasons))
+
+
 # La meme entite, rendue de trois facons differentes.
 _RENDUS = ('{"fid": 5}', '{"fid":5}', '{ "fid" : 5 }')
 
@@ -106,6 +120,14 @@ def setup(ctx):
     # entite qu'il vient de recreer.
     ctx.data["chaine_ins_del"] = [
         _event(2, t0 + timedelta(seconds=20), "DELETE", '{"fid":9}'),
+        _event(1, t0 + timedelta(seconds=10), "INSERT", '{"fid": 9}'),
+    ]
+    # Cas C bis: la meme paire, le DELETE retirant exactement ce que l'INSERT
+    # a cree. La chaine se prouve alors par son contenu: plan vide, sans
+    # refus.
+    ctx.data["chaine_ins_del_meme_etat"] = [
+        _event(2, t0 + timedelta(seconds=20), "DELETE", '{"fid":9}')._replace(
+            attributes_json=json.dumps({"all_attributes": {"v": 1}})),
         _event(1, t0 + timedelta(seconds=10), "INSERT", '{"fid": 9}'),
     ]
 
@@ -130,7 +152,9 @@ def run(ctx):
     )
     from recoverland.core.temporal_snapshot_engine import compute_entity_key
     from recoverland.core.logger import flog
+    from recoverland.core import rewind_dedup
 
+    refusal_reason = getattr(rewind_dedup, "refusal_reason", lambda e: "")
     t0 = ctx.data["t0"]
 
     flog(f"rw_entity_key_canonical run start: trace_id={ctx.trace_id}", "INFO")
@@ -154,6 +178,13 @@ def run(ctx):
     ctx.data["ins_del_actifs"] = sorted(
         e.event_id for e in actifs if e.event_id is not None)
     ctx.data["ins_del_stats"] = dict(stats)
+    ctx.data["ins_del_refus"] = [refusal_reason(e) for e in actifs
+                                 if refusal_reason(e)]
+    ctx.data["ins_del_preflight"] = _preflight(actifs, t0)
+    actifs, _stats = collapse_rewind_events_with_stats(
+        ctx.data["chaine_ins_del_meme_etat"])
+    ctx.data["ins_del_meme_etat_actifs"] = sorted(
+        e.event_id for e in actifs if e.event_id is not None)
 
     # --- cas D: garde-fou --------------------------------------------------
     ctx.data["cles_distinctes"] = sorted({
@@ -203,14 +234,41 @@ def assertions(ctx):
     ))
 
     # ===== Cas C: consequence reelle sur le dedup ========================
+    # Hypothesis revised (v7): "an INSERT then a DELETE of the same FID is
+    # one entity born and dead after the cutoff" is false on a key that
+    # names a RECORD: the INSERT created {"v": 1}, the DELETE removed
+    # {"v": 2} with no UPDATE between them, which is either a feature
+    # changed outside the journal or another feature the record number
+    # named after a shapefile repack; nothing in these rows (no session)
+    # tells which. Cancelling is then a guess, and keeping both halves the
+    # executor's resurrection path. Accepted now: the plan is empty, or it
+    # holds ONE named refusal that names BOTH events and the planner
+    # blocks it (nothing is compensated). The check keeps its purpose and
+    # its strength: a refusal naming both events exists only if the three
+    # renderings landed in ONE bucket; split across buckets, the plan
+    # holds two compensations and no such refusal, and the preflight goes.
+    # The equal-state variant (cas C bis) must still give an empty plan.
+    refus = ctx.data.get("ins_del_refus") or []
+    verdict, raisons = ctx.data.get("ins_del_preflight") or ("?", [])
+    un_seau = (len(refus) == 1 and "event 1 (" in refus[0]
+               and "event 2 (" in refus[0] and verdict == "BLOCKED")
     out.append((
         "insert_puis_delete_reste_un_no_op",
-        ctx.data.get("ins_del_actifs") == [],
-        f"actifs={ctx.data.get('ins_del_actifs')} attendu=[]: l'entite est "
-        f"nee et morte apres le cutoff, il n'y a rien a compenser. Si les "
-        f"deux evenements tombent dans des seaux differents, le plugin "
-        f"planifie une re-creation puis une suppression sur une entite qui "
-        f"n'aurait jamais du bouger. stats={ctx.data.get('ins_del_stats')}",
+        ctx.data.get("ins_del_actifs") == [] or un_seau,
+        f"actifs={ctx.data.get('ins_del_actifs')} refus={refus} "
+        f"preflight={verdict} {raisons[:2]} attendu=[] ou un refus nomme des "
+        f"deux evenements: l'entite est nee et morte apres le cutoff, il n'y "
+        f"a rien a compenser. Si les deux evenements tombent dans des seaux "
+        f"differents, le plugin planifie une re-creation puis une suppression "
+        f"sur une entite qui n'aurait jamais du bouger. "
+        f"stats={ctx.data.get('ins_del_stats')}",
+    ))
+    out.append((
+        "insert_puis_delete_meme_etat_annule",
+        ctx.data.get("ins_del_meme_etat_actifs") == [],
+        f"actifs={ctx.data.get('ins_del_meme_etat_actifs')} attendu=[]: le "
+        f"DELETE retire exactement ce que l'INSERT a cree, sur les rendus du "
+        f"meme FID; rien a compenser, rien a refuser.",
     ))
 
     # ===== Cas D: pas de sur-fusion ======================================

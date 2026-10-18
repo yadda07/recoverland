@@ -4,10 +4,10 @@ Called once from ``classFactory`` at plugin load time.
 Strategy: pip in-process first (zero subprocess), then silent subprocess
 fallback.  If all fail the plugin still loads (stdlib fallbacks exist).
 
-Runs at most **once per QGIS session** — the ``_already_ran`` flag is
+Runs at most **once per QGIS session** - the ``_already_ran`` flag is
 module-level and survives plugin reloads (Python caches imported modules).
 
-QGIS 3.40 — 4.x compatible.
+QGIS 3.40 - 4.x compatible.
 """
 import importlib
 import logging
@@ -39,7 +39,7 @@ def _ensure_vendor_on_path() -> None:
 
     append, NOT insert(0): sys.path is process-wide. Prepending made every
     vendored package win over the system copy for QGIS itself and for every
-    other plugin, for the whole session — measured, defusedxml resolved to
+    other plugin, for the whole session - measured, defusedxml resolved to
     ``recoverland/_vendor`` instead of site-packages. The vendor dir is a
     last-resort fallback and must lose to an installed copy.
     """
@@ -48,7 +48,7 @@ def _ensure_vendor_on_path() -> None:
 
 
 def _install_inprocess(pip_name: str) -> bool:
-    """Install via pip's internal API — no subprocess, no shell window."""
+    """Install via pip's internal API - no subprocess, no shell window."""
     try:
         from pip._internal.commands.install import InstallCommand  # noqa: PLC0415
         cmd = InstallCommand("install", "Install packages.")

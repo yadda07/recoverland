@@ -7,10 +7,11 @@ from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtWidgets import QWidget, QHBoxLayout, QLabel
 
 from .segmented_switch import SegmentedSwitch
+from .theme import resolve_theme
 
 
 class RestoreModeSelector(QWidget):
-    """Three-segment animated toggle selector for restore mode."""
+    """Three-segment animated toggle selector for restore mode (style VTT)."""
 
     VALID_MODES = ("event", "temporal", "review")
     _MODE_IDX = {"temporal": 0, "event": 1, "review": 2}
@@ -22,14 +23,18 @@ class RestoreModeSelector(QWidget):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
         self._label = QLabel(self.tr("Mode :"))
-        self._label.setStyleSheet("font-weight: bold;")
+        t = resolve_theme(self)
+        self._label.setStyleSheet(
+            f"font-weight: 600; color: {t.secondaire.name()}; background: transparent; border: none;"
+        )
 
         self._switch = SegmentedSwitch(
             [self.tr("Rewind"), self.tr("Restore"), self.tr("Review")],
             self,
+            icons=("rewind", "restore", "review"),
         )
         self._switch.setToolTip(self.tr("Choisir le mode de restauration"))
         self._switch.segmentClicked.connect(self._on_segment)

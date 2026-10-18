@@ -15,7 +15,7 @@
 <header class="bar">
   <a class="bar-logo" href="index.html">
     <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
-    <span class="bar-name">RecoverLand</span><span class="bar-ver">6.0.0</span>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">7.0.0</span>
   </a>
   <nav class="bar-nav">
     <a href="index.html">Overview</a>
@@ -66,7 +66,7 @@
 <div class="hero" style="padding:36px 0 24px;text-align:left">
   <div class="slbl">Review</div>
   <h1 style="font-size:36px">Time travel on the canvas</h1>
-  <p class="lead" style="max-width:680px">Review reads the local SQLite journal, reconstructs the state of tracked layers at a user-chosen date T, and projects the result onto the QGIS canvas as transient overlay layers &mdash; without ever writing back. A slim canvas-anchored date bar (Google Earth style) lets the user scrub through time. It is the read-only twin of Restore: same data, opposite intent.</p>
+  <p class="lead" style="max-width:680px">Review reads the local SQLite journal, reconstructs the state of tracked layers at a user-chosen date T, and projects the result onto the QGIS canvas as transient overlay layers : without ever writing back. A slim canvas-anchored date bar (Google Earth style) lets the user scrub through time. It is the read-only twin of Restore: same data, opposite intent.</p>
   <div class="hero-line" style="margin:18px 0 0"></div>
 </div>
 
@@ -80,12 +80,12 @@
   <div class="card">
     <div class="card-tag tag-core">Read-only</div>
     <div class="card-t">Zero side effects on source data</div>
-    <p>Review only reads from the journal and adds memory layers prefixed <code>__rl_lens_</code>. The mode never calls <code>changeGeometry</code>, <code>changeAttributeValue</code>, <code>addFeatures</code> or <code>deleteFeatures</code> on a tracked layer.</p>
+    <p>Review only reads from the journal and adds read-only memory layers in the <code>Review Snapshot</code> group (with explicit <code>_rl_etat_incomplet</code> markers). It never mutates or truncates a user layer, even if an overlay is made permanent or duplicated.</p>
   </div>
   <div class="card">
     <div class="card-tag tag-core">Spatial-first</div>
-    <div class="card-t">Filter by viewport, not by table</div>
-    <p>The cache holds events for a time range; the renderer keeps only those whose envelope intersects the current canvas extent. Pan or zoom and the visible subset recomputes in 20&ndash;80&nbsp;ms per layer.</p>
+    <div class="card-t">Per-date SQL + viewport filter</div>
+    <p>A background worker queries only the events after date T in bounded SQL batches, reconstructs state at T, and filters by memoized WKB envelopes against the current canvas extent without blocking the GUI thread.</p>
   </div>
   <div class="card">
     <div class="card-tag tag-core">Live</div>
@@ -128,27 +128,27 @@
 <svg viewBox="0 0 640 360" xmlns="http://www.w3.org/2000/svg">
   <!-- L1: UI -->
   <rect x="20" y="14" width="600" height="64" class="nd-ac"/>
-  <text x="36" y="38" class="lbl" font-size="11">L1 &mdash; UI surface</text>
+  <text x="36" y="38" class="lbl" font-size="11">L1 : UI surface</text>
   <text x="36" y="54" class="dim" font-size="10.5">recover_dialog (toggle, dock host) &middot; widgets/temporal_lens_dock</text>
   <text x="36" y="70" class="dim" font-size="10.5">widgets/review_status_widget &middot; widgets/review_segmented_switch &middot; widgets/temporal_lens_*_map_tool</text>
 
   <!-- L2: Orchestration -->
   <rect x="20" y="92" width="600" height="50" class="nd"/>
-  <text x="36" y="114" class="lbl" font-size="11">L2 &mdash; Session orchestration (UI thread)</text>
-  <text x="36" y="130" class="dim" font-size="10.5">core/review_session &nbsp;&mdash;&nbsp; cache, overlay lifecycle, viewport debounce</text>
+  <text x="36" y="114" class="lbl" font-size="11">L2 : Session orchestration (UI thread)</text>
+  <text x="36" y="130" class="dim" font-size="10.5">core/review_session &nbsp;-&nbsp; cache, overlay lifecycle, viewport debounce</text>
 
   <!-- L3: Domain -->
   <rect x="20" y="156" width="600" height="76" class="nd-ac"/>
-  <text x="36" y="178" class="lbl" font-size="11">L3 &mdash; Pure domain (zero QGIS, zero Qt)</text>
-  <text x="36" y="194" class="dim" font-size="10.5">core/lens_contracts &nbsp;&mdash;&nbsp; NamedTuples, Enums, fetch stats</text>
-  <text x="36" y="210" class="dim" font-size="10.5">core/lens_planner &nbsp;&mdash;&nbsp; group by entity, classify, build timelines</text>
-  <text x="36" y="226" class="dim" font-size="10.5">core/wkb_envelope &nbsp;&mdash;&nbsp; bbox parsing &amp; intersection (no GEOS)</text>
+  <text x="36" y="178" class="lbl" font-size="11">L3 : Pure domain (zero QGIS, zero Qt)</text>
+  <text x="36" y="194" class="dim" font-size="10.5">core/lens_contracts &nbsp;-&nbsp; NamedTuples, Enums, fetch stats</text>
+  <text x="36" y="210" class="dim" font-size="10.5">core/lens_planner &nbsp;-&nbsp; group by entity, classify, build timelines</text>
+  <text x="36" y="226" class="dim" font-size="10.5">core/wkb_envelope &nbsp;-&nbsp; bbox parsing &amp; intersection (no GEOS)</text>
 
   <!-- L4: Workers -->
   <rect x="20" y="246" width="600" height="64" class="nd"/>
-  <text x="36" y="268" class="lbl" font-size="11">L4 &mdash; Background workers (QThread)</text>
-  <text x="36" y="284" class="dim" font-size="10.5">widgets/review_worker &nbsp;&mdash;&nbsp; initial cache load (one-shot)</text>
-  <text x="36" y="300" class="dim" font-size="10.5">widgets/review_render_worker &nbsp;&mdash;&nbsp; per-viewport feature build (cancelable)</text>
+  <text x="36" y="268" class="lbl" font-size="11">L4 : Background workers (QThread)</text>
+  <text x="36" y="284" class="dim" font-size="10.5">widgets/review_worker &nbsp;-&nbsp; initial cache load (one-shot)</text>
+  <text x="36" y="300" class="dim" font-size="10.5">widgets/review_render_worker &nbsp;-&nbsp; per-viewport feature build (cancelable)</text>
 
   <!-- Dependencies on existing infrastructure -->
   <rect x="20" y="324" width="600" height="30" class="nd"/>
@@ -187,7 +187,7 @@
   <line x1="320" y1="56" x2="320" y2="74" class="edge-ac"/>
 
   <rect x="80" y="76" width="480" height="46" class="nd-ac"/>
-  <text x="320" y="98" text-anchor="middle" class="lbl" font-size="11">2. recover_dialog &mdash; build LensSelection</text>
+  <text x="320" y="98" text-anchor="middle" class="lbl" font-size="11">2. recover_dialog : build LensSelection</text>
   <text x="320" y="114" text-anchor="middle" class="dim" font-size="10">layer fingerprints &middot; t_min/t_max &middot; op filter &middot; visualization mode</text>
   <line x1="320" y1="122" x2="320" y2="140" class="edge-ac"/>
 
@@ -198,7 +198,7 @@
   <line x1="320" y1="192" x2="320" y2="212" class="edge-ac"/>
 
   <rect x="80" y="214" width="480" height="46" class="nd-ac"/>
-  <text x="320" y="236" text-anchor="middle" class="lbl" font-size="11">4. review_session.start() &mdash; UI thread</text>
+  <text x="320" y="236" text-anchor="middle" class="lbl" font-size="11">4. review_session.start() : UI thread</text>
   <text x="320" y="252" text-anchor="middle" class="dim" font-size="10">create 3 memory overlays per source layer &middot; once</text>
   <line x1="320" y1="260" x2="320" y2="278" class="edge-ac"/>
 
@@ -261,7 +261,7 @@
 
   <rect x="100" y="228" width="440" height="46" class="nd-ac"/>
   <text x="320" y="250" text-anchor="middle" class="lbl" font-size="11">layer_ready(fp, past[], arrows[], attr_markers[])</text>
-  <text x="320" y="266" text-anchor="middle" class="dim" font-size="10">Each item = (wkb_bytes, attribute_list) &mdash; no QGIS objects</text>
+  <text x="320" y="266" text-anchor="middle" class="dim" font-size="10">Each item = (wkb_bytes, attribute_list) : no QGIS objects</text>
   <line x1="320" y1="274" x2="320" y2="290" class="edge-ac"/>
 
   <rect x="180" y="292" width="280" height="22" rx="6" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.4"/>
@@ -304,7 +304,7 @@
 <!-- ============================== STOP PIPELINE ============================== -->
 <section id="stop-pipe">
 <h2>Session stop</h2>
-<p>Toggle off, status pill close button, dialog close, project switch &mdash; four entry points, one teardown path.</p>
+<p>Toggle off, status pill close button, dialog close, project switch : four entry points, one teardown path.</p>
 
 <div class="tw"><table>
 <thead><tr><th>Trigger</th><th>Effect</th></tr></thead>
@@ -328,7 +328,7 @@
   <div class="card">
     <div class="card-tag tag-core">Zero SQL per drag</div>
     <div class="card-t">In-RAM forward replay</div>
-    <p>The <code>temporal_snapshot_engine</code> replays the cached events (already bounded by time range) up to T. O(N) over cache, ~1&ndash;5&nbsp;ms per 5000 events. No SQLite read per date change.</p>
+    <p>The <code>temporal_snapshot_engine</code> replays the cached events (already bounded by time range) up to T. O(N) over cache, ~1-5&nbsp;ms per 5000 events. No SQLite read per date change.</p>
   </div>
   <div class="card">
     <div class="card-tag tag-core">800&nbsp;ms debounce</div>
@@ -383,7 +383,7 @@
 <tbody>
   <tr><td><code>geom_past</code></td><td>Same family as source (Point / Line / Polygon)</td><td>OLD geometry of every event in scope</td><td>Where the entity was before the change.</td></tr>
   <tr><td><code>arrows</code></td><td>LineString</td><td>centroid(OLD) &rarr; centroid(NEW) for UPDATEs with geometry change</td><td>Movement vector. Length and direction tell the eye.</td></tr>
-  <tr><td><code>attr_markers</code></td><td>Point</td><td>centroid for UPDATEs that changed attributes only</td><td>&laquo; something changed but not the shape &raquo; &mdash; opens the diff panel on click.</td></tr>
+  <tr><td><code>attr_markers</code></td><td>Point</td><td>centroid for UPDATEs that changed attributes only</td><td>&laquo; something changed but not the shape &raquo; : opens the diff panel on click.</td></tr>
 </tbody>
 </table></div>
 
@@ -430,7 +430,7 @@
 
 <!-- ============================== MODULE CATALOG ============================== -->
 <section id="cat-contracts">
-<h2>Module catalog &mdash; Contracts</h2>
+<h2>Module catalog : Contracts</h2>
 <p>Pure data, zero QGIS, zero Qt. The vocabulary every other Review module agrees on.</p>
 
 <div class="tw"><table>
@@ -443,7 +443,7 @@
 </section>
 
 <section id="cat-domain">
-<h2>Module catalog &mdash; Domain (planner, renderer)</h2>
+<h2>Module catalog : Domain (planner, renderer)</h2>
 <p>Pure logic. Same import discipline as the contracts. Tested without a running QGIS instance.</p>
 
 <div class="tw"><table>
@@ -451,14 +451,14 @@
 <tbody>
   <tr><td><code>core/lens_planner.py</code></td><td>236</td><td>Groups events by entity (fingerprint preferred, identity_json fallback for shapefile FID recycling), orders timelines, builds <code>EntityState</code>s with old/new geom and attr delta, classifies the entity. Output: <code>LensRenderPlan</code>.</td></tr>
   <tr><td><code>core/lens_renderer.py</code></td><td>549</td><td>Synchronous renderer that consumes a plan and creates the three QGIS memory layers in one call. Used by the standalone Time Lens dock; reused by <code>review_session</code> for overlay creation primitives (<code>_make_overlay_layer</code>) and by the render worker as the attribute schema reference.</td></tr>
-  <tr><td><code>core/temporal_snapshot_engine.py</code></td><td>290</td><td><strong>Snapshot mode core.</strong> Forward-replays cached events until cutoff date T. Per entity: last event &le; T &rarr; INSERT/UPDATE = exists, DELETE = absent. Returns <code>SnapshotResult</code> mapping {datasource_fp: {entity_fp: <code>SnapshotFeature</code>}}. Pure Python, O(N) over cache, ~1&ndash;5&nbsp;ms per 5000 events.</td></tr>
+  <tr><td><code>core/temporal_snapshot_engine.py</code></td><td>290</td><td><strong>Snapshot mode core.</strong> Forward-replays cached events until cutoff date T. Per entity: last event &le; T &rarr; INSERT/UPDATE = exists, DELETE = absent. Returns <code>SnapshotResult</code> mapping {datasource_fp: {entity_fp: <code>SnapshotFeature</code>}}. Pure Python, O(N) over cache, ~1-5&nbsp;ms per 5000 events.</td></tr>
   <tr><td><code>core/snapshot_overlay_session.py</code></td><td>650</td><td>Manages one memory layer per source layer showing the reconstructed state at date T. Lifecycle: <code>start()</code> &rarr; <code>update(snapshot_result)</code> &rarr; <code>stop()</code>. Prefix <code>__rl_snap_</code>, group &laquo;&nbsp;Review Snapshot&nbsp;&raquo;.</td></tr>
 </tbody>
 </table></div>
 </section>
 
 <section id="cat-session">
-<h2>Module catalog &mdash; Session &amp; workers</h2>
+<h2>Module catalog : Session &amp; workers</h2>
 <p>Where domain meets QGIS. The session lives on the UI thread; the workers run off it.</p>
 
 <div class="tw"><table>
@@ -473,7 +473,7 @@
 </section>
 
 <section id="cat-ui">
-<h2>Module catalog &mdash; UI surface</h2>
+<h2>Module catalog : UI surface</h2>
 
 <div class="tw"><table>
 <thead><tr><th>File</th><th>Lines</th><th>Role</th></tr></thead>
@@ -511,9 +511,9 @@
   <rect x="14" y="130" width="612" height="64" rx="8" fill="var(--bg2)" stroke="var(--brd)" stroke-width="1"/>
   <text x="28" y="154" class="lbl" font-size="12">Worker threads (QThread)</text>
   <rect x="36" y="166" width="280" height="22" class="nd"/>
-  <text x="176" y="182" text-anchor="middle" class="lbl" font-size="10.5">review_worker (cache load &mdash; one-shot)</text>
+  <text x="176" y="182" text-anchor="middle" class="lbl" font-size="10.5">review_worker (cache load : one-shot)</text>
   <rect x="330" y="166" width="280" height="22" class="nd"/>
-  <text x="470" y="182" text-anchor="middle" class="lbl" font-size="10.5">review_render_worker (per refresh &mdash; cancelable)</text>
+  <text x="470" y="182" text-anchor="middle" class="lbl" font-size="10.5">review_render_worker (per refresh : cancelable)</text>
 
   <rect x="180" y="216" width="280" height="50" rx="8" fill="var(--ac-lt)" stroke="var(--ac)" stroke-width="1.6"/>
   <text x="320" y="240" text-anchor="middle" class="lbl" font-size="11.5">SQLite read-only connection</text>
@@ -561,11 +561,11 @@
 <tbody>
   <tr><td>Toggle ON &rarr; pill visible</td><td>&lt; 50 ms</td><td>Synchronous insert + <code>processEvents()</code></td></tr>
   <tr><td>Cache load (10k events, 5 layers)</td><td>&lt; 1.5 s</td><td>Single bounded SELECT in QThread</td></tr>
-  <tr><td>Viewport refresh (one layer in extent)</td><td>20&ndash;80 ms</td><td>Pure-Python envelope filter on cached dict</td></tr>
+  <tr><td>Viewport refresh (one layer in extent)</td><td>20-80 ms</td><td>Pure-Python envelope filter on cached dict</td></tr>
   <tr><td>UI thread <code>addFeatures</code></td><td>&asymp; 5 ms / layer</td><td>Memory provider, batched in one call</td></tr>
   <tr><td>Live edit &rarr; visible</td><td>&lt; 800 ms</td><td>600 ms debounce + 80 ms render + 5 ms add</td></tr>
   <tr><td>RAM at 50k cached events</td><td>&asymp; 100 MB</td><td>~2 KB per <code>AuditEvent</code> in cache</td></tr>
-  <tr><td>Snapshot rebuild (5k entities)</td><td>1&ndash;5 ms</td><td>Pure-Python forward replay on cached events, zero SQL</td></tr>
+  <tr><td>Snapshot rebuild (5k entities)</td><td>1-5 ms</td><td>Pure-Python forward replay on cached events, zero SQL</td></tr>
   <tr><td>Snapshot date change &rarr; overlay</td><td>&lt; 900 ms</td><td>800 ms debounce + 5 ms replay + <code>addFeatures</code></td></tr>
 </tbody>
 </table></div>
@@ -625,7 +625,7 @@
 </aside>
 </div>
 
-<footer>RecoverLand 6.0.0 &middot; GEODECI &middot; Technical documentation</footer>
+<footer>RecoverLand 7.0.0 &middot; GEODECI &middot; Technical documentation</footer>
 <script src="rl.js?v=20"></script>
 </body>
 </html>

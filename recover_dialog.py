@@ -9,7 +9,7 @@ from qgis.PyQt.QtCore import (QDateTime, QDate, QTimer,
                               QVariantAnimation)
 from qgis.PyQt.QtGui import QIcon, QColor, QKeySequence
 from qgis.core import (
-    QgsVectorLayer, QgsProject, QgsApplication, QgsSettings,
+    QgsVectorLayer, QgsProject, QgsSettings,
     QgsGeometry, QgsCoordinateTransform, QgsCoordinateReferenceSystem,
 )
 from qgis.gui import QgsCollapsibleGroupBox, QgsDateTimeEdit
@@ -43,7 +43,8 @@ from .version_fetch_thread import VersionFetchThread
 from .widgets import (AppleToggleSwitch, ReviewSegmentedSwitch,
                       ThemedLogoWidget, RestoreModeSelector,
                       RestorePreflightDialog, TimeSliderWidget,
-                      ActionButtonBar)
+                      ActionButtonBar, build_dialog_stylesheet,
+                      resolve_theme, theme_icon)
 import os
 import json
 import time
@@ -72,6 +73,11 @@ def _change_type_labels():
 
 _MIN_RECOVER_ANIMATION_SEC = 3.0
 _MIN_RESTORE_ANIMATION_SEC = 1.8
+# Read-your-writes barrier before a plan (see _journal_barrier): long
+# enough for a normal backlog, short enough not to freeze the dialog.
+_JOURNAL_BARRIER_TIMEOUT_S = 5.0
+# How long a project switch waits for a cancelled runner to reach its end.
+_QUIESCE_TIMEOUT_MS = 15000
 
 
 def _flog_events(label: str, events, trace_id: str = "") -> None:
@@ -134,26 +140,47 @@ def _restore_buckets(result, partial_n: int = 0, report=None) -> dict:
         skipped = int(report.get("apply_skipped", 0) or 0)
         # `apply_fail` is the failure TOTAL; the residual bucket that the
         # runner also publishes under the short name `failed` is only one
-        # of its three parts (see restore_runner._apply_counters).
+        # of its parts (see restore_runner._apply_counters).
         failed_total = int(report.get("apply_fail", 0) or 0)
         absent = int(report.get("failed_target_absent", 0) or 0)
         drift = int(report.get("failed_geometry_drift", 0) or 0)
-        other = int(report.get("failed_other", 0) or 0)
+        postcommit = int(report.get("failed_postcommit_verification", 0) or 0)
+        # The residual is what the total leaves once its named parts are
+        # taken out, so the reasons shown always add up to the failures
+        # announced. It used to be read from `failed_other`, a key the
+        # runner's report did not carry: always 0, and a run with 3
+        # failures "for another reason" was announced "3 echouee(s)" with
+        # no reason at all. The published bucket is checked against it.
+        other = failed_total - absent - drift - postcommit
+        published = report.get("failed_other", report.get("failed"))
         cancelled = int(report.get("cancelled", 0) or 0)
         planned = int(report.get("plan_actions", 0) or 0)
         plan_known = True
+        from .core.observability import assert_invariant
+        assert_invariant(
+            other >= 0 and (published is None or int(published) == other),
+            "dialog_failure_reasons_vs_total",
+            failed_total=failed_total, absent=absent, drift=drift,
+            postcommit=postcommit, residual=other, published=published)
+        assert_invariant(
+            applied + partial + skipped + failed_total + cancelled == planned,
+            "dialog_buckets_vs_plan",
+            applied=applied, applied_partial=partial, skipped=skipped,
+            failed_total=failed_total, cancelled=cancelled, planned=planned)
+        other = max(other, 0)
     else:
         applied = int(getattr(result, "applied", 0) or 0)
         partial = int(partial_n or 0)
         skipped = int(getattr(result, "skipped_idempotent", 0) or 0)
         absent = int(getattr(result, "failed_target_absent", 0) or 0)
         drift = int(getattr(result, "failed_geometry_drift", 0) or 0)
+        postcommit = int(getattr(result, "failed_postcommit_verification", 0) or 0)
         # `GroupedRestoreResult.failed` is the RESIDUAL bucket, not the
         # total: the contract in core/workflow_service.py says so, and
         # displaying it as the total is the defect this function exists
         # to close.
         other = int(getattr(result, "failed", 0) or 0)
-        failed_total = absent + drift + other
+        failed_total = absent + drift + postcommit + other
         cancelled = 0
         planned = applied + partial + skipped + failed_total
         plan_known = False
@@ -164,6 +191,7 @@ def _restore_buckets(result, partial_n: int = 0, report=None) -> dict:
         "failed_total": failed_total,
         "failed_absent": absent,
         "failed_drift": drift,
+        "failed_postcommit": postcommit,
         "failed_other": other,
         "cancelled": cancelled,
         "planned": planned,
@@ -182,7 +210,10 @@ class RecoverDialog(QDialog, LoggerMixin):
         "_restore_in_progress",
         "_last_restore_by_ds",
         "_last_restore_events",
-        "_pending_rewind_events",
+        # What "Annuler le dernier restore" reverts (the last run), and
+        # the journal mark that tells its traces from older ones.
+        "_last_run_ids",
+        "_last_run_mark",
         "_active_restore_trace_id",
         "_restore_runner",
     )
@@ -312,8 +343,23 @@ class RecoverDialog(QDialog, LoggerMixin):
         # falling back to raw totals.
         self._cancelled_restore_runner = None
         self._last_restore_events = None
+        # Per layer, the compensations the runs of this session wrote and
+        # nothing has undone since, in the order they were applied.
         self._last_restore_by_ds = None
-        self._pending_rewind_events = None
+        # The event ids the LAST run wrote and nothing has undone since:
+        # the only scope of "Annuler le dernier restore" (see
+        # `_manual_undo_scope`).
+        self._last_run_ids: set = set()
+        # The journal high-water mark (MAX(event_id)) read when that last
+        # run was launched: the traces it wrote are above it, the traces of
+        # earlier runs on the same events are not (`_run_trace_split`).
+        # `_run_journal_mark` is the mark of the run in flight, handed over
+        # by `_record_last_run`. None: unknown.
+        self._last_run_mark = None
+        self._run_journal_mark = None
+        # Set by cleanup_resources: a late slot (a fetch result queued
+        # before the close) must not start a run on a closed dialog.
+        self._closing = False
         self._pending_cycle_stats = None
         # RLU-056: the layers whose feature count does not match the state
         # the last rewind transition asked for. Filled by
@@ -352,6 +398,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         # the journal (reconstruction depends only on the date, not the extent).
         self._review_snap_raw_result = None
         self._review_snap_raw_iso = ""
+        # The live completion of the date the worker answered, run across
+        # event-loop turns (snapshot_overlay_session.LiveCompletion).
+        self._review_snap_completion = None
         # Extent-scoped marker scanner (CHANGE C): runs on pan/zoom settle to show
         # modification dates only inside the current viewport.
         self._review_marker_worker = None
@@ -384,23 +433,36 @@ class RecoverDialog(QDialog, LoggerMixin):
         finally:
             self._programmatic_toggle = False
         if not tracking_on:
+            t = resolve_theme(self)
             self.tracking_label.setText(self.tr("Enregistrement désactivé"))
-            self.tracking_label.setStyleSheet("color: #e74c3c; font-weight: 600;")
+            self.tracking_label.setStyleSheet(f"color: {t.erreur.name()}; font-weight: 600;")
         self._refresh_smart_bar()
         self._check_onboarding()
         self._check_disk_space()
 
     def _cancel_snap_worker(self, disconnect_signals: bool = False) -> None:
-        """Cancel current snap worker and park it in zombie list for reaping."""
+        """Cancel current snap worker and park it in zombie list for reaping.
+
+        The live completion of a date the worker already answered is the
+        rest of the same reconstruction: it is cancelled with it (a new
+        date, a commit, Review stopped), and delivers nothing afterwards.
+        """
+        job = getattr(self, "_review_snap_completion", None)
+        if job is not None:
+            job.cancel("superseded")
+            self._review_snap_completion = None
         worker = self._review_snap_worker
         if worker is None:
             return
         if disconnect_signals:
-            try:
-                worker.result_ready.disconnect()
-                worker.error.disconnect()
-            except (TypeError, RuntimeError):
-                pass
+            for signal in (worker.result_ready, worker.error,
+                           getattr(worker, "refused", None)):
+                if signal is None:
+                    continue
+                try:
+                    signal.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
         worker.cancel()
         self._review_snap_zombies.append(worker)
         worker.finished.connect(self._reap_snap_zombies)
@@ -611,9 +673,14 @@ class RecoverDialog(QDialog, LoggerMixin):
         journal = self._journal
         if journal is None or not journal.is_open:
             return False
+        # Not only a degraded reconciliation: a history attached on the
+        # single-service ASSUMPTION (`ReconciliationReport.assumed`) must be
+        # said too, so the user can tell the plugin it guessed wrong. The
+        # gate used to be `is_reconciliation_degraded` alone, which is
+        # False for that case: the assumption was never shown, although
+        # `describe_reconciliation` spells it out (`needs_notice`).
         try:
-            if not journal.is_reconciliation_degraded:
-                return False
+            degraded = bool(journal.is_reconciliation_degraded)
         except Exception as exc:  # noqa: BLE001 - never block on a warning
             flog(f"reconciliation warning: unreadable state: {exc}", "WARNING")
             return False
@@ -622,7 +689,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         if context == "project":
             if key in self._reconciliation_notified:
                 return False
-            self._reconciliation_notified.add(key)
+        conn = self._get_dialog_read_conn()
+        if conn is not None:
+            # The report as stored NOW: a history attached or taken back
+            # from the results menu changed it after the journal was opened.
+            try:
+                from .core.datasource_alias import load_reconciliation
+                report = load_reconciliation(conn)
+                if report is not None:
+                    degraded = bool(report.is_degraded)
+            except Exception as exc:  # noqa: BLE001 - the flag above stands
+                flog(f"reconciliation warning: report unreadable: {exc}",
+                     "WARNING")
 
         try:
             message = journal.reconciliation_warning()
@@ -631,6 +709,8 @@ class RecoverDialog(QDialog, LoggerMixin):
             message = ""
         if not message:
             return False
+        if context == "project":
+            self._reconciliation_notified.add(key)
 
         names = self._ambiguous_datasource_names()
         if names:
@@ -639,15 +719,52 @@ class RecoverDialog(QDialog, LoggerMixin):
             message += " " + self.tr(
                 "Sources concernees : {names}."
             ).format(names=", ".join(names))
+        services = self._service_history_lines()
+        if services:
+            message += " " + services
         if context == "rewind":
-            message = self.tr(
+            message = (self.tr(
                 "Restauration lancee sur un historique partiellement "
-                "rattache."
-            ) + " " + message
+                "rattache.") if degraded else self.tr(
+                "Restauration lancee sur un historique rattache par "
+                "hypothese.")) + " " + message
         qlog(message, "WARNING")
         flog(f"reconciliation_warning_shown context={context} "
-             f"ambiguous={len(names)} journal={journal.path}", "WARNING")
+             f"degraded={degraded} ambiguous={len(names)} "
+             f"journal={journal.path}", "WARNING")
         return True
+
+    def _service_history_lines(self) -> str:
+        """Each refused service-less history, its known services, and the way out.
+
+        '' when there is none. The reconciliation refused to attach these
+        histories because several connection services are known; the
+        user is the only one who can say which database the old events
+        came from, and he needs the names to say it.
+        """
+        conn = self._get_dialog_read_conn()
+        if conn is None:
+            return ""
+        try:
+            from .core.datasource_alias import service_history_candidates
+            candidates = service_history_candidates(conn)
+        except Exception as exc:  # noqa: BLE001 - a warning never blocks
+            flog(f"service_history_lines: unreadable: {exc}", "WARNING")
+            return ""
+        if not candidates:
+            return ""
+        parts = []
+        for item in candidates:
+            label = ", ".join(item.layer_names) or item.fingerprint[-40:]
+            known = ", ".join(item.known_services) or self.tr("aucun")
+            parts.append(self.tr("{layers} (services connus : {known})").format(
+                layers=label, known=known))
+        return self.tr(
+            "Historique d'avant v7 non rattache faute de savoir de quel "
+            "service il vient : {items}. Pour le rattacher, clic droit sur un "
+            "de ses evenements dans les resultats de recherche, puis "
+            "'Rattacher cet historique a un service'."
+        ).format(items="; ".join(parts))
 
     def _get_dialog_read_conn(self):
         """Return a reusable read connection with proper PRAGMAs."""
@@ -671,6 +788,62 @@ class RecoverDialog(QDialog, LoggerMixin):
                 flog(f"_close_dialog_read_conn: dialog read connection close "
                      f"failed, handle dropped anyway ({exc!r})", "DEBUG")
             self._dialog_read_conn = None
+
+    def _run_journal_path(self):
+        """The journal a run's identity proofs and coverage guard must read.
+
+        Handed to every runner (`journal_path`): each opens its own
+        read-only connection per layer group on it. None when no journal
+        is open; the entry points refuse to plan anything then.
+        """
+        journal = self._journal
+        if journal is None or not getattr(journal, "is_open", False):
+            return None
+        return getattr(journal, "path", None) or None
+
+    def _live_key_columns(self, events):
+        """``key_columns(datasource)`` for the collapse: the LIVE layer's key.
+
+        Events journaled before v7 name a composite key by its first column
+        only (``pk:zone_id=12`` for every parcel of zone 12). The collapse
+        re-keys them from their own snapshot when it knows the layer's key
+        columns (`rewind_dedup.prove_legacy_keys`); without a v7 row of the
+        layer in the window it did not, and kept a key that names several
+        features: the whole bucket was refused, and an INSERT of one parcel
+        could cancel the DELETE of another. The layer loaded in the project
+        is the authority on its key: the same `pkAttributeIndexes` capture
+        reads (`identity.compute_feature_identity`). None for a datasource
+        whose layer cannot be resolved or inspected: the journal's own rows
+        decide then, as before.
+        """
+        first = {}
+        for event in events or ():
+            first.setdefault(event.datasource_fingerprint or "", event)
+        cache = {}
+
+        def key_columns(datasource):
+            if datasource in cache:
+                return cache[datasource]
+            names = None
+            event = first.get(datasource or "")
+            if event is not None:
+                # Loaded layers only (no read connection): planning happens
+                # before the user confirms, and the registry fallback of
+                # `find_target_layer` would add a temporary layer to his
+                # project for a rewind he may decline.
+                layer = find_target_layer(event, None)
+                if layer is not None:
+                    provider = layer.dataProvider()
+                    fields = layer.fields()
+                    names = [fields.at(i).name()
+                             for i in (provider.pkAttributeIndexes() or [])
+                             if 0 <= i < fields.count()]
+            cache[datasource] = names
+            flog(f"live_key_columns: datasource={str(datasource)[:60]} "
+                 f"columns={names}")
+            return names
+
+        return key_columns
 
     def _on_layer_changed(self, _index=None) -> None:
         """React to layer combo change: update dates and ops from cache, then refresh."""
@@ -913,13 +1086,14 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self._tracker.activate()
             else:
                 self._tracker.deactivate()
+        t = resolve_theme(self)
         if enabled:
             self.tracking_label.setText(self.tr("Enregistrement actif"))
-            self.tracking_label.setStyleSheet("color: #2ecc71; font-weight: 600;")
+            self.tracking_label.setStyleSheet(f"color: {t.acheve.name()}; font-weight: 600;")
             qlog(self.tr("Enregistrement des modifications active."))
         else:
             self.tracking_label.setText(self.tr("Enregistrement désactivé"))
-            self.tracking_label.setStyleSheet("color: #e74c3c; font-weight: 600;")
+            self.tracking_label.setStyleSheet(f"color: {t.erreur.name()}; font-weight: 600;")
             qlog(self.tr(
                 "Enregistrement desactive. Les modifications ne sont plus tracees."
             ), "WARNING")
@@ -1025,65 +1199,17 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self.tr("{n} / {total} couche(s) surveillée(s)").format(n=len(allowed), total=total))
 
     def _apply_global_button_style(self) -> None:
-        pal = self.palette()
-        hl = pal.highlight().color()
-        mid = pal.mid().color()
-        base = pal.base().color()
-        text = pal.text().color()
-        hl_text = pal.highlightedText().color()
-        border = f"rgba({mid.red()},{mid.green()},{mid.blue()},120)"
-        bg = f"rgba({base.red()},{base.green()},{base.blue()},220)"
-        hover_bg = f"rgba({base.red()},{base.green()},{base.blue()},255)"
-        pressed_bg = f"rgba({hl.red()},{hl.green()},{hl.blue()},210)"
-        checked_bg = f"rgba({hl.red()},{hl.green()},{hl.blue()},200)"
-        dis_text = f"rgba({text.red()},{text.green()},{text.blue()},90)"
-        dis_border = f"rgba({mid.red()},{mid.green()},{mid.blue()},60)"
-        dis_bg = f"rgba({base.red()},{base.green()},{base.blue()},120)"
-        self.setStyleSheet(
-            "QPushButton {"
-            f"  background-color: {bg};"
-            f"  color: palette(text);"
-            f"  border: 1px solid {border};"
-            f"  border-radius: 6px;"
-            f"  padding: 5px 14px;"
-            "}"
-            "QPushButton:hover {"
-            f"  background-color: {hover_bg};"
-            "}"
-            "QPushButton:pressed {"
-            f"  background-color: {pressed_bg};"
-            f"  color: {hl_text.name()};"
-            f"  border: none;"
-            f"  font-weight: bold;"
-            "}"
-            "QPushButton:checked {"
-            f"  background-color: {checked_bg};"
-            f"  color: {hl_text.name()};"
-            f"  border: none;"
-            f"  font-weight: bold;"
-            "}"
-            "QPushButton:disabled {"
-            f"  color: {dis_text};"
-            f"  border: 1px solid {dis_border};"
-            f"  background-color: {dis_bg};"
-            "}"
-        )
+        t = resolve_theme(self)
+        css = build_dialog_stylesheet(t)
+        if self.styleSheet() != css:
+            self.setStyleSheet(css)
 
-    def setup_ui(self):
-
-        main_layout = QVBoxLayout()
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(15, 15, 15, 15)
-        logo_label = ThemedLogoWidget()
-        logo_label.setSizePolicy(QtCompat.SIZE_FIXED, QtCompat.SIZE_FIXED)
-        self.logo_label = logo_label
-        self._load_themed_logo()
-        # Status Frame (Sleek modern header instead of QFormLayout GroupBox)
+    def _build_status_frame(self, t) -> QFrame:
         status_frame = QFrame()
         status_frame.setObjectName("statusFrame")
         status_frame.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
         status_layout = QHBoxLayout(status_frame)
-        status_layout.setContentsMargins(4, 4, 4, 4)
+        status_layout.setContentsMargins(0, 0, 0, 0)
         status_layout.setSpacing(8)
 
         self.smart_bar = JournalInfoBar()
@@ -1094,20 +1220,21 @@ class RecoverDialog(QDialog, LoggerMixin):
         tracking_panel.setSizePolicy(QtCompat.SIZE_FIXED, QtCompat.SIZE_FIXED)
         tracking_panel.setStyleSheet("background: transparent;")
         tracking_layout = QHBoxLayout(tracking_panel)
-        tracking_layout.setContentsMargins(4, 0, 0, 0)
+        tracking_layout.setContentsMargins(6, 0, 0, 0)
         tracking_layout.setSpacing(6)
 
         self.tracking_label = QLabel(self.tr("Enregistrement actif"))
-        self.tracking_label.setStyleSheet("font-weight: bold;")
+        self.tracking_label.setStyleSheet(f"color: {t.acheve.name()}; font-weight: 600;")
         self.tracking_toggle = AppleToggleSwitch()
         self.tracking_toggle.toggled.connect(self._on_tracking_toggled)
 
         tracking_layout.addWidget(self.tracking_label)
         tracking_layout.addWidget(self.tracking_toggle)
-
         status_layout.addWidget(self.smart_bar, 1)
         self.smart_bar.add_trailing_widget(tracking_panel)
+        return status_frame
 
+    def _build_layers_group(self, t) -> QgsCollapsibleGroupBox:
         layers_group = QgsCollapsibleGroupBox()
         layers_group.setTitle(self.tr("Couches surveillées"))
         layers_group.setCollapsed(True)
@@ -1116,10 +1243,12 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         layers_header = QHBoxLayout()
         self.layers_status_label = QLabel(self.tr("Toutes les couches surveillées"))
-        self.layers_status_label.setStyleSheet("font-style: italic; color: #555;")
+        self.layers_status_label.setStyleSheet(f"color: {t.secondaire.name()}; font-weight: 500;")
         refresh_layers_btn = QPushButton()
-        refresh_layers_btn.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
-        refresh_layers_btn.setFixedSize(24, 24)
+        refresh_layers_btn.setObjectName("rlToolBtn")
+        refresh_layers_btn.setIcon(theme_icon("refresh", color=t.texte, size=16))
+        refresh_layers_btn.setFixedSize(28, 28)
+        refresh_layers_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
         refresh_layers_btn.setToolTip(self.tr("Rafraîchir la liste"))
         refresh_layers_btn.clicked.connect(self._refresh_layers_panel)
         layers_header.addWidget(self.layers_status_label, 1)
@@ -1127,11 +1256,11 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         self.layers_scroll = QScrollArea()
         self.layers_scroll.setWidgetResizable(True)
-        self.layers_scroll.setMaximumHeight(160)
-        self.layers_scroll.setStyleSheet("QScrollArea { border: none; }")
+        self.layers_scroll.setMaximumHeight(150)
+        self.layers_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         self.layers_container = QWidget()
         self.layers_container_layout = QVBoxLayout()
-        self.layers_container_layout.setSpacing(3)
+        self.layers_container_layout.setSpacing(4)
         self.layers_container_layout.setContentsMargins(4, 4, 4, 4)
         self.layers_container_layout.addStretch()
         self.layers_container.setLayout(self.layers_container_layout)
@@ -1140,12 +1269,57 @@ class RecoverDialog(QDialog, LoggerMixin):
         layers_vbox.addLayout(layers_header)
         layers_vbox.addWidget(self.layers_scroll)
         layers_group.setLayout(layers_vbox)
+        layers_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
+        layers_group.setMinimumHeight(0)
+        return layers_group
 
+    def _build_version_layer_stack(self, t) -> QStackedWidget:
+        self._version_layer_list = QListWidget()
+        self._version_layer_list.setToolTip(self.tr("Cochez les couches a restaurer"))
+        self._version_layer_list.setMaximumHeight(92)
+        self._version_layer_btns = QWidget()
+        vl_btn_layout = QHBoxLayout(self._version_layer_btns)
+        vl_btn_layout.setContentsMargins(0, 0, 0, 0)
+        vl_btn_layout.setSpacing(6)
+        vl_btn_layout.addStretch()
+        self._vl_select_all_btn = QPushButton()
+        self._vl_select_all_btn.setObjectName("rlToolBtn")
+        self._vl_select_all_btn.setIcon(theme_icon("select-all", color=t.texte, size=16))
+        self._vl_select_all_btn.setToolTip(self.tr("Tout selectionner"))
+        self._vl_select_all_btn.setFixedSize(28, 28)
+        self._vl_select_all_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
+        self._vl_select_all_btn.clicked.connect(self._version_layers_check_all)
+        self._vl_deselect_btn = QPushButton()
+        self._vl_deselect_btn.setObjectName("rlToolBtn")
+        self._vl_deselect_btn.setIcon(theme_icon("deselect-all", color=t.texte, size=16))
+        self._vl_deselect_btn.setToolTip(self.tr("Tout deselectionner"))
+        self._vl_deselect_btn.setFixedSize(28, 28)
+        self._vl_deselect_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
+        self._vl_deselect_btn.clicked.connect(self._version_layers_uncheck_all)
+        vl_btn_layout.addWidget(self._vl_select_all_btn)
+        vl_btn_layout.addWidget(self._vl_deselect_btn)
+
+        vl_page = QWidget()
+        vl_lay = QVBoxLayout(vl_page)
+        vl_lay.setContentsMargins(0, 0, 0, 0)
+        vl_lay.setSpacing(6)
+        vl_lay.addWidget(self._version_layer_list)
+        vl_lay.addWidget(self._version_layer_btns)
+
+        self._layer_sel_stack = QStackedWidget()
+        self._layer_sel_stack.addWidget(QWidget())
+        self._layer_sel_stack.addWidget(vl_page)
+        self._layer_sel_stack.setFixedHeight(
+            self._version_layer_list.maximumHeight() + self._vl_select_all_btn.height() + 6
+        )
+        self._layer_sel_stack.setCurrentIndex(0)
+        return self._layer_sel_stack
+
+    def _build_selection_group(self, t) -> QgsCollapsibleGroupBox:
         selection_group = QgsCollapsibleGroupBox()
         selection_group.setTitle(self.tr("Sélection"))
         selection_outer = QVBoxLayout()
-        selection_outer.setSpacing(6)
-
+        selection_outer.setSpacing(8)
         selection_row = QHBoxLayout()
         selection_row.setSpacing(10)
 
@@ -1153,81 +1327,78 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.layer_input.setToolTip(self.tr("Couche dont les modifications sont enregistrées dans le journal local"))
         self.layer_input.currentIndexChanged.connect(self._on_layer_changed)
 
-        self._version_layer_list = QListWidget()
-        self._version_layer_list.setToolTip(self.tr("Cochez les couches a restaurer"))
-        self._version_layer_list.setMaximumHeight(120)
-        self._version_layer_list.setStyleSheet("QListWidget { border: 1px solid palette(mid); border-radius: 3px; }")
-        self._version_layer_btns = QWidget()
-        vl_btn_layout = QHBoxLayout(self._version_layer_btns)
-        vl_btn_layout.setContentsMargins(0, 0, 0, 0)
-        vl_btn_layout.setSpacing(4)
-        vl_btn_layout.addStretch()
-        self._vl_select_all_btn = QPushButton()
-        self._vl_select_all_btn.setIcon(QgsApplication.getThemeIcon('/mActionSelectAll.svg'))
-        self._vl_select_all_btn.setToolTip(self.tr("Tout selectionner"))
-        self._vl_select_all_btn.setFixedSize(26, 26)
-        self._vl_select_all_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
-        self._vl_select_all_btn.clicked.connect(self._version_layers_check_all)
-        self._vl_deselect_btn = QPushButton()
-        self._vl_deselect_btn.setIcon(QgsApplication.getThemeIcon('/mActionDeselectAll.svg'))
-        self._vl_deselect_btn.setToolTip(self.tr("Tout deselectionner"))
-        self._vl_deselect_btn.setFixedSize(26, 26)
-        self._vl_deselect_btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
-        self._vl_deselect_btn.clicked.connect(self._version_layers_uncheck_all)
-        vl_btn_layout.addWidget(self._vl_select_all_btn)
-        vl_btn_layout.addWidget(self._vl_deselect_btn)
         self.operation_input = QComboBox()
         self.operation_input.addItem(self.tr("Toutes"), "ALL")
         self.operation_input.setToolTip(self.tr("Type d'opération à rechercher"))
         self.operation_input.currentIndexChanged.connect(self._refresh_smart_bar)
 
-        layer_label = QLabel(self.tr("Couche:"))
-        op_label = QLabel(self.tr("Opération:"))
-        selection_row.addWidget(layer_label)
+        selection_row.addWidget(QLabel(self.tr("Couche:")))
         selection_row.addWidget(self.layer_input, 3)
-        selection_row.addWidget(op_label)
+        selection_row.addWidget(QLabel(self.tr("Opération:")))
         selection_row.addWidget(self.operation_input, 1)
         selection_outer.addLayout(selection_row)
-
-        _vl_page = QWidget()
-        _vl_lay = QVBoxLayout(_vl_page)
-        _vl_lay.setContentsMargins(0, 0, 0, 0)
-        _vl_lay.setSpacing(6)
-        _vl_lay.addWidget(self._version_layer_list)
-        _vl_lay.addWidget(self._version_layer_btns)
-
-        self._layer_sel_stack = QStackedWidget()
-        self._layer_sel_stack.addWidget(QWidget())  # page 0: event
-        self._layer_sel_stack.addWidget(_vl_page)    # page 1: version/review
-        _list_h = self._version_layer_list.maximumHeight()
-        _btn_h = self._vl_select_all_btn.height() + 6
-        self._layer_sel_stack.setFixedHeight(_list_h + _btn_h)
-        self._layer_sel_stack.setCurrentIndex(0)
-        selection_outer.addWidget(self._layer_sel_stack)
+        selection_outer.addWidget(self._build_version_layer_stack(t))
         selection_group.setLayout(selection_outer)
+        selection_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
+        selection_group.setMinimumHeight(0)
+        return selection_group
+
+    def _build_date_shortcuts_row(self, t) -> QHBoxLayout:
+        date_shortcuts = QHBoxLayout()
+        date_shortcuts.setSpacing(6)
+        clock_icon = theme_icon("timer", color=t.secondaire, size=13)
+        chip_css = (
+            f"QPushButton {{ border-radius: 13px; padding: 2px 8px; font-size: 11px; "
+            f"font-weight: 600; background-color: {t.surface_douce.name()}; "
+            f"color: {t.texte.name()}; border: 1px solid {t.ligne_controle.name()}; }}"
+            f"QPushButton:hover {{ background-color: {t.accent_doux.name()}; "
+            f"color: {t.accent.name()}; border-color: {t.accent.name()}; }}"
+        )
+        specs = (
+            ("10 min", 84, "10min", self.tr("Dernieres 10 minutes")),
+            ("30 min", 84, "30min", self.tr("Dernieres 30 minutes")),
+            (self.tr("1 heure"), 88, "1hour", self.tr("Derniere heure")),
+            (self.tr("1 jour"), 84, "1day", self.tr("Dernieres 24 heures")),
+            (self.tr("Aujourd'hui"), 104, "today", self.tr("Depuis minuit aujourd'hui")),
+            (self.tr("Semaine"), 90, "week", self.tr("Depuis lundi 00:00")),
+            (self.tr("Tout"), 76, "all", self.tr("Tout l'historique du journal")),
+        )
+        for label, width, key, tip in specs:
+            btn = QPushButton(label)
+            btn.setIcon(clock_icon)
+            btn.setFixedSize(width, 28)
+            btn.setCursor(QtCompat.POINTING_HAND_CURSOR)
+            btn.setStyleSheet(chip_css)
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda _c=False, k=key: self.set_period(k))
+            date_shortcuts.addWidget(btn)
+        date_shortcuts.addStretch()
+        return date_shortcuts
+
+    def _build_date_group(self, t) -> QgsCollapsibleGroupBox:
         date_group = QgsCollapsibleGroupBox()
         date_group.setTitle(self.tr("Période"))
         date_layout = QVBoxLayout()
-        date_layout.setSpacing(6)
-
+        date_layout.setSpacing(8)
         self.restore_mode_selector = RestoreModeSelector()
         date_layout.addWidget(self.restore_mode_selector)
-
         self._period_stack = QStackedWidget()
 
         event_page = QWidget()
         event_vbox = QVBoxLayout(event_page)
         event_vbox.setContentsMargins(0, 0, 0, 0)
-        event_vbox.setSpacing(6)
+        event_vbox.setSpacing(8)
 
         today = QDateTime.currentDateTime()
         self.start_input = QgsDateTimeEdit()
+        self.start_input.setAllowNull(False)
         self.start_input.setDateTime(today.addDays(-3650))
         self.start_input.setDisplayFormat("dd/MM/yyyy HH:mm")
         self.start_input.dateTimeChanged.connect(self._validate_dates)
         self.start_input.dateTimeChanged.connect(self._refresh_smart_bar)
 
         self.end_input = QgsDateTimeEdit()
+        self.end_input.setAllowNull(False)
         self.end_input.setDateTime(today)
         self.end_input.setDisplayFormat("dd/MM/yyyy HH:mm")
         self.end_input.setMaximumDateTime(today)
@@ -1241,105 +1412,85 @@ class RecoverDialog(QDialog, LoggerMixin):
         dates_row.addWidget(QLabel(self.tr("Date fin:")))
         dates_row.addWidget(self.end_input, 1)
 
-        date_shortcuts = QHBoxLayout()
-        date_shortcuts.setSpacing(8)
-        shortcut_button_width = 90
-        shortcut_button_height = 28
-
-        # /mIconClock.svg is absent from the QGIS icon resource on 3.40 AND on
-        # 4.x, so this yielded a null icon on every supported version.
-        clock_icon = QgsApplication.getThemeIcon('/mActionHistory.svg')
-
-        min10_btn = QPushButton("10 min")
-        min10_btn.setIcon(clock_icon)
-        min10_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
-        min10_btn.clicked.connect(lambda: self.set_period("10min"))
-        min10_btn.setToolTip(self.tr("Dernieres 10 minutes"))
-
-        min30_btn = QPushButton("30 min")
-        min30_btn.setIcon(clock_icon)
-        min30_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
-        min30_btn.clicked.connect(lambda: self.set_period("30min"))
-        min30_btn.setToolTip(self.tr("Dernieres 30 minutes"))
-
-        hour1_btn = QPushButton(self.tr("1 heure"))
-        hour1_btn.setIcon(clock_icon)
-        hour1_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
-        hour1_btn.clicked.connect(lambda: self.set_period("1hour"))
-        hour1_btn.setToolTip(self.tr("Derniere heure"))
-
-        day1_btn = QPushButton(self.tr("1 jour"))
-        day1_btn.setIcon(clock_icon)
-        day1_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
-        day1_btn.clicked.connect(lambda: self.set_period("1day"))
-        day1_btn.setToolTip(self.tr("Dernieres 24 heures"))
-
-        today_btn = QPushButton(self.tr("Aujourd'hui"))
-        today_btn.setIcon(clock_icon)
-        today_btn.setFixedSize(shortcut_button_width + 10, shortcut_button_height)
-        today_btn.clicked.connect(lambda: self.set_period("today"))
-        today_btn.setToolTip(self.tr("Depuis minuit aujourd'hui"))
-
-        week_btn = QPushButton(self.tr("Semaine"))
-        week_btn.setIcon(clock_icon)
-        week_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
-        week_btn.clicked.connect(lambda: self.set_period("week"))
-        week_btn.setToolTip(self.tr("Depuis lundi 00:00"))
-
-        all_btn = QPushButton(self.tr("Tout"))
-        all_btn.setIcon(clock_icon)
-        all_btn.setFixedSize(shortcut_button_width, shortcut_button_height)
-        all_btn.clicked.connect(lambda: self.set_period("all"))
-        all_btn.setToolTip(self.tr("Tout l'historique du journal"))
-
-        date_shortcuts.addWidget(min10_btn)
-        date_shortcuts.addWidget(min30_btn)
-        date_shortcuts.addWidget(hour1_btn)
-        date_shortcuts.addWidget(day1_btn)
-        date_shortcuts.addWidget(today_btn)
-        date_shortcuts.addWidget(week_btn)
-        date_shortcuts.addWidget(all_btn)
-        date_shortcuts.addStretch()
-
         self._dates_container = QWidget()
-        _dc_lay = QVBoxLayout(self._dates_container)
-        _dc_lay.setContentsMargins(0, 0, 0, 0)
-        _dc_lay.setSpacing(6)
-        _dc_lay.addLayout(dates_row)
-        _dc_lay.addLayout(date_shortcuts)
+        dc_lay = QVBoxLayout(self._dates_container)
+        dc_lay.setContentsMargins(0, 0, 0, 0)
+        dc_lay.setSpacing(8)
+        dc_lay.addLayout(dates_row)
+        dc_lay.addLayout(self._build_date_shortcuts_row(t))
         event_vbox.addWidget(self._dates_container)
 
         self.time_slider = TimeSliderWidget()
-
         self._period_stack.addWidget(event_page)
         self._period_stack.addWidget(self.time_slider)
         self._period_stack.setCurrentIndex(0)
 
         self.restore_mode_selector.modeChanged.connect(self._on_period_mode_changed)
-
         date_layout.addWidget(self._period_stack)
         date_group.setLayout(date_layout)
+        date_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
+        date_group.setMinimumHeight(0)
+        return date_group
+
+    def _build_options_group(self, t) -> QgsCollapsibleGroupBox:
         options_group = QgsCollapsibleGroupBox(self.tr("Options"))
         options_layout = QHBoxLayout()
         options_layout.setSpacing(20)
 
         self.auto_zoom_check = QCheckBox(self.tr("Zoomer automatiquement sur les résultats"))
-        self.auto_zoom_check.setIcon(QgsApplication.getThemeIcon('/mActionZoomToSelected.svg'))
+        self.auto_zoom_check.setIcon(theme_icon("zoom-selection", color=t.accent, size=16))
         self.auto_zoom_check.setChecked(True)
 
         self.open_attribute_check = QCheckBox(self.tr("Ouvrir la table d'attributs après chargement"))
-        self.open_attribute_check.setIcon(QgsApplication.getThemeIcon('/mActionOpenTable.svg'))
+        self.open_attribute_check.setIcon(theme_icon("table", color=t.accent, size=16))
         self.open_attribute_check.setChecked(False)
 
         options_layout.addWidget(self.auto_zoom_check)
         options_layout.addWidget(self.open_attribute_check)
         options_layout.addStretch()
         options_group.setLayout(options_layout)
+        options_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
+        options_group.setMinimumHeight(0)
+        return options_group
+
+    def _build_results_selection_row(self, t) -> QHBoxLayout:
+        selection_buttons_layout = QHBoxLayout()
+        selection_buttons_layout.setSpacing(8)
+        self.select_all_button = QPushButton(self.tr("Tout sélectionner"))
+        self.select_all_button.setIcon(theme_icon("select-all", color=t.texte, size=16))
+        self.select_all_button.setFixedHeight(34)
+        self.select_all_button.setCursor(QtCompat.POINTING_HAND_CURSOR)
+        self.select_all_button.clicked.connect(self.select_all_rows)
+        self.select_all_button.setEnabled(False)
+        self.select_all_button.setToolTip(self.tr("Sélectionner toutes les lignes du tableau"))
+
+        self.select_none_button = QPushButton(self.tr("Tout désélectionner"))
+        self.select_none_button.setIcon(theme_icon("deselect-all", color=t.texte, size=16))
+        self.select_none_button.setFixedHeight(34)
+        self.select_none_button.setCursor(QtCompat.POINTING_HAND_CURSOR)
+        self.select_none_button.clicked.connect(self.select_none_rows)
+        self.select_none_button.setEnabled(False)
+        self.select_none_button.setToolTip(self.tr("Désélectionner toutes les lignes du tableau"))
+
+        self.selection_count_label = QLabel("")
+        self.selection_count_label.setStyleSheet(
+            f"font-family: '{t.police_titre}'; font-size: 11px; font-weight: 700; "
+            f"color: {t.accent.name()};"
+        )
+        selection_buttons_layout.addWidget(self.select_all_button)
+        selection_buttons_layout.addWidget(self.select_none_button)
+        selection_buttons_layout.addStretch()
+        selection_buttons_layout.addWidget(self.selection_count_label)
+        return selection_buttons_layout
+
+    def _build_results_group(self, t) -> QgsCollapsibleGroupBox:
         results_group = QgsCollapsibleGroupBox()
         results_group.setTitle(self.tr("Résultats"))
         results_group.setCollapsed(True)
         results_layout = QVBoxLayout()
+        results_layout.setSpacing(8)
         self.results_info_label = QLabel(self.tr("Aucune donnée récupérée"))
+        self.results_info_label.setStyleSheet(f"color: {t.secondaire.name()}; font-weight: 500;")
 
         self.search_filter = QLineEdit()
         self.search_filter.setPlaceholderText(self.tr("Rechercher (GID, utilisateur, ...)"))
@@ -1355,106 +1506,65 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.table_widget.setSelectionBehavior(QtCompat.SELECT_ROWS)
         self.table_widget.setAlternatingRowColors(False)
         self.table_widget.horizontalHeader().setStretchLastSection(True)
-        self.table_widget.setMinimumHeight(100)
+        self.table_widget.setMinimumHeight(120)
         self.table_widget.setSortingEnabled(True)
         self.table_widget.setSizePolicy(QtCompat.SIZE_EXPANDING, QtCompat.SIZE_PREFERRED)
         self.table_widget.itemSelectionChanged.connect(self.on_selection_changed)
         self.table_widget.setContextMenuPolicy(QtCompat.CUSTOM_CONTEXT_MENU)
         self.table_widget.customContextMenuRequested.connect(self._show_results_context_menu)
-        selection_buttons_layout = QHBoxLayout()
-        selection_buttons_layout.setSpacing(8)
-        selection_button_height = 32
-        self.select_all_button = QPushButton(self.tr("Tout sélectionner"))
-        select_all_icon = QgsApplication.getThemeIcon('/mActionSelectAll.svg')
-        self.select_all_button.setIcon(select_all_icon)
-        self.select_all_button.setFixedHeight(selection_button_height)
-        self.select_all_button.clicked.connect(self.select_all_rows)
-        self.select_all_button.setEnabled(False)
-        self.select_all_button.setToolTip(self.tr("Sélectionner toutes les lignes du tableau"))
-        self.select_none_button = QPushButton(self.tr("Tout désélectionner"))
-        deselect_icon = QgsApplication.getThemeIcon('/mActionDeselectAll.svg')
-        self.select_none_button.setIcon(deselect_icon)
-        self.select_none_button.setFixedHeight(selection_button_height)
-        self.select_none_button.clicked.connect(self.select_none_rows)
-        self.select_none_button.setEnabled(False)
-        self.select_none_button.setToolTip(self.tr("Désélectionner toutes les lignes du tableau"))
-
-        self.selection_count_label = QLabel("")
-        selection_buttons_layout.addWidget(self.select_all_button)
-        selection_buttons_layout.addWidget(self.select_none_button)
-        selection_buttons_layout.addStretch()
-        selection_buttons_layout.addWidget(self.selection_count_label)
 
         results_layout.addWidget(self.results_info_label)
         results_layout.addWidget(self.search_filter)
         results_layout.addWidget(self.change_legend)
         results_layout.addWidget(self.table_widget)
-        results_layout.addLayout(selection_buttons_layout)
+        results_layout.addLayout(self._build_results_selection_row(t))
         results_group.setLayout(results_layout)
+        results_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_EXPANDING)
+        results_group.setMinimumHeight(0)
+        return results_group
 
-        self.results_group = results_group
+    def _build_action_bar_segments(self) -> list:
+        return [
+            {
+                "label": self.tr("Fermer"),
+                "icon": theme_icon("close", size=16),
+                "icon_name": "close",
+                "tooltip": self.tr("Fermer"),
+                "enabled": True,
+                "visible": True,
+            },
+            {
+                "label": "Recover",
+                "icon": theme_icon("refresh", size=16),
+                "icon_name": "refresh",
+                "tooltip": self.tr("Lancer la recherche (F5)"),
+                "enabled": True,
+                "visible": True,
+            },
+            {
+                "label": "Restore",
+                "icon": theme_icon("restore", size=16),
+                "icon_name": "restore",
+                "tooltip": "",
+                "enabled": False,
+                "visible": True,
+            },
+            {
+                "label": "Last",
+                "icon": theme_icon("undo", size=16),
+                "icon_name": "undo",
+                "tooltip": self.tr("Annuler le dernier restore"),
+                "enabled": False,
+                "visible": True,
+            },
+        ]
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-        # Smoothing animation: interpolates progress_bar value between
-        # successive emits from the restore runner. The runner only emits
-        # once per chunk (~20 events), so the bar would otherwise jump in
-        # ~5% increments. This QVariantAnimation runs on Qt's global
-        # animation scheduler (same as the logo widget), so progress
-        # smoothing and the logo animation share a single clock and do not
-        # compete for QTimer slots in the UI thread.
-        self._progress_smoother = QVariantAnimation(self)
-        self._progress_smoother.setDuration(300)
-        self._progress_smoother.setEasingCurve(QtCompat.EASE_IN_OUT_QUAD)
-        self._progress_smoother.valueChanged.connect(
-            self._on_progress_smoother_value)
-        self.progress_phase_label = QLabel("")
-        self.progress_phase_label.setVisible(False)
-        flog(
-            f"setup_ui: progress_bar created, id={id(self.progress_bar)},"
-            f" visible={self.progress_bar.isVisible()},"
-            f" parent={self.progress_bar.parent()}"
-        )
-
+    def _build_footer_bar(self, t) -> QHBoxLayout:
         button_layout = QHBoxLayout()
         button_layout.setSpacing(10)
-        button_height = 35
+        button_height = 36
 
-        self._action_bar = ActionButtonBar(
-            [
-                {
-                    "label": self.tr("Fermer"),
-                    "icon": QgsApplication.getThemeIcon('/mActionRemove.svg'),
-                    "tooltip": self.tr("Fermer"),
-                    "enabled": True,
-                    "visible": True,
-                },
-                {
-                    "label": "Recover",
-                    "icon": QgsApplication.getThemeIcon('/mActionRefresh.svg'),
-                    "tooltip": self.tr("Lancer la recherche (F5)"),
-                    "enabled": True,
-                    "visible": True,
-                },
-                {
-                    "label": "Restore",
-                    "icon": QgsApplication.getThemeIcon('/mActionSaveAllEdits.svg'),
-                    "tooltip": "",
-                    "enabled": False,
-                    "visible": True,
-                },
-                {
-                    "label": "Last",
-                    "icon": QgsApplication.getThemeIcon('/mActionUndo.svg'),
-                    "tooltip": self.tr("Annuler le dernier restore"),
-                    "enabled": False,
-                    "visible": True,
-                },
-            ],
-            self,
-        )
+        self._action_bar = ActionButtonBar(self._build_action_bar_segments(), self)
         self._action_bar.setPrimaryIndex(-1)
         self.cancel_button = self._action_bar.segment(0)
         self.recover_button = self._action_bar.segment(1)
@@ -1465,18 +1575,15 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.restore_button.clicked.connect(self.restore_selected_data)
         self.undo_last_btn.clicked.connect(self._undo_last_restore)
 
-        pal_hl = self.palette().highlight().color()
-        glow_color = QColor(pal_hl.red(), pal_hl.green(), pal_hl.blue(), 180)
-        self._glow_color = glow_color
+        self._glow_color = QColor(t.accent.red(), t.accent.green(), t.accent.blue(), 180)
         self._apply_logo_glow_effect()
 
-        self.help_button = QPushButton("?")
+        self.help_button = QPushButton("")
+        self.help_button.setObjectName("rlToolBtn")
+        self.help_button.setIcon(theme_icon("help", color=t.texte, size=18))
         self.help_button.setFixedSize(button_height, button_height)
         self.help_button.setToolTip(self.tr("Ouvrir la documentation"))
         self.help_button.setCursor(QtCompat.POINTING_HAND_CURSOR)
-        self.help_button.setStyleSheet(
-            "QPushButton { font-weight: bold; }"
-        )
         self.help_button.clicked.connect(self._open_help)
 
         self._review_toggle = ReviewSegmentedSwitch(self)
@@ -1488,20 +1595,60 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._review_viz_combo.addItem(self.tr("Snapshot (état à T)"), "snapshot_at_t")
         self._review_viz_combo.setVisible(False)
 
+        right_spacer = QWidget(self)
+        right_spacer.setFixedSize(button_height, button_height)
+
         button_layout.addWidget(self.help_button)
         button_layout.addStretch()
         button_layout.addWidget(self._action_bar)
         button_layout.addWidget(self._review_viz_combo)
         button_layout.addWidget(self._review_toggle)
         button_layout.addStretch()
-        right_spacer = QWidget(self)
-        right_spacer.setFixedSize(button_height, button_height)
         button_layout.addWidget(right_spacer)
+        return button_layout
+
+    def setup_ui(self):
+        t = resolve_theme(self)
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+
+        logo_label = ThemedLogoWidget()
+        logo_label.setSizePolicy(QtCompat.SIZE_FIXED, QtCompat.SIZE_FIXED)
+        self.logo_label = logo_label
+        self._load_themed_logo()
+
+        status_frame = self._build_status_frame(t)
+        layers_group = self._build_layers_group(t)
+        selection_group = self._build_selection_group(t)
+        date_group = self._build_date_group(t)
+        options_group = self._build_options_group(t)
+        self.results_group = self._build_results_group(t)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self._progress_smoother = QVariantAnimation(self)
+        self._progress_smoother.setDuration(240)
+        self._progress_smoother.setEasingCurve(QtCompat.EASE_OUT_CUBIC)
+        self._progress_smoother.valueChanged.connect(
+            self._on_progress_smoother_value)
+        self.progress_phase_label = QLabel("")
+        self.progress_phase_label.setStyleSheet(
+            f"color: {t.secondaire.name()}; font-size: 11px; font-weight: 600;"
+        )
+        self.progress_phase_label.setVisible(False)
+        flog(
+            f"setup_ui: progress_bar created, id={id(self.progress_bar)},"
+            f" visible={self.progress_bar.isVisible()},"
+            f" parent={self.progress_bar.parent()}"
+        )
+
+        button_layout = self._build_footer_bar(t)
         main_layout.addWidget(logo_label, 0, QtCompat.ALIGN_HCENTER)
         main_layout.addWidget(status_frame)
         main_layout.addWidget(layers_group)
-        layers_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
-        layers_group.setMinimumHeight(0)
         main_layout.addWidget(selection_group)
         main_layout.addWidget(date_group)
         main_layout.addWidget(options_group)
@@ -1509,18 +1656,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         main_layout.addWidget(self.progress_phase_label)
         main_layout.addWidget(self.progress_bar)
         main_layout.addLayout(button_layout)
-        selection_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
-        selection_group.setMinimumHeight(0)
-
-        date_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
-        date_group.setMinimumHeight(0)
-
-        options_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_FIXED)
-        options_group.setMinimumHeight(0)
-
-        self.results_group.setSizePolicy(QtCompat.SIZE_PREFERRED, QtCompat.SIZE_EXPANDING)
-        self.results_group.setMinimumHeight(0)
-
         self.setLayout(main_layout)
 
         self._on_period_mode_changed(self.restore_mode_selector.mode())
@@ -1558,7 +1693,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         selected = self.table_widget.selectionModel().selectedRows()
         if selected:
             restore_act = menu.addAction(
-                QgsApplication.getThemeIcon('/mActionSaveAllEdits.svg'),
+                theme_icon("restore", size=16),
                 self.tr("Restaurer ({count} ligne(s))").format(count=len(selected)))
             restore_act.triggered.connect(self.restore_selected_data)
             menu.addSeparator()
@@ -1575,6 +1710,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                     filter_act.triggered.connect(
                         lambda: self._filter_on_layer(event.datasource_fingerprint))
                 self._append_undo_session_menu(menu, event)
+                self._append_service_history_menu(menu, event)
         menu.addSeparator()
         sel_all = menu.addAction(self.tr("Tout selectionner"))
         sel_all.triggered.connect(self.select_all_rows)
@@ -1720,13 +1856,14 @@ class RecoverDialog(QDialog, LoggerMixin):
         QTimer.singleShot(260, lambda: self._animate_glow(self.logo_label, hover_in=False))
 
     def changeEvent(self, event):
-        """Re-render logo when QGIS theme/palette changes (dark mode)."""
+        """Re-render logo and dialog theme when QGIS palette changes (dark/light mode)."""
         super().changeEvent(event)
         if getattr(self, '_refreshing_theme', False):
             return
         if event.type() == QtCompat.EVENT_PALETTE_CHANGE and hasattr(self, 'logo_label'):
             self._refreshing_theme = True
             try:
+                self._apply_global_button_style()
                 self._load_themed_logo()
                 self._refresh_smart_bar()
             finally:
@@ -1819,7 +1956,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         For INSERT : list of created attribute values (max 10).
         For DELETE : list of pre-deletion attribute values (max 10).
         Includes a geometry note if relevant. Never includes user_name or
-        other identity fields (A3 of US-03 — PII discipline).
+        other identity fields (A3 of US-03 - PII discipline).
         """
         op = event.operation_type or ""
         header_parts = [f"<b>{op}</b>"]
@@ -1929,9 +2066,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.results_group.setVisible(False)
             self.restore_button.setVisible(False)
             self.recover_button.setText(self.tr("Rewind"))
-            self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionUndo.svg'))
+            self.recover_button.setIcon(theme_icon("rewind", size=16))
+            if hasattr(self.recover_button, "setIconName"):
+                self.recover_button.setIconName("rewind")
             self._action_bar.setPrimaryIndex(1)
-            if not self._is_recovering:
+            # A restore or an Undo in flight does not raise _is_recovering:
+            # reopening the Rewind button under it offered a second run.
+            if not self._is_recovering and not self._run_in_flight():
                 self.recover_button.setEnabled(True)
             self._refresh_slider_bounds()
         elif is_review:
@@ -1963,8 +2104,10 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.results_group.setVisible(has_rows)
             self.restore_button.setVisible(True)
             self.recover_button.setText(self.tr("Recover"))
-            self.recover_button.setIcon(QgsApplication.getThemeIcon('/mActionRefresh.svg'))
-            self._action_bar.setPrimaryIndex(2)
+            self.recover_button.setIcon(theme_icon("refresh", size=16))
+            if hasattr(self.recover_button, "setIconName"):
+                self.recover_button.setIconName("refresh")
+            self._action_bar.setPrimaryIndex(2 if self.restore_button.isEnabled() else 1)
 
     def _version_layers_check_all(self) -> None:
         for i in range(self._version_layer_list.count()):
@@ -1983,7 +2126,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         when the slider is at its lowest position, the exclusive cutoff (>)
         still includes the oldest event.  Without this offset, events at
         exactly the oldest timestamp are excluded and the rewind finds 0
-        results — the root cause of "rewind broken after purge".
+        results - the root cause of "rewind broken after purge".
         """
         if self._stats_cache.is_empty():
             self.time_slider.disable()
@@ -2175,11 +2318,17 @@ class RecoverDialog(QDialog, LoggerMixin):
         Called by the plugin after a short delay post-commit so the
         WriteQueue has time to flush.
         """
+        # The user edited this layer after a restore: its undo state is
+        # stale whatever the dialog shows. Kept behind the visibility test,
+        # an edit made while the dialog was closed left it armed, and the
+        # next Undo or auto-undo wrote the event's NEW values over that
+        # edit. The run's own writes are suppressed, so they never land
+        # here.
+        self._invalidate_undo_for(edited_fingerprint)
         if not self.isVisible():
             return
-        if self._is_recovering:
+        if self._is_recovering or self._run_in_flight():
             return
-        self._invalidate_undo_for(edited_fingerprint)
         self._close_dialog_read_conn()
         self._request_stats_refresh()
         flog("on_events_committed: stats refresh requested")
@@ -2193,6 +2342,14 @@ class RecoverDialog(QDialog, LoggerMixin):
     def recover_and_load(self):
         """Launch recovery from local SQLite journal."""
         flog("recover_and_load: START")
+        # F5 and the Review toggle reach this without the Rewind button: a
+        # run that writes the layers (event restore, Undo) does not raise
+        # `_is_recovering`, so that test alone let a Rewind start beside it.
+        # Checked before the button is touched: the run owns it.
+        if self._refuse_while_busy(self.tr("Recherche ou Rewind"),
+                                   check_recovering=False):
+            return
+        self._closing = False
         self.recover_button.setEnabled(False)
         if not self.validate_inputs():
             self.recover_button.setEnabled(True)
@@ -2240,8 +2397,14 @@ class RecoverDialog(QDialog, LoggerMixin):
         3. Render visible features from cache.
         4. On zoom/pan: re-filter cache (~20-80ms, no SQL).
         """
+        # recover_and_load() raised the run guard for this start; Review
+        # owns it until _init_snapshot_direct or _review_done lowers it.
+        # _review_stop_session may only release a guard Review holds: it
+        # runs on every mode switch, a Rewind in progress included.
+        self._review_holds_run_guard = True
         canvas = self.iface.mapCanvas()
-        src_crs = canvas.mapSettings().destinationCrs().authid()
+        dest_crs = canvas.mapSettings().destinationCrs()
+        src_crs = (dest_crs.authid() or dest_crs.toWkt()) if dest_crs.isValid() else ""
 
         checked_fps = self._get_checked_layer_fingerprints()
         if not checked_fps:
@@ -2250,6 +2413,8 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         t_min = self.start_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
         t_max = self.end_input.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm:ss")
+
+        from .core.commit_guard import fid_is_stable  # noqa: PLC0415
 
         layer_infos = []
         root = QgsProject.instance().layerTreeRoot()
@@ -2264,12 +2429,22 @@ class RecoverDialog(QDialog, LoggerMixin):
                     "DEBUG",
                 )
                 continue
-            storage_crs = layer.crs().authid() if layer.crs().isValid() else src_crs
+            storage_crs = ((layer.crs().authid() or layer.crs().toWkt())
+                           if layer.crs().isValid() else src_crs)
+            # Asked here, on the GUI thread: the worker may not touch the
+            # layer. On a Shapefile or a GeoJSON the fid is the record
+            # position, renumbered by every deletion; the reconstruction
+            # then never reads one fid key as one record across it.
+            fid_stable = fid_is_stable(layer)
+            if not fid_stable:
+                flog(f"review: layer={layer.name()} fp={fingerprint[:8]} "
+                     f"fid_stable=False (fid = record position)", "INFO")
             layer_infos.append({
                 "fingerprint": fingerprint,
                 "layer_name": layer.name(),
                 "layer_id": layer.id(),
                 "storage_crs": storage_crs,
+                "fid_stable": fid_stable,
             })
 
         if not layer_infos:
@@ -2383,9 +2558,23 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._stop_snapshot_mode()
         self._review_wants_persist = False
         self._review_disconnect_auto_refresh()
-        self._is_recovering = False
-        self.enable_controls(True)
-        self.update_phase("")
+        # This method runs on EVERY switch to Rewind or Restore, whether
+        # Review was on or not. It used to lower _is_recovering and
+        # re-enable the controls unconditionally: switching modes in the
+        # middle of a Rewind reopened the Rewind button and let a second
+        # run write concurrently with the first. Review releases only the
+        # guard it raised itself, and never under a restore.
+        if getattr(self, "_review_holds_run_guard", False):
+            self._review_holds_run_guard = False
+            if (self._restore_runner is None
+                    and not getattr(self, "_restore_in_progress", False)):
+                self._is_recovering = False
+                self.enable_controls(True)
+        if not self._is_recovering:
+            self.update_phase("")
+        else:
+            flog("review: stop_session left the run guard alone "
+                 "(held by a running restore/rewind/search)", "INFO")
         if self._review_status_widget is not None:
             self._review_status_widget.deactivate()
         self._hide_review_status_bar()
@@ -2407,6 +2596,7 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _review_done(self, trace_id: str, reason: str) -> None:
         """Unlock UI and log after a Review early exit."""
         flog(f"[{trace_id}] review: {reason}", "WARNING")
+        self._review_holds_run_guard = False
         self._is_recovering = False
         self.enable_controls(True)
         self._review_toggle.blockSignals(True)
@@ -2432,10 +2622,19 @@ class RecoverDialog(QDialog, LoggerMixin):
             f"[{trace_id}] review: snapshot_init_direct n_layers={len(layer_infos)}",
             "INFO",
         )
+        if self._review_snap_mode:
+            # A second start over a live session used to orphan the first
+            # one's overlays, date bar and workers.
+            flog(f"[{trace_id}] review: snapshot_init over a live session, "
+                 f"stopping it first", "WARNING")
+            self._stop_snapshot_mode()
 
         snap = SnapshotOverlaySession()
         self._review_snap_session = snap
         self._review_snap_mode = True
+        self._review_snap_error = ""
+        self._review_floor_iso = None
+        self._review_floor_notified = False
         self._review_connect_auto_refresh()
 
         today = _dt.date.today().isoformat()
@@ -2471,6 +2670,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             "DEBUG",
         )
 
+        self._review_holds_run_guard = False
         self._is_recovering = False
         self.enable_controls(True)
         self._review_toggle.setEnabled(True)
@@ -2483,20 +2683,25 @@ class RecoverDialog(QDialog, LoggerMixin):
         )
 
         def _on_layers_ready() -> None:
-            if not self._review_snap_mode:
+            if not self._review_snap_mode or self._review_snap_session is not snap:
                 return
             self.update_phase("")
             flog(
                 f"[{trace_id}] review: snapshot_ready n_layers={snap.n_layers}",
                 "INFO",
             )
+            from .widgets.snapshot_rebuild_worker import query_snapshot_floor
+            # The oldest date Review can answer: a purge horizon, not the
+            # first captured event (before it, every feature is in the state
+            # its first event records as old).
+            self._review_floor_iso = query_snapshot_floor(self._journal, layer_infos)
             QTimer.singleShot(100, lambda: self._deferred_set_bar_range(layer_infos))
             self._on_snapshot_date_changed(bar.current_date_iso())
 
         snap.start_async_create(layer_infos, src_crs, trace_id, _on_layers_ready)
 
     def _deferred_set_bar_range(self, layer_infos: list) -> None:
-        """Run date-range SQL off the critical path — updates bar after first paint."""
+        """Run date-range SQL off the critical path - updates bar after first paint."""
         from .widgets.snapshot_rebuild_worker import query_snapshot_date_range
         bar = self._review_date_bar
         if bar is None or not self._review_snap_mode:
@@ -2527,6 +2732,9 @@ class RecoverDialog(QDialog, LoggerMixin):
             "INFO",
         )
         if not self._review_snap_mode:
+            # Workers cancelled by an earlier stop may still be unwinding;
+            # this is the last call before the dialog can be deleted.
+            self._review_join_workers()
             flog("review: stop_snapshot_mode NOOP snap_mode=False", "INFO")
             return
         self._review_snap_mode = False
@@ -2540,11 +2748,13 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_snap_ext_debounce.stop()
             self._review_snap_ext_debounce.deleteLater()
             self._review_snap_ext_debounce = None
-        self._cancel_snap_worker()
+        self._cancel_snap_worker(disconnect_signals=True)
+        self._review_snap_expected_trace = ""
         flog("review: snap_worker cancelled", "DEBUG")
         self._cancel_marker_worker()
         self._review_marker_bbox_signature = ""
         flog("review: marker_worker cancelled", "DEBUG")
+        self._review_join_workers()
         if self._review_date_bar is not None:
             try:
                 self.iface.mapCanvas().mapCanvasRefreshed.disconnect(
@@ -2573,62 +2783,113 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._review_snap_cache = {}
         self._review_snap_raw_result = None
         self._review_snap_raw_iso = ""
+        self._review_snap_error = ""
         flog("review: snapshot_mode_stopped", "INFO")
 
-    def _clamp_cutoff_to_baseline(self, iso: str) -> str:
-        """Never request a cutoff earlier than the global tracking start (t0).
+    def _review_join_workers(self, timeout_ms: int = 3000) -> None:
+        """Cancel and join every Review thread, active and parked.
 
-        Scrubbing before t0 lands in the empty 'pre-tracking void' where every
-        layer is flagged before-baseline (noisy). We snap the requested cutoff
-        (and the visible slider) up to t0 instead (RL-E1-03).
+        The dialog is deleted on unload right after cleanup_resources().
+        Nothing used to wait for the Review workers: a rebuild still
+        streaming rows, or a marker scan still closing its connection, died
+        with its owner (qFatal, QGIS gone with the user's unsaved work).
+        cancel() interrupts the SQLite statement in flight, so the join is
+        normally immediate; a thread that outlives the bound stays retained
+        by snapshot_rebuild_worker until it finishes, never destroyed.
         """
-        t0_iso = self._review_global_t0_iso
-        if not t0_iso:
+        from .widgets.snapshot_rebuild_worker import join_review_thread
+        workers = []
+        for attr in ("_review_snap_worker", "_review_marker_worker"):
+            worker = getattr(self, attr, None)
+            if worker is not None:
+                workers.append(worker)
+        workers.extend(self._review_snap_zombies)
+        workers.extend(self._review_marker_zombies)
+        n_left = 0
+        for worker in workers:
+            if not join_review_thread(worker, timeout_ms,
+                                      getattr(worker, "trace_id", "?")):
+                n_left += 1
+        self._review_snap_zombies = []
+        self._review_marker_zombies = []
+        if workers:
+            flog(f"review: workers_joined n={len(workers)} still_running={n_left}",
+                 "INFO" if not n_left else "WARNING")
+
+    def _clamp_cutoff_to_baseline(self, iso: str) -> str:
+        """Never request a cutoff Review cannot answer, and say so.
+
+        The floor (snapshot_rebuild_worker.query_snapshot_floor) is the date
+        from which the journal answers for every entity: its purge horizon
+        when it records one, else the last second BEFORE its oldest
+        surviving row (a journal purged by an older version records no
+        horizon). Below the floor the events were deleted: the before-image
+        of the first surviving event is the state at the purge line, which
+        was shown as the state of the date asked. The date is brought to
+        the floor, the bar shows it and the user is told (once per
+        session). The floor is never the first event itself: that inclusive
+        clamp showed the first edit as already done (RL-E1-03). When the
+        floor cannot be read, the second before the first event is used.
+        """
+        from .widgets.snapshot_rebuild_worker import second_before
+        floor = getattr(self, "_review_floor_iso", None)
+        if floor is None:
+            t0_iso = self._review_global_t0_iso
+            floor = (second_before(t0_iso) or "") if t0_iso else ""
+        if not floor:
             return iso
         req_dt = self._parse_iso_datetime(iso)
-        t0_dt = self._parse_iso_datetime(t0_iso)
-        if req_dt.isValid() and t0_dt.isValid() and req_dt < t0_dt:
+        floor_dt = self._parse_iso_datetime(floor)
+        if req_dt.isValid() and floor_dt.isValid() and req_dt < floor_dt:
             flog(
-                f"review: cutoff_clamped_to_t0 requested={iso} t0={t0_iso}",
-                "DEBUG",
+                f"review: cutoff_clamped_to_floor requested={iso} floor={floor}",
+                "INFO",
             )
             if self._review_date_bar is not None:
-                self._review_date_bar.set_value_iso(t0_iso)
-            return t0_iso
+                self._review_date_bar.set_value_iso(floor)
+            if not getattr(self, "_review_floor_notified", False):
+                self._review_floor_notified = True
+                self.iface.messageBar().pushMessage(
+                    self.tr("Review : date ramenée"),
+                    self.tr(
+                        "Le journal ne permet pas de reconstituer l'état avant "
+                        "le {floor} (UTC) : l'historique antérieur a été purgé "
+                        "ou n'a pas été journalisé. La date demandée ({asked}) "
+                        "a été ramenée au {floor}."
+                    ).format(floor=floor, asked=iso),
+                    QgisCompat.MSG_WARNING, 0,
+                )
+            return floor
         return iso
 
     def _compute_bbox_per_layer(self) -> dict:
-        """Map each layer fingerprint → current canvas extent in its storage CRS.
-
-        Cheap (no I/O): a single canvas.extent() read + per-layer CRS transform.
-        Used by the apply step on both date change and pan/zoom.
-        """
+        """Map each layer fingerprint -> current canvas extent in its storage CRS."""
         from qgis.core import (  # noqa: PLC0415
-            QgsCoordinateReferenceSystem,
             QgsCoordinateTransform,
             QgsProject,
         )
+        from .core.snapshot_overlay_session import _crs_from_spec  # noqa: PLC0415
         canvas = self.iface.mapCanvas()
         extent = canvas.extent()
-        project_crs = QgsProject.instance().crs()
+        project = QgsProject.instance()
+        project_crs = project.crs()
         bbox_per_layer: dict = {}
         for _info in self._review_layer_infos:
             _fp = _info["fingerprint"]
-            _scrs = _info.get("storage_crs", "")
-            if not _scrs or _scrs == project_crs.authid():
+            _lyr = project.mapLayer(_info.get("layer_id", ""))
+            if _lyr is not None and _lyr.crs().isValid():
+                _lcrs = _lyr.crs()
+                _info["storage_crs"] = _lcrs.authid() or _lcrs.toWkt()
+            else:
+                _lcrs = _crs_from_spec(_info.get("storage_crs", ""))
+            if not _lcrs.isValid() or not project_crs.isValid() or _lcrs == project_crs:
                 bbox_per_layer[_fp] = extent
             else:
-                _lcrs = QgsCoordinateReferenceSystem(_scrs)
-                if not _lcrs.isValid():
+                _tr = QgsCoordinateTransform(project_crs, _lcrs, project)
+                try:
+                    bbox_per_layer[_fp] = _tr.transformBoundingBox(extent)
+                except Exception:  # noqa: BLE001
                     bbox_per_layer[_fp] = extent
-                else:
-                    _tr = QgsCoordinateTransform(
-                        project_crs, _lcrs, QgsProject.instance()
-                    )
-                    try:
-                        bbox_per_layer[_fp] = _tr.transformBoundingBox(extent)
-                    except Exception:  # noqa: BLE001
-                        bbox_per_layer[_fp] = extent
         flog(
             f"review: snap_bbox_computed n_layers={len(bbox_per_layer)} "
             f"project_crs={project_crs.authid()}",
@@ -2642,16 +2903,32 @@ class RecoverDialog(QDialog, LoggerMixin):
         Reconstruction reads the journal, so a date change always needs the
         background worker. Pan/zoom keeps the same date and is handled by
         _refresh_snapshot_for_extent WITHOUT a worker (see
-        _on_review_snap_bbox_fire) — that is the core fix for the review-mode
+        _on_review_snap_bbox_fire) - that is the core fix for the review-mode
         slowness: panning no longer re-runs SQL + event replay.
         """
-        from .widgets.snapshot_rebuild_worker import SnapshotRebuildWorker
+        from .widgets.snapshot_rebuild_worker import (
+            SnapshotRebuildWorker,
+            retain_until_finished,
+        )
 
         iso = self._clamp_cutoff_to_baseline(iso)
         self._review_snap_pending_iso = iso
         flog(f"review: snapshot_date_changed iso={iso}", "DEBUG")
 
+        # This very date is being completed (a pan or the extent debounce
+        # asks for it again): it goes on, and is applied to the extent of
+        # the moment it ends. Restarted at every pan, the completion of a
+        # mass-edited date never ended. A commit cancels it first
+        # (_review_on_commit_changed), so its rebuild does start again.
+        job = getattr(self, "_review_snap_completion", None)
+        if (job is not None and job.active and self._review_snap_mode
+                and getattr(self, "_review_snap_completion_iso", "") == iso):
+            flog(f"[{job.trace_id}] review: snapshot_date_kept iso={iso} "
+                 f"(its completion is running)", "DEBUG")
+            return
+
         self._cancel_snap_worker(disconnect_signals=True)
+        self._review_snap_expected_trace = ""
 
         if not self._review_snap_mode or self._review_snap_session is None:
             flog("review: snapshot_date_changed skipped mode_inactive", "DEBUG")
@@ -2664,19 +2941,33 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._refresh_snapshot_for_extent()
             return
 
+        self._review_snap_error = ""
         if self._review_date_bar is not None:
             self._review_date_bar.set_loading()
 
+        # No parent: a child of the dialog was destroyed WITH it on unload
+        # while still running (qFatal). The worker is retained until Qt
+        # reports it finished, and joined by _review_join_workers.
         worker = SnapshotRebuildWorker(
             self._journal,
             self._review_layer_infos,
             iso,
             bbox_per_layer=None,
-            parent=self,
         )
         worker.result_ready.connect(self._on_snapshot_result)
         worker.error.connect(self._on_snapshot_error)
+        # A date inside a purged interval (the worker names it). getattr: a
+        # stand-in worker without the signal stays usable.
+        refused = getattr(worker, "refused", None)
+        if refused is not None:
+            refused.connect(self._on_snapshot_refused)
+        retain_until_finished(worker)
         self._review_snap_worker = worker
+        # Only the answer of THIS worker is accepted. A superseded one may
+        # already have posted its result before being disconnected: cached
+        # under the new date (or after a commit), it was reused as if fresh.
+        self._review_snap_expected_trace = worker.trace_id
+        self._review_snap_expected_iso = iso
         worker.start()
         flog(
             f"[{worker.trace_id}] review: snap_worker_started iso={iso}",
@@ -2686,23 +2977,201 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _on_snapshot_result(self, trace_id: str, result) -> None:
         """Slot: SnapshotRebuildWorker delivered a reconstruction.
 
-        Caches the RAW result (pre-bbox, pre-merge) keyed by date so pan/zoom
-        can re-apply it cheaply, then applies it to the current extent.
+        Starts its live completion (`LiveCompletion`, across event-loop
+        turns); `_on_snapshot_completed` then caches the result (pre-bbox)
+        keyed by date so pan/zoom can re-apply it cheaply, and applies it to
+        the current extent.
         """
+        expected = getattr(self, "_review_snap_expected_trace", "")
+        if trace_id != expected:
+            flog(f"[{trace_id}] review: snap_result_discarded stale "
+                 f"expected={expected or 'none'}", "INFO")
+            return
+        self._review_snap_expected_trace = ""
         self._review_snap_worker = None
         snap = self._review_snap_session
         if snap is None or not self._review_snap_mode:
             flog(f"[{trace_id}] review: snap_result_discarded mode_inactive", "DEBUG")
             return
 
+        from .core.snapshot_overlay_session import LiveCompletion
+        iso = getattr(self, "_review_snap_expected_iso",
+                      self._review_snap_pending_iso)
+        # What no event gives (a geometry or a field untouched since T) is
+        # the live value, and every journal geometry is placed by the CRS
+        # verdict: both on the GUI thread, once per date. In one call that
+        # held QGIS for seconds on a mass-edited layer (minutes on a remote
+        # provider), at every date: it now runs across event-loop turns,
+        # the bar keeping its loading state, and a new date, a commit or
+        # Review stopped cancels it (_cancel_snap_worker).
+        job = LiveCompletion(
+            result, self._review_layer_infos, trace_id,
+            on_done=lambda completed: self._on_snapshot_completed(
+                job, trace_id, iso, completed),
+            on_failed=lambda message: self._on_snapshot_completion_failed(
+                job, trace_id, iso, message),
+            on_progress=lambda done, total: self._on_snapshot_completion_progress(
+                job, done, total))
+        self._review_snap_completion = job
+        self._review_snap_completion_iso = iso
+        job.start()
+
+    def _on_snapshot_completion_progress(self, job, done: int, total: int) -> None:
+        """The bar says how far the completion of the date is (loading state)."""
+        if getattr(self, "_review_snap_completion", None) is not job:
+            return
+        bar = self._review_date_bar
+        if bar is not None and bar.status_state() == "loading":
+            bar.set_loading(done, total)
+
+    def _on_snapshot_completed(self, job, trace_id: str, iso: str, result) -> None:
+        """The live completion of *iso* ended: cache it and draw it."""
+        if getattr(self, "_review_snap_completion", None) is not job:
+            flog(f"[{trace_id}] review: snap_completion_discarded stale "
+                 f"iso={iso}", "INFO")
+            return
+        self._review_snap_completion = None
+        if self._review_snap_session is None or not self._review_snap_mode:
+            flog(f"[{trace_id}] review: snap_completion_discarded "
+                 f"mode_inactive", "DEBUG")
+            return
         self._review_snap_raw_result = result
-        self._review_snap_raw_iso = self._review_snap_pending_iso
+        self._review_snap_raw_iso = iso
+        self._review_surface_snapshot_gaps(trace_id, result)
         self._apply_snapshot_to_extent(result, trace_id)
+
+    def _on_snapshot_completion_failed(self, job, trace_id: str, iso: str,
+                                       message: str) -> None:
+        """The live completion of *iso* could not end: say why, show nothing.
+
+        A layer removed from the project, or given another CRS, while the
+        date was being completed (or an error): half of the state would be
+        placed one way and half another. The overlays are emptied as for a
+        failed rebuild, and the message says the date can be asked again.
+        """
+        if getattr(self, "_review_snap_completion", None) is not job:
+            return
+        self._review_snap_completion = None
+        self._review_snap_error = message or "?"
+        self._review_snap_raw_result = None
+        self._review_snap_raw_iso = ""
+        flog(f"[{trace_id}] review: snap_completion_failed iso={iso} "
+             f"reason={message}", "WARNING")
+        if self._review_snap_session is not None:
+            self._review_snap_session.clear_all()
+        if self._review_date_bar is not None:
+            self._review_date_bar.set_error(message)
+        self.iface.messageBar().pushMessage(
+            self.tr("Review : reconstruction interrompue"),
+            self.tr("L'état à la date {date} n'a pas pu être établi ({msg}). "
+                    "Les calques Review ont été vidés : la carte ne montre pas "
+                    "l'état à cette date. Choisissez une date pour relancer "
+                    "la reconstruction.").format(date=iso or "?", msg=message),
+            QgisCompat.MSG_WARNING, 0,
+        )
+
+    def _review_surface_snapshot_gaps(self, trace_id: str, result) -> None:
+        """Say, once per reconstruction, what the overlays cannot show."""
+        n_unresolved = getattr(result, "n_unresolved", 0)
+        if n_unresolved:
+            flog(f"[{trace_id}] review: warn_unresolved n={n_unresolved}",
+                 "WARNING")
+            self.iface.messageBar().pushMessage(
+                self.tr("Review : état incomplet"),
+                self.tr(
+                    "{n} entité(s) existaient à cette date mais leur état "
+                    "n'est pas entièrement connu (journal ou couche actuelle "
+                    "insuffisants) : elles ne sont pas dessinées ou le sont "
+                    "partiellement."
+                ).format(n=n_unresolved),
+                QgisCompat.MSG_WARNING, 0,
+            )
+        # Among them, a geometry the Rewind's CRS verdict refuses to place
+        # (snapshot_overlay_session._align_to_layer_crs): named apart, it is
+        # the one the user can act on (the CRS the layer declares).
+        from .core.temporal_snapshot_engine import count_reason
+        features = getattr(result, "features", None) or {}
+        n_crs = (count_reason(features, "crs_ambiguous")
+                 + count_reason(features, "crs_mismatch"))
+        if n_crs:
+            flog(f"[{trace_id}] review: warn_crs_refused n={n_crs}", "WARNING")
+            self.iface.messageBar().pushMessage(
+                self.tr("Review : SCR non départagé"),
+                self.tr(
+                    "{n} entité(s) ont à cette date une géométrie capturée "
+                    "dans un autre SCR que celui de la couche, et rien ne dit "
+                    "si ce SCR a été corrigé (mêmes coordonnées) ou si le "
+                    "fichier a été reprojeté (coordonnées converties) : elles "
+                    "ne sont pas dessinées, comme le Rewind refuse de les "
+                    "écrire."
+                ).format(n=n_crs),
+                QgisCompat.MSG_WARNING, 0,
+            )
+        n_unproven = getattr(result, "n_identity_unproven", 0)
+        if n_unproven:
+            flog(f"[{trace_id}] review: warn_identity_unproven n={n_unproven}",
+                 "WARNING")
+            self.iface.messageBar().pushMessage(
+                self.tr("Review : identité non prouvée"),
+                self.tr(
+                    "{n} entité(s) modifiée(s) après cette date ne peuvent "
+                    "pas être rattachées à leur état à cette date : sur un "
+                    "Shapefile ou un GeoJSON, chaque suppression renumérote "
+                    "les fid, et le journal ne prouve plus quelle entité "
+                    "elles étaient. Leur état à cette date n'est pas "
+                    "montré ; ce que montrent les couches actuelles est leur "
+                    "état après ces modifications."
+                ).format(n=n_unproven),
+                QgisCompat.MSG_WARNING, 0,
+            )
+        unsaved_names, n_unsaved = RecoverDialog._review_unsaved_edits(self)
+        if n_unsaved:
+            flog(f"[{trace_id}] review: warn_unsaved_edit_buffer "
+                 f"n={n_unsaved} layers={unsaved_names}", "WARNING")
+            self.iface.messageBar().pushMessage(
+                self.tr("Review : modifications non enregistrées"),
+                self.tr(
+                    "La couche {layers} contient {n} modification(s) non "
+                    "enregistrée(s) dans son tampon d'édition : elles ne sont "
+                    "pas dans le journal et restent affichées par la couche "
+                    "actuelle sur la carte."
+                ).format(layers=", ".join(unsaved_names), n=n_unsaved),
+                QgisCompat.MSG_WARNING, 0,
+            )
+
+    def _review_unsaved_edits(self) -> tuple:
+        """([layer names], total modified/added/deleted features in edit buffers)."""
+        from qgis.core import QgsProject  # noqa: PLC0415
+        project = QgsProject.instance()
+        names = []
+        total = 0
+        for info in getattr(self, "_review_layer_infos", None) or ():
+            lyr = project.mapLayer(info.get("layer_id", ""))
+            if lyr is None:
+                continue
+            try:
+                if not (lyr.isEditable() and lyr.isModified()):
+                    continue
+                eb = lyr.editBuffer()
+                n = 0
+                if eb is not None:
+                    ids_of = getattr(eb, "allAddedOrEditedFeatures", None)
+                    edited = set(ids_of()) if callable(ids_of) else (
+                        set(eb.changedAttributeValues().keys())
+                        | set(eb.changedGeometries().keys())
+                        | set(eb.addedFeatures().keys())
+                    )
+                    n = len(edited | set(eb.deletedFeatureIds()))
+                total += max(1, n)
+                names.append(lyr.name())
+            except RuntimeError:
+                continue
+        return names, total
 
     def _refresh_snapshot_for_extent(self) -> None:
         """Re-apply the cached reconstruction to the current viewport (pan/zoom).
 
-        Runs on the UI thread but never touches the journal — only the bbox
+        Runs on the UI thread but never touches the journal - only the bbox
         filter and the overlay repaint. Safe to call on every settled pan/zoom.
         """
         if self._review_snap_raw_result is None or not self._review_snap_mode:
@@ -2739,10 +3208,27 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._surface_snapshot_warnings(trace_id, result)
 
         n_total_before_bbox = n_before if bbox_per_layer else result.n_entities
+        n_born_after = getattr(result, "n_born_after", 0)
+        n_unresolved = getattr(self._review_snap_raw_result, "n_unresolved", 0)
+        n_trace_ref_missing = getattr(self._review_snap_raw_result,
+                                      "n_trace_ref_missing", 0)
+        n_identity_unproven = getattr(self._review_snap_raw_result,
+                                      "n_identity_unproven", 0)
+        # Listed without shape in the overlays; the live layers may still
+        # draw a geometry they received after T, so the bar says it.
+        from .core.temporal_snapshot_engine import count_null_geometry
+        n_null_geometry = count_null_geometry(result.features)
 
         def _on_update_done(stats: dict) -> None:
             if bar is not None and self._review_snap_mode:
-                bar.set_stats(stats["n_entities"], n_total=n_total_before_bbox)
+                _names, n_unsaved = self._review_unsaved_edits()
+                bar.set_stats(stats["n_entities"], n_total=n_total_before_bbox,
+                              n_born_after=n_born_after,
+                              n_unresolved=n_unresolved,
+                              n_null_geometry=n_null_geometry,
+                              n_trace_ref_missing=n_trace_ref_missing,
+                              n_identity_unproven=n_identity_unproven,
+                              n_unsaved_edits=n_unsaved)
             flog(
                 f"[{trace_id}] review: snap_result_applied "
                 f"n_entities={stats['n_entities']} "
@@ -2775,66 +3261,266 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
 
     def _on_snapshot_export_requested(self) -> None:
-        """Slot: user clicked Export — save snapshot overlays to GeoPackage."""
+        """Slot: user clicked Export: write the state at T to a GeoPackage.
+
+        The export used to serialise the overlays (changed entities in the
+        CURRENT VIEW only, attributes possibly incomplete) and announce
+        "Snapshot exporte", a file then kept as "the data at T". It now
+        writes the full reconstruction of the date (every extent), says
+        what it holds in the message AND in the file, and refuses while the
+        state of the date is not established (reconstruction running,
+        overlays being repainted, failed or partial reconstruction).
+
+        The refusal is evaluated again once "Save as" is closed: that dialog
+        runs the event loop, and a commit notification or a worker error
+        arriving meanwhile emptied the reconstruction (the export then died
+        on an AttributeError) or replaced it. The result exported is the
+        one checked at that point, with its date.
+
+        An export that holds entities whose state at T is only partly known,
+        or that could not write some of them, is announced "Export partiel"
+        with each population named: the written ones carry
+        ``_rl_etat_incomplet`` (an empty field there is an unknown value),
+        the omitted ones are counted by cause. It used to say "Export
+        termine" and count them among the entities written in their state
+        at T.
+        """
         snap = self._review_snap_session
-        bar = self._review_date_bar
         if snap is None or not snap.is_active:
             flog("review: export_requested but no active snapshot session", "WARNING")
             return
 
-        from datetime import datetime as _dt  # noqa: PLC0415
-        ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"recoverland_snapshot_{ts}.gpkg"
-        iso = bar.current_date_iso() if bar else "?"
-
         from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox  # noqa: PLC0415
+        iso = self._review_snap_pending_iso or "?"
+        if self._review_export_refused(iso, self._review_export_refusal()):
+            return
+
+        stamp = "".join(ch for ch in iso if ch.isdigit())[:14] or "date"
+        default_name = f"recoverland_etat_{stamp}_modifiees.gpkg"
         path, _ = QFileDialog.getSaveFileName(
             self,
-            self.tr("Exporter le snapshot vers GeoPackage"),
+            self.tr("Exporter l'état à cette date des entités modifiées depuis"),
             default_name,
             "GeoPackage (*.gpkg)",
         )
         if not path:
             return
 
+        # Checked again: the dialog above ran the event loop.
+        refusal = self._review_export_refusal()
+        if not refusal and (self._review_snap_pending_iso or "?") != iso:
+            refusal = self.tr("la date a changé pendant le choix du fichier")
+        if self._review_export_refused(iso, refusal):
+            return
+        snap = self._review_snap_session
+        raw = self._review_snap_raw_result
         flog(
-            f"review: snapshot_export_start path={path} iso={iso}",
+            f"review: snapshot_export_start path={path} iso={iso} "
+            f"n_entities={raw.n_entities}",
             "INFO",
         )
-        result = snap.export_to_geopackage(path)
+        result = snap.export_to_geopackage(path, snapshot_result=raw, cutoff_iso=iso)
+        notes = self._review_export_notes(result)
+        if result["n_born_after"]:
+            notes.append(self.tr(
+                "{n} entité(s) créée(s) après cette date ne sont pas "
+                "incluses (elles n'existaient pas).").format(n=result["n_born_after"]))
+        if result.get("n_null_geometry"):
+            notes.append(self.tr(
+                "{n} entité(s) n'avaient pas de géométrie à cette date : "
+                "elles sont écrites sans géométrie.").format(
+                    n=result["n_null_geometry"]))
+        summary = self.tr(
+            "État au {date} des {n_expected} entité(s) modifiée(s) depuis "
+            "cette date, sur toute l'emprise : {n_features} entité(s) "
+            "écrite(s) dans {n_layers} couche(s).\n"
+            "Les entités non modifiées depuis cette date ne sont pas "
+            "incluses : elles sont identiques aux couches actuelles.\n"
+            "Le détail est dans la table recoverland_etat_info du fichier."
+        ).format(date=iso, n_expected=result["n_expected"],
+                 n_features=result["n_features"], n_layers=result["n_layers"])
+        body = "\n".join([summary] + notes + ["", path])
+        partial = bool(result["errors"] or result["n_not_written"]
+                       or result.get("n_unresolved")
+                       or result.get("n_identity_unproven"))
         if result["errors"]:
             QMessageBox.warning(
                 self,
                 self.tr("Export partiel"),
-                self.tr("{n} couche(s) en erreur : {errors}").format(
+                self.tr("{n} erreur(s) : {errors}").format(
                     n=len(result["errors"]),
                     errors="; ".join(result["errors"]),
-                ),
+                ) + "\n\n" + body,
             )
+        elif partial:
+            QMessageBox.warning(self, self.tr("Export partiel"), body)
         else:
-            QMessageBox.information(
-                self,
-                self.tr("Export terminé"),
-                self.tr(
-                    "Snapshot exporté : {n_layers} couche(s), "
-                    "{n_features} entité(s) ({elapsed_ms} ms).\n\n{path}"
-                ).format(**result, path=path),
-            )
+            QMessageBox.information(self, self.tr("Export terminé"), body)
         flog(
             f"review: snapshot_export_done n_layers={result['n_layers']} "
-            f"n_features={result['n_features']} "
+            f"n_features={result['n_features']} n_expected={result['n_expected']} "
+            f"n_not_written={result['n_not_written']} "
+            f"n_unresolved={result.get('n_unresolved', 0)} "
+            f"n_unresolved_written={result.get('n_unresolved_written', 0)} "
+            f"n_identity_unproven={result.get('n_identity_unproven', 0)} "
+            f"scope={result['scope']} partial={partial} "
             f"errors={len(result['errors'])} elapsed_ms={result['elapsed_ms']}",
-            "INFO",
+            "WARNING" if partial else "INFO",
         )
 
+    def _review_export_refused(self, iso: str, refusal: str) -> bool:
+        """Show *refusal* (nothing is written) and return True, or False."""
+        if not refusal:
+            return False
+        from qgis.PyQt.QtWidgets import QMessageBox  # noqa: PLC0415
+        flog(f"review: snapshot_export_refused iso={iso} reason={refusal!r}",
+             "WARNING")
+        QMessageBox.warning(
+            self, self.tr("Export impossible"),
+            self.tr("L'état à cette date n'est pas établi : {reason}\n"
+                    "Rien n'a été écrit.").format(reason=refusal),
+        )
+        return True
+
+    def _review_export_notes(self, result: dict) -> list:
+        """What the file does not hold as known, each population by its cause."""
+        from .core.snapshot_overlay_session import INCOMPLETE_FIELD
+        notes = []
+        if result.get("n_unresolved"):
+            notes.append(self.tr(
+                "{n} entité(s) dont l'état à cette date n'est pas entièrement "
+                "connu (journal ou couche actuelle insuffisants)."
+            ).format(n=result["n_unresolved"]))
+        if result.get("n_unresolved_written"):
+            notes.append(self.tr(
+                "{n} d'entre elles sont écrites avec la colonne {field}, qui en "
+                "donne la raison : un champ vide y est une valeur inconnue, pas "
+                "NULL à cette date."
+            ).format(n=result["n_unresolved_written"], field=INCOMPLETE_FIELD))
+        if result.get("n_trace_ref_missing"):
+            notes.append(self.tr(
+                "{n} entité(s) dépendent d'un retour arrière dont l'événement "
+                "source a été purgé du journal."
+            ).format(n=result["n_trace_ref_missing"]))
+        if result.get("n_identity_unproven"):
+            # Not among the entities counted above: their state at this
+            # date is unknown, their existence at it included.
+            notes.append(self.tr(
+                "{n} entité(s) modifiée(s) après cette date sans identité "
+                "prouvée à cette date (fid renumérotés par une suppression : "
+                "Shapefile, GeoJSON) n'ont pas été écrites : leur état à "
+                "cette date est inconnu, et elles ne sont pas identiques "
+                "aux couches actuelles."
+            ).format(n=result["n_identity_unproven"]))
+        causes = (
+            ("n_geometry_unknown", self.tr(
+                "{n} entité(s) dont la géométrie à cette date est inconnue "
+                "n'ont pas été écrites.")),
+            ("n_geometry_undecodable", self.tr(
+                "{n} entité(s) dont la géométrie journalisée est illisible "
+                "n'ont pas été écrites.")),
+            ("n_type_skipped", self.tr(
+                "{n} entité(s) dont la géométrie n'est pas du type de la "
+                "couche n'ont pas été écrites.")),
+            ("n_layer_missing", self.tr(
+                "{n} entité(s) d'une couche source absente du projet n'ont "
+                "pas été écrites.")),
+            ("n_write_failed", self.tr(
+                "{n} entité(s) n'ont pas pu être écrites (écriture refusée ou "
+                "non relue).")),
+        )
+        for key, text in causes:
+            if result.get(key):
+                notes.append(text.format(n=result[key]))
+        return notes
+
+    def _review_export_refusal(self) -> str:
+        """Why the state at the current date cannot be exported, or ""."""
+        snap = self._review_snap_session
+        job = getattr(self, "_review_snap_completion", None)
+        if self._review_snap_worker is not None or (job is not None and job.active):
+            return self.tr("la reconstruction de cette date est en cours")
+        if getattr(self, "_review_snap_error", ""):
+            return self.tr("la reconstruction a échoué ({msg})").format(
+                msg=self._review_snap_error)
+        raw = self._review_snap_raw_result
+        if raw is None or self._review_snap_raw_iso != self._review_snap_pending_iso:
+            return self.tr("aucune reconstruction terminée pour cette date")
+        if getattr(raw, "partial", False):
+            return self.tr("la reconstruction est partielle ({reason})").format(
+                reason=getattr(raw, "partial_reason", "?"))
+        if snap is not None and getattr(snap, "is_updating", False):
+            return self.tr("la carte est encore en cours de mise à jour")
+        return ""
+
     def _on_snapshot_error(self, trace_id: str, message: str) -> None:
-        """Slot: SnapshotRebuildWorker encountered a fatal error."""
+        """Slot: SnapshotRebuildWorker encountered a fatal error.
+
+        Fail loud. It used to set the bar to the empty-set symbol ("no
+        entity at this date") and leave the previous date's overlays
+        painted: a failed read was shown as a valid, empty answer.
+        """
+        expected = getattr(self, "_review_snap_expected_trace", "")
+        if trace_id != expected:
+            flog(f"[{trace_id}] review: snap_worker_error from a superseded "
+                 f"worker ignored msg={message}", "WARNING")
+            return
+        self._review_snap_expected_trace = ""
         self._review_snap_worker = None
-        if self._review_date_bar is not None:
-            self._review_date_bar.set_stats(0)
+        self._review_snap_error = message or "?"
+        self._review_snap_raw_result = None
+        self._review_snap_raw_iso = ""
         flog(
             f"[{trace_id}] review: snap_worker_error msg={message}",
             "ERROR",
+        )
+        if self._review_snap_session is not None:
+            self._review_snap_session.clear_all()
+        if self._review_date_bar is not None:
+            self._review_date_bar.set_error(message)
+        self.iface.messageBar().pushMessage(
+            self.tr("Review : reconstruction impossible"),
+            self.tr("L'état à la date {date} n'a pas pu être lu dans le "
+                    "journal ({msg}). Les calques Review ont été vidés : la "
+                    "carte ne montre pas l'état à cette date.").format(
+                date=self._review_snap_pending_iso or "?", msg=message),
+            QgisCompat.MSG_CRITICAL, 0,
+        )
+
+    def _on_snapshot_refused(self, trace_id: str, reason: str) -> None:
+        """Slot: the journal cannot rebuild this date, the worker says why.
+
+        A date inside an interval a logical purge removed (the Rewind
+        refuses the same date, retention.coverage_refusal). It is not moved
+        to another date, which would draw another state under the date
+        asked: the overlays are emptied, the bar shows the refusal and the
+        message names the interval, and that a date on either side of it
+        can be shown.
+        """
+        expected = getattr(self, "_review_snap_expected_trace", "")
+        if trace_id != expected:
+            flog(f"[{trace_id}] review: snap_refusal from a superseded "
+                 f"worker ignored reason={reason}", "INFO")
+            return
+        self._review_snap_expected_trace = ""
+        self._review_snap_worker = None
+        self._review_snap_error = reason or "?"
+        self._review_snap_raw_result = None
+        self._review_snap_raw_iso = ""
+        flog(f"[{trace_id}] review: snap_refused "
+             f"iso={self._review_snap_pending_iso} reason={reason}", "WARNING")
+        if self._review_snap_session is not None:
+            self._review_snap_session.clear_all()
+        if self._review_date_bar is not None:
+            self._review_date_bar.set_error(reason)
+        # The wording of _on_snapshot_error, the reason names the interval.
+        self.iface.messageBar().pushMessage(
+            self.tr("Review : reconstruction impossible"),
+            self.tr("L'état à la date {date} n'a pas pu être lu dans le "
+                    "journal ({msg}). Les calques Review ont été vidés : la "
+                    "carte ne montre pas l'état à cette date.").format(
+                date=self._review_snap_pending_iso or "?", msg=reason),
+            QgisCompat.MSG_WARNING, 0,
         )
 
     def _reap_snap_zombies(self) -> None:
@@ -2939,6 +3625,12 @@ class RecoverDialog(QDialog, LoggerMixin):
         )
         worker.markers_ready.connect(self._on_markers_ready)
         worker.error.connect(self._on_marker_error)
+        # Unparented, and its result slot drops self._review_marker_worker
+        # while run() is still closing its connection: without this hold,
+        # that was the last reference and the running QThread was deleted
+        # (qFatal) on an ordinary pan.
+        from .widgets.snapshot_rebuild_worker import retain_until_finished
+        retain_until_finished(worker)
         self._review_marker_worker = worker
         worker.start()
         flog(
@@ -2948,7 +3640,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         )
 
     def _on_review_snap_extent_changed(self) -> None:
-        """Slot: canvas extent changed — (re)start spatial debounce."""
+        """Slot: canvas extent changed - (re)start spatial debounce."""
         if not self._review_snap_mode:
             return
         debounce_alive = self._review_snap_ext_debounce is not None
@@ -2960,7 +3652,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._review_snap_ext_debounce.start()
 
     def _on_review_snap_bbox_fire(self) -> None:
-        """Slot: spatial debounce expired — refresh snapshot for current extent.
+        """Slot: spatial debounce expired - refresh snapshot for current extent.
 
         Pan/zoom only changes the viewport, not the cutoff date: re-apply the
         cached reconstruction instead of spawning a worker (no SQL + replay).
@@ -3003,7 +3695,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         None forever, leaving Review with no status indicator nor stop control.
         """
         if self._review_status_widget is None:
-            flog("review: status_bar widget missing on show — recreating", "INFO")
+            flog("review: status_bar widget missing on show - recreating", "INFO")
             self._setup_review_status_bar()
         if self._review_status_widget is None:
             flog("review: status_bar show skipped (widget unavailable)", "WARNING")
@@ -3044,8 +3736,18 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._review_active = True
         canvas = self.iface.mapCanvas()
         canvas.extentsChanged.connect(self._review_on_extent_changed)
+        # The tracker we listen to, kept: on a project switch self._tracker
+        # is replaced, and disconnecting "the current one" missed ours.
+        self._review_tracker = self._tracker
         if self._tracker is not None:
             self._tracker.committed_features.connect(self._review_on_commit_changed)
+        # A Review session describes ONE project's journal and layers. It
+        # used to survive a project switch (it persists when the dialog
+        # closes): dead overlay ids, the old project's counts on the new
+        # canvas, fingerprints of project A queried in the journal of B.
+        from qgis.core import QgsProject  # noqa: PLC0415
+        QgsProject.instance().aboutToBeCleared.connect(
+            self._review_on_project_clearing)
         self._show_review_status_bar()
         if self._review_status_widget is not None:
             self._review_status_widget.activate()
@@ -3062,19 +3764,29 @@ class RecoverDialog(QDialog, LoggerMixin):
             canvas.extentsChanged.disconnect(self._review_on_extent_changed)
         except TypeError as exc:
             flog(f"review: canvas_disconnect_failed reason={exc}", "WARNING")
-        if self._tracker is not None:
+        tracker = getattr(self, "_review_tracker", self._tracker)
+        self._review_tracker = None
+        if tracker is not None:
             try:
-                self._tracker.committed_features.disconnect(self._review_on_commit_changed)
-            except (AttributeError, TypeError) as exc:
+                tracker.committed_features.disconnect(self._review_on_commit_changed)
+            except (AttributeError, TypeError, RuntimeError) as exc:
                 flog(f"review: tracker_disconnect_failed reason={exc}", "WARNING")
+        try:
+            from qgis.core import QgsProject  # noqa: PLC0415
+            QgsProject.instance().aboutToBeCleared.disconnect(
+                self._review_on_project_clearing)
+        except (TypeError, RuntimeError) as exc:
+            flog(f"review: project_clear_disconnect skipped ({exc!r})", "DEBUG")
         if self._review_status_widget is not None:
             self._review_status_widget.deactivate()
         self._hide_review_status_bar()
         flog("review: auto_refresh disconnected", "INFO")
 
     def _review_on_extent_changed(self, *_args) -> None:
-        """Slot for canvas extentsChanged or journal committed — debounce 600ms."""
+        """Slot for canvas extentsChanged - ignored when snapshot debounce owns pans."""
         if not self._review_active:
+            return
+        if self._review_snap_mode and self._review_snap_ext_debounce is not None:
             return
         self._review_debounce.start()
 
@@ -3106,6 +3818,12 @@ class RecoverDialog(QDialog, LoggerMixin):
             f"iso={self._review_snap_pending_iso} invalidating_cache",
             "INFO",
         )
+        # The worker in flight read the journal BEFORE this commit. Left
+        # running, its result landed inside the debounce, was cached under
+        # the current date, and the debounce then reused it: Review never
+        # showed the commit. Cancel it and forget which answer we expect.
+        self._cancel_snap_worker(disconnect_signals=True)
+        self._review_snap_expected_trace = ""
         self._review_snap_raw_result = None
         self._review_snap_raw_iso = ""
         flog(
@@ -3114,6 +3832,25 @@ class RecoverDialog(QDialog, LoggerMixin):
             "INFO",
         )
         self._review_debounce.start()
+
+    def _review_on_project_clearing(self) -> None:
+        """QgsProject.aboutToBeCleared: end Review before the layers vanish.
+
+        Runs before the project's layers are removed and before the plugin
+        replaces the journal and the tracker, so the overlays, the date bar,
+        the workers and the commit listener are all released while they
+        still refer to the project they were built for.
+        """
+        flog("review: project_clearing, stopping the Review session", "INFO")
+        self._review_wants_persist = False
+        self._review_stop_session()
+        toggle = getattr(self, "_review_toggle", None)
+        if toggle is not None:
+            toggle.blockSignals(True)
+            toggle.setChecked(False)
+            toggle.blockSignals(False)
+            toggle.setEnabled(True)
+        self._review_layer_infos = []
 
     def _recover_event_mode(self) -> None:
         """Event mode: threaded search with start/end date range."""
@@ -3135,7 +3872,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         )
 
         self.cancel_button.setText(self.tr("Arreter"))
-        self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mTaskCancel.svg'))
+        self.cancel_button.setIcon(theme_icon("stop", size=16))
+        if hasattr(self.cancel_button, "setIconName"):
+            self.cancel_button.setIconName("stop")
 
         self.worker_thread = LocalSearchThread(self._journal, criteria, trace_id=trace_id)
         self.worker_thread.results_ready.connect(self._on_search_complete)
@@ -3149,7 +3888,6 @@ class RecoverDialog(QDialog, LoggerMixin):
     def _recover_version_mode(self) -> None:
         """Version/temporal mode: fetch events after cutoff in background thread."""
         from .core.restore_contracts import RestoreCutoff, CutoffType
-        from .core.event_stream_repository import has_active_restore_traces
 
         cutoff_dt = self.time_slider.cutoff_datetime()
         cutoff_iso = cutoff_dt.toUTC().toString("yyyy-MM-ddTHH:mm:ss")
@@ -3186,47 +3924,40 @@ class RecoverDialog(QDialog, LoggerMixin):
         # user must read that before the rewind writes anything, not after
         # wondering why his oldest edits were not undone.
         self._warn_if_reconciliation_degraded("rewind")
-        undo_layers = len(self._last_restore_by_ds) if self._last_restore_by_ds else 0
-        undo_events = (sum(len(v) for v in self._last_restore_by_ds.values())
-                       if self._last_restore_by_ds else 0)
+        # Read-your-writes: plan on a journal that holds every edit made.
+        if not self._journal_barrier(self.tr("Rewind"), checked_fps, trace_id):
+            self._active_restore_trace_id = ""
+            return
+        # The scope of THIS rewind, fixed now: the undo state and the final
+        # message follow it, not the checkboxes of later.
+        self._rewind_scope_fps = list(checked_fps)
+        # From here until the chain ends nothing else may start: the Undo
+        # button would otherwise stay armed on the previous run while this
+        # one is planned, confirmed and written (revue brev2, P1).
+        self.undo_last_btn.setEnabled(False)
 
-        # BL-RW-P0-24: active traces are the persistent dedup memory
-        # (invariant I-8).  A new rewind proceeds even without in-memory undo
-        # state: the fetch includes active traces and collapse_rewind_events
-        # neutralises every already-compensated event, so nothing is replayed.
+        # v7: the window IS the plan. `fetch_events_after_cutoff` carries,
+        # from the journal alone, the user events after the cutoff and the
+        # plan items of the history before it (a compensation made after
+        # the cutoff re-applied, one in effect at the cutoff and undone
+        # since made again, refusals by name), and the collapse orders them
+        # in one chronological pass. A compensation made BEFORE the cutoff
+        # is part of the state asked for.
         #
-        # That covers going FURTHER BACK. Going FORWARD (the layers sit at an
-        # older date than the one now requested) needs the opposite move:
-        # re-apply the events between the two dates by undoing their
-        # compensations. `_last_restore_by_ds` knows how, but it lives in RAM
-        # and is empty after a QGIS restart -- the rewind then reported
-        # "nothing to restore" while leaving the data one or more states
-        # behind. Rebuild that set from the journal, which is durable, so a
-        # sequence of hops behaves the same before and after a restart
-        # (scenario rw_multi_hop_navigation).
-        if undo_layers == 0:
-            read_conn = self._get_dialog_read_conn()
-            if read_conn is not None and has_active_restore_traces(
-                read_conn, list(checked_fps), trace_id=trace_id
-            ):
-                recovered = self._reapply_set_from_journal(
-                    read_conn, checked_fps, cutoff, trace_id)
-                if recovered:
-                    self._last_restore_by_ds = recovered
-                    undo_layers = len(recovered)
-                    undo_events = sum(len(v) for v in recovered.values())
-                    flog(f"[{trace_id}] recover_version: undo_state_rebuilt "
-                         f"from_journal layers={undo_layers} "
-                         f"events={undo_events} (forward hop)")
-                else:
-                    flog(f"[{trace_id}] recover_version: active_traces_present "
-                         f"datasource_count={len(checked_fps)} -> proceed, "
-                         f"dedup neutralises already-compensated events")
-
+        # The dialog used to undo its own undo pool first, plus the
+        # compensations `_reapply_set_from_journal` rebuilt from the
+        # journal, invalidate their traces, and re-read the window at the
+        # same date. That re-read saw the invalidations just written
+        # (invalidated_at = now, after the cutoff) and compensated again
+        # everything the undo had reverted: "Revenir a l'etat actuel" ended
+        # in the rewound state reported as restored, and a rewind to a date
+        # after a recovery deleted the recovered features before the window
+        # re-inserted them (scenario rw_rewind_no_autoundo). Nothing is
+        # undone before a rewind now: the window alone is applied.
         include_traces = True
         flog(f"[{trace_id}] recover_version: start scope={len(checked_fps)} layer(s) "
-             f"cutoff={cutoff_iso} undo_state=layers={undo_layers}/events={undo_events} "
-             f"include_traces={include_traces}")
+             f"cutoff={cutoff_iso} include_traces={include_traces} "
+             f"(the window is the complete plan, nothing undone first)")
 
         self.progress_bar.setVisible(True)
         self._start_logo_activity(self._glow_color, "recover")
@@ -3311,42 +4042,6 @@ class RecoverDialog(QDialog, LoggerMixin):
         )
         return True
 
-    def _reapply_set_from_journal(self, read_conn, checked_fps, cutoff,
-                                  trace_id: str) -> dict:
-        """Rebuild the undo scope from the journal: {ds_fp: [user events]}.
-
-        Returns the user events that a previous rewind compensated and that
-        the requested cutoff puts back in the past -- i.e. the events to
-        re-apply to move the layers forward. Undoing their traces is exactly
-        what `UndoRunner` does, so the existing auto-undo path can consume
-        this without any change to the runner.
-
-        Empty dict when the hop only goes further back (nothing to re-apply)
-        or when the journal cannot be read: the caller then keeps the plain
-        compensate-only behaviour.
-        """
-        from .core.event_stream_repository import (
-            fetch_active_traces_before_cutoff, fetch_events_by_ids,
-        )
-
-        try:
-            traces = fetch_active_traces_before_cutoff(
-                read_conn, list(checked_fps), cutoff, trace_id=trace_id)
-            src_ids = [t.restored_from_event_id for t in traces
-                       if t.restored_from_event_id is not None]
-            if not src_ids:
-                return {}
-            by_ds: dict = {}
-            for event in fetch_events_by_ids(read_conn, src_ids):
-                by_ds.setdefault(event.datasource_fingerprint or '', []).append(event)
-            flog(f"[{trace_id}] reapply_set_from_journal: traces={len(traces)} "
-                 f"events={len(src_ids)} layers={len(by_ds)}")
-            return by_ds
-        except Exception as exc:  # noqa: BLE001 - never block a rewind on this
-            flog(f"[{trace_id}] reapply_set_from_journal: failed: {exc}",
-                 "WARNING")
-            return {}
-
     def _refuse_truncated_window(self, raw_count: int, trace_id: str) -> bool:
         """Abort the rewind when the fetched window was cut by the LIMIT.
 
@@ -3396,55 +4091,37 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         raw_count = len(events)
         trace_id = self._active_restore_trace_id
+        if getattr(self, "_closing", False):
+            # A fetch result queued before the dialog was closed: nobody is
+            # there to confirm, and nothing may be written on its behalf.
+            flog(f"[{trace_id}] on_version_fetch_done: dialog closed, "
+                 f"{raw_count} event(s) dropped, nothing planned", "WARNING")
+            self._is_recovering = False
+            return
         if self._refuse_truncated_window(raw_count, trace_id):
             return
 
-        events, dedup_stats = collapse_rewind_events_with_stats(events)
+        # The live layers' key columns: a pre-v7 composite key is re-keyed
+        # from its snapshot instead of refused (`_live_key_columns`).
+        events, dedup_stats = collapse_rewind_events_with_stats(
+            events, key_columns=self._live_key_columns(events))
         total_count = len(events)
         cutoff_dt = getattr(self, '_version_cutoff_dt', None)
-        prior_rewind = bool(self._last_restore_by_ds)
-        prior_count = (sum(len(v) for v in self._last_restore_by_ds.values())
-                       if self._last_restore_by_ds else 0)
         # Stash dedup stats so the runner can fold them into CYCLE_SUMMARY.
         self._pending_cycle_stats = dict(dedup_stats)
         flog(f"[{trace_id}] on_version_fetch_done: raw={raw_count} "
              f"collapsed={total_count} "
-             f"prior_rewind={prior_rewind} prior_events={prior_count}")
+             f"plan_reapply={dedup_stats.get('plan_reapply', 0)} "
+             f"plan_recompensate={dedup_stats.get('plan_recompensate', 0)} "
+             f"plan_refused={dedup_stats.get('plan_refused', 0)}")
         _flog_events("active", events, trace_id)
 
         if total_count == 0:
-            if self._last_restore_by_ds:
-                dropped = dedup_stats.get('dedup_dropped', 0)
-                traces_active = dedup_stats.get('traces_active', 0)
-                if dropped > 0 and traces_active > 0:
-                    flog(f"[{trace_id}] on_version_fetch_done: "
-                         f"dedup_dropped={dropped} traces_active={traces_active} "
-                         f"events neutralized by prior rewind traces; "
-                         f"auto-undo + re-fetch")
-                    self._pending_rewind_events = None
-                    self._force_refetch_after_undo = True
-                    self._auto_undo_for_rewind()
-                    return
-                n_undo = sum(len(v) for v in self._last_restore_by_ds.values())
-                reply = QMessageBox.question(
-                    self,
-                    self.tr("Revenir a l'etat actuel"),
-                    self.tr("Remettre {count} entite(s) dans leur etat actuel ?").format(
-                        count=n_undo),
-                    QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_NO)
-                if reply != QtCompat.MSG_YES:
-                    self._is_recovering = False
-                    self._stop_logo_activity()
-                    self.progress_bar.setVisible(False)
-                    self.enable_controls(True)
-                    self.recover_button.setEnabled(True)
-                    return
-                flog(f"auto-undo: slider at current date, returning to current state ({n_undo} entities) "
-                     f"force_refetch=True (RW-18)")
-                self._pending_rewind_events = None
-                self._force_refetch_after_undo = True
-                self._auto_undo_for_rewind()
-                return
+            # An empty window means the layers already hold their state at
+            # this date: nothing is undone, nothing is written. The
+            # compensations of this session's runs made before the date are
+            # part of that state (the cursor at "now" included); undoing
+            # them is what "Annuler le dernier restore" is for.
             if trace_id:
                 self._active_restore_trace_id = ""
             self._is_recovering = False
@@ -3452,7 +4129,18 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_bar.setVisible(False)
             self.enable_controls(True)
             self.recover_button.setEnabled(True)
-            qlog(self.tr("Aucun evenement apres cette date. Rien a restaurer."))
+            msg = self.tr(
+                "Les couches sont deja dans leur etat a cette date : aucun "
+                "evenement a compenser, rien n'a ete modifie.")
+            if self._last_run_in_scope(self._rewind_scope()):
+                msg += " " + self.tr(
+                    "Le dernier Rewind ou restore de ces couches fait partie "
+                    "de cet etat : pour le defaire, utilisez 'Annuler le "
+                    "dernier restore', ou choisissez une date anterieure a "
+                    "ce Rewind.")
+            flog(f"[{trace_id}] on_version_fetch_done: empty window, "
+                 f"layers already at the cutoff, nothing undone")
+            qlog(msg)
             return
 
         if total_count > MAX_EVENTS_PER_RESTORE:
@@ -3513,211 +4201,222 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self._active_restore_trace_id = ""
             return
 
-        if self._last_restore_by_ds:
-            self._pending_rewind_events = events
-            flog("auto-undo: previous rewind active, undoing before new rewind")
-            self._auto_undo_for_rewind()
-            return
-
         self._execute_version_restore(events)
 
-    def _auto_undo_for_rewind(self) -> None:
-        """Silently undo the previous Rewind, then apply the pending new one."""
-        by_ds = self._last_restore_by_ds
-        total_undo = sum(len(v) for v in by_ds.values()) if by_ds else 0
-        n_layers = len(by_ds) if by_ds else 0
-        flog(f"auto_undo_for_rewind: START layers={n_layers} "
-             f"events_to_undo={total_undo}")
-        # Until now this phase was invisible: the label still read
-        # "{n} evenement(s) a analyser" from the fetch, and the user watched
-        # a 139 s undo of a run he had not asked for, described as something
-        # else entirely (measured, trace a1517527).
-        self.update_phase(self.tr(
-            "Annulation du Rewind precedent : {count} evenement(s) "
-            "sur {layers} couche(s)"
-        ).format(count=total_undo, layers=n_layers))
-        # From here on the run writes to the layers; the thaw is driven by
-        # the `_is_recovering` transition, which every exit path performs.
-        self._freeze_canvas_for_write(True)
-        if heavy_diag_enabled():
-            for fp, evts in (by_ds or {}).items():
-                for e in evts:
-                    flog(f"  undo op={e.operation_type} eid={e.event_id} "
-                         f"identity={(e.feature_identity_json or '')[:80]}")
-        self._undo_counts_before = self._rewind_count_snapshot(
-            "before_undo", by_ds)
-        self._last_restore_events = None
-        self._last_restore_by_ds = None
-        self.undo_last_btn.setEnabled(False)
+    def _rewind_scope(self) -> list:
+        """Fingerprints the current rewind moves, fixed when it started."""
+        scope = getattr(self, "_rewind_scope_fps", None)
+        if scope:
+            return list(scope)
+        return list(self._get_version_checked_fingerprints())
 
+    def _expand_scope(self, fps) -> set:
+        """`fps` plus the obsolete fingerprints the journal aliases to them."""
+        out = {fp for fp in (fps or []) if fp}
         read_conn = self._get_dialog_read_conn()
+        if read_conn is None:
+            return out
+        try:
+            from .core.event_stream_repository import resolve_scope
+            for fp in list(out):
+                out.update(resolve_scope(read_conn, fp))
+        except Exception as exc:  # noqa: BLE001 - the plain set still scopes
+            flog(f"undo_scope: alias expansion failed, plain fingerprints "
+                 f"used ({exc})", "WARNING")
+        return out
 
-        def resolver(evt):
-            return find_target_layer(evt, read_conn)
+    @staticmethod
+    def _merge_undo_scopes(first, second) -> dict:
+        """Per-layer union by event id, in the ORDER OF APPLICATION.
 
-        runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
-        runner.progress.connect(self._on_restore_runner_progress)
-        runner.layer_started.connect(self._on_restore_runner_layer)
-        runner.finished.connect(self._on_auto_undo_then_rewind)
-        self._restore_runner = runner
-        runner.start()
-
-    def _on_auto_undo_then_rewind(self, result) -> None:
-        """After auto-undo completes, proceed with the pending Rewind."""
-        self._restore_runner = None
-        flog(f"auto-undo done: ok={result.total_ok} fail={result.total_fail}")
-        if result.total_fail > 0:
-            flog(f"auto-undo: {result.total_fail} failures: {result.errors[:5]}", "WARNING")
-            qlog(self.tr(
-                "Annulation du Rewind precedent partielle: {fail} entite(s) "
-                "n'ont pas pu etre localisees (FID deplace). "
-                "Le Rewind continue malgre tout."
-            ).format(fail=result.total_fail), "WARNING")
-        events = getattr(self, '_pending_rewind_events', None)
-        self._pending_rewind_events = None
-        force_refetch = getattr(self, '_force_refetch_after_undo', False)
-        self._force_refetch_after_undo = False
-        undo_by_ds = getattr(result, 'by_ds', {}) or {}
-        before = getattr(self, '_undo_counts_before', {})
-        self._rewind_count_snapshot("after_undo", undo_by_ds, before=before)
-        self._undo_counts_before = {}
-        # RLU-056: this auto-undo is the phase that produced
-        # `apply_ok=273 apply_fail=0` next to two [MISMATCH] layers. The
-        # counts were already compared here; now the user is told, before
-        # the new rewind is stacked on top of a state nobody verified.
-        self._report_state_mismatches()
-        flog(f"on_auto_undo_then_rewind: undo_ok={result.total_ok} "
-             f"undo_fail={result.total_fail} "
-             f"pending_events_stale={len(events) if events else 0} "
-             f"force_refetch={force_refetch}")
-        if events or force_refetch:
-            # RW-stale-dedup fix: the `_pending_rewind_events` list was produced
-            # by `collapse_rewind_events_with_stats` BEFORE this auto-undo.
-            # It dropped every user event whose trace (from the prior rewind we
-            # just undid) was still flagged active. Applying it now would
-            # re-play only the residual "always-skipped" events, masking the
-            # actual rewind. Discard the stale plan, invalidate the undone
-            # events' traces, and re-run fetch+dedup against the current state.
-            undone_eids = [
-                e.event_id for evts in undo_by_ds.values()
-                for e in evts if e.event_id
-            ]
-            invalidated_n = 0
-            if undone_eids:
-                invalidated_n = self._invalidate_trace_events(undone_eids)
-                flog(f"auto-undo: trace invalidation: "
-                     f"undone_eids_n={len(undone_eids)} "
-                     f"rows_updated={invalidated_n} "
-                     f"(re-fetch will dedup against current state)")
-                if invalidated_n == 0:
-                    flog("auto-undo: WARNING no traces invalidated despite "
-                         f"{len(undone_eids)} undone event(s); next fetch "
-                         "will likely still see stale dedup",
-                         "WARNING")
-            self._refetch_after_auto_undo()
-        else:
-            self._restore_in_progress = False
-            self._is_recovering = False
-            self._stop_logo_activity()
-            self._end_progress_ui()
-            self.enable_controls(True)
-            self.recover_button.setEnabled(True)
-            if result.total_ok > 0:
-                qlog(self.tr("{count} entite(s) remise(s) a l'etat actuel.").format(
-                    count=result.total_ok))
-                self.iface.mapCanvas().refresh()
-
-    def _refetch_after_auto_undo(self) -> None:
-        """Re-run the version fetch after auto-undo invalidated stale traces.
-
-        Routes the result to ``_on_post_undo_fetch_done`` which re-runs dedup
-        and applies the fresh plan without re-prompting the user (they already
-        confirmed before the auto-undo).
+        `second` is the run that has just ended: its events were applied
+        after everything in `first`, so they go after them, in the order
+        that run applied them (an event applied again moves to its new
+        place). `UndoRunner` walks each layer backwards (`undo_prepare`
+        reverses it): the undo is then the exact reverse of what was
+        applied. The pool used to be re-sorted on (created_at, event_id);
+        a plan item carries the date of the toggle it undoes and its
+        chronology breaks ties on the TOGGLE's id, not on its own, and a
+        plan applies INSERT, UPDATE and DELETE compensations in phases:
+        neither is the order a re-sort by date gives back.
         """
-        cutoff = self._version_restore_cutoff
-        trace_id = self._active_restore_trace_id
-        if cutoff is None:
-            flog("refetch_after_auto_undo: no cutoff saved -> abort", "ERROR")
-            self._restore_in_progress = False
-            self._is_recovering = False
-            self._stop_logo_activity()
-            self.progress_bar.setVisible(False)
-            self.enable_controls(True)
-            self.recover_button.setEnabled(True)
-            return
-        checked_fps = self._get_version_checked_fingerprints()
-        if not checked_fps:
-            flog("refetch_after_auto_undo: no checked layers -> abort",
-                 "WARNING")
-            self._restore_in_progress = False
-            self._is_recovering = False
-            self._stop_logo_activity()
-            self.progress_bar.setVisible(False)
-            self.enable_controls(True)
-            self.recover_button.setEnabled(True)
-            return
-        flog(f"[{trace_id}] refetch_after_auto_undo: "
-             f"scope={len(checked_fps)} layer(s) cutoff_reuse=True")
+        merged: dict = {}
+        for scope in (first or {}, second or {}):
+            for fp, evts in scope.items():
+                bucket = merged.setdefault(fp, {})
+                for e in evts or ():
+                    key = e.event_id if e.event_id is not None else id(e)
+                    bucket.pop(key, None)
+                    bucket[key] = e
+        return {fp: list(bucket.values())
+                for fp, bucket in merged.items() if bucket}
 
-        if (self._version_fetch_thread and self._version_fetch_thread.isRunning()):
-            self._version_fetch_thread.stop()
-            self._version_fetch_thread.wait(500)
+    def _in_application_order(self, by_ds, cutoff) -> dict:
+        """What a strict run wrote, each layer in the order its plan applied it.
 
-        self._version_fetch_thread = VersionFetchThread(
-            self._journal, checked_fps, cutoff, trace_id=trace_id,
-            include_traces=True)
-        # Keep the stashed total describing the LAST fetch, so the
-        # truncation guard in _on_post_undo_fetch_done compares like
-        # with like instead of against the pre-undo count.
-        self._version_fetch_total = 0
-        self._version_fetch_thread.count_ready.connect(
-            self._on_version_fetch_count_ready)
-        self._version_fetch_thread.events_ready.connect(
-            self._on_post_undo_fetch_done)
-        self._version_fetch_thread.error_occurred.connect(
-            self._on_version_fetch_error)
-        self._version_fetch_thread.start()
-
-    def _on_post_undo_fetch_done(self, events) -> None:
-        """Handle re-fetched events after auto-undo: re-dedup and execute.
-
-        User already confirmed before the auto-undo, so skip volume warnings
-        and the date confirmation dialog. The cutoff is unchanged.
+        `StrictRestoreRunner` publishes its written scope in INPUT order
+        (the collapsed window, newest first); its planner applies the
+        compensations in phases (INSERT, then UPDATE newest first, then
+        DELETE). The same planner, on the same events, gives that order
+        back: the undo can then be its exact reverse.
         """
-        from .core import collapse_rewind_events_with_stats
+        from .core.restore_planner import plan_temporal_restore
+        out: dict = {}
+        for fp, evts in (by_ds or {}).items():
+            evts = list(evts or ())
+            rank: dict = {}
+            if evts:
+                try:
+                    plan = plan_temporal_restore(
+                        evts, fp, evts[0].layer_name_snapshot or fp, cutoff)
+                    rank = {a.event_id: i for i, a in enumerate(plan.actions)}
+                except Exception as exc:  # noqa: BLE001 - input order kept
+                    flog(f"undo_scope: plan order unreadable for fp="
+                         f"{fp[:16]} ({exc}); input order kept", "WARNING")
+            out[fp] = sorted(evts, key=lambda e: rank.get(e.event_id, len(rank)))
+        return out
 
-        raw_count = len(events)
-        trace_id = self._active_restore_trace_id
-        if self._refuse_truncated_window(raw_count, trace_id):
-            self._restore_in_progress = False
-            return
+    def _without_layers_edited_during_run(self, by_ds) -> dict:
+        """`by_ds` minus the layers the user edited while the run went on.
 
-        events, dedup_stats = collapse_rewind_events_with_stats(events)
-        self._pending_cycle_stats = dict(dedup_stats)
-        flog(f"[{trace_id}] on_post_undo_fetch_done: raw={raw_count} "
-             f"collapsed={len(events)}")
-        _flog_events("active", events, trace_id)
+        The capture is given back to a layer as soon as the run is done
+        with it, so the user can save there while the next layers are
+        written, and his commit is journalled. Such a layer leaves the undo
+        state like any edited layer (`_invalidate_undo_for`): an Undo would
+        otherwise offer to write the run's values over his edit. Consumes
+        the set gathered during the run.
+        """
+        edited = set(getattr(self, "_edited_during_run", None) or ())
+        self._edited_during_run = set()
+        if not edited:
+            return by_ds
+        kept = {fp: evts for fp, evts in (by_ds or {}).items() if fp not in edited}
+        if len(kept) != len(by_ds or {}):
+            flog(f"undo_scope: {len(by_ds) - len(kept)} layer(s) edited by the "
+                 f"user during the run, left out of the undo state")
+        return kept
 
-        if not events:
-            flog("on_post_undo_fetch_done: no active events after re-dedup "
-                 "-> finish")
-            self._restore_in_progress = False
-            self._is_recovering = False
-            self._stop_logo_activity()
-            self.progress_bar.setVisible(False)
-            self.enable_controls(True)
-            self.recover_button.setEnabled(True)
-            if trace_id:
-                self._active_restore_trace_id = ""
-            qlog(self.tr(
-                "Auto-undo termine. Aucun evenement supplementaire a rejouer."
-            ))
-            return
+    def _last_run_in_scope(self, fps) -> bool:
+        """True when the last run wrote on one of the layers `fps` names."""
+        scope = self._expand_scope(fps)
+        return any(fp in scope for fp in self._manual_undo_scope())
 
-        self._execute_version_restore(events)
+    def _set_undo_state(self, by_ds, arm_button: bool = True) -> None:
+        """Install `by_ds` as the undo pool; the button follows the last run unless a run owns it."""
+        state = {fp: list(evts) for fp, evts in (by_ds or {}).items() if evts}
+        self._last_restore_by_ds = state or None
+        self._last_restore_events = (
+            [e for evts in state.values() for e in evts] or None)
+        self.undo_last_btn.setEnabled(
+            bool(self._manual_undo_scope()) and arm_button
+            and not self._run_in_flight())
+
+    def _manual_undo_scope(self) -> dict:
+        """What "Annuler le dernier restore" reverts: the last run, nothing else.
+
+        The pool (`_last_restore_by_ds`) is per layer and cumulative: runs
+        are merged into it so that a Rewind of B leaves the compensations
+        of A to a later Rewind of A, and the journal adds to it, for a
+        forward hop, compensations written by other sessions. Fed from the
+        pool, the button undid the restore before the last one as well, a
+        previous Rewind of another layer, and a compensation rebuilt from
+        the journal for a hop the user had declined; its question counted
+        them all under "le dernier restore". Returns fresh lists: the undo
+        runs on a copy, never on the live state.
+        """
+        run_ids = getattr(self, "_last_run_ids", None) or set()
+        scope: dict = {}
+        for fp, evts in (self._last_restore_by_ds or {}).items():
+            mine = [e for e in evts if e.event_id in run_ids]
+            if mine:
+                scope[fp] = mine
+        return scope
+
+    def _record_last_run(self, written_by_ds) -> None:
+        """The run that just ended wrote `written_by_ds`: it becomes the last run.
+
+        Its journal mark, read at its launch (`_launch_runner`), goes with
+        it: the Undo invalidates the traces written above that mark and no
+        other (`_run_trace_split`). Consumed here, so that a run recorded
+        without a launch of its own never borrows another run's mark.
+        """
+        self._last_run_ids = {
+            e.event_id for evts in (written_by_ds or {}).values()
+            for e in evts if e.event_id is not None}
+        self._last_run_mark = getattr(self, "_run_journal_mark", None)
+        self._run_journal_mark = None
+
+    def _drop_undone(self, undone_ids, arm_button: bool = True) -> None:
+        """Take what an undo really reverted out of the pool and the last run.
+
+        Everything else stays as it is NOW. In particular a layer the user
+        edited while the undo ran has already left the pool
+        (`_invalidate_undo_for`) and is not re-armed from the undo input.
+        """
+        done = {int(i) for i in (undone_ids or []) if i}
+        left = {fp: [e for e in evts if (e.event_id or 0) not in done]
+                for fp, evts in (self._last_restore_by_ds or {}).items()}
+        self._last_run_ids = (
+            (getattr(self, "_last_run_ids", None) or set()) - done)
+        self._set_undo_state(left, arm_button=arm_button)
+
+    def _undo_outcome(self, runner, result, undo_input) -> dict:
+        """What an undo did to each input event.
+
+        Read from the runner (`UndoRunner.undo_outcome`); when it is gone,
+        rebuilt from the result, whose by_ds is the UNDONE scope by
+        contract. Anything not proven undone stays in the pool
+        (`_drop_undone` takes out the undone ones only): its compensation
+        may still be in the layer.
+        """
+        outcome = None
+        reader = getattr(runner, "undo_outcome", None)
+        if callable(reader):
+            try:
+                outcome = dict(reader())
+            except Exception as exc:  # noqa: BLE001 - fall back on the result
+                flog(f"undo_outcome: unreadable ({exc}), rebuilt from the "
+                     f"result", "WARNING")
+        if outcome is None:
+            undone = {e.event_id for evts in (result.by_ds or {}).values()
+                      for e in evts if e.event_id}
+            failed = set(result.failed_eids or []) - undone
+            rest = [e.event_id or 0 for evts in (undo_input or {}).values()
+                    for e in evts
+                    if e.event_id not in undone and e.event_id not in failed]
+            outcome = {"undone": sorted(undone), "failed": sorted(failed),
+                       "skipped": [], "unattempted": rest, "cancelled": False}
+        return outcome
+
+    def _format_undo_shortfall(self, outcome: dict) -> str:
+        """Name what an undo left in place; empty when it reverted everything."""
+        parts = []
+        if outcome.get("failed"):
+            parts.append(self.tr("{count} echec(s)").format(
+                count=len(outcome["failed"])))
+        if outcome.get("skipped"):
+            parts.append(self.tr("{count} introuvable(s) laissee(s) en "
+                                 "l'etat").format(count=len(outcome["skipped"])))
+        if outcome.get("unattempted"):
+            parts.append(self.tr("{count} non traitee(s)").format(
+                count=len(outcome["unattempted"])))
+        return ", ".join(parts)
 
     def _execute_version_restore(self, events) -> None:
         """Execute reverse replay restore (async, strict atomic per layer)."""
+        busy = self._run_in_flight()
+        if busy or getattr(self, "_closing", False):
+            # Defence in depth: the entry points refuse a second run, this
+            # is the last door before the layers are written. The run in
+            # flight keeps its flags, its runner and its controls: only
+            # this rewind's own preparation is released.
+            flog(f"[{self._active_restore_trace_id}] execute_version_restore: "
+                 f"refused, n={len(events)} busy={busy or '-'} "
+                 f"closing={getattr(self, '_closing', False)}", "ERROR")
+            self._is_recovering = False
+            if busy:
+                qlog(self._busy_message(self.tr("Rewind"), busy), "WARNING")
+            return
         trace_id = self._active_restore_trace_id or generate_trace_id()
         self._active_restore_trace_id = trace_id
         self.recover_button.setEnabled(False)
@@ -3748,20 +4447,24 @@ class RecoverDialog(QDialog, LoggerMixin):
         def resolver(evt):
             return find_target_layer(evt, read_conn)
 
+        # `journal_path`: the journal this rewind was planned from. The
+        # runner reads it per layer for the durable purge horizon and the
+        # key continuity proofs, and refuses a layer whose journal it
+        # cannot read (never the session memory alone).
         runner = StrictRestoreRunner(
             events, resolver, cutoff,
             write_queue=self._write_queue,
             tracker=self._tracker, trace_id=trace_id,
             parent=self,
             extra_stats=getattr(self, '_pending_cycle_stats', None),
+            journal_path=self._run_journal_path(),
         )
         # Consume the stash; subsequent runs must repopulate it.
         self._pending_cycle_stats = None
         runner.progress.connect(self._on_restore_runner_progress)
         runner.layer_started.connect(self._on_restore_runner_layer)
         runner.finished.connect(self._on_version_restore_done)
-        self._restore_runner = runner
-        runner.start()
+        self._launch_runner(runner)
 
     def _on_restore_runner_progress(self, done: int, total: int) -> None:
         if total > 0:
@@ -3824,17 +4527,23 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._rewind_count_snapshot("after_restore", restore_by_ds, before=before)
         self._restore_counts_before = {}
         events = getattr(self, '_version_restore_events', None)
-        if result.total_ok > 0 and events:
-            self._last_restore_events = events
-            self._last_restore_by_ds = result.by_ds
-            self.undo_last_btn.setEnabled(True)
+        if result.by_ds and events:
+            # Merged per layer into the pool, in the order the plan applied
+            # it: the button, "Annuler le dernier restore", points at this
+            # run and at it alone, and walks it backwards.
+            written = self._without_layers_edited_during_run(
+                self._in_application_order(
+                    result.by_ds, self._version_restore_cutoff))
+            self._record_last_run(written)
+            self._set_undo_state(self._merge_undo_scopes(
+                self._last_restore_by_ds, written))
             flog(f"undo_last_btn: ENABLED ({result.total_ok} events)")
             for fp, evts in (result.by_ds or {}).items():
                 layer_name = evts[0].layer_name_snapshot if evts else '?'
                 flog(f"  stored_undo layer={layer_name!r} "
                      f"fp={fp[:16]}... n={len(evts)}")
         else:
-            flog("on_version_restore_done: ok=0 or no events "
+            flog("on_version_restore_done: nothing written "
                  "-> undo state NOT updated")
         self._version_restore_events = None
 
@@ -4128,6 +4837,10 @@ class RecoverDialog(QDialog, LoggerMixin):
                 reasons.append(
                     self.tr("{count} refusee(s) pour derive de geometrie")
                     .format(count=buckets["failed_drift"]))
+            if buckets.get("failed_postcommit"):
+                reasons.append(self.tr(
+                    "{count} ecrite(s) mais contredite(s) par la relecture "
+                    "du fichier").format(count=buckets["failed_postcommit"]))
             if buckets["failed_other"]:
                 reasons.append(self.tr("{count} pour une autre raison").format(
                     count=buckets["failed_other"]))
@@ -4210,7 +4923,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.progress_bar.setVisible(False)
         self.progress_phase_label.setVisible(False)
         self.cancel_button.setText(self.tr("Fermer"))
-        self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
+        self.cancel_button.setIcon(theme_icon("close", size=16))
+        if hasattr(self.cancel_button, "setIconName"):
+            self.cancel_button.setIconName("close")
         self.enable_controls(True)
 
         flog(f"_display_search_result: total_count={result.total_count} events={len(result.events)}")
@@ -4397,7 +5112,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.progress_bar.setVisible(False)
         self.progress_phase_label.setVisible(False)
         self.cancel_button.setText(self.tr("Fermer"))
-        self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
+        self.cancel_button.setIcon(theme_icon("close", size=16))
+        if hasattr(self.cancel_button, "setIconName"):
+            self.cancel_button.setIconName("close")
         self.enable_controls(True)
         if trace_id:
             flog(f"[{trace_id}] recover_dialog: error={error_message}", "ERROR")
@@ -4418,7 +5135,9 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_bar.setVisible(False)
             self.progress_phase_label.setVisible(False)
             self.cancel_button.setText(self.tr("Fermer"))
-            self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
+            self.cancel_button.setIcon(theme_icon("close", size=16))
+            if hasattr(self.cancel_button, "setIconName"):
+                self.cancel_button.setIconName("close")
             self.enable_controls(True)
             self._active_search_trace_id = ""
             qlog(self.tr("Recuperation annulee."))
@@ -4430,7 +5149,9 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_bar.setVisible(False)
             self.progress_phase_label.setVisible(False)
             self.cancel_button.setText(self.tr("Fermer"))
-            self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
+            self.cancel_button.setIcon(theme_icon("close", size=16))
+            if hasattr(self.cancel_button, "setIconName"):
+                self.cancel_button.setIconName("close")
             self.enable_controls(True)
             self._active_search_trace_id = ""
             qlog(self.tr("Recuperation annulee."))
@@ -4441,14 +5162,20 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_bar.setVisible(False)
             self.progress_phase_label.setVisible(False)
             self.cancel_button.setText(self.tr("Fermer"))
-            self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
+            self.cancel_button.setIcon(theme_icon("close", size=16))
+            if hasattr(self.cancel_button, "setIconName"):
+                self.cancel_button.setIconName("close")
             self.enable_controls(True)
             self._active_restore_trace_id = ""
             qlog(self.tr("Recuperation annulee."))
         elif self._restore_runner is not None:
-            applied = getattr(self._restore_runner, '_total_ok', 0)
-            by_ds = dict(getattr(self._restore_runner, '_by_ds', {}))
+            written_fn = getattr(self._restore_runner, "written_count", None)
+            applied = (
+                written_fn() if callable(written_fn)
+                else getattr(self._restore_runner, "_applied", 0)
+            )
             is_strict = isinstance(self._restore_runner, StrictRestoreRunner)
+            is_undo = isinstance(self._restore_runner, UndoRunner)
             self._restore_runner.cancel()
             # RLU-055: cancel() only asks; the runner still walks to its
             # own _finish and emits `finished`. Keeping it reachable is
@@ -4462,16 +5189,23 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.progress_bar.setVisible(False)
             self.progress_phase_label.setVisible(False)
             self.cancel_button.setText(self.tr("Fermer"))
-            self.cancel_button.setIcon(QgsApplication.getThemeIcon('/mActionRemove.svg'))
+            self.cancel_button.setIcon(theme_icon("close", size=16))
+            if hasattr(self.cancel_button, "setIconName"):
+                self.cancel_button.setIconName("close")
             self.enable_controls(True)
             trace_id = self._active_restore_trace_id
             self._active_restore_trace_id = ""
-            if applied > 0:
-                events = getattr(self, '_version_restore_events', None) or getattr(self, '_event_restore_events', None)
-                if events and by_ds:
-                    self._last_restore_events = events
-                    self._last_restore_by_ds = by_ds
-                    self.undo_last_btn.setEnabled(True)
+            # The undo state is NOT touched here. It used to be set to the
+            # runner's whole input (`_by_ds`), i.e. also the events it had
+            # not reached yet and would never reach: a click on Undo in
+            # that window applied their inverse. The runner still walks to
+            # its own `finished`, whose slot stores what it really wrote.
+            if is_undo:
+                qlog(self.tr(
+                    "Annulation interrompue a votre demande ; le detail de ce "
+                    "qui a ete remis suit a la fin de l'etape en cours."),
+                    "WARNING")
+            elif applied > 0:
                 if is_strict:
                     msg = self.tr(
                         "Rewind interrompu. {count} entite(s) restaurees sur "
@@ -4499,6 +5233,11 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.operation_input.setEnabled(enabled)
         self.start_input.setEnabled(enabled)
         self.end_input.setEnabled(enabled)
+        if enabled:
+            # Every end of a chain comes through here: the Undo button and
+            # the mode selector follow the state, unless a run still holds
+            # the layers (a cancelled one walking to its end included).
+            self._sync_run_controls()
 
     def _resolve_event_indices(self) -> list:
         """Map selected visual rows to original _search_events indices via UserRole."""
@@ -4567,13 +5306,19 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
             return
         wkb = event.geometry_wkb
+        # The event's other captured geometry: with the displayed one, the
+        # witnesses the Rewind places it with (`restore_executor
+        # ._geometry_in_layer_crs`). The table rows are lightweight: both
+        # columns come as a 1-byte marker and are read back together.
+        new_wkb = getattr(event, "new_geometry_wkb", None)
         wkb_source = "lightweight"
-        if wkb == _BLOB_MARKER and event.event_id is not None:
+        if _BLOB_MARKER in (wkb, new_wkb) and event.event_id is not None:
             conn = self._get_dialog_read_conn()
             if conn is not None:
                 full = get_event_by_id(conn, event.event_id)
                 if full is not None:
                     wkb = full.geometry_wkb
+                    new_wkb = full.new_geometry_wkb
                     wkb_source = "full_fetch"
         if not wkb or wkb == _BLOB_MARKER:
             self._geom_preview.clear()
@@ -4583,6 +5328,20 @@ class RecoverDialog(QDialog, LoggerMixin):
                 "WARNING",
             )
             return
+        # Without the witnesses the display cannot tell a relabel from a
+        # reprojection when the layer CRS changed, and refused a geometry
+        # the Rewind puts back. A witness left as the marker is not one
+        # (a 1-byte non-geometry): none is given then, and the refusal says
+        # the witnesses were not provided rather than that they disagree.
+        witnesses = (wkb, new_wkb)
+        if new_wkb == _BLOB_MARKER:
+            witnesses = ()
+            flog(
+                f"_update_geometry_preview: witness_unresolved "
+                f"event_id={event.event_id} (new geometry not read back; "
+                f"the verdict gets the displayed geometry alone)",
+                "WARNING",
+            )
         target_layer = None
         try:
             target_layer = find_target_layer(event, self._get_dialog_read_conn())
@@ -4592,12 +5351,13 @@ class RecoverDialog(QDialog, LoggerMixin):
                 f"event_id={event.event_id} err={exc}",
                 "WARNING",
             )
-        rendered = self._geom_preview.show(wkb, event.crs_authid, target_layer)
+        rendered = self._geom_preview.show(wkb, event.crs_authid, target_layer,
+                                           witnesses=witnesses)
         if not rendered:
             flog(
                 f"_update_geometry_preview: show_returned_false "
                 f"event_id={event.event_id} crs={event.crs_authid} "
-                f"wkb_source={wkb_source}",
+                f"wkb_source={wkb_source} witnesses={len(witnesses)}",
                 "WARNING",
             )
             return
@@ -4623,7 +5383,9 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def restore_selected_data(self):
         """Restore selected audit events to their source QGIS layers."""
-        if getattr(self, '_restore_in_progress', False):
+        # Refused by name while anything else holds the layers: this used
+        # to return in silence on `_restore_in_progress` alone.
+        if self._refuse_while_busy(self.tr("Restauration")):
             return
         if not self.selected_rows:
             qlog(self.tr("Selectionnez au moins une ligne a restaurer."), "WARNING")
@@ -4638,12 +5400,19 @@ class RecoverDialog(QDialog, LoggerMixin):
             return
 
         ds_fps = {e.datasource_fingerprint for e in lightweight_events}
+        # Before the plan and the preflight: the journal must hold every
+        # edit already made on these layers.
+        if not self._journal_barrier(self.tr("Restauration"), ds_fps):
+            return
         ds_fp = next(iter(ds_fps)) if len(ds_fps) == 1 else "mixed"
         layer_names = sorted({e.layer_name_snapshot or "?" for e in lightweight_events})
         layer_label = ", ".join(layer_names)
 
         plan = plan_event_restore(lightweight_events, ds_fp, layer_label)
-        report = preflight_check(plan)
+        # With the journal's read connection: the purge horizon the journal
+        # persisted is the durable one (restore_planner._purged_horizon_reason);
+        # without it only this process's memory of its own purges was read.
+        report = preflight_check(plan, conn=self._get_dialog_read_conn())
 
         layer_warnings, layer_blocking = self._preflight_layer_checks(lightweight_events)
         merged_warnings = list(report.warnings) + layer_warnings
@@ -4690,25 +5459,118 @@ class RecoverDialog(QDialog, LoggerMixin):
         self._start_logo_activity(self._glow_color, "restore")
         self._restore_in_progress = True
 
-        read_conn = self._get_dialog_read_conn()
-        event_ids = [e.event_id for e in lightweight_events if e.event_id is not None]
-        if read_conn is not None and event_ids:
-            selected_events = fetch_events_by_ids(read_conn, event_ids)
+        # From here until the runner owns the run, a failure must give the
+        # dialog back: see `_abort_event_restore_setup`.
+        try:
+            # The runner gets the events re-read in full from the journal,
+            # ALL of them or none. The table rows are lightweight (their
+            # geometry is a 1-byte marker): without a read connection they
+            # were handed to the runner as they are, and refused there as
+            # "Geometry unreadable" or "could not be verified", a false
+            # reason. An event purged since the search (the maintenance
+            # does not refresh the table) was dropped in silence: the run
+            # executed fewer events than the preflight the user confirmed,
+            # reported them restored, and never named the others.
+            import sqlite3
+            read_conn = self._get_dialog_read_conn()
+            if read_conn is None:
+                raise sqlite3.OperationalError(
+                    "no read connection on the journal")
+            event_ids = [e.event_id for e in lightweight_events]
+            if any(eid is None for eid in event_ids):
+                raise ValueError("a selected row has no journal event id")
+            # EventsNotInJournal names every missing id; the whole run is
+            # refused with them (`_abort_event_restore_setup`).
+            selected_events = fetch_events_by_ids(read_conn, event_ids,
+                                                  require_all=True)
+            self._event_restore_events = selected_events
+            flog(f"[{trace_id}] restore_event: start selected={len(selected_events)} datasources={len(ds_fps)}")
+
+            def resolver(evt):
+                return find_target_layer(evt, read_conn)
+
+            runner = RestoreRunner(selected_events, resolver, self._write_queue,
+                                   tracker=self._tracker, trace_id=trace_id,
+                                   parent=self,
+                                   journal_path=self._run_journal_path())
+            runner.progress.connect(self._on_restore_runner_progress)
+            runner.finished.connect(self._on_event_restore_done)
+        except Exception as exc:  # noqa: BLE001 - named, dialog given back
+            self._abort_event_restore_setup(trace_id, exc,
+                                            selected=lightweight_events)
+            return
+        self._launch_runner(runner)
+
+    def _abort_event_restore_setup(self, trace_id: str,
+                                   exc: BaseException,
+                                   selected=()) -> None:
+        """A restore that failed between its confirmation and its runner.
+
+        The dialog has already put itself in "restore in progress" (flag,
+        buttons, bar, logo) when it reads the selected events back from the
+        journal. That read raised on a journal a writer holds past the busy
+        timeout ("database is locked", a journal on a network share): the
+        exception went out of the slot to Qt, no runner was made, no message
+        was shown, and `_restore_in_progress` stayed set, so every later
+        action was refused "une restauration est en cours" until the project
+        changed. Nothing has been written at this point: everything the
+        restore took is given back and the reason is named.
+
+        `EventsNotInJournal`: selected events the journal no longer holds.
+        Each one is named, from the row the user chose (*selected*).
+        """
+        import sqlite3
+        from .core.event_stream_repository import EventsNotInJournal
+        flog(f"[{trace_id}] restore_event: setup failed before any write "
+             f"({type(exc).__name__}: {exc}); dialog released", "ERROR")
+        self._restore_in_progress = False
+        self._active_restore_trace_id = ""
+        self._event_restore_events = None
+        self._stop_logo_activity()
+        self._end_progress_ui()
+        self.restore_button.setEnabled(bool(self.selected_rows))
+        self.recover_button.setEnabled(True)
+        self._sync_run_controls()
+        error = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, EventsNotInJournal):
+            # Named as the table shows them: its id column, its date.
+            rows = {e.event_id: e for e in selected or ()}
+            named = []
+            for eid in exc.missing_ids:
+                row = rows.get(eid)
+                if row is None:
+                    named.append(f"#{eid}")
+                    continue
+                named.append(self.tr(
+                    "#{eid} ({op} sur '{layer}', {date})"
+                ).format(eid=eid, op=row.operation_type or "?",
+                         layer=row.layer_name_snapshot or "?",
+                         date=format_relative_time(row.created_at or "")
+                         or "?"))
+            qlog(self.tr(
+                "Restauration non lancee : {n} des {total} evenement(s) "
+                "choisi(s) ne sont plus dans le journal (purges depuis la "
+                "recherche, par exemple par la maintenance du journal) : "
+                "{events}. Restaurer les autres seuls ne serait pas la "
+                "restauration confirmee et peut laisser une entite dans un "
+                "etat intermediaire. Rien n'a ete ecrit. Relancez la "
+                "recherche pour afficher l'historique restant, puis "
+                "choisissez a nouveau."
+            ).format(n=len(exc.missing_ids), total=exc.asked,
+                     events="; ".join(named)), "ERROR")
+        elif isinstance(exc, sqlite3.Error):
+            qlog(self.tr(
+                "Restauration non lancee : les evenements choisis n'ont pas "
+                "pu etre relus dans le journal ({error}). Rien n'a ete ecrit. "
+                "Le journal est peut-etre tenu par un autre programme ou une "
+                "autre instance de QGIS : recommencez quand il est de nouveau "
+                "lisible."
+            ).format(error=error), "ERROR")
         else:
-            selected_events = lightweight_events
-        self._event_restore_events = selected_events
-        flog(f"[{trace_id}] restore_event: start selected={len(selected_events)} datasources={len(ds_fps)}")
-
-        def resolver(evt):
-            return find_target_layer(evt, read_conn)
-
-        runner = RestoreRunner(selected_events, resolver, self._write_queue,
-                               tracker=self._tracker, trace_id=trace_id,
-                               parent=self)
-        runner.progress.connect(self._on_restore_runner_progress)
-        runner.finished.connect(self._on_event_restore_done)
-        self._restore_runner = runner
-        runner.start()
+            qlog(self.tr(
+                "Restauration non lancee : sa preparation a echoue ({error}). "
+                "Rien n'a ete ecrit."
+            ).format(error=error), "ERROR")
 
     def _on_event_restore_done(self, result) -> None:
         trace_id = self._active_restore_trace_id
@@ -4732,11 +5594,21 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._active_restore_trace_id = ""
 
         events = getattr(self, '_event_restore_events', None)
-        if result.total_ok > 0 and events:
-            self._last_restore_events = events
-            self._last_restore_by_ds = result.by_ds
-            self.undo_last_btn.setEnabled(True)
+        # result.by_ds is what the runner WROTE (skips, refusals and never
+        # attempted events excluded), not what was selected: `total_ok`
+        # counts the skips too, so it cannot gate the undo scope. Merged
+        # into the pool, in the order the runner applied it (its input
+        # order, layer by layer); the button points at this run alone.
+        if result.by_ds and events:
+            written = self._without_layers_edited_during_run(result.by_ds)
+            self._record_last_run(written)
+            self._set_undo_state(self._merge_undo_scopes(
+                self._last_restore_by_ds, written))
         self._event_restore_events = None
+        # The chain ends here: the Undo button and the mode selector the
+        # runner held are given back (the other controls come back with
+        # the deferred feedback).
+        self._sync_run_controls()
 
         if result.total_ok > 0:
             self._open_attribute_tables_if_requested(result.by_ds, "event")
@@ -4807,25 +5679,54 @@ class RecoverDialog(QDialog, LoggerMixin):
             )
 
     def _invalidate_undo_for(self, edited_fingerprint: str) -> None:
-        """Remove a single layer from the undo state after user edits it."""
-        if not self._last_restore_by_ds:
-            return
+        """Remove a single layer from the undo state after user edits it.
+
+        The layer is matched through the journal's alias scope, not by the
+        letter of its fingerprint: a compensation filed under a fingerprint
+        the journal declares equivalent (v6 alias of a re-pointed layer,
+        obsolete pre-v6 form) belongs to the same source, and left in the
+        pool it kept the button armed to write the restore's NEW values
+        over the user's edit.
+        """
         if not edited_fingerprint:
             return
-        if edited_fingerprint not in self._last_restore_by_ds:
+        in_flight = bool(self._run_in_flight())
+        if not in_flight and not self._last_restore_by_ds:
             return
-        name = self._last_restore_by_ds[edited_fingerprint][0].layer_name_snapshot
-        del self._last_restore_by_ds[edited_fingerprint]
+        scope = self._expand_scope([edited_fingerprint])
+        if in_flight:
+            # Captured because the run no longer holds that layer (the
+            # capture is given back layer by layer): what the run wrote
+            # there must not become undoable at its end either
+            # (`_without_layers_edited_during_run`).
+            self._edited_during_run = (
+                set(getattr(self, "_edited_during_run", None) or ()) | scope)
+        if not self._last_restore_by_ds:
+            return
+        hit = [fp for fp in self._last_restore_by_ds if fp in scope]
+        if not hit:
+            return
+        name = self._last_restore_by_ds[hit[0]][0].layer_name_snapshot
+        dropped = {e.event_id for fp in hit
+                   for e in self._last_restore_by_ds[fp]}
+        for fp in hit:
+            del self._last_restore_by_ds[fp]
+        # Out of the last run too, for good: nothing may re-arm the button
+        # on a layer the user has edited since.
+        self._last_run_ids = (
+            (getattr(self, "_last_run_ids", None) or set()) - dropped)
         self._last_restore_events = [
             e for e in (self._last_restore_events or [])
-            if e.datasource_fingerprint != edited_fingerprint
+            if e.datasource_fingerprint not in hit
         ]
-        flog(f"undo: '{name}' invalidated (edited), "
+        flog(f"undo: '{name}' invalidated (edited, fingerprints={len(hit)}), "
              f"{len(self._last_restore_by_ds)} layer(s) still undo-able")
         if not self._last_restore_by_ds:
             self._last_restore_events = None
+        if not self._manual_undo_scope():
+            # Never enabled here: a run in flight owns the button.
             self.undo_last_btn.setEnabled(False)
-            flog("undo_last_btn: DISABLED (all layers edited)")
+            flog("undo_last_btn: DISABLED (last run's layers edited)")
 
     def _append_undo_session_menu(self, menu, event) -> None:
         """US-4.10.01: Append an 'undo entire session' entry to the menu.
@@ -4853,11 +5754,189 @@ class RecoverDialog(QDialog, LoggerMixin):
             return
         session_date = (event.created_at or "")[:16] or "?"
         undo_act = menu.addAction(
-            QgsApplication.getThemeIcon('/mActionUndo.svg'),
+            theme_icon("undo", size=16),
             self.tr("Annuler toute la session d'edition ({n} evenements)").format(
                 n=n_events))
         undo_act.setToolTip(self.tr("Session du {date}").format(date=session_date))
         undo_act.triggered.connect(lambda: self._undo_session(session_id))
+
+    def _service_history_state(self, fingerprint: str) -> tuple:
+        """``(candidate, manual_target)`` of a service-less history, or Nones.
+
+        *candidate*: the history the reconciliation refused to attach
+        (`datasource_alias.service_history_candidates`), with the services
+        known for its provider. *manual_target*: the fingerprint the user
+        attached it to through `_attach_service_history`, which he can
+        take back. Both None when neither applies or the journal cannot
+        be read.
+        """
+        conn = self._get_dialog_read_conn()
+        if not fingerprint or conn is None:
+            return None, None
+        try:
+            from .core import datasource_alias as da
+            candidate = next((c for c in da.service_history_candidates(conn)
+                              if c.fingerprint == fingerprint), None)
+            note = getattr(da, "_NOTE_MANUAL_SERVICE",
+                           "rattachement manuel : service ")
+            manual = next((target for alias, target, _at, text
+                           in da.list_aliases(conn)
+                           if alias == fingerprint
+                           and (text or "").startswith(note)), None)
+        except Exception as exc:  # noqa: BLE001 - a menu never blocks
+            flog(f"service_history_menu: journal unreadable ({exc})", "WARNING")
+            return None, None
+        return candidate, manual
+
+    def _append_service_history_menu(self, menu, event) -> None:
+        """Attach a refused service-less history to a service, or take it back.
+
+        The reconciliation refuses to attach a pre-v7 database history
+        whose connection service it cannot tell (several services known):
+        the history stayed out of every rewind, the layer that reads it was
+        refused as a target, and nothing let the user say which service
+        the old events came from. This is that way, on an event of the
+        history, and its undo.
+        """
+        candidate, manual = self._service_history_state(
+            event.datasource_fingerprint or "")
+        if candidate is None and manual is None:
+            return
+        menu.addSeparator()
+        fingerprint = event.datasource_fingerprint
+        if candidate is not None:
+            attach_act = menu.addAction(
+                self.tr("Rattacher cet historique a un service..."))
+            attach_act.setToolTip(self.tr(
+                "Services connus : {known}").format(
+                    known=", ".join(candidate.known_services) or "-"))
+            attach_act.triggered.connect(
+                lambda: self._attach_service_history(fingerprint))
+        if manual is not None:
+            detach_act = menu.addAction(
+                self.tr("Retirer le rattachement de cet historique au service"))
+            detach_act.triggered.connect(
+                lambda: self._detach_service_history(fingerprint))
+
+    def _attach_service_history(self, fingerprint: str) -> bool:
+        """Ask which service a refused history comes from, then attach it.
+
+        `datasource_alias.attach_service_history` does the attaching and
+        refuses what it cannot prove (another table, a scope that does not
+        hold the events); its answer is shown as is. Returns True when the
+        history was attached.
+        """
+        from qgis.PyQt.QtWidgets import QInputDialog
+        if self._refuse_while_busy(self.tr("Rattachement d'historique")):
+            return False
+        candidate, _manual = self._service_history_state(fingerprint)
+        if candidate is None:
+            qlog(self.tr("Cet historique n'est plus a rattacher."), "WARNING")
+            return False
+        label = ", ".join(candidate.layer_names) or fingerprint[-40:]
+        services = list(candidate.known_services)
+        if not services:
+            qlog(self.tr(
+                "Aucun service de connexion connu pour '{layers}' : "
+                "impossible de rattacher son historique."
+            ).format(layers=label), "WARNING")
+            return False
+        service, ok = QInputDialog.getItem(
+            self, self.tr("Rattacher un historique"),
+            self.tr(
+                "De quel service de connexion viennent les evenements "
+                "d'avant v7 de '{layers}' ?\n({detail})\n\nSi vous ne le "
+                "savez pas, annulez : un historique rattache a la mauvaise "
+                "base ferait rejouer ses editions sur d'autres lignes."
+            ).format(layers=label, detail=candidate.detail or "-"),
+            services, 0, False)
+        if not ok or not service:
+            flog(f"service_history: attach declined fp={fingerprint[-60:]}")
+            return False
+        journal = self._journal
+        conn = None
+        try:
+            from .core.datasource_alias import attach_service_history
+            conn = journal.create_write_connection()
+            attached, message = attach_service_history(conn, fingerprint,
+                                                       str(service))
+        except Exception as exc:  # noqa: BLE001 - said, never guessed
+            attached, message = False, str(exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"service_history: write connection close failed "
+                         f"({exc!r})", "WARNING")
+        flog(f"service_history: attach fp={fingerprint[-60:]} "
+             f"service={service!r} ok={attached} msg={message}",
+             "WARNING" if attached else "ERROR")
+        if attached:
+            qlog(self.tr(
+                "'{layers}' : {message}. Clic droit sur un de ses evenements "
+                "pour retirer ce rattachement."
+            ).format(layers=label, message=message), "WARNING")
+        else:
+            qlog(self.tr("'{layers}' : {message}.").format(
+                layers=label, message=message), "WARNING")
+        return bool(attached)
+
+    def _detach_service_history(self, fingerprint: str) -> bool:
+        """Take back a history the user attached to a service.
+
+        The alias goes (`datasource_alias.remove_alias`), then the
+        reconciliation examines the journal again (`force`): the history
+        is refused again with its reason and its known services, instead
+        of dropping out of the report while attached to nothing.
+        """
+        if self._refuse_while_busy(self.tr("Retrait de rattachement")):
+            return False
+        _candidate, manual = self._service_history_state(fingerprint)
+        if manual is None:
+            return False
+        reply = QMessageBox.question(
+            self, self.tr("Retirer le rattachement"),
+            self.tr(
+                "Retirer le rattachement de cet historique a {target} ?\n\n"
+                "Ses evenements d'avant v7 ne seront plus vus par un Rewind "
+                "de cette couche."
+            ).format(target=manual),
+            QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_NO)
+        if reply != QtCompat.MSG_YES:
+            return False
+        conn = None
+        removed = 0
+        try:
+            from .core.datasource_alias import (
+                remove_alias, reconcile_legacy_fingerprints,
+            )
+            conn = self._journal.create_write_connection()
+            removed = remove_alias(conn, fingerprint)
+            if removed:
+                # The pass writes inside the caller's transaction (the
+                # journal open commits it with the schema): committed here.
+                with conn:
+                    reconcile_legacy_fingerprints(conn, force=True)
+        except Exception as exc:  # noqa: BLE001 - said, never guessed
+            flog(f"service_history: detach failed fp={fingerprint[-60:]} "
+                 f"({exc})", "ERROR")
+            qlog(self.tr("Retrait du rattachement impossible : {error}").format(
+                error=exc), "ERROR")
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"service_history: write connection close failed "
+                         f"({exc!r})", "WARNING")
+        flog(f"service_history: detach fp={fingerprint[-60:]} "
+             f"removed={removed}", "WARNING")
+        qlog(self.tr(
+            "Rattachement retire : cet historique est de nouveau hors de "
+            "portee des Rewind de la couche."), "WARNING")
+        return bool(removed)
 
     def _count_session_events(self, session_id: str) -> int:
         """US-4.10.01: Count events of a session for the context-menu label."""
@@ -4877,16 +5956,30 @@ class RecoverDialog(QDialog, LoggerMixin):
             return 0
 
     def _undo_session(self, session_id: str) -> None:
-        """US-4.10.01: Reverse all events of a given edit session.
+        """US-4.10.01: undo a whole edit session, with the guarantees of a Rewind.
 
-        Fetches the user events of the session, builds the by_ds payload,
-        confirms with the user, then dispatches to UndoRunner. Reuses the
-        existing rewind_dedup logic for idempotence.
+        The session's USER events used to go to `UndoRunner`, whose
+        `undo_apply_one` reverses a RESTORE: an INSERT of the session was
+        inserted a second time, a DELETE deleted a snapshot match instead of
+        bringing the feature back, an UPDATE rewrote its NEW values, no trace
+        was written, and the message announced the session "neutralisee"
+        (scenario rw_undo_session_compensates). Undoing a session is
+        compensating its events: the same engine as a Rewind
+        (`StrictRestoreRunner`: identity proofs, per-layer atomicity,
+        read-back of the file, traces), on the session's events collapsed
+        with their traces (`_session_undo_plan`).
         """
+        from .core.restore_contracts import (
+            RestoreCutoff, CutoffType, MAX_EVENTS_PER_RESTORE,
+        )
+        from .core.rewind_dedup import chronological_key
+
         if not session_id:
             return
-        if getattr(self, '_restore_in_progress', False):
-            qlog(self.tr("Un restore est deja en cours."), "WARNING")
+        if self._refuse_while_busy(self.tr("Annulation de session")):
+            return
+        # The session's last edits may still be on their way to the journal.
+        if not self._journal_barrier(self.tr("Annulation de session"), None):
             return
         read_conn = self._get_dialog_read_conn()
         if read_conn is None:
@@ -4894,6 +5987,7 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         t0 = time.monotonic()
         try:
+            n_total = count_events_by_session(read_conn, session_id)
             events = fetch_events_by_session(read_conn, session_id)
         except Exception as exc:
             flog(
@@ -4912,14 +6006,49 @@ class RecoverDialog(QDialog, LoggerMixin):
                 "INFO",
             )
             return
+        if n_total > len(events):
+            # The read is capped: compensating the part that came back is a
+            # partial undo announced as the undo of the session.
+            flog(f"_undo_session: refused session_id={session_id} "
+                 f"n_total={n_total} fetched={len(events)} (capped)", "ERROR")
+            qlog(self.tr(
+                "Annulation de session refusee : la session compte {count} "
+                "evenements, au-dela de la limite ({limit}) ; son annulation "
+                "serait partielle. Utilisez un Rewind a une date anterieure a "
+                "la session."
+            ).format(count=n_total, limit=MAX_EVENTS_PER_RESTORE), "WARNING")
+            return
 
-        by_ds = {}
-        for e in events:
+        try:
+            plan_events, refused, stats = self._session_undo_plan(
+                read_conn, events)
+        except Exception as exc:  # noqa: BLE001 - unproven is refused
+            flog(f"_undo_session: plan failed session_id={session_id} "
+                 f"err={exc}", "ERROR")
+            qlog(self.tr(
+                "Annulation de session refusee : le journal de la session "
+                "n'a pas pu etre lu entierement ({error})."
+            ).format(error=exc), "ERROR")
+            return
+        refused_line = self._format_session_refusals(refused)
+        if not plan_events:
+            if refused_line:
+                qlog(self.tr("Annulation de session : rien n'a ete modifie.")
+                     + "\n" + refused_line, "WARNING")
+            else:
+                qlog(self.tr(
+                    "Cette session est deja annulee : ses modifications sont "
+                    "toutes compensees, rien n'a ete modifie."))
+            flog(f"_undo_session: nothing to compensate session_id={session_id} "
+                 f"refused={len(refused)}", "INFO")
+            return
+
+        by_ds: dict = {}
+        for e in plan_events:
             by_ds.setdefault(e.datasource_fingerprint, []).append(e)
-
-        layer_names = sorted({e.layer_name_snapshot or '?' for e in events})
+        layer_names = sorted({e.layer_name_snapshot or '?' for e in plan_events})
         op_counts = {}
-        for e in events:
+        for e in plan_events:
             op_counts[e.operation_type] = op_counts.get(e.operation_type, 0) + 1
         ops_str = ', '.join(f"{n} {op}" for op, n in sorted(op_counts.items()))
         layers_str = '\n'.join(f"  - {n}" for n in layer_names)
@@ -4931,9 +6060,11 @@ class RecoverDialog(QDialog, LoggerMixin):
             "Operations : {ops}\n\n"
             "Couches touchees :\n{layers}"
         ).format(
-            sid=session_id[:8] + "...", total=len(events),
+            sid=session_id[:8] + "...", total=len(plan_events),
             nlayers=len(by_ds), ops=ops_str, layers=layers_str,
         )
+        if refused_line:
+            msg += "\n\n" + refused_line
 
         reply = QMessageBox.question(
             self, self.tr("Annuler la session"),
@@ -4950,12 +6081,20 @@ class RecoverDialog(QDialog, LoggerMixin):
         flog(
             f"[{trace_id}] undo_session: start "
             f"session_id={session_id} n_events={len(events)} "
+            f"to_compensate={len(plan_events)} refused={len(refused)} "
             f"n_layers={len(by_ds)} fetch_elapsed_ms={fetch_ms}",
             "INFO",
         )
+        oldest = min(events, key=chronological_key)
+        # "Before the session": the date of its first event, inclusive, for
+        # the plan and its coverage preflight.
+        cutoff = RestoreCutoff(CutoffType.BY_DATE, oldest.created_at or "",
+                               inclusive=True)
 
         self._active_restore_trace_id = trace_id
         self._current_undo_session_id = session_id
+        self._undo_session_cutoff = cutoff
+        self._undo_session_refused = list(refused)
         self.restore_button.setEnabled(False)
         self.recover_button.setEnabled(False)
         self.progress_bar.setRange(0, 100)
@@ -4968,22 +6107,137 @@ class RecoverDialog(QDialog, LoggerMixin):
         def resolver(evt):
             return find_target_layer(evt, read_conn)
 
-        runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
+        runner = StrictRestoreRunner(
+            plan_events, resolver, cutoff,
+            write_queue=self._write_queue,
+            tracker=self._tracker, trace_id=trace_id,
+            parent=self,
+            extra_stats=dict(stats or {}),
+            journal_path=self._run_journal_path(),
+        )
         runner.progress.connect(self._on_restore_runner_progress)
         runner.layer_started.connect(self._on_restore_runner_layer)
         runner.finished.connect(self._on_undo_session_done)
-        self._restore_runner = runner
-        runner.start()
+        self._launch_runner(runner)
+
+    def _session_undo_plan(self, read_conn, events) -> tuple:
+        """``(to_compensate, refused, stats)`` for "Annuler toute la session".
+
+        The session's events with every trace that references them, whole
+        chains included, collapsed like a rewind window: an event already
+        compensated (by a Rewind, a restore, an earlier undo of the
+        session) is not compensated twice, and one a forward hop re-applied
+        is compensated at the place of that re-application.
+
+        An entity edited AFTER the session by an event outside it is
+        refused, whatever became of that edit: writing the session's old
+        values over it would erase a later modification the journal still
+        describes as applied. Refusing is better than overwriting; the user
+        can rewind to a date before the session instead.
+        ``refused`` lists ``(layer name, entity, later event id)``.
+        """
+        from .core import collapse_rewind_events_with_stats
+        from .core.event_stream_repository import (
+            fetch_entity_stream, fetch_events_by_ids,
+        )
+        from .core.restore_contracts import MAX_EVENTS_PER_RESTORE
+        from .core.rewind_dedup import chronological_key
+
+        ids = [e.event_id for e in events if e.event_id is not None]
+        traces = fetch_events_by_ids(
+            read_conn, self._trace_tree_ids(read_conn, ids))
+        active, stats = collapse_rewind_events_with_stats(
+            list(events) + traces, key_columns=self._live_key_columns(events))
+
+        session_ids = set(ids)
+        newest: dict = {}
+        names: dict = {}
+        for e in events:
+            key = (e.datasource_fingerprint, e.entity_fingerprint)
+            mark = chronological_key(e)
+            if key not in newest or mark > newest[key]:
+                newest[key] = mark
+            names[key] = e.layer_name_snapshot or e.datasource_fingerprint
+        blocked: dict = {}
+        for key, last in newest.items():
+            fp, entity = key
+            if not entity:
+                continue
+            stream = fetch_entity_stream(read_conn, fp, entity)
+            if len(stream) >= MAX_EVENTS_PER_RESTORE:
+                # The history of this entity was capped: a later edit cannot
+                # be ruled out.
+                blocked[key] = None
+                continue
+            later = [r for r in stream
+                     if r.restored_from_event_id is None
+                     and r.event_id not in session_ids
+                     and chronological_key(r) > last]
+            if later:
+                blocked[key] = later[0].event_id
+        keep = [e for e in active
+                if (e.datasource_fingerprint, e.entity_fingerprint) not in blocked]
+        refused = [(names.get(key, key[0]), key[1], eid)
+                   for key, eid in blocked.items()]
+        flog(f"_session_undo_plan: events={len(events)} traces={len(traces)} "
+             f"active={len(active)} to_compensate={len(keep)} "
+             f"refused_entities={len(refused)}")
+        return keep, refused, stats
+
+    @staticmethod
+    def _trace_tree_ids(read_conn, source_ids) -> list:
+        """Ids of every trace below `source_ids`: traces, traces of traces..."""
+        out: list = []
+        ids = sorted({int(i) for i in (source_ids or []) if i})
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            ph = ",".join("?" for _ in chunk)
+            # B608: `ph` is only `?,?,...`; the ids are bound as parameters.
+            rows = read_conn.execute(
+                "WITH RECURSIVE tree(id) AS ("  # nosec B608
+                " SELECT event_id FROM audit_event"
+                " WHERE restored_from_event_id IN (" + ph + ")"
+                " UNION"
+                " SELECT a.event_id FROM audit_event a"
+                " JOIN tree t ON a.restored_from_event_id = t.id)"
+                " SELECT id FROM tree", chunk).fetchall()
+            out.extend(int(r[0]) for r in rows)
+        return sorted(set(out))
+
+    def _format_session_refusals(self, refused) -> str:
+        """Name the entities an undo of session leaves alone, and why."""
+        if not refused:
+            return ""
+        shown = ", ".join(
+            f"{layer} {entity}" for layer, entity, _eid in list(refused)[:10])
+        more = len(refused) - min(len(refused), 10)
+        if more:
+            shown += self.tr(" (+{count} autre(s))").format(count=more)
+        return self.tr(
+            "{count} entite(s) modifiee(s) apres la session par une autre "
+            "edition, non annulee(s) pour ne pas effacer cette modification "
+            "posterieure : {names}. Pour les remettre dans leur etat d'avant "
+            "la session, utilisez un Rewind a une date anterieure a la session."
+        ).format(count=len(refused), names=shown)
 
     def _on_undo_session_done(self, result) -> None:
-        """US-4.10.01: Callback after undo_session completes."""
+        """US-4.10.01: the session undo ended: undo state, report by bucket, UI."""
         trace_id = self._active_restore_trace_id
         session_id = getattr(self, '_current_undo_session_id', '')
         self._restore_in_progress = False
+        # Read off the runner before its reference goes, like the rewind.
+        runner = self._restore_runner or self._cancelled_restore_runner
+        partial_n, partial_fields = self._partial_restore_report(runner)
+        apply_report = self._runner_apply_report(runner)
         self._restore_runner = None
+        self._cancelled_restore_runner = None
         cleanup_temp_layers()
         self._smooth_set_progress(100)
         self._stop_logo_activity()
+        refused = list(getattr(self, "_undo_session_refused", []) or [])
+        self._undo_session_refused = []
+        cutoff = getattr(self, "_undo_session_cutoff", None)
+        self._undo_session_cutoff = None
 
         if trace_id:
             started = self._restore_started_at
@@ -4992,17 +6246,34 @@ class RecoverDialog(QDialog, LoggerMixin):
                 f"[{trace_id}] undo_session: done "
                 f"session_id={session_id} "
                 f"ok={result.total_ok} fail={result.total_fail} "
-                f"elapsed_ms={elapsed_ms}",
+                f"refused={len(refused)} elapsed_ms={elapsed_ms}",
                 "INFO",
             )
             self._active_restore_trace_id = ""
 
-        if result.total_fail == 0:
-            qlog(self.tr("Session annulee : {ok} evenement(s) neutralise(s).").format(
-                ok=result.total_ok))
-        else:
-            qlog(self.tr("Annulation partielle : {ok} OK, {fail} echec(s).").format(
-                ok=result.total_ok, fail=result.total_fail), "WARNING")
+        if result.by_ds:
+            # A run like any other: "Annuler le dernier restore" brings the
+            # session back, in the reverse order of this undo.
+            written = self._without_layers_edited_during_run(
+                self._in_application_order(result.by_ds, cutoff))
+            self._record_last_run(written)
+            self._set_undo_state(self._merge_undo_scopes(
+                self._last_restore_by_ds, written))
+
+        buckets = _restore_buckets(result, partial_n=partial_n,
+                                   report=apply_report)
+        partial_line = self._format_partial_restore(partial_n, partial_fields)
+        refused_line = self._format_session_refusals(refused)
+        msg = self.tr("Annulation de la session : {outcome}").format(
+            outcome=self._format_restore_outcome(buckets))
+        clean = (buckets["failed_total"] == 0 and buckets["cancelled"] == 0
+                 and not result.errors and not partial_line and not refused)
+        if result.errors:
+            msg += " | " + " | ".join(result.errors[:5])
+        if refused_line:
+            msg += "\n" + refused_line
+        qlog(msg + partial_line + self._build_restore_summary(result.by_ds),
+             "INFO" if clean else "WARNING")
 
         self._end_progress_ui()
         self.enable_controls(True)
@@ -5013,9 +6284,23 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _undo_last_restore(self):
         """Undo the last restore: revert data to its pre-restore state."""
-        by_ds = self._last_restore_by_ds
+        # Nothing else may hold the layers: with a Rewind of another layer
+        # in flight the button used to stay armed, and a click started an
+        # UndoRunner beside it (revue brev2, P1). Refused before anything is
+        # asked, and without touching the run's controls.
+        if self._refuse_while_busy(self.tr("Annulation")):
+            return
+        # The last run and nothing else, as a copy: the runner accounts
+        # against what it was given, whatever the live pool becomes while
+        # it runs (an edit notified mid-run drops a layer from the pool).
+        by_ds = self._manual_undo_scope()
         if not by_ds:
             flog("undo_last: requested but no undo state available")
+            return
+        # The traces of the restore to undo may still be on their way to
+        # the journal: invalidating them before they land would leave them
+        # active over data the undo has reverted.
+        if not self._journal_barrier(self.tr("Annulation"), list(by_ds)):
             return
 
         layer_lines = []
@@ -5052,18 +6337,38 @@ class RecoverDialog(QDialog, LoggerMixin):
         def resolver(evt):
             return find_target_layer(evt, read_conn)
 
-        runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self)
+        runner = UndoRunner(by_ds, resolver, tracker=self._tracker, parent=self,
+                            journal_path=self._run_journal_path())
         runner.progress.connect(self._on_restore_runner_progress)
         runner.layer_started.connect(self._on_restore_runner_layer)
         runner.finished.connect(self._on_undo_done)
-        self._restore_runner = runner
-        runner.start()
+        self._undo_input_by_ds = by_ds
+        self._launch_runner(runner)
 
     def _on_undo_done(self, result) -> None:
+        """Account a manual undo by what it really reverted.
+
+        trace-invalidation-ignores-undo-outcome / undo-invalidates-failed-
+        traces: every event of the input used to have its trace
+        invalidated, plus the failed ones explicitly, and the undo state was
+        dropped whole. A failed undo, an undo that found nothing ("Already
+        absent", counted as a success) and the tail a cancel left alone
+        still have their compensation in the layer: invalidating their
+        trace made the next Rewind replay it (a DELETE compensation is an
+        addFeature: the feature came back twice). Now only the undone
+        events lose their trace and leave the undo state; the others stay
+        revertible, and the message counts each population by its name.
+        """
+        runner = self._restore_runner or self._cancelled_restore_runner
+        undo_input = getattr(self, "_undo_input_by_ds", None) or {}
+        self._undo_input_by_ds = None
+        outcome = self._undo_outcome(runner, result, undo_input)
         self._restore_in_progress = False
         self._restore_runner = None
-        self._last_restore_events = None
-        self._last_restore_by_ds = None
+        self._cancelled_restore_runner = None
+        # What was undone leaves the pool and the last run; what was not
+        # stays revertible (unless the user edited its layer meanwhile).
+        self._drop_undone(outcome["undone"])
 
         self._smooth_set_progress(100)
         self._stop_logo_activity()
@@ -5071,45 +6376,116 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.enable_controls(True)
         self.recover_button.setEnabled(True)
 
-        if result.total_fail == 0 and result.total_ok > 0:
-            qlog(self.tr("{count} entite(s) remise(s) dans leur etat initial.").format(count=result.total_ok))
-        elif result.total_ok > 0:
-            qlog(self.tr("Annulation partielle: {ok} ok, {fail} echec(s).").format(
-                ok=result.total_ok, fail=result.total_fail), "WARNING")
+        n_undone = len(outcome["undone"])
+        shortfall = self._format_undo_shortfall(outcome)
+        if n_undone and not shortfall:
+            qlog(self.tr("{count} entite(s) remise(s) dans leur etat initial.").format(
+                count=n_undone))
+        elif n_undone:
+            qlog(self.tr(
+                "Annulation partielle : {count} entite(s) remise(s) dans leur "
+                "etat initial ; {rest}. Les entites non remises restent "
+                "annulables."
+            ).format(count=n_undone, rest=shortfall), "WARNING")
         else:
-            qlog("Annulation: " + " | ".join(result.errors[:5]), "ERROR")
+            qlog(self.tr("Annulation : aucune entite remise ({rest}).").format(
+                rest=shortfall or "0")
+                + (" | " + " | ".join(result.errors[:5]) if result.errors else ""),
+                "ERROR")
 
-        if result.total_ok > 0:
+        if n_undone:
             self.iface.mapCanvas().refreshAllLayers()
 
-        if result.total_ok > 0 and result.by_ds:
-            # RW-stale-dedup symmetry: a manual undo that reverts a previous
-            # rewind's data MUST also invalidate the corresponding traces.
-            # Otherwise the next rewind on the same scope would see those
-            # traces as still "active", dedup would neutralise the matching
-            # user events, and the rewind would collapse to a no-op (or to
-            # the residual always-skipped events). Until 2026-05 this branch
-            # said "kept traces active so dedup will neutralize them", but
-            # the actual UPDATE silently failed (readonly DB), so the
-            # documented behaviour never took effect. Restoring DB
-            # consistency makes the latent bug visible; invalidate instead.
-            ok_eids = [
-                e.event_id for evts in result.by_ds.values()
-                for e in evts if e.event_id
-            ]
-            if result.failed_eids:
-                n_failed = self._invalidate_trace_events(result.failed_eids)
-                flog(f"undo_done: trace invalidation (failed): "
-                     f"failed_eids_n={len(result.failed_eids)} "
-                     f"rows_updated={n_failed}")
-            n_ok = self._invalidate_trace_events(ok_eids) if ok_eids else 0
-            flog(f"undo_done: trace invalidation (succeeded): "
-                 f"ok_eids_n={len(ok_eids)} rows_updated={n_ok} "
-                 f"(rewind on same scope will now see those events as "
-                 f"active again)")
+        # RW-stale-dedup symmetry: a manual undo that reverts a previous
+        # rewind's data MUST also invalidate the corresponding traces, or
+        # the next rewind on the same scope sees them as still "active" and
+        # collapses to a no-op. Only for what was really reverted, and
+        # read back: a journal that cannot be brought in line is said.
+        if not self._invalidate_undone_traces(outcome["undone"], "undo_done"):
+            qlog(self.tr(
+                "Annulation appliquee aux couches, mais le journal n'a pas pu "
+                "etre mis a jour pour {count} entite(s) (verrou, trace du "
+                "restore annule absente, ou trace d'un restore anterieur "
+                "touchee). Un Rewind sur ces couches partirait d'un "
+                "historique faux : verifiez-les avant de rembobiner."
+            ).format(count=n_undone), "ERROR")
+
+    def _journal_high_water_mark(self):
+        """MAX(event_id) of the journal now, or None when it cannot be read.
+
+        Read on a connection of its own: a long-lived read handle can sit
+        on an old snapshot, and a mark read below the real one would count
+        an older run's traces as this run's.
+        """
+        journal = self._journal
+        if journal is None or not getattr(journal, "is_open", False):
+            flog("run_mark: journal not open, mark unknown (the Undo will "
+                 "fall back on the newest trace of each event)", "WARNING")
+            return None
+        conn = None
+        try:
+            conn = journal.create_read_connection()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(event_id), 0) FROM audit_event").fetchone()
+            return int(row[0])
+        except Exception as exc:  # noqa: BLE001 - unknown is said, never guessed
+            flog(f"run_mark: unreadable ({exc}), mark unknown (the Undo will "
+                 f"fall back on the newest trace of each event)", "WARNING")
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"run_mark: read connection close failed ({exc!r})",
+                         "DEBUG")
+
+    def _run_trace_split(self, conn, source_ids) -> dict:
+        """``{source id: (own, older)}``: the ACTIVE traces of these events.
+
+        `own` are the traces the last run wrote: above the journal mark read
+        at its launch (event_id is AUTOINCREMENT, a later row has a larger
+        id). `older` are the traces earlier runs wrote on the same events.
+        Under v7 an event can hold both at once: a forward hop cancels a
+        compensation with a trace of the trace and leaves the first one
+        active, and a later Rewind (or "Annuler toute la session")
+        compensates the event again. The Undo of that last run used to
+        invalidate every active trace of the event: the journal then said
+        the earlier run's compensation was undone too, and a Rewind to a
+        date between the runs wrote the wrong value, reported restored
+        (scenario rw_undo_invalidates_own_trace).
+
+        Without a mark, `own` falls back on the newest active trace of each
+        event. Both lists are in id order. Raises when the journal cannot
+        be read.
+        """
+        mark = getattr(self, "_last_run_mark", None)
+        ids = [int(i) for i in source_ids]
+        active: dict = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            ph = ','.join('?' * len(chunk))
+            for tid, sid in conn.execute(
+                    f"SELECT event_id, restored_from_event_id FROM audit_event "  # nosec B608
+                    f"WHERE restored_from_event_id IN ({ph}) "
+                    f"AND invalidated_at IS NULL ORDER BY event_id",
+                    chunk).fetchall():
+                active.setdefault(int(sid), []).append(int(tid))
+        split: dict = {}
+        for sid, tids in active.items():
+            own = ([t for t in tids if t > mark] if mark is not None
+                   else tids[-1:])
+            split[sid] = (own, [t for t in tids if t not in own])
+        return split
 
     def _invalidate_trace_events(self, undone_ids: list) -> int:
-        """Soft-delete trace events referencing undone event IDs (RW-02).
+        """Soft-delete the traces the undone run wrote for these events (RW-02).
+
+        Only the last run's own traces (`_run_trace_split`): an older
+        trace of the same event belongs to an earlier run whose
+        compensation this undo does not touch. The selection and the
+        UPDATE run in one write transaction, so nothing lands between what
+        is chosen and what is stamped.
 
         Uses a dedicated write connection (NOT a read-only one) because the
         ``audit_event`` table is being mutated. SQLite WAL serialises writers
@@ -5118,25 +6494,47 @@ class RecoverDialog(QDialog, LoggerMixin):
 
         Returns the number of rows actually invalidated. Returns 0 on
         failure or when no matching trace exists.
+
+        `undone_ids` comes in the order the undo REVERTED the events, and
+        each trace gets its own instant, strictly increasing in that order.
+        One instant for the whole undo erased that order: a later rewind
+        unwinds these toggles newest first and, at equal instants, fell back
+        on the trace ids, i.e. on the order the undone restore had written
+        them, the opposite of the undo's. Two edits of one field then came
+        back in the wrong order and the field ended on the older NEW value,
+        reported restored (scenario rw_undo_order_journal).
         """
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
         if not undone_ids:
             return 0
-        now_iso = datetime.now(timezone.utc).isoformat()
+        base = datetime.now(timezone.utc)
+        mark = getattr(self, "_last_run_mark", None)
         conn = None
         try:
             conn = self._journal.create_write_connection()
-            ph = ','.join('?' * len(undone_ids))
-            cursor = conn.execute(
-                f"UPDATE audit_event SET invalidated_at = ? "  # nosec B608
-                f"WHERE restored_from_event_id IN ({ph}) "
-                f"AND invalidated_at IS NULL",
-                [now_iso] + undone_ids,
-            )
-            rowcount = cursor.rowcount
+            conn.execute("BEGIN IMMEDIATE")
+            split = self._run_trace_split(conn, undone_ids)
+            # Undo order across events; within one event, newest first.
+            targets = [tid for sid in undone_ids
+                       for tid in reversed(split.get(int(sid), ((), ()))[0])]
+            stamps = [
+                ((base + timedelta(microseconds=i)).isoformat(
+                    timespec="microseconds"), tid)
+                for i, tid in enumerate(targets)]
+            rowcount = 0
+            if stamps:
+                cursor = conn.executemany(
+                    "UPDATE audit_event SET invalidated_at = ? "
+                    "WHERE event_id = ? AND invalidated_at IS NULL",
+                    stamps,
+                )
+                rowcount = cursor.rowcount
             conn.commit()
             flog(f"_invalidate_trace_events: undone_ids_n={len(undone_ids)} "
-                 f"rows_updated={rowcount} at={now_iso}")
+                 f"run_mark={mark if mark is not None else 'unknown(newest)'} "
+                 f"own_traces={targets[:20]} rows_updated={rowcount} "
+                 f"from={stamps[0][0] if stamps else '-'} "
+                 f"to={stamps[-1][0] if stamps else '-'} (in undo order)")
             return rowcount if rowcount is not None and rowcount >= 0 else 0
         except Exception as exc:
             flog(f"_invalidate_trace_events: trace invalidation failed: "
@@ -5154,6 +6552,90 @@ class RecoverDialog(QDialog, LoggerMixin):
                          f"failed, journal lock may be held ({exc!r})",
                          "WARNING")
 
+    def _active_trace_sources(self, source_ids: list):
+        """``{source id: (own, older)}`` of the active traces, or None if unreadable.
+
+        The same selection as the UPDATE (`_run_trace_split`), read on a
+        connection of its own so that it sees the last commit, not the
+        snapshot of a long-lived handle.
+        """
+        journal = self._journal
+        if journal is None or not getattr(journal, "is_open", False):
+            return None
+        conn = None
+        try:
+            conn = journal.create_read_connection()
+            return self._run_trace_split(conn, source_ids)
+        except Exception as exc:  # noqa: BLE001 - unknown is reported as such
+            flog(f"_active_trace_sources: unreadable ({exc})", "WARNING")
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"_active_trace_sources: read connection close "
+                         f"failed ({exc!r})", "DEBUG")
+
+    def _invalidate_undone_traces(self, undone_ids: list, context: str) -> bool:
+        """Invalidate the traces the undone run wrote, and prove it by reading back.
+
+        True when every undone event had an active trace of the undone run
+        before (`_run_trace_split`), each of those is invalidated after,
+        and every OLDER active trace of these events is still active: an
+        earlier run's compensation, cancelled by a trace of the trace, is
+        not this undo's to touch, and the event may keep an active trace.
+        False when the journal could not be read or written (lock, closed
+        journal), when an undone event had no active trace of the run to
+        invalidate (still queued, in the pending file, or never written: it
+        may come back ACTIVE after this undo; an older trace is never taken
+        in its place), when a trace of the run is still active, or when an
+        older trace was invalidated. The journal then no longer describes
+        the layers, and the caller must say so. An invalidation failure used
+        to be a WARNING, and a rowcount of 0 was indistinguishable from
+        success.
+
+        The ids keep the order the undo reverted them in (duplicates
+        dropped): `_invalidate_trace_events` records that order.
+        """
+        ids = list(dict.fromkeys(int(i) for i in (undone_ids or []) if i))
+        if not ids:
+            return True
+        before = self._active_trace_sources(ids)
+        rows = self._invalidate_trace_events(ids)
+        after = self._active_trace_sources(ids)
+        mark = getattr(self, "_last_run_mark", None)
+        own: dict = {}
+        collateral: list = []
+        if before is None or after is None:
+            missing, still = ids, ids
+        else:
+            own = {t: sid for sid, (mine, _old) in before.items() for t in mine}
+            older = {t for _mine, old in before.values() for t in old}
+            active_after = {t for mine, old in after.values()
+                            for t in (*mine, *old)}
+            missing = [sid for sid in ids if not before.get(sid, ((), ()))[0]]
+            still = sorted({sid for t, sid in own.items() if t in active_after})
+            collateral = sorted(older - active_after)
+            guessed = sorted(sid for sid, (_mine, old) in before.items() if old)
+            if mark is None and guessed:
+                # No mark: the newest trace was taken as the run's for events
+                # that hold several. Right unless the run wrote none for one
+                # of them; the log keeps the guess visible.
+                flog(f"{context}: run mark unknown, newest active trace taken "
+                     f"as the undone run's for events with older active "
+                     f"traces={guessed[:20]}", "WARNING")
+        ok = (before is not None and after is not None and not missing
+              and not still and not collateral)
+        flog(f"{context}: trace invalidation: undone_eids_n={len(ids)} "
+             f"run_mark={mark if mark is not None else 'unknown(newest)'} "
+             f"run_traces_n={len(own)} rows_updated={rows} "
+             f"without_run_trace={missing[:20]} "
+             f"still_active={still[:20]} older_invalidated={collateral[:20]} "
+             f"verdict={'ok' if ok else 'JOURNAL_OUT_OF_SYNC'}",
+             "INFO" if ok else "ERROR")
+        return ok
+
     def reset_undo_state(self) -> None:
         """Drop the last-restore memory (called by the plugin on project switch).
 
@@ -5162,11 +6644,347 @@ class RecoverDialog(QDialog, LoggerMixin):
         had_state = bool(self._last_restore_by_ds)
         self._last_restore_events = None
         self._last_restore_by_ds = None
-        self._pending_rewind_events = None
+        self._last_run_ids = set()
+        self._last_run_mark = None
+        self._run_journal_mark = None
+        self._rewind_scope_fps = None
+        self._undo_input_by_ds = None
+        self._undo_session_refused = []
+        self._undo_session_cutoff = None
         if hasattr(self, 'undo_last_btn'):
             self.undo_last_btn.setEnabled(False)
         if had_state:
             flog("RecoverDialog: undo state reset (project switched)")
+
+    def _journal_barrier(self, action: str, scope_fps=None,
+                         trace_id: str = "") -> bool:
+        """Read-your-writes before planning a Restore, a Rewind or an Undo.
+
+        unflushed-and-pending-events-invisible: the plan reads committed
+        rows only. Edits still in the write queue, in the durable outbox of
+        a writer that is not indexing, or in the pending-recovery file, are
+        real edits the plan cannot see: they were not compensated, the run
+        was announced complete, and once imported at the next start they
+        sat inside the span of a trace written meanwhile and stayed
+        neutralised ("Rien a restaurer" on a wrong value).
+
+        True when the plan may go on. Otherwise the refusal is logged and
+        shown with its reason, the controls are released, and False is
+        returned: nothing has been asked, planned or written.
+        """
+        prefix = f"[{trace_id}] " if trace_id else ""
+        reason = ""
+        wq = self._write_queue
+        if wq is not None:
+            try:
+                drained = bool(wq.wait_until_drained(
+                    timeout=_JOURNAL_BARRIER_TIMEOUT_S))
+            except Exception as exc:  # noqa: BLE001 - unproven is refused
+                flog(f"{prefix}journal_barrier: barrier failed ({exc})", "ERROR")
+                drained = False
+            if not drained:
+                backlog = self._get_write_queue_pending()
+                reason = self.tr(
+                    "{count} modification(s) recente(s) pas encore ecrite(s) "
+                    "dans le journal"
+                ).format(count=backlog) if backlog else self.tr(
+                    "l'enregistreur du journal ne confirme pas avoir tout "
+                    "ecrit")
+            elif callable(getattr(wq, "health", None)):
+                try:
+                    health = wq.health()
+                    # Event batches durable in the outbox and not indexed
+                    # yet (a writer that is dead, stopped or behind). An
+                    # open prepare is a commit in flight, not a backlog.
+                    backlog = max(0, int(getattr(health, "outbox_outstanding", 0) or 0)
+                                  - int(getattr(health, "open_prepares", 0) or 0))
+                except Exception as exc:  # noqa: BLE001 - unproven is refused
+                    flog(f"{prefix}journal_barrier: health unreadable ({exc})",
+                         "ERROR")
+                    backlog = -1
+                if backlog:
+                    reason = self.tr(
+                        "des lots de modifications attendent d'etre indexes "
+                        "dans le journal (enregistreur arrete ou en retard)")
+        shared_only = False
+        if not reason:
+            reasons = []
+            waiting = self._pending_file_events(scope_fps)
+            for n_pending, pending_path, own in waiting:
+                if own:
+                    reasons.append(self.tr(
+                        "{count} modification(s) de ces couches attendent dans "
+                        "le fichier de secours {path}, reintegre au prochain "
+                        "demarrage"
+                    ).format(count=n_pending, path=pending_path))
+                else:
+                    # The profile's shared legacy file is never imported:
+                    # a restart does not bring these edits back, the user
+                    # has to deal with the file (integrity._report_shared_pending).
+                    reasons.append(self.tr(
+                        "{count} modification(s) de ces couches attendent dans "
+                        "le fichier de secours {path}, partage par tous les "
+                        "projets non enregistres du profil et jamais "
+                        "reintegre automatiquement (le journal auquel "
+                        "appartiennent ses evenements ne peut pas etre "
+                        "prouve)"
+                    ).format(count=n_pending, path=pending_path))
+            reason = " ; ".join(reasons)
+            shared_only = bool(waiting) and all(
+                not own for _n, _p, own in waiting)
+        if not reason:
+            return True
+        flog(f"{prefix}journal_barrier: action={action} status=refused "
+             f"reason={reason}", "ERROR")
+        if not self._run_in_flight():
+            # Released only when nothing else holds them: a refusal must
+            # never reopen the controls of a run that still writes.
+            self._is_recovering = False
+            self._stop_logo_activity()
+            self.progress_bar.setVisible(False)
+            self.enable_controls(True)
+            self.recover_button.setEnabled(True)
+        if shared_only:
+            qlog(self.tr(
+                "{action} refuse(e) : le journal est incomplet ({reason}). "
+                "Planifier maintenant ignorerait ces modifications et "
+                "annoncerait un etat faux. Un redemarrage ne les reintegrera "
+                "pas : examinez ce fichier, puis deplacez-le hors du dossier "
+                "une fois ces modifications traitees ou jugees etrangeres a "
+                "ce projet."
+            ).format(action=action, reason=reason), "WARNING")
+            return False
+        qlog(self.tr(
+            "{action} refuse(e) : le journal est incomplet ({reason}). "
+            "Planifier maintenant ignorerait ces modifications et annoncerait "
+            "un etat faux. Reessayez dans quelques secondes ; si le refus "
+            "persiste, redemarrez QGIS pour reintegrer les modifications en "
+            "attente."
+        ).format(action=action, reason=reason), "WARNING")
+        return False
+
+    def _pending_file_events(self, scope_fps) -> list:
+        """``[(n, path, own)]``: events of the scope waiting outside the journal.
+
+        Every pending file whose events may belong to this journal
+        (`integrity.pending_files_for`): its own, reintegrated at the next
+        start (``own`` True), and for a journal of the profile's shared
+        audit directory the LEGACY file shared by every unsaved-project
+        journal, never imported because the journal its events belong to
+        cannot be proven (``own`` False). Only the own file used to be
+        read: edits of these very layers waiting in the shared file were
+        invisible to the plan, which then announced a state that ignores
+        them. Only the files holding events of the scope are listed.
+
+        ``scope_fps`` None means every layer. A file that cannot be read
+        cannot be proven empty for the scope: it counts as one.
+        """
+        path = getattr(self._journal, "path", None) if self._journal else None
+        if not path:
+            return []
+        try:
+            from .core.integrity import pending_files_for, _get_pending_path
+            own_path = _get_pending_path(path)
+            files = pending_files_for(path)
+        except Exception as exc:  # noqa: BLE001 - same location, spelled out
+            flog(f"journal_barrier: pending files unresolved ({exc}); "
+                 f"the file next to the journal is read", "WARNING")
+            own_path = os.path.join(os.path.dirname(path),
+                                    "recoverland_pending.json")
+            files = [own_path]
+        scope = self._expand_scope(scope_fps) if scope_fps else None
+        out = []
+        for pending in files:
+            if not os.path.isfile(pending):
+                continue
+            try:
+                with open(pending, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError) as exc:
+                flog(f"journal_barrier: pending file unreadable {pending} "
+                     f"({exc})", "ERROR")
+                data = None
+            if not isinstance(data, list):
+                n = 1
+            else:
+                n = sum(1 for evt in data if isinstance(evt, dict) and (
+                    scope is None
+                    or evt.get("datasource_fingerprint") in scope))
+            if n:
+                try:
+                    from .core.long_paths import plain
+                    shown = plain(pending)
+                except Exception:  # noqa: BLE001 - shown as it is spelled
+                    shown = pending
+                out.append((n, shown, pending == own_path))
+        return out
+
+    def _run_in_flight(self) -> str:
+        """Class name of the run that holds the layers, "" when none does.
+
+        A runner the dialog owns, or one a cancel detached and that still
+        walks to its end: both still write. `_restore_in_progress` covers
+        the moment a run is set up before its runner exists.
+        """
+        runner = (getattr(self, "_restore_runner", None)
+                  or getattr(self, "_cancelled_restore_runner", None))
+        if runner is not None:
+            return type(runner).__name__
+        if getattr(self, "_restore_in_progress", False):
+            return "restore"
+        return ""
+
+    def _busy_message(self, action: str, busy: str) -> str:
+        """The refusal the user reads: what was refused, and what holds the layers."""
+        what = {
+            "StrictRestoreRunner": self.tr("un Rewind"),
+            "UndoRunner": self.tr("une annulation"),
+            "RestoreRunner": self.tr("une restauration"),
+            "recovering": self.tr("une recherche ou la preparation d'un Rewind"),
+        }.get(busy, self.tr("une restauration"))
+        return self.tr(
+            "{action} refuse(e) : {what} est en cours sur les couches. "
+            "Attendez sa fin, ou annulez-la, puis recommencez."
+        ).format(action=action, what=what)
+
+    def _refuse_while_busy(self, action: str,
+                           check_recovering: bool = True) -> bool:
+        """True, and said, when another operation holds the dialog.
+
+        Every entry point that plans or writes asks this FIRST, and a
+        refusal touches nothing else: the run in flight owns its flags,
+        its runner and the controls. The Undo button had no such guard: a
+        click during a Rewind of another layer started an UndoRunner beside
+        it, `_launch_runner` overwrote the Rewind's reference and the
+        undo's end reopened the controls while the Rewind still wrote
+        (revue brev2, P1). F5, the Review toggle, a restore or an Undo of
+        session had the same hole.
+        """
+        busy = self._run_in_flight()
+        if not busy and check_recovering and getattr(self, "_is_recovering", False):
+            busy = "recovering"
+        if not busy:
+            return False
+        flog(f"run_guard: action={action!r} refused busy={busy}", "WARNING")
+        qlog(self._busy_message(action, busy), "WARNING")
+        return True
+
+    def _sync_run_controls(self) -> None:
+        """Undo button and mode selector follow the state; off while a run holds the layers."""
+        busy = bool(self._run_in_flight())
+        selector = getattr(self, "restore_mode_selector", None)
+        if selector is not None:
+            # A switch to Rewind mode re-enabled the Rewind button under a
+            # restore or an Undo in flight.
+            selector.setEnabled(not busy)
+        button = getattr(self, "undo_last_btn", None)
+        if button is not None:
+            button.setEnabled(not busy and bool(self._manual_undo_scope()))
+
+    def _launch_runner(self, runner) -> None:
+        """Start a runner the dialog owns until its `finished`.
+
+        The project-clear guard is armed first: a runner must never outlive
+        the project whose layers it writes (project-switch-does-not-
+        quiesce-runner). From here until the finished slot of this runner,
+        the Undo button and the mode selector are off.
+
+        The journal mark is read here, after the entry point's barrier and
+        before the runner writes anything: every trace this run writes has
+        a larger id (`_record_last_run` keeps it with the run).
+        """
+        self._run_journal_mark = self._journal_high_water_mark()
+        self._restore_runner = runner
+        self._edited_during_run = set()
+        self._sync_run_controls()
+        self._arm_project_clear_guard()
+        runner.start()
+
+    def _arm_project_clear_guard(self) -> None:
+        if getattr(self, "_project_clear_guard_armed", False):
+            return
+        try:
+            QgsProject.instance().aboutToBeCleared.connect(
+                self._on_project_about_to_clear)
+            self._project_clear_guard_armed = True
+        except (AttributeError, TypeError, RuntimeError) as exc:
+            flog(f"project_clear_guard: not armed ({exc}); "
+                 f"on_project_switched still stops the runner", "WARNING")
+
+    def _on_project_about_to_clear(self) -> None:
+        """The project is going: end the runner while its layers and journal exist.
+
+        `QgsProject.aboutToBeCleared` comes before `cleared`, on which the
+        plugin stops the write queue and closes the journal (and before
+        `readProject` when another project is opened). Unload already
+        released the dialog before the backend; a project switch did not.
+        """
+        self._quiesce_restore_runner("project_about_to_clear")
+
+    def _quiesce_restore_runner(self, reason: str,
+                                timeout_ms: int = 0) -> bool:
+        """Cancel the running runner and wait for its `finished`, bounded.
+
+        cancel() only asks: the runner stops at its next tick, and its
+        finished slot then accounts what it wrote (undo state, trace
+        invalidation) while the project it wrote to is still there; its
+        traces leave while that project's writer still runs. No run is
+        chained after another's end any more (the undo that preceded a
+        Rewind is gone), so nothing new starts from that slot. A runner
+        that does not end in time is detached: its late end must not arm
+        the next project's Undo with this project's scope.
+        """
+        from qgis.PyQt.QtCore import QEventLoop
+        runner = self._restore_runner or self._cancelled_restore_runner
+        if runner is None:
+            return True
+        timeout_ms = int(timeout_ms or _QUIESCE_TIMEOUT_MS)
+        name = type(runner).__name__
+        flog(f"quiesce_runner: reason={reason} runner={name} cancelling, "
+             f"waiting up to {timeout_ms} ms for its end", "WARNING")
+        finished = []
+        loop = QEventLoop()
+
+        def _on_finished(_result=None):
+            finished.append(True)
+            loop.quit()
+
+        runner.finished.connect(_on_finished)
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        try:
+            runner.cancel()
+            if not finished:
+                timer.start(timeout_ms)
+                loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        finally:
+            timer.stop()
+            try:
+                runner.finished.disconnect(_on_finished)
+            except (TypeError, RuntimeError):
+                pass
+        if finished:
+            flog(f"quiesce_runner: reason={reason} runner={name} ended "
+                 f"before the project went")
+            return True
+        try:
+            runner.finished.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        self._restore_runner = None
+        self._cancelled_restore_runner = None
+        self._restore_in_progress = False
+        # Its finished slot will never come here: the controls it held are
+        # given back now.
+        self._sync_run_controls()
+        flog(f"quiesce_runner: reason={reason} runner={name} still running "
+             f"after {timeout_ms} ms; detached from the dialog", "ERROR")
+        qlog(self.tr(
+            "Une restauration en cours n'a pas pu se terminer avant le "
+            "changement de projet ; elle a ete detachee. Verifiez les couches "
+            "du projet precedent a sa reouverture."), "ERROR")
+        return False
 
     def on_project_switched(self, tracker=None) -> None:
         """Full reset when the QGIS project changes.
@@ -5174,6 +6992,21 @@ class RecoverDialog(QDialog, LoggerMixin):
         Drops the stale read connection, stats cache, date bounds, search
         results and undo state so the dialog picks up the new journal.
         """
+        # First: a runner still alive here escaped the project-clear guard.
+        # It is stopped before anything else goes, and its end cannot arm
+        # the new project's Undo (the reset below runs after it).
+        self._quiesce_restore_runner("project_switched")
+        thread = self._version_fetch_thread
+        if thread is not None:
+            # A fetch of the old journal must not feed a rewind here.
+            self._disconnect_thread_signals(thread)
+            try:
+                if thread.isRunning():
+                    thread.stop()
+                    thread.wait(500)
+            except RuntimeError as exc:
+                flog(f"on_project_switched: fetch thread stop: {exc}", "DEBUG")
+            self._version_fetch_thread = None
         self._close_dialog_read_conn()
         self._stats_cache = LayerStatsCache()
         # New project, new journal, new reconciliation verdict: the
@@ -5213,7 +7046,7 @@ class RecoverDialog(QDialog, LoggerMixin):
                 "INFO",
             )
             # The date bar lives on the canvas viewport, so it survives the
-            # dialog hide — but its geometry/z-order can be stale after a
+            # dialog hide - but its geometry/z-order can be stale after a
             # canvas resize while we were hidden, leaving it invisible. Force
             # a reposition (which re-shows it) once Qt has re-mapped us.
             bar = self._review_date_bar
@@ -5224,7 +7057,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             else:
                 flog(
                     "showEvent: date_bar missing on reopen "
-                    "(snap_mode=True, bar=None) — bar lost",
+                    "(snap_mode=True, bar=None) - bar lost",
                     "WARNING",
                 )
             # Defensive: ensure the status bar pill stays visible. Calling
@@ -5234,7 +7067,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             if self._review_status_widget is not None:
                 self._review_status_widget.activate()
         elif self._review_snap_mode and not self._review_wants_persist:
-            flog("showEvent: snap_mode orphan detected — stopping", "WARNING")
+            flog("showEvent: snap_mode orphan detected - stopping", "WARNING")
             self._stop_snapshot_mode()
 
     def hideEvent(self, event):
@@ -5251,7 +7084,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             self._stats_debounce_timer.stop()
 
     def closeEvent(self, event):
-        """Close event — data stays in its current state (rewound or not)."""
+        """Close event - data stays in its current state (rewound or not)."""
         flog(
             "RecoverDialog: closeEvent "
             f"snap_mode={self._review_snap_mode} "
@@ -5292,6 +7125,11 @@ class RecoverDialog(QDialog, LoggerMixin):
     def cleanup_resources(self) -> None:
         """Cleanup threads and resources."""
         try:
+            # A slot queued before the close (a fetch result, a runner's
+            # end) must not start a run on a dialog the user has closed:
+            # `_on_version_fetch_done` and `_execute_version_restore` read
+            # this. Lowered by the next `recover_and_load`.
+            self._closing = True
             self._active_search_trace_id = ""
             self._active_restore_trace_id = ""
             self._close_dialog_read_conn()
@@ -5313,14 +7151,14 @@ class RecoverDialog(QDialog, LoggerMixin):
                     self.worker_thread.stop()
                 self.worker_thread = None
 
-            # Cleanup async restore runner
+            # Cleanup async restore runner: keep _cancelled_restore_runner so
+            # the runner's finished slot still reads its apply_report and
+            # partial_restore_report when the tick completes.
             if self._restore_runner is not None:
                 self._restore_runner.cancel()
-                if self._tracker is not None and self._tracker.is_suppressed:
-                    self._tracker.force_unsuppress()
+                self._cancelled_restore_runner = self._restore_runner
                 self._restore_runner = None
-            # The dialog is going away: nobody will read that report.
-            self._cancelled_restore_runner = None
+            self._sync_run_controls()
 
             # Stop progress timer
             if hasattr(self, 'progress_timer') and self.progress_timer.isActive():
@@ -5417,8 +7255,20 @@ class RecoverDialog(QDialog, LoggerMixin):
             name = group[0].layer_name_snapshot or fp
             layer = find_target_layer(group[0], read_conn)
             if layer is None:
-                blocking.append(
-                    self.tr("Couche '{name}' introuvable dans le projet.").format(name=name))
+                # A loaded layer REFUSED as the target (history captured
+                # before v7 without its connection service, layer re-pointed
+                # to another table) is not a missing layer: the reason is
+                # what tells the user what to do.
+                from .core.workflow_service import target_refusal_reason
+                reason = target_refusal_reason(group[0])
+                if reason:
+                    blocking.append(self.tr(
+                        "Couche '{name}' refusee comme cible : {reason}."
+                    ).format(name=name, reason=reason))
+                else:
+                    blocking.append(self.tr(
+                        "Couche '{name}' introuvable dans le projet."
+                    ).format(name=name))
                 continue
 
             if hasattr(layer, 'isEditable') and layer.isEditable():

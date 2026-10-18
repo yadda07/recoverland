@@ -30,8 +30,10 @@ with zipfile.ZipFile(str(zip_path), 'r') as z:
     print("SAMPLE_ENTRIES:", entries[:10])
 
     # Check for forbidden files
-    _FORBIDDEN = ['.git', '.github', 'scripts/', 'tests/', 'build/', 'dist/',
-                  '__pycache__', '.pyc', '.log', 'AGENTS.md', 'orchestrator',
+    _FORBIDDEN = ['.git', '.github', '.claude', '.devin', '.windsurf',
+                  'controllers/', 'scripts/', 'tests/', 'build/', 'dist/',
+                  '_vendor/', '__pycache__', '.pyc', '.log', 'AGENTS.md',
+                  'orchestrator',
                   # The runtime never compiles a catalogue; shipping the
                   # compiler is what allowed classFactory to overwrite a
                   # correct .qm with a dead one, and it carries every bandit

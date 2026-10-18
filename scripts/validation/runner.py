@@ -7,26 +7,34 @@ A scenario is a Python module that exposes:
     setup(ctx)                        - prepare state (idempotent)
     run(ctx)                          - perform the action under test
     assertions(ctx) -> list[Assertion]
+    teardown(ctx)                     - optional: release what setup/run
+                                        started; always called last
 
 ctx is a SimpleNamespace populated by the runner:
 
     ctx.scenario_id, ctx.invariant, ctx.t0, ctx.trace_id
     ctx.log_path, ctx.log_offset_start, ctx.log_offset_end
     ctx.records   (filled after run, before assertions)
+    ctx.log_window (how ctx.records was gathered: files, rotations, ...)
     ctx.data      (free for the scenario to stash state)
 """
 from __future__ import annotations
 
+import heapq
 import json
+import logging
+import os
+import re
 import sys
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from .assert_log import AssertionSummary, summarize
-from .parse_log import LogRecord, log_file_size, read_records
+from .parse_log import log_anchor, log_file_size, parse_line, read_window
 
 _HERE = Path(__file__).resolve().parent
 
@@ -82,7 +90,7 @@ def _resolve_log_path() -> Path:
     Order matters, and the first entry is the one that makes log-based
     assertions work anywhere:
 
-    1. ``core.logger._LOG_FILE`` — the path the logger ACTUALLY opened, once
+    1. ``core.logger._LOG_FILE``: the path the logger ACTUALLY opened, once
        and for all, at import time. Asking the logger removes any chance of
        the runner and the logger disagreeing, which is exactly what happened
        on a headless run: the logger resolved the profile through
@@ -136,15 +144,189 @@ def _build_ctx(scenario_module) -> SimpleNamespace:
         log_offset_start=0,
         log_offset_end=0,
         records=[],
+        log_window={},
         data={},
     )
 
 
-def _capture_log_window(ctx: SimpleNamespace) -> list[LogRecord]:
-    return read_records(
-        ctx.log_path,
-        start_offset=ctx.log_offset_start,
-    )
+# --------------------------------------------------------------------- #
+# The scenario's log window
+# --------------------------------------------------------------------- #
+#
+# The window used to be "the bytes of recoverland_debug.log from its size
+# before setup(ctx) to its end after run(ctx)". The log rotates at 5 MB:
+# when it turned over during a scenario, the live file was a new, shorter
+# one, the saved offset pointed past its end, and the window came back
+# EMPTY. Every log assertion of that scenario then failed with n=0 on code
+# that had behaved perfectly, and only when the scenario happened to cross
+# the 5 MB mark, i.e. depending on the order of the suite.
+#
+# The window is still the LOG FILE, now read across rotations from the file
+# it started in (parse_log.read_window): scenarios check what the forensic
+# log holds (lines lost or mangled in it are defects some of them look
+# for), including what OTHER processes wrote there (a child QGIS started by
+# a scenario shares the profile's log). An in-memory handler on the
+# plugin's logger, attached for the scenario's duration, keeps every record
+# of THIS process as a second source. It fills in only what the files can
+# no longer give: records written to a file that more rotations than kept
+# backups have deleted. A record of this process that the files should
+# hold and do not is NOT slipped back in (that would hide a log that loses
+# lines); it is counted and said.
+
+_FILE_LOGGER = "RecoverLand.FileDebug"
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+
+
+class _RecordCapture(logging.Handler):
+    """Every record the plugin's debug logger emits while it is attached.
+
+    Formatted by the file handler's own formatter: each line is, byte for
+    byte, the one written to the log, and parse_log reads it the same way.
+    Split on line breaks as a text-mode read of the file would.
+    """
+
+    def __init__(self, formatter):
+        super().__init__(logging.DEBUG)
+        self.setFormatter(formatter)
+        self._lines = []
+        self._open = True
+
+    def emit(self, record):
+        if not self._open:
+            return
+        try:
+            text = self.format(record)
+        except Exception:  # noqa: BLE001 - the file handler reports it
+            return
+        self._lines.extend(_LINE_BREAK_RE.split(text))
+
+    def drain(self) -> list:
+        """Stop capturing (a record being emitted right now is waited for)."""
+        self.acquire()
+        try:
+            self._open = False
+            lines, self._lines = self._lines, []
+        finally:
+            self.release()
+        return lines
+
+
+def _same_file(a, b) -> bool:
+    return (os.path.normcase(os.path.abspath(str(a)))
+            == os.path.normcase(os.path.abspath(str(b))))
+
+
+class _LogWindow:
+    """The log records of one scenario, from before setup(ctx) to after run(ctx)."""
+
+    def __init__(self, log_path):
+        self.log_path = log_path
+        self.logger = logging.getLogger(_FILE_LOGGER)
+        self.capture = None
+        self.capture_off = ""
+        # The anchor BEFORE the capture: every record the capture sees is
+        # then written after the anchor, so one missing from a complete
+        # window really is missing from the log.
+        self.anchor = log_anchor(log_path)
+        writer = next((h for h in list(self.logger.handlers)
+                       if getattr(h, "baseFilename", None)
+                       and _same_file(h.baseFilename, log_path)), None)
+        if writer is None:
+            # Never attach to a logger that core.logger has not set up yet:
+            # it only adds its file handler to a logger WITHOUT handlers,
+            # so a handler of ours would stop the debug log being written
+            # at all. The file alone is then the window, as before.
+            self.capture_off = (f"no handler of {_FILE_LOGGER} writes "
+                                f"{log_path}: the window is the file alone")
+        else:
+            self.capture = _RecordCapture(writer.formatter or logging.Formatter())
+            self.logger.addHandler(self.capture)
+        self._closed = False
+
+    def detach(self) -> list:
+        """Remove the in-memory handler; return the lines it kept."""
+        if self._closed:
+            return []
+        self._closed = True
+        if self.capture is None:
+            return []
+        self.logger.removeHandler(self.capture)
+        lines = self.capture.drain()
+        self.capture.close()
+        return lines
+
+    def close(self) -> tuple:
+        """``(records, info)`` of the window; detaches the handler."""
+        mem_lines = self.detach()
+        window = read_window(self.anchor)
+        memory = [r for r in map(parse_line, mem_lines) if r is not None]
+        records, restored, absent = _merge_window(
+            window.records, memory, window.complete)
+        info = {
+            "files": window.files,
+            "rotations": window.rotations,
+            "complete": window.complete,
+            "note": window.note,
+            "bytes_read": window.bytes_read,
+            "file_records": len(window.records),
+            "memory_records": len(memory),
+            "restored_from_memory": len(restored),
+            "not_in_log": len(absent),
+            "not_in_log_first": absent[0].raw[:200] if absent else "",
+            "memory_capture": ("on" if self.capture is not None
+                               else f"off: {self.capture_off}"),
+        }
+        return records, info
+
+
+def _merge_window(file_records: list, memory_records: list,
+                  complete: bool) -> tuple:
+    """``(records, restored, absent)`` of a window.
+
+    Each memory record is matched to one identical line of the files (same
+    timestamp, level, thread and message). The rest is ``restored`` when
+    the files that should hold it are gone (the window lost its start:
+    records up to the first one the surviving files hold), and put back at
+    its timestamp, after the file records of the same millisecond.
+    Otherwise it is ``absent``: this process emitted it, the log does not
+    have it, and the window stays what the log holds.
+    """
+    pending = Counter(r.raw for r in file_records)
+    missing = []
+    for rec in memory_records:
+        if pending[rec.raw] > 0:
+            pending[rec.raw] -= 1
+        else:
+            missing.append(rec)
+    if complete or not missing:
+        return list(file_records), [], missing
+    if file_records:
+        first_ts = file_records[0].ts
+        restored = [r for r in missing if r.ts <= first_ts]
+        absent = [r for r in missing if r.ts > first_ts]
+    else:
+        restored, absent = missing, []
+    merged = list(heapq.merge(file_records, restored, key=lambda r: r.ts))
+    return merged, restored, absent
+
+
+def _say_window(ctx) -> None:
+    """Say what a reader of the log assertions must know about the window."""
+    info = ctx.log_window
+    if not info.get("complete", True):
+        kept = (f"{info.get('restored_from_memory')} record(s) of this "
+                f"process written there are restored from memory"
+                if str(info.get("memory_capture", "")).startswith("on")
+                else "no in-memory capture: records written there are lost")
+        print(f"[validation] log window of {ctx.scenario_id} is incomplete: "
+              f"{info.get('note')}; {kept}; lines of OTHER processes written "
+              f"there are lost")
+    if info.get("not_in_log"):
+        print(f"[validation] {info.get('not_in_log')} record(s) emitted by "
+              f"this process during {ctx.scenario_id} are NOT in the debug "
+              f"log {ctx.log_path} (a write that failed, or a line mangled "
+              f"in the file); they are not in ctx.records either. First: "
+              f"{info.get('not_in_log_first')}")
 
 
 def run_scenario(scenario_or_path) -> dict:
@@ -158,22 +340,40 @@ def run_scenario(scenario_or_path) -> dict:
     print(f"[validation] start scenario={ctx.scenario_id} "
           f"invariant={ctx.invariant} trace_id={ctx.trace_id}")
 
-    ctx.log_offset_start = log_file_size(ctx.log_path)
+    window = _LogWindow(ctx.log_path)
+    ctx.log_offset_start = window.anchor.offset
     t_setup_start = time.monotonic()
 
-    setup = getattr(scenario_module, "setup", None)
-    if setup is not None:
-        setup(ctx)
-    t_run_start = time.monotonic()
-    scenario_module.run(ctx)
-    t_run_end = time.monotonic()
+    teardown = getattr(scenario_module, "teardown", None)
+    try:
+        setup = getattr(scenario_module, "setup", None)
+        if setup is not None:
+            setup(ctx)
+        t_run_start = time.monotonic()
+        scenario_module.run(ctx)
+        t_run_end = time.monotonic()
 
-    # Give the rotating handler a chance to flush.
-    time.sleep(0.2)
-    ctx.log_offset_end = log_file_size(ctx.log_path)
-    ctx.records = _capture_log_window(ctx)
+        # Give the rotating handler a chance to flush.
+        time.sleep(0.2)
+        ctx.log_offset_end = log_file_size(ctx.log_path)
+        ctx.records, ctx.log_window = window.close()
+        _say_window(ctx)
 
-    raw_assertions = list(scenario_module.assertions(ctx))
+        raw_assertions = list(scenario_module.assertions(ctx))
+    except BaseException:
+        # The scenario is already lost; what it started must not become the
+        # next scenario's problem. Its own exception is the one reported.
+        # Nor may its in-memory log handler outlive it.
+        window.detach()
+        _run_teardown(teardown, ctx)
+        raise
+    teardown_error = _run_teardown(teardown, ctx)
+    if teardown_error:
+        raw_assertions.append((
+            "_teardown_released_everything", False,
+            f"teardown(ctx) raised {teardown_error}: what this scenario "
+            f"started (threads, journals, layers) may still be running "
+            f"during the next one"))
     summary: AssertionSummary = summarize(raw_assertions)
 
     duration_ms = int((time.monotonic() - t_setup_start) * 1000)
@@ -187,8 +387,12 @@ def run_scenario(scenario_or_path) -> dict:
         "duration_ms": duration_ms,
         "run_ms": run_ms,
         "log_path": str(ctx.log_path),
-        "log_window_bytes": ctx.log_offset_end - ctx.log_offset_start,
+        # Bytes read across the rotation chain; the difference of two
+        # offsets of a file that turned over meant nothing (it went
+        # negative exactly when the window came back empty).
+        "log_window_bytes": ctx.log_window.get("bytes_read", 0),
         "log_records_captured": len(ctx.records),
+        "log_window": ctx.log_window,
         "assertions": [
             {"name": name, "ok": ok, "message": msg}
             for (name, ok, msg) in raw_assertions
@@ -208,6 +412,26 @@ def run_scenario(scenario_or_path) -> dict:
         marker = "PASS" if ok else "FAIL"
         print(f"  [{marker}] {name}: {msg}")
     return verdict
+
+
+def _run_teardown(teardown, ctx) -> str:
+    """Call the optional ``teardown(ctx)``; return "" or what it raised.
+
+    Scenarios had no way to release what they start: the contract stopped
+    at assertions(ctx), so a writer thread, a journal connection or a map
+    layer created by one scenario lived on through every later one (the
+    headless runner now reports those as LEAK). teardown(ctx) runs after
+    the assertions, whatever happened before it, and is optional.
+    """
+    if teardown is None:
+        return ""
+    try:
+        teardown(ctx)
+    except Exception as exc:  # noqa: BLE001 - reported, never masks a verdict
+        import traceback
+        traceback.print_exc()
+        return repr(exc)
+    return ""
 
 
 def run_regression_suite() -> dict:

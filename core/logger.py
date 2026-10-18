@@ -57,22 +57,114 @@ class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
     _RETRY_DELAY_S = 60.0
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
         self._rollover_retry_at = 0.0
+        super().__init__(*args, **kwargs)
+
+    def _open(self):
+        """Open with Win32 FILE_APPEND_DATA so multi-process appends never collide."""
+        if os.name == "nt" and "a" in (self.mode or "a"):
+            try:
+                import ctypes
+                import msvcrt
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.CreateFileW.argtypes = [
+                    ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                    ctypes.c_void_p,
+                ]
+                kernel32.CreateFileW.restype = ctypes.c_void_p
+                handle = kernel32.CreateFileW(
+                    self.baseFilename,
+                    0x0004 | 0x00100000,  # FILE_APPEND_DATA | SYNCHRONIZE
+                    0x0001 | 0x0002,      # FILE_SHARE_READ | FILE_SHARE_WRITE
+                    None,
+                    4,                    # OPEN_ALWAYS
+                    0x80,                 # FILE_ATTRIBUTE_NORMAL
+                    None,
+                )
+                invalid = ctypes.c_void_p(-1).value
+                if handle is not None and handle != invalid:
+                    fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_TEXT)
+                    return os.fdopen(
+                        fd, "w", encoding=self.encoding or "utf-8",
+                        errors=self.errors)
+            except Exception:  # noqa: BLE001 # nosec B110 - fall back to stdlib open
+                pass
+        return super()._open()
 
     def doRollover(self):
+        """Rotate only once the current file is known to be movable.
+
+        The stock rollover shifts the backups (.4 -> .5, deleting the
+        oldest) BEFORE renaming the live file. When a sibling QGIS holds
+        that file, the rename fails after the shift: every failed attempt
+        destroyed one backup, 4 of the 5 forensic files within minutes.
+        Here the live file is moved aside FIRST; the backups are only
+        shifted once that move succeeded.
+
+        A shift can still fail: on Windows a backup opened by a reader that
+        does not share deletion (antivirus, indexer, a `tail`, another
+        QGIS) cannot be renamed. The generation just moved aside then
+        stays in `.rolling`, newest after the live file, where log readers
+        look for it (parse_log._chain_paths). It is never deleted: the
+        next rollover moves it into the chain first, and postpones itself
+        while it cannot. Each failure writes a named `#` line in the live
+        file instead of being swallowed.
+        """
         if time.monotonic() < self._rollover_retry_at:
             return
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        aside = self.baseFilename + ".rolling"
+        if os.path.exists(aside):
+            try:
+                self._shift_into_chain(aside)
+            except OSError as exc:
+                self._postpone(
+                    f"# rollover postponed (backup shift: {exc}); "
+                    f"{os.path.basename(aside)} kept, still appending here\n")
+                return
         try:
-            super().doRollover()
-            self._rollover_retry_at = 0.0
+            os.replace(self.baseFilename, aside)
         except OSError as exc:
-            self._rollover_retry_at = time.monotonic() + self._RETRY_DELAY_S
-            if self.stream is None:
-                self.stream = self._open()
+            self._postpone(
+                f"# rollover postponed ({exc}); still appending here\n")
+            return
+        self._rollover_retry_at = 0.0
+        self.stream = self._open()
+        try:
+            self._shift_into_chain(aside)
+        except OSError as exc:
             self.stream.write(
-                f"# rollover postponed ({exc}); still appending here\n"
-            )
+                f"# backup shift postponed ({exc}); "
+                f"{os.path.basename(aside)} kept\n")
+
+    def _postpone(self, line: str) -> None:
+        """Keep appending to the live file, retry the rollover later."""
+        self._rollover_retry_at = time.monotonic() + self._RETRY_DELAY_S
+        self.stream = self._open()
+        self.stream.write(line)
+
+    def _shift_into_chain(self, aside: str) -> None:
+        """Move *aside* to `.1`, pushing the backups down to the first free slot.
+
+        Only a full chain loses its oldest generation (the retention of
+        `backupCount` copies). A hole left by an earlier failed shift is
+        filled instead: a generation still within the retention is never
+        deleted to make room. Renames go from the oldest end, so a failure
+        halfway leaves every generation on disk, in order, around one hole.
+        """
+        names = [self.rotation_filename(f"{self.baseFilename}.{i}")
+                 for i in range(1, max(1, self.backupCount) + 1)]
+        free = next((i for i, name in enumerate(names)
+                     if not os.path.exists(name)), None)
+        if free is None:
+            os.remove(names[-1])
+            free = len(names) - 1
+        for i in range(free, 0, -1):
+            os.rename(names[i - 1], names[i])
+        os.rename(aside, names[0])
 
 
 _file_logger = logging.getLogger("RecoverLand.FileDebug")
@@ -231,21 +323,20 @@ def _format_kv_value(value) -> str:
           close the wrapper
         - other special character     -> wrapped in double quotes
     """
-    s = _escape_line_breaks(str(value))
+    s = str(value)
     if s == "":
         return '""'
-    if not any(c in s for c in _KV_QUOTE_TRIGGERS):
+    if not any(c in s for c in _KV_QUOTE_TRIGGERS + ("\r",)):
+        # Bare token: a Windows path without spaces stays exactly as is.
         return s
-    has_double = '"' in s
-    has_single = "'" in s
-    if has_double and not has_single:
-        return f"'{s}'"
-    if has_double and has_single:
-        # Backslashes are left alone here on purpose, as everywhere else
-        # in this module: doubling them would rewrite every Windows path
-        # of the log, and they are no longer used as an escape character.
-        return '"{}"'.format(s.replace('"', _KV_DQUOTE_ESCAPE))
-    return f'"{s}"'
+    # Anything that needs quoting is written as a JSON string: quotes,
+    # backslashes, tabs and line breaks all escaped by one standard, so
+    # the reader (parse_log) decodes the value EXACTLY with json.loads.
+    # The previous scheme left backslashes raw: "\n" in a record could be
+    # an escaped line break or the start of a path, and the round trip
+    # lost multi-line values and values with both quote characters.
+    import json as _json
+    return _json.dumps(s, ensure_ascii=False)
 
 
 def flog_kv(level: str, event: str, *, module: str, **fields) -> None:
@@ -280,6 +371,8 @@ _QLOG_LEVELS = {
     "INFO": QgisCompat.MSG_INFO,
     "WARNING": QgisCompat.MSG_WARNING,
     "ERROR": QgisCompat.MSG_CRITICAL,
+    # A CRITICAL message used to fall through to Info in the log panel.
+    "CRITICAL": QgisCompat.MSG_CRITICAL,
 }
 
 
@@ -295,6 +388,63 @@ def qlog(message: str, level: str = "INFO") -> None:
         QgsMessageLog.logMessage(message, PLUGIN_NAME, qgis_level)
     except Exception as exc:  # QGIS message log unavailable (shutdown, no UI)
         _file_logger.debug("QgsMessageLog unavailable: %s", exc)
+
+
+# ----------------------------------------------------------------------
+# JSON Lines forensic sink: one self-describing JSON object per line,
+# readable by a machine after an incident whatever the values contain.
+# ----------------------------------------------------------------------
+
+_EVENTS_FILE = os.path.join(os.path.dirname(_LOG_FILE), "recoverland_events.jsonl")
+_events_logger = logging.getLogger("RecoverLand.Events")
+_events_logger.setLevel(logging.DEBUG)
+_events_logger.propagate = False
+if not _events_logger.handlers:
+    try:
+        _eh = _SharedRotatingFileHandler(
+            _EVENTS_FILE, mode='a', maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUP_COUNT, encoding='utf-8')
+        _eh.setLevel(logging.DEBUG)
+        _eh.setFormatter(logging.Formatter('%(message)s'))
+        _events_logger.addHandler(_eh)
+    except Exception as exc:  # noqa: BLE001 - the text log still works
+        _file_logger.warning("log: cannot open JSON Lines sink %s: %s",
+                             _EVENTS_FILE, exc)
+
+
+def jlog(event: str, level: str = "INFO", component: str = "",
+         trace_id: str = "", **fields) -> None:
+    """Record a technical event as ONE JSON line (and mirror it in the text log).
+
+    Keys always present: ts, level, component, trace_id, event, pid,
+    thread. Everything else is caller data (project, layer, commit_id,
+    event_count, queue_depth, state_before, state_after, duration_ms,
+    error_code, error_detail, ...). json.dumps escapes every character that
+    could split or confuse a line.
+    """
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+    record = {
+        "ts": _dt.now(_tz.utc).isoformat(),
+        "level": level,
+        "component": component,
+        "trace_id": trace_id,
+        "event": event,
+        "pid": os.getpid(),
+        "thread": threading.current_thread().name,
+    }
+    record.update(fields)
+    try:
+        line = _json.dumps(record, ensure_ascii=False, default=str)
+    except (TypeError, ValueError) as exc:
+        line = _json.dumps({"ts": record["ts"], "event": event,
+                            "error": f"unserialisable fields: {exc}"})
+    try:
+        _events_logger.info(line)
+    except Exception:  # noqa: BLE001 # nosec B110 - logging must never raise
+        pass
+    flog_kv(level, event, module=component or "recoverland",
+            trace_id=trace_id, **fields)
 
 
 def generate_trace_id() -> str:

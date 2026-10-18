@@ -3,7 +3,7 @@ stress_edit.py  -  Stress-test éditions aléatoires pour RecoverLand Rewind
 ==========================================================================
 Lance depuis la console Python QGIS :
 
-    exec(open('C:/Users/yadda/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/stress_edit.py').read())
+    exec(open('C:/Users/<user>/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/stress_edit.py').read())
 
 Ou copie-colle le contenu dans la console.
 

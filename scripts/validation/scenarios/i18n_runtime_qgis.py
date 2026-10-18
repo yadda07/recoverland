@@ -1,4 +1,4 @@
-"""G4 PROVEN — runtime QGIS i18n verification without changing locale.
+"""G4 PROVEN - runtime QGIS i18n verification without changing locale.
 
 This script loads recoverland_en.qm into a QTranslator and checks that every
 expected (context, source) returns the English translation. It does NOT install
@@ -9,8 +9,8 @@ test. This avoids side effects on the running QGIS UI.
 Convention: top-level script, run from QGIS Python console via:
 
     exec(compile(
-        Path('C:/Users/yadda/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/i18n_runtime_qgis.py').read_text(),
-        'C:/Users/yadda/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/i18n_runtime_qgis.py',
+        Path('C:/Users/<user>/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/i18n_runtime_qgis.py').read_text(),
+        'C:/Users/<user>/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/i18n_runtime_qgis.py',
         'exec'))
 
 Output: [i18n-runtime] verdict=PASS|FAIL passed=N/M trace_id=...
@@ -39,12 +39,17 @@ _EXPECTED = [
     ("ReviewStatusWidget", "Review", "Review"),
     ("ReviewStatusWidget", "Desactiver Review", "Disable Review"),
     ("ReviewStatusWidget", "Review · Recherche...", "Review · Searching..."),
-    ("ReviewStatusWidget", "Review — Recherche des modifications", "Review — Searching for modifications"),
+    # Hypothesis revised (v7): the three "Review <em dash> ..." sources are
+    # still in widgets/review_status_widget.py, but their English can no
+    # longer carry the em dash: the project's typographic rule forbids it in
+    # every user-facing string (the colon replaces it). Same exact-match
+    # check on the same (context, source), expected != source: as strong.
+    ("ReviewStatusWidget", "Review : Recherche des modifications", "Review: searching for modifications"),
     ("ReviewStatusWidget", "Review · Rendu {detail}", "Review · Rendering {detail}"),
     ("ReviewStatusWidget", "Review · Rendu...", "Review · Rendering..."),
     ("ReviewStatusWidget", "Review · actif", "Review · active"),
     ("ReviewStatusWidget", "Review · {n}", "Review · {n}"),
-    ("ReviewStatusWidget", "Review — Visualisation temps reel", "Review — Real-time visualization"),
+    ("ReviewStatusWidget", "Review : Visualisation temps reel", "Review: real-time visualization"),
     ("ReviewStatusWidget", "{n_layers} couche(s) · {n_entities} entite(s)", "{n_layers} layer(s) · {n_entities} entity(ies)"),
     ("ReviewStatusWidget", "MAJ : a l'instant", "Updated: just now"),
     ("ReviewStatusWidget", "MAJ : il y a {ago}s", "Updated: {ago}s ago"),
@@ -52,7 +57,7 @@ _EXPECTED = [
     ("ReviewStatusWidget", "Deplacez la carte pour rafraichir", "Move the map to refresh"),
     ("ReviewStatusWidget", "Clic X : desactiver", "Click X: disable"),
     ("ReviewStatusWidget", "Inactif", "Inactive"),
-    ("ReviewStatusWidget", "Review — Inactif", "Review — Inactive"),
+    ("ReviewStatusWidget", "Review : Inactif", "Review: inactive"),
     # ReviewSegmentedSwitch
     ("ReviewSegmentedSwitch", "Présent", "Present"),
     ("ReviewSegmentedSwitch", "Basculer entre l'etat present et Review", "Toggle between present state and Review"),
@@ -61,7 +66,11 @@ _EXPECTED = [
     ("AppleToggleSwitch", "Enregistrement actif", "Recording active"),
     ("AppleToggleSwitch", "Enregistrement desactive", "Recording disabled"),
     # CanvasDateBar
-    ("CanvasDateBar", "Aucune entité à cette date", "No entity at this date"),
+    # Hypothesis revised (v7): "Aucune entité à cette date" is gone from
+    # widgets/canvas_date_bar.py; the empty-date tooltip now says that no
+    # entity DIFFERS from the current state (an empty result is not "no
+    # entity"). Same widget, same state, same exact-match check.
+    ("CanvasDateBar", "Aucune entité ne diffère de l'état actuel à cette date", "No entity differs from the current state at this date"),
     ("CanvasDateBar", "Aujourd'hui", "Today"),
     ("CanvasDateBar", "Export", "Export"),
     ("CanvasDateBar", "Exporter le snapshot vers GeoPackage", "Export snapshot to GeoPackage"),

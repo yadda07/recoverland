@@ -1,7 +1,8 @@
 """Template scenario for RecoverLand runtime validation.
 
 Copy this file, rename it `<id>_<short_name>.py`, fill the four
-hooks. Run it from the QGIS Python console:
+hooks (and teardown if the scenario starts anything). Run it from the
+QGIS Python console:
 
     from pathlib import Path
     SCRIPTS = Path(r'C:\\Users\\<user>\\AppData\\Roaming\\QGIS\\QGIS4'
@@ -17,6 +18,7 @@ Contract:
     setup(ctx):                idempotent state preparation
     run(ctx):                  the action under test
     assertions(ctx) -> list:   list of (name, ok, message) tuples
+    teardown(ctx):             optional; releases what setup/run started
 """
 from __future__ import annotations
 
@@ -68,6 +70,23 @@ def assertions(ctx):
         ]
     """
     return []
+
+
+def teardown(ctx):
+    """Optional: release what setup/run started. Delete it if nothing is.
+
+    The runner calls it last, after the assertions, even when setup, run or
+    the assertions raised. Every scenario of a suite shares one QGIS: a
+    writer thread, a journal connection, an outbox segment or a map layer
+    left alive here runs, or holds its file, during the next scenario, and
+    the suite reports it as a LEAK of this one. If it raises, the scenario
+    gets a failing assertion (_teardown_released_everything).
+    Example:
+        wq = ctx.data.get("write_queue")
+        if wq is not None:
+            wq.stop()
+    """
+    return
 
 
 if __name__ == "__main__":

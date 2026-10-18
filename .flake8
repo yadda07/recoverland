@@ -1,6 +1,6 @@
 [flake8]
 max-line-length = 120
-exclude = .git,__pycache__,build,_vendor,scripts/orchestrator,scripts/tmp_*.py
+exclude = .git,__pycache__,build,dist,_vendor,scripts/orchestrator,scripts/tmp_*.py,scripts/validation/scrub_*.py
 per-file-ignores =
     tests/*:E402
     widgets/toggle_switch.py:E221

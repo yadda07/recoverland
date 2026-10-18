@@ -1,19 +1,22 @@
+"""Bandeau de synthese et d'etat du journal local (contour actif sans soulignement redondant)."""
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
 from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtGui import QColor
-from qgis.PyQt.QtWidgets import QPushButton, QHBoxLayout, QLabel, QVBoxLayout, QWidget
-from qgis.core import QgsApplication
+from qgis.PyQt.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from .compat import QtCompat
-
-_TILE_ICONS: Dict[str, str] = {
-    "ALL": '/mIconDbSchema.svg',
-    "UPDATE": '/mActionRefresh.svg',
-    "DELETE": '/mActionDeleteSelected.svg',
-    "INSERT": '/mActionAdd.svg',
-}
+from .widgets.icons import couleur_etat, icone_etat, theme_pixmap
+from .widgets.theme import (
+    HAUTEUR_CONFORTABLE,
+    ICONE_MD,
+    ICONE_SM,
+    RAYON_CONTROLE,
+    RAYON_PANNEAU,
+    resolve_theme,
+    rgba_css,
+)
 
 
 @dataclass(frozen=True)
@@ -38,42 +41,42 @@ class SmartBarState:
     health_suggestion: str = ""
 
 
-def _rgba(color: QColor, alpha: int) -> str:
-    return f"rgba({color.red()}, {color.green()}, {color.blue()}, {alpha})"
-
-
 class SmartBarTile(QPushButton):
+    """Tuile d'indicateur et de filtre d'operation (contour actif seul, zero fond parasite)."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._visual_mode = "idle"
+        self._metric_key = "ALL"
         self.setObjectName("smartBarTile")
         self.setCursor(QtCompat.POINTING_HAND_CURSOR)
-        self.setMinimumHeight(38)
-        self.setMinimumWidth(90)
+        self.setFixedHeight(HAUTEUR_CONFORTABLE)
+        self.setMinimumWidth(96)
         self.setSizePolicy(QtCompat.SIZE_EXPANDING, QtCompat.SIZE_FIXED)
         self._icon_label = QLabel(self)
-        self._icon_label.setFixedSize(20, 20)
+        self._icon_label.setFixedSize(ICONE_MD, ICONE_MD)
+        self._icon_label.setStyleSheet("background: transparent; border: none;")
         self._value_label = QLabel("0", self)
         self._title_label = QLabel("", self)
         for child in (self._icon_label, self._value_label, self._title_label):
             child.setAttribute(QtCompat.WA_TRANSPARENT_FOR_MOUSE)
         content = QHBoxLayout(self)
-        content.setContentsMargins(8, 4, 8, 4)
-        content.setSpacing(6)
+        content.setContentsMargins(12, 4, 12, 4)
+        content.setSpacing(10)
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(1)
+        text_col.setSpacing(0)
+        text_col.addStretch(1)
         text_col.addWidget(self._value_label)
         text_col.addWidget(self._title_label)
+        text_col.addStretch(1)
         content.addWidget(self._icon_label, 0, QtCompat.ALIGN_VCENTER)
         content.addLayout(text_col, 1)
         self._refresh_theme()
 
     def apply_state(self, tile_state: SmartBarTileState) -> None:
+        self._metric_key = tile_state.key
         self.setProperty("metric_key", tile_state.key)
-        icon_path = _TILE_ICONS.get(tile_state.key, _TILE_ICONS["ALL"])
-        icon = QgsApplication.getThemeIcon(icon_path)
-        self._icon_label.setPixmap(icon.pixmap(20, 20))
         self._value_label.setText(tile_state.value)
         self._title_label.setText(tile_state.label)
         self.setToolTip(tile_state.tooltip)
@@ -85,55 +88,60 @@ class SmartBarTile(QPushButton):
         self._refresh_theme()
 
     def _refresh_theme(self) -> None:
-        pal = self.palette()
-        text = pal.windowText().color()
-        highlight = pal.highlight().color()
-        mid = pal.mid().color()
+        t = resolve_theme(self)
+        sem_color = couleur_etat(self._metric_key, t)
         if self._visual_mode == "active":
-            bg = _rgba(highlight, 30)
-            border = _rgba(highlight, 100)
-            hover_bg = _rgba(highlight, 45)
-            value_color = text.name()
+            bg = t.accent_doux.name()
+            border = f"1px solid {t.accent.name()}"
+            hover_bg = t.surface_survol.name()
+            val_color = t.texte.name()
+            lbl_color = t.accent.name()
+            ic_color = sem_color
         elif self._visual_mode == "disabled":
-            bg = _rgba(mid, 12)
-            border = _rgba(mid, 30)
+            bg = t.surface_douce.name()
+            border = f"1px solid {t.ligne.name()}"
             hover_bg = bg
-            value_color = _rgba(text, 88)
+            val_color = t.tertiaire.name()
+            lbl_color = t.tertiaire.name()
+            ic_color = t.tertiaire
         else:
-            bg = _rgba(mid, 18)
-            border = _rgba(mid, 40)
-            hover_bg = _rgba(mid, 30)
-            value_color = text.name()
-        title_color = _rgba(text, 160)
+            bg = t.surface_douce.name()
+            border = f"1px solid {t.ligne.name()}"
+            hover_bg = t.surface_survol.name()
+            val_color = t.texte.name()
+            lbl_color = t.secondaire.name()
+            ic_color = sem_color
+
+        pm = theme_pixmap(icone_etat(self._metric_key), color=ic_color, size=ICONE_MD)
+        if not pm.isNull():
+            self._icon_label.setPixmap(pm)
+
         self.setStyleSheet(
             f"QPushButton#smartBarTile {{"
-            f"background-color: {bg};"
-            f"border: 1px solid {border};"
-            f"border-radius: 4px;"
-            f"text-align: left;"
-            f"padding: 0px;"
+            f"  background-color: {bg};"
+            f"  border: {border};"
+            f"  border-radius: {RAYON_CONTROLE}px;"
+            f"  text-align: left;"
+            f"  padding: 0px;"
             f"}}"
             f"QPushButton#smartBarTile:hover {{"
-            f"background-color: {hover_bg};"
+            f"  background-color: {hover_bg};"
+            f"  border-color: {t.accent.name()};"
             f"}}"
         )
         self._value_label.setStyleSheet(
-            f"font-size: 13px; font-weight: 700; color: {value_color};"
+            f"font-family: '{t.police_titre}'; font-size: 14px; font-weight: 700; "
+            f"color: {val_color}; background: transparent; border: none;"
         )
         self._title_label.setStyleSheet(
-            f"font-size: 9px; font-weight: 600; color: {title_color};"
+            f"font-family: '{t.police}'; font-size: 10px; font-weight: 600; "
+            f"color: {lbl_color}; background: transparent; border: none;"
         )
-
-
-_HEALTH_COLORS = {
-    "healthy": None,
-    "info": QColor(66, 133, 244),
-    "warning": QColor(255, 152, 0),
-    "critical": QColor(219, 68, 55),
-}
 
 
 class JournalInfoBar(QWidget):
+    """Bandeau de source et d'activite du journal local inspire de VTT."""
+
     metricActivated = pyqtSignal(str)
     maintenanceRequested = pyqtSignal()
 
@@ -141,6 +149,11 @@ class JournalInfoBar(QWidget):
         super().__init__(parent)
         self.setObjectName("journalInfoBar")
         self.setSizePolicy(QtCompat.SIZE_EXPANDING, QtCompat.SIZE_FIXED)
+        self._source_icon = QLabel(self)
+        self._source_icon.setFixedSize(ICONE_SM, ICONE_SM)
+        self._source_icon.setStyleSheet("background: transparent; border: none;")
+        self._status_dot = QLabel(self)
+        self._status_dot.setFixedSize(8, 8)
         self._title_label = QLabel(self)
         self._meta_label = QLabel(self)
         self._message_label = QLabel(self)
@@ -151,19 +164,24 @@ class JournalInfoBar(QWidget):
         self._health_label.setCursor(QtCompat.POINTING_HAND_CURSOR)
         self._health_label.mousePressEvent = lambda _e: self.maintenanceRequested.emit()
         self._current_health = "healthy"
+        self._current_mode = "ready"
         self._refreshing = False
         self._tiles: Dict[str, SmartBarTile] = {}
+
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 6, 10, 6)
-        root.setSpacing(4)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(6)
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
-        top.setSpacing(10)
-        top.addWidget(self._title_label)
-        top.addWidget(self._meta_label)
+        top.setSpacing(8)
+        top.addWidget(self._source_icon, 0, QtCompat.ALIGN_VCENTER)
+        top.addWidget(self._status_dot, 0, QtCompat.ALIGN_VCENTER)
+        top.addWidget(self._title_label, 0, QtCompat.ALIGN_VCENTER)
+        top.addWidget(self._meta_label, 0, QtCompat.ALIGN_VCENTER)
         top.addStretch(1)
         top.addWidget(self._message_label, 2)
         self._top_layout = top
+
         tiles_row = QHBoxLayout()
         tiles_row.setContentsMargins(0, 0, 0, 0)
         tiles_row.setSpacing(8)
@@ -186,6 +204,7 @@ class JournalInfoBar(QWidget):
         self._message_label.setText(state.message)
         self._message_label.setVisible(bool(state.message))
         self._current_health = state.health_level
+        self._current_mode = state.mode
         has_health = bool(state.health_message)
         self._health_label.setText(state.health_message)
         self._health_label.setToolTip(state.health_suggestion)
@@ -225,36 +244,47 @@ class JournalInfoBar(QWidget):
                 self._refreshing = False
 
     def _refresh_theme(self) -> None:
-        pal = self.palette()
-        text = pal.windowText().color()
-        highlight = pal.highlight().color()
-        mid = pal.mid().color()
+        t = resolve_theme(self)
+        dot_color = (
+            t.tertiaire if self._current_mode != "ready"
+            else couleur_etat(self._current_health, t)
+        )
+        pm = theme_pixmap("database", color=dot_color, size=ICONE_SM)
+        if not pm.isNull():
+            self._source_icon.setPixmap(pm)
+        self._status_dot.setStyleSheet(
+            f"background-color: {dot_color.name()}; border-radius: 4px; border: none; "
+            f"min-width: 8px; min-height: 8px; max-width: 8px; max-height: 8px;"
+        )
         self.setStyleSheet(
             f"QWidget#journalInfoBar {{"
-            f"background-color: {_rgba(highlight, 14)};"
-            f"border: 1px solid {_rgba(mid, 60)};"
-            f"border-radius: 4px;"
+            f"  background-color: {t.surface.name()};"
+            f"  border: 1px solid {t.ligne.name()};"
+            f"  border-radius: {RAYON_PANNEAU}px;"
             f"}}"
         )
         self._title_label.setStyleSheet(
-            f"font-size: 12px; font-weight: 700; color: {text.name()};"
+            f"font-family: '{t.police_titre}'; font-size: 13px; font-weight: 700; "
+            f"color: {t.texte.name()}; background: transparent; border: none;"
         )
         self._meta_label.setStyleSheet(
-            f"font-size: 11px; font-weight: 500; color: {_rgba(text, 150)};"
+            f"font-family: '{t.police_titre}'; font-size: 11px; font-weight: 600; "
+            f"color: {t.secondaire.name()}; background-color: {t.surface_douce.name()}; "
+            f"border: 1px solid {t.ligne.name()}; border-radius: 10px; padding: 2px 8px;"
         )
         self._message_label.setStyleSheet(
-            f"font-size: 11px; font-weight: 500; color: {_rgba(text, 180)};"
+            f"font-size: 11px; font-weight: 500; color: {t.secondaire.name()}; "
+            f"background: transparent; border: none;"
         )
-        health_color = _HEALTH_COLORS.get(self._current_health)
-        if health_color is not None:
+        if self._current_health in ("warning", "critical", "info"):
+            h_col = couleur_etat(self._current_health, t)
             self._health_label.setStyleSheet(
-                f"font-size: 11px; font-weight: 600; "
-                f"color: {health_color.name()}; "
-                f"padding: 2px 6px; "
-                f"background: {_rgba(health_color, 20)}; "
-                f"border-radius: 6px;"
+                f"font-size: 11px; font-weight: 600; color: {h_col.name()}; "
+                f"padding: 4px 8px; background: {rgba_css(h_col, 24)}; "
+                f"border: 1px solid {rgba_css(h_col, 90)}; border-radius: {RAYON_CONTROLE}px;"
             )
         else:
             self._health_label.setStyleSheet(
-                f"font-size: 11px; font-weight: 500; color: {_rgba(text, 150)};"
+                f"font-size: 11px; font-weight: 500; color: {t.secondaire.name()}; "
+                f"background: transparent; border: none;"
             )

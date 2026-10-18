@@ -23,6 +23,36 @@ def trace_prefix(trace_id: str) -> str:
     return f"[{trace_id}] " if trace_id else ""
 
 
+# Outcome tags of a job run through QgsTask. QgsTaskWrapper.finished()
+# calls ``on_finished(exception, values)`` only ``if self.returned_values``:
+# a job that legitimately found NOTHING ([] events, {} digests) reached
+# on_finished with no result at all and emitted no signal. The dialog then
+# waited forever ("recovering", Rewind blocked until QGIS restarts). Every
+# outcome is therefore boxed in a tuple, which is never falsy.
+_TASK_DONE = "done"
+_TASK_CANCELLED = "cancelled"
+
+
+def _boxed(function):
+    """Wrap a task function so its outcome always reaches on_finished.
+
+    The cancel is read BEFORE the value: a job does not say how far it got.
+    Several hand back what they hold when they see is_cancelled() (the
+    journal statistics their half-filled StatsResult, the geometry index
+    the digests of the features read so far); taken as a result, that
+    part was delivered as the whole (the dialog then announced a journal
+    without any layer). A task cancelled from the QGIS task manager is
+    therefore always CANCELLED, whatever it returned; anything else, empty
+    included, is a result.
+    """
+    def _run(task, *args, **kwargs):
+        value = function(task, *args, **kwargs)
+        if task.isCanceled():
+            return (_TASK_CANCELLED, None)
+        return (_TASK_DONE, value)
+    return _run
+
+
 def supports_qgs_task() -> bool:
     return (
         QgsTask is not None and QgsApplication is not None and hasattr(QgsApplication, "taskManager")
@@ -126,7 +156,7 @@ class TaskEnabledThread(QThread):
         self._running = True
         self._task = QgsTask.fromFunction(
             description,
-            function,
+            _boxed(function),
             on_finished=on_finished,
             **kwargs,
         )
@@ -147,6 +177,13 @@ class TaskEnabledThread(QThread):
         self.start()
 
     def _handle_task_finished(self, exception, result, result_signal, label):
+        """Deliver exactly one outcome of a finished job.
+
+        Silence is only legitimate when the CALLER cancelled (stop()): it
+        gave up and expects nothing. Every other ending emits: the result
+        (an empty one included), or error_occurred, including a job
+        cancelled from the QGIS task manager, which used to vanish.
+        """
         from .core.logger import flog
         prefix = trace_prefix(self._trace_id)
         cancelled = self._stopped
@@ -158,8 +195,20 @@ class TaskEnabledThread(QThread):
                 flog(f"{prefix}{label}: error: {exception}", "ERROR")
                 self.error_occurred.emit(str(exception))
                 return
-            if result is not None:
-                result_signal.emit(result)
+            tag, value = (result if isinstance(result, tuple) and len(result) == 2
+                          and result[0] in (_TASK_DONE, _TASK_CANCELLED)
+                          else (_TASK_DONE if result is not None else None, result))
+            if tag == _TASK_DONE:
+                result_signal.emit(value)
+                return
+            reason = ("cancelled outside RecoverLand (QGIS task manager)"
+                      if tag == _TASK_CANCELLED else
+                      "finished without any outcome")
+            flog(f"{prefix}{label}: {reason}", "WARNING")
+            self.error_occurred.emit(QCoreApplication.translate(
+                "TaskEnabledThread",
+                "Tache interrompue avant son terme ({reason})").format(
+                    reason=reason))
         finally:
             # After the outcome of the finished job has been delivered, so
             # a deferred restart never overwrites it.

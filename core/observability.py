@@ -3,17 +3,17 @@
 Goal: make the log self-explanatory so a reader can reconstruct what
 happened without needing to read the code. Three primitives:
 
-1. ``CycleStats`` — accumulator for stats during a rewind/undo cycle.
+1. ``CycleStats``: accumulator for stats during a rewind/undo cycle.
    Use ``record(key, value)`` or ``add(key, n=1)`` from each phase, then
    ``finalize(cycle_name, elapsed_ms)`` at the end emits one
    ``CYCLE_SUMMARY`` line followed by ``CYCLE_ANOMALY`` lines for any
    suspicious pattern.
 
-2. ``log_state_transition`` — log every change of a critical flag in
+2. ``log_state_transition``: log every change of a critical flag in
    the dialog state machine so we correlate UI state with runtime.
    Stuck flags (``_is_recovering`` left True after crash) are visible.
 
-3. ``assert_invariant`` — log CRITICAL when a documented invariant is
+3. ``assert_invariant``: log CRITICAL when a documented invariant is
    violated (e.g. trace event without entity_fingerprint), with a short
    stack hint. Returns the condition so callers can early-return.
 
@@ -37,20 +37,27 @@ from .logger import flog, _format_kv_value
 # ----------------------------- Cycle stats ----------------------------- #
 
 # Canonical stat keys (extend as new phases are instrumented):
-#   raw                  — events fetched from DB before any filtering
-#   user                 — user events after splitting traces out
-#   traces               — total trace events seen in fetch
-#   traces_invalidated   — traces with invalidated_at != None
-#   traces_active        — traces - traces_invalidated
-#   dedup_active         — events surviving dedup (planner input)
-#   dedup_dropped        — events neutralized by traces or fused chains
-#   dedup_redundant      — chain collapses (INSERT->...->DELETE no-op)
-#   plan_actions         — actions emitted by the planner
-#   plan_skipped         — events the planner refused (drift, no PK, ...)
-#   apply_ok             — actions that succeeded in the runner
-#   apply_skipped        — actions skipped at runtime (RW-08, GEOS, ...)
-#   apply_fail           — hard failures (commit, capability, exception)
-#   traces_written       — trace events enqueued for the journal
+#   raw                  - events fetched from DB before any filtering
+#   user                 - user events after splitting traces out
+#   traces               - total trace events seen in fetch
+#   traces_invalidated   - traces with invalidated_at != None
+#   traces_active        - traces - traces_invalidated
+#   dedup_active         - events surviving dedup (planner input)
+#   dedup_dropped        - events neutralized by traces or fused chains
+#   dedup_redundant      - chain collapses (INSERT->...->DELETE no-op)
+#   plan_actions         - actions emitted by the planner
+#   plan_skipped         - events the planner refused (drift, no PK, ...)
+#   apply_ok             - actions written: applied + applied_partial
+#   apply_skipped        - skipped_idempotent: the feature already held
+#                          the state the action would give it
+#   apply_fail           - failed + failed_target_absent
+#                          + failed_geometry_drift
+#                          + failed_postcommit_verification
+#   traces_written       - trace events enqueued for the journal
+# (restore_runner._apply_counters derives the three apply_* counters from
+# the outcome buckets.) The cycles are the ones restore_runner names:
+# "event_restore", "rewind", "undo". There is no "auto_undo" cycle in v7:
+# nothing is undone before a Rewind any more (rw_rewind_no_autoundo).
 
 
 class CycleStats:
@@ -123,7 +130,7 @@ def _detect_anomalies(
     """Pattern-match suspicious cycle outcomes.
 
     Returns a list of (severity, code, message) tuples. Severities are
-    INFO, WARNING, ERROR, CRITICAL — passed straight to flog.
+    INFO, WARNING, ERROR, CRITICAL: passed straight to flog.
     """
     anomalies: List[Tuple[str, str, str]] = []
 
@@ -140,16 +147,26 @@ def _detect_anomalies(
 
     active_traces = max(traces - traces_invalidated, 0)
 
-    # 1. Everything skipped: classic "rewind already applied" symptom.
+    # 1. Everything skipped: every feature already held the state its
+    # action would give it (apply_skipped is skipped_idempotent alone, see
+    # restore_runner._apply_counters). The journal and the layer disagree
+    # about what was already done. The old text blamed an auto-undo that
+    # was skipped or had failed; v7 has none (nothing is undone before a
+    # Rewind), and drift or a change between fetch and apply are counted
+    # as failures (failed_geometry_drift, failed_target_absent), not here.
     if all((cycle == "rewind", plan_actions > 0, apply_ok == 0,
             apply_skipped == plan_actions)):
         anomalies.append((
             "WARNING", "all_skipped",
-            f"all {plan_actions} action(s) skipped at apply phase. "
-            "Likely cause: previous rewind not undone (auto-undo skipped "
-            "or failed), schema drift, or external modification of the "
-            "layer between fetch and apply. Check STATE logs for "
-            "_last_restore_by_ds and _is_recovering around this cycle.",
+            f"all {plan_actions} action(s) skipped at apply phase "
+            "(skipped_idempotent): every target feature already held the "
+            "state its action would give it. The journal did not know it: "
+            "that state was reached without an active trace in this window "
+            "(a restore whose trace events are missing or were invalidated, "
+            "an edit made outside RecoverLand), or the edits after the "
+            "cutoff cancel each other out (a value changed then set back). "
+            "Check the per-action reason_code lines of this cycle and the "
+            "trace events of these layers.",
         ))
 
     # 2. Rewind landed in an empty plan but user events existed: dedup
@@ -207,16 +224,26 @@ def _detect_anomalies(
             "individual ERROR logs for this cycle.",
         ))
 
-    # 6. Undo with partial success: we just shipped a fix for trace
-    # invalidation; any partial undo deserves a reminder.
+    # 6. Undo with partial success: the layers are in a mixed state. Only
+    # the events the undo really reverted lose their trace
+    # (UndoRunner.undo_outcome, RecoverDialog._invalidate_undone_traces);
+    # a failed, skipped or unattempted event still has its compensation in
+    # the layer, so its trace stays active and the next rewind does not
+    # replay that compensation on top of itself. v7 names every Undo
+    # "undo" (restore_runner._RUNNER_TO_CYCLE); the old "auto_undo" name is
+    # still matched so that a caller passing it as its explicit cycle
+    # (_finish_runner's `cycle`) is reported, never left silent.
     if cycle in ("undo", "auto_undo") and apply_ok > 0 and apply_fail > 0:
         anomalies.append((
             "WARNING", "undo_partial",
             f"undo partially succeeded ({apply_ok} ok / "
-            f"{apply_fail} fail). Traces for failed events are "
-            "invalidated so a follow-up rewind can retry; traces "
-            "for succeeded events stay active so dedup neutralizes "
-            "them. Check undo_done log line for the eid lists.",
+            f"{apply_fail} fail). Only the undone events had their "
+            "traces invalidated. The failed, skipped or unattempted "
+            "ones keep their compensation in the layer, so their traces "
+            "stay active: a follow-up rewind treats them as still "
+            "restored and does not replay them; undo them again to "
+            "revert them. Check the 'UndoRunner: outcome' and 'trace "
+            "invalidation' log lines for the eid lists.",
         ))
 
     return anomalies
@@ -241,7 +268,8 @@ def log_cycle_summary(
 ) -> None:
     """Emit one ``CYCLE_SUMMARY`` line + anomalies for a cycle.
 
-    cycle: short name ("rewind", "undo", "auto_undo", "event_restore").
+    cycle: short name, as restore_runner names it: "rewind", "undo",
+    "event_restore".
     stats: bag of counters / values; only canonical keys appear in the
     summary, the rest are dropped to keep the line greppable.
     """

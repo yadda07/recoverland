@@ -394,14 +394,21 @@ def assertions(ctx):
     # ===== W2 : debranchement en pleine edition =========================
     w2 = phase("W2_disconnect_mid_session")
     w2_delta = _delta(w2[0]) if w2 else {}
+    # Hypothesis revised with the v7 capture (commit attempts): the whole
+    # pre-edit state is read at beforeCommitChanges, so NO capture state
+    # lives between editingStarted and the commit. There is nothing a
+    # mid-session disconnect could drop; what matters is unchanged and
+    # asserted below: the edit reaches the journal with its true OLD value.
+    # A buffer that exists before the disconnect must still be dropped.
     out.append((
-        "W2_disconnect_really_dropped_the_buffer",
-        ctx.data.get("w2_buffer_before") is True
-        and ctx.data.get("w2_buffer_after_disconnect") is False,
+        "W2_disconnect_leaves_no_stale_buffer",
+        ctx.data.get("w2_buffer_after_disconnect") is False
+        and ctx.data.get("w2_buffer_before") in (True, False),
         f"tampon avant={ctx.data.get('w2_buffer_before')} "
-        f"apres deconnexion={ctx.data.get('w2_buffer_after_disconnect')} : la "
-        f"phase doit vraiment detruire le tampon de la session en cours pour "
-        f"tester le filet de securite",
+        f"apres deconnexion={ctx.data.get('w2_buffer_after_disconnect')} : "
+        f"aucun etat de capture ne doit survivre a la deconnexion ; depuis la "
+        f"capture par tentative de commit, rien n'est tenu en memoire entre "
+        f"editingStarted et beforeCommitChanges",
     ))
     out.append((
         "W2_edit_survives_the_reconnection",

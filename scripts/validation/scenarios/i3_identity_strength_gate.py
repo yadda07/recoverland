@@ -1,4 +1,4 @@
-"""i3_identity_strength_gate — RecoverLand validation runtime.
+"""i3_identity_strength_gate - RecoverLand validation runtime.
 
 Invariant: I-3 (KPI K-3 covers identity strength matrix; no silent
 fallback when a provider has weak or missing identity).

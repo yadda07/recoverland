@@ -1,4 +1,4 @@
-"""i8_rewind_idempotence — RecoverLand validation runtime.
+"""i8_rewind_idempotence - RecoverLand validation runtime.
 
 Invariant: I-8 (rewind idempotence: a 2nd rewind on the same cutoff
 applies 0 action). Charter §5 line I-8.
@@ -352,6 +352,18 @@ def assertions(ctx):
     ))
 
     return out
+
+
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()
 
 
 if __name__ == "__main__":

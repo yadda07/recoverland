@@ -1,4 +1,4 @@
-"""Interactive temporal timeline widget — zoomable, calendar-aware ribbon.
+"""Interactive temporal timeline widget - zoomable, calendar-aware ribbon.
 
 Design principles:
 - Pure QWidget with paintEvent: DPI-aware, no style-sheet artefacts.
@@ -24,14 +24,15 @@ from typing import List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QPoint, QRect, QSize, pyqtSignal
 from qgis.PyQt.QtGui import (
-    QBrush, QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPen,
-    QPolygon,
+    QBrush, QFont, QFontMetrics, QLinearGradient, QPainter, QPen, QPolygon,
 )
 from qgis.PyQt.QtWidgets import QToolTip, QWidget
 
 from ..compat import QtCompat
 from ..core.logger import flog
 from ..core.time_format import journal_now, parse_iso_date
+from .icons import couleur_etat
+from .theme import resolve_theme
 
 # ---- geometry -------------------------------------------------------------
 _TRACK_H = 7
@@ -52,28 +53,6 @@ _ZOOM_IN_FACTOR = 0.80
 _ZOOM_OUT_FACTOR = 1.25
 
 _EPOCH = datetime(1970, 1, 1)
-
-# ---- palette --------------------------------------------------------------
-_COLOR_TRACK_BASE = QColor("#26292e")     # tracked-but-quiet baseline
-_COLOR_TRACK_HATCH = QColor("#3a3f47")    # "no data" texture
-_COLOR_SEG_A = QColor("#2f7fd1")          # covered band gradient (top)
-_COLOR_SEG_B = QColor("#3a91ff")          # covered band gradient (bottom)
-_COLOR_SEG_EDGE = QColor(120, 190, 255, 90)
-_COLOR_PAST_TINT = QColor(58, 145, 255, 38)
-_COLOR_HANDLE = QColor("#eaf3ff")
-_COLOR_HANDLE_RING = QColor("#3a91ff")
-_COLOR_HANDLE_HOVER = QColor("#ffffff")
-_COLOR_RULER_MAJOR = QColor("#9aa3ad")
-_COLOR_RULER_MINOR = QColor(120, 128, 138, 150)
-_COLOR_RULER_TEXT = QColor("#aab2bd")
-_COLOR_CROSSHAIR = QColor(220, 230, 245, 130)
-_COLOR_OOV = QColor("#80c8ff")            # out-of-view chevron
-_COLOR_OP = {
-    "INSERT": QColor("#2ecc71"),
-    "UPDATE": QColor("#f39c12"),
-    "DELETE": QColor("#e74c3c"),
-    "default": QColor("#f0c040"),
-}
 
 # Calendar step ladder: (unit, n, approx_seconds, label_fmt).
 _STEPS: List[Tuple[str, int, float, str]] = [
@@ -120,13 +99,13 @@ class TemporalTimelineWidget(QWidget):
     """Interactive painted timeline (zoom + pan + availability segments).
 
     Public API (unchanged, mirrors the previous widget):
-        set_range(first_iso, last_iso)   — configure time axis (full range)
-        set_markers(date_op_pairs)       — list of (iso_str, op_type_str)
-        current_date_iso() -> str        — current ISO 8601 datetime
-        set_value_iso(iso)               — programmatically move handle
+        set_range(first_iso, last_iso)   - configure time axis (full range)
+        set_markers(date_op_pairs)       - list of (iso_str, op_type_str)
+        current_date_iso() -> str        - current ISO 8601 datetime
+        set_value_iso(iso)               - programmatically move handle
 
     Signal:
-        date_changed(str)  — emitted with ISO datetime when user drags / snaps
+        date_changed(str)  - emitted with ISO datetime when user drags / snaps
     """
 
     date_changed = pyqtSignal(str)
@@ -172,7 +151,7 @@ class TemporalTimelineWidget(QWidget):
         now = journal_now()
         if end < start:
             start, end = end, start
-        # Never let the axis run past "now" — future has no snapshots.
+        # Never let the axis run past "now" - future has no snapshots.
         if end > now:
             end = now
         if end <= start:
@@ -307,52 +286,41 @@ class TemporalTimelineWidget(QWidget):
             p.end()
 
     def _paint(self, p: QPainter) -> None:
+        t = resolve_theme(self)
         x0, ty, tw, th = self._track_rect()
         cy = self._track_cy()
         radius = th / 2.0
 
-        # 1. Track baseline (tracked-but-quiet).
-        p.setPen(QtCompat.NO_PEN)
-        p.setBrush(_COLOR_TRACK_BASE)
+        p.setPen(QPen(t.ligne, 1))
+        p.setBrush(t.surface_douce)
         p.drawRoundedRect(QRect(x0, ty, tw, th), radius, radius)
 
-        # 2. "No data" hatch over the whole track, clipped to the rounded rect.
         p.save()
         p.setClipRect(QRect(x0, ty, tw, th))
-        hatch = QBrush(_COLOR_TRACK_HATCH, QtCompat.BRUSH_BDIAG)
-        p.setBrush(hatch)
+        p.setBrush(QBrush(t.ligne, QtCompat.BRUSH_BDIAG))
         p.drawRect(QRect(x0, ty, tw, th))
         p.restore()
 
-        # 3. Availability segments (solid colour over the hatch).
         self._paint_segments(p, ty, th)
-
-        # 4. Subtle "past" tint up to the handle.
         hx = self._handle_x()
         hx_c = max(x0, min(x0 + tw, hx))
         if hx_c > x0:
             p.save()
             p.setClipRect(QRect(x0, ty, tw, th))
             p.setPen(QtCompat.NO_PEN)
-            p.setBrush(_COLOR_PAST_TINT)
+            p.setBrush(t.accent_doux)
             p.drawRect(QRect(x0, ty, int(hx_c - x0), th))
             p.restore()
 
-        # 5. Op-type markers (visible window only).
         self._paint_markers(p, cy)
-
-        # 6. Ruler (adaptive ticks).
-        self._paint_ruler(p, x0, tw, cy)
-
-        # 7. Hover crosshair + floating label.
-        self._paint_crosshair(p, x0, tw, ty, th)
-
-        # 8. Selection handle (or out-of-view chevron).
-        self._paint_handle(p, x0, tw, cy, hx)
+        self._paint_ruler(p, cy)
+        self._paint_crosshair(p)
+        self._paint_handle(p, cy, hx)
 
     def _paint_segments(self, p: QPainter, ty: int, th: int) -> None:
         if not self._segments:
             return
+        t = resolve_theme(self)
         x0, _, tw, _ = self._track_rect()
         radius = th / 2.0
         p.save()
@@ -366,18 +334,19 @@ class TemporalTimelineWidget(QWidget):
             xb = min(x0 + tw, xb)
             w = max(_MIN_SEG_PX, xb - xa)
             grad = QLinearGradient(0, ty, 0, ty + th)
-            grad.setColorAt(0.0, _COLOR_SEG_A)
-            grad.setColorAt(1.0, _COLOR_SEG_B)
+            grad.setColorAt(0.0, t.accent)
+            grad.setColorAt(1.0, t.accent_survol)
             p.setPen(QtCompat.NO_PEN)
             p.setBrush(QBrush(grad))
             rect = QRect(int(xa), ty, int(w), th)
             p.drawRoundedRect(rect, radius, radius)
-            p.setPen(QPen(_COLOR_SEG_EDGE, 1))
+            p.setPen(QPen(t.ligne_selection, 1))
             p.setBrush(QtCompat.NO_BRUSH)
             p.drawRoundedRect(rect, radius, radius)
         p.restore()
 
     def _paint_markers(self, p: QPainter, cy: int) -> None:
+        t = resolve_theme(self)
         x0, _, tw, _ = self._track_rect()
         tip_y = cy - _TRACK_H // 2 - 3
         for dt, op in self._markers:
@@ -385,8 +354,7 @@ class TemporalTimelineWidget(QWidget):
             if mx < x0 - 2 or mx > x0 + tw + 2:
                 continue
             mx_i = int(round(mx))
-            color = _COLOR_OP.get(op, _COLOR_OP["default"])
-            p.setBrush(color)
+            p.setBrush(couleur_etat(op, t))
             p.setPen(QtCompat.NO_PEN)
             pts = [
                 QPoint(mx_i, tip_y),
@@ -395,137 +363,135 @@ class TemporalTimelineWidget(QWidget):
             ]
             p.drawPolygon(QPolygon(pts))
 
-    def _paint_ruler(self, p: QPainter, x0: int, tw: int, cy: int) -> None:
+    def _paint_ruler(self, p: QPainter, cy: int) -> None:
         if self._view_start is None or self._view_end is None:
             return
+        t = resolve_theme(self)
+        x0, _, tw, _ = self._track_rect()
         major, minor = _select_steps(self._view_start, self._view_end, tw)
         top_y = cy + _TRACK_H // 2 + 2
-
-        # Calendar ladder as minor ticks (short, unlabeled) for scale reference.
         if minor is not None:
-            p.setPen(QPen(_COLOR_RULER_MINOR, 1))
+            p.setPen(QPen(t.ligne_controle, 1))
             for tdt in _iter_ticks(self._view_start, self._view_end, minor):
                 lx = self._dt_to_x(tdt)
-                if lx < x0 or lx > x0 + tw:
-                    continue
-                p.drawLine(int(lx), top_y, int(lx), top_y + 3)
-
-        font = QFont()
+                if x0 <= lx <= x0 + tw:
+                    p.drawLine(int(lx), top_y, int(lx), top_y + 3)
+        font = QFont(t.police_titre)
         font.setPointSize(7)
         p.setFont(font)
+        if self._marker_ticks:
+            self._paint_marker_ticks(p, top_y, font)
+        else:
+            self._paint_calendar_ticks(p, top_y, major)
+
+    def _paint_marker_ticks(self, p: QPainter, top_y: int, font: QFont) -> None:
+        t = resolve_theme(self)
+        x0, _, tw, _ = self._track_rect()
         fm = QFontMetrics(font)
         align = int(QtCompat.ALIGN_HCENTER) | int(QtCompat.ALIGN_TOP)
-        last_label_right = -10000
-        n_major_drawn = 0
+        last_right = -10000
+        drawn = 0
+        visible = self._deduplicate_marker_ticks([
+            dt for dt in (self._marker_ticks or [])
+            if self._view_start <= dt <= self._view_end
+        ])
+        for tdt in visible:
+            lx = self._dt_to_x(tdt)
+            if lx < x0 - 1 or lx > x0 + tw + 1:
+                continue
+            label = _format_marker_tick_label(tdt, self._view_start, self._view_end)
+            lw = fm.horizontalAdvance(label)
+            lleft = int(lx) - lw // 2
+            if lleft <= last_right + 4:
+                continue
+            p.setPen(QPen(t.secondaire, 1))
+            p.drawLine(int(lx), top_y, int(lx), top_y + 5)
+            p.drawText(QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4), align, label)
+            last_right = lleft + lw
+            drawn += 1
+        flog(
+            f"timeline: paint_ruler_marker_mode total_ticks={len(self._marker_ticks or [])} "
+            f"visible_ticks={len(visible)} drawn={drawn} "
+            f"view={self._view_start.isoformat()}..{self._view_end.isoformat()}",
+            "DEBUG",
+        )
 
-        # Marker dates as major ticks (long, labeled) when in modification-centric
-        # mode; otherwise fall back to the calendar ladder as major ticks.
-        if self._marker_ticks:
-            visible_ticks = self._deduplicate_marker_ticks([
-                dt for dt in self._marker_ticks
-                if self._view_start <= dt <= self._view_end
-            ])
-            for tdt in visible_ticks:
-                lx = self._dt_to_x(tdt)
-                if lx < x0 - 1 or lx > x0 + tw + 1:
-                    continue
-                label = _format_marker_tick_label(tdt, self._view_start, self._view_end)
-                lw = fm.horizontalAdvance(label)
-                lleft = int(lx) - lw // 2
-                if lleft <= last_label_right + 4:
-                    continue
-                p.setPen(QPen(_COLOR_RULER_MAJOR, 1))
-                p.drawLine(int(lx), top_y, int(lx), top_y + 5)
-                p.setPen(QPen(_COLOR_RULER_TEXT, 1))
-                p.drawText(
-                    QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4),
-                    align, label,
-                )
-                last_label_right = lleft + lw
-                n_major_drawn += 1
-            flog(
-                f"timeline: paint_ruler_marker_mode "
-                f"total_ticks={len(self._marker_ticks)} "
-                f"visible_ticks={len(visible_ticks)} "
-                f"drawn={n_major_drawn} "
-                f"view={self._view_start.isoformat()}..{self._view_end.isoformat()}",
-                "DEBUG",
-            )
-        else:
-            # Major ticks (long, labeled).
-            for tdt in _iter_ticks(self._view_start, self._view_end, major):
-                lx = self._dt_to_x(tdt)
-                if lx < x0 - 1 or lx > x0 + tw + 1:
-                    continue
-                label = tdt.strftime(major[3])
-                lw = fm.horizontalAdvance(label)
-                lleft = int(lx) - lw // 2
-                if lleft <= last_label_right + 4:
-                    continue
-                p.setPen(QPen(_COLOR_RULER_MAJOR, 1))
-                p.drawLine(int(lx), top_y, int(lx), top_y + 5)
-                p.setPen(QPen(_COLOR_RULER_TEXT, 1))
-                p.drawText(
-                    QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4),
-                    align, label,
-                )
-                last_label_right = lleft + lw
-                n_major_drawn += 1
-            flog(
-                f"timeline: paint_ruler_calendar_mode "
-                f"major={major[0]}-{major[1]} drawn={n_major_drawn}",
-                "DEBUG",
-            )
+    def _paint_calendar_ticks(self, p: QPainter, top_y: int, major) -> None:
+        t = resolve_theme(self)
+        x0, _, tw, _ = self._track_rect()
+        fm = QFontMetrics(p.font())
+        align = int(QtCompat.ALIGN_HCENTER) | int(QtCompat.ALIGN_TOP)
+        last_right = -10000
+        drawn = 0
+        for tdt in _iter_ticks(self._view_start, self._view_end, major):
+            lx = self._dt_to_x(tdt)
+            if lx < x0 - 1 or lx > x0 + tw + 1:
+                continue
+            label = tdt.strftime(major[3])
+            lw = fm.horizontalAdvance(label)
+            lleft = int(lx) - lw // 2
+            if lleft <= last_right + 4:
+                continue
+            p.setPen(QPen(t.secondaire, 1))
+            p.drawLine(int(lx), top_y, int(lx), top_y + 5)
+            p.drawText(QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4), align, label)
+            last_right = lleft + lw
+            drawn += 1
+        flog(f"timeline: paint_ruler_calendar_mode major={major[0]}-{major[1]} drawn={drawn}", "DEBUG")
 
-    def _paint_crosshair(self, p: QPainter, x0: int, tw: int, ty: int, th: int) -> None:
+    def _paint_crosshair(self, p: QPainter) -> None:
         if self._hover_pos is None or self._dragging or self._panning:
             return
+        t = resolve_theme(self)
+        x0, ty, tw, th = self._track_rect()
         hx = self._hover_pos
         if hx < x0 or hx > x0 + tw:
             return
-        p.setPen(QPen(_COLOR_CROSSHAIR, 1, QtCompat.DASH_LINE))
+        p.setPen(QPen(t.secondaire, 1, QtCompat.DASH_LINE))
         p.drawLine(hx, 1, hx, ty + th + 1)
 
         dt = self._x_to_dt(hx)
         label = _format_dt_label(dt, self._view_start, self._view_end)
-        font = QFont()
+        font = QFont(t.police_titre)
         font.setPointSize(7)
         p.setFont(font)
         fm = QFontMetrics(font)
-        lw = fm.horizontalAdvance(label) + 8
+        lw = fm.horizontalAdvance(label) + 10
         lh = fm.height() + 2
         bx = max(x0, min(x0 + tw - lw, hx - lw // 2))
         rect = QRect(int(bx), 0, int(lw), int(lh))
-        p.setPen(QtCompat.NO_PEN)
-        p.setBrush(QColor(20, 24, 30, 220))
+        p.setPen(QPen(t.ligne_controle, 1))
+        p.setBrush(t.surface_douce)
         p.drawRoundedRect(rect, 3, 3)
-        p.setPen(QPen(QColor("#dfe6ef"), 1))
+        p.setPen(QPen(t.texte, 1))
         p.drawText(rect, int(QtCompat.ALIGN_CENTER), label)
 
-    def _paint_handle(self, p: QPainter, x0: int, tw: int, cy: int, hx: float) -> None:
-        # Out-of-view: draw an edge chevron pointing toward the handle.
+    def _paint_handle(self, p: QPainter, cy: int, hx: float) -> None:
+        t = resolve_theme(self)
+        x0, _, tw, _ = self._track_rect()
         if hx < x0:
-            self._paint_chevron(p, x0 + 1, cy, left=True)
+            self._paint_chevron(p, x0 + 1, cy)
             return
         if hx > x0 + tw:
-            self._paint_chevron(p, x0 + tw - 1, cy, left=False)
+            self._paint_chevron(p, x0 + tw - 1, cy)
             return
 
         hx_i = int(round(hx))
         ty = cy - _TRACK_H // 2
-        # Vertical stem through the track.
-        p.setPen(QPen(_COLOR_HANDLE_RING, 2))
+        p.setPen(QPen(t.accent, 2))
         p.drawLine(hx_i, ty - 4, hx_i, ty + _TRACK_H + 4)
 
         hovering = (self._hover_pos is not None and abs(self._hover_pos - hx_i) < _HANDLE_R + 4)
-        fill = _COLOR_HANDLE_HOVER if hovering else _COLOR_HANDLE
-        p.setBrush(fill)
-        p.setPen(QPen(_COLOR_HANDLE_RING, 2))
+        p.setBrush(t.accent_doux if hovering else t.surface)
+        p.setPen(QPen(t.accent, 2))
         p.drawEllipse(QPoint(hx_i, cy), _HANDLE_R, _HANDLE_R)
 
-    def _paint_chevron(self, p: QPainter, x: int, cy: int, left: bool) -> None:
+    def _paint_chevron(self, p: QPainter, x: int, cy: int) -> None:
+        t = resolve_theme(self)
+        x0, _, _, _ = self._track_rect()
+        left = x <= x0 + 2
         p.setPen(QtCompat.NO_PEN)
-        p.setBrush(_COLOR_OOV)
+        p.setBrush(t.accent)
         d = 5
         if left:
             pts = [QPoint(x, cy), QPoint(x + d, cy - d), QPoint(x + d, cy + d)]

@@ -11,19 +11,26 @@ from typing import NamedTuple, List
 
 from .sqlite_schema import (
     apply_pragmas, get_schema_version, CURRENT_SCHEMA_VERSION,
-    AUDIT_EVENT_INSERT_SQL, AUDIT_EVENT_INSERT_PLACEHOLDERS,
     AUDIT_EVENT_INSERT_COLUMNS,
 )
-from .journal_manager import sqlite_readonly_uri
+from .journal_manager import sqlite_readonly_uri, journal_shares_directory
+from .long_paths import when_needed, plain
 from .logger import flog, timed_op
 
+# Legacy name, in the journal's directory: kept for a journal that owns its
+# directory (<project>/.recoverland/). In the profile's shared audit
+# directory the pending file is named after its journal (_PENDING_SUFFIX).
 _PENDING_FILENAME = "recoverland_pending.json"
+_PENDING_SUFFIX = ".pending.json"
 
 _VALID_OP_TYPES = frozenset({"INSERT", "UPDATE", "DELETE"})
 
 # Authoritative key set for pending events: derived from the schema column
 # list so a column rename/addition propagates without manual updates here.
-_KNOWN_EVENT_KEYS = frozenset(AUDIT_EVENT_INSERT_COLUMNS)
+# The v7 columns (event_uid, commit_id) are part of AuditEvent._asdict():
+# leaving them out rejected EVERY pending event written since v7.
+from .journal_writes import EVENT_EXT_COLUMNS, EVENT_WRITE_COLUMNS  # noqa: E402
+_KNOWN_EVENT_KEYS = frozenset(AUDIT_EVENT_INSERT_COLUMNS) | frozenset(EVENT_EXT_COLUMNS)
 
 _REQUIRED_EVENT_KEYS = frozenset({
     "operation_type", "created_at", "user_name",
@@ -85,6 +92,7 @@ def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult
     rejected = 0
 
     with timed_op("check_journal_integrity", trace_id):
+        db_path = when_needed(db_path)
         if not os.path.isfile(db_path):
             return IntegrityResult(False, ["Journal file not found"], 0)
 
@@ -94,10 +102,19 @@ def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult
             apply_pragmas(conn)
 
             _check_sqlite_integrity(conn, issues)
+            corrupt = any(i.startswith("Integrity check failed") for i in issues)
             _check_wal_state(conn, issues)
             _check_schema_version(conn, issues)
             _check_logical_integrity(conn, issues)
-            recovered, rejected = _recover_pending_events(db_path, conn, issues)
+            if corrupt:
+                # Importing the last copy of accepted edits into a file that
+                # is about to be renamed aside as corrupt buries them where
+                # nothing reads them. Keep the pending file for the journal
+                # that will actually be used.
+                issues.append("Pending events file kept: the journal failed "
+                              "its integrity check")
+            else:
+                recovered, rejected = _recover_pending_events(db_path, conn, issues)
 
         except sqlite3.Error as e:
             issues.append(f"Cannot open journal: {e}")
@@ -200,9 +217,59 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection,
     Every branch that keeps the file back therefore also reports an issue,
     so the startup message stops saying "healthy" over an unread file.
 
+    Only the journal's OWN pending file is imported. A journal of the
+    profile's shared audit directory used to import the directory's legacy
+    file too, shared by every unsaved-project journal: the events of one
+    session went into the next unsaved journal opened, another project's
+    history. That file is kept and reported instead (_report_shared_pending).
+
     Returns (recovered_count, rejected_count).
     """
-    pending_path = _get_pending_path(db_path)
+    result = _recover_pending_file(_get_pending_path(db_path), conn, issues)
+    if journal_shares_directory(db_path):
+        _report_shared_pending(db_path, issues)
+    return result
+
+
+def _report_shared_pending(db_path: str, issues: List[str]) -> None:
+    """Say that the shared legacy pending file exists and why it stays."""
+    legacy = when_needed(os.path.join(os.path.dirname(db_path), _PENDING_FILENAME))
+    if not os.path.isfile(legacy):
+        return
+    try:
+        with open(legacy, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        what = (f"{len(data)} event(s)" if isinstance(data, list)
+                else f"JSON root {type(data).__name__}")
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        what = f"unreadable: {exc}"
+    flog(f"integrity: shared legacy pending file {legacy} ({what}) kept, not "
+         f"imported into {db_path}: its journal cannot be proven", "WARNING")
+    issues.append(
+        f"Pending events file kept unrecovered ({plain(legacy)}, {what}): it "
+        f"is shared by every unsaved-project journal of the profile, so the "
+        f"journal its events belong to cannot be proven; it is never imported "
+        f"into another project's journal")
+
+
+def pending_files_for(db_path: str) -> List[str]:
+    """Every pending file whose events may belong to the journal *db_path*.
+
+    Its own file, and for a journal of the shared audit directory the
+    legacy file of that directory (never imported, see
+    _recover_pending_events). For callers that must not act on a journal
+    while edits wait outside it.
+    """
+    paths = [_get_pending_path(db_path)]
+    if journal_shares_directory(db_path):
+        paths.append(when_needed(os.path.join(os.path.dirname(db_path),
+                                              _PENDING_FILENAME)))
+    return paths
+
+
+def _recover_pending_file(pending_path: str, conn: sqlite3.Connection,
+                          issues: List[str]) -> tuple:
+    """Import one pending file into *conn* (see _recover_pending_events)."""
     if not os.path.isfile(pending_path):
         return 0, 0
 
@@ -248,7 +315,16 @@ def _recover_pending_events(db_path: str, conn: sqlite3.Connection,
             os.remove(pending_path)
             return 0, 0
 
-        count, remaining = _insert_pending_events(conn, events)
+        try:
+            count, remaining = _insert_pending_events(conn, events)
+        except sqlite3.Error as exc:
+            # A COMMIT that fails (disk full, busy share) is not corruption:
+            # letting it escape turned it into "Cannot open journal", which
+            # the plugin offers to fix by renaming a HEALTHY journal aside.
+            flog(f"integrity: pending import failed, file kept: {exc}", "ERROR")
+            issues.append(f"Pending events file kept unrecovered "
+                          f"(journal write failed: {exc})")
+            return 0, 0
         rejected = len(remaining)
         if remaining:
             _rewrite_pending_events(pending_path, remaining)
@@ -278,16 +354,20 @@ def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
     Uses the shared AUDIT_EVENT_INSERT_* constants so the column list
     stays in lockstep with WriteQueue and the schema definition.
     """
+    from .journal_writes import ensure_v7_schema
+    # v7: keyed by event_uid, so a pending file replayed twice (a kill
+    # between the COMMIT and the file removal) cannot duplicate an edit.
     sql = "".join((
         "INSERT INTO audit_event (",  # nosec B608: column list is a module constant
-        AUDIT_EVENT_INSERT_SQL,
+        ", ".join(EVENT_WRITE_COLUMNS),
         ") VALUES (",
-        AUDIT_EVENT_INSERT_PLACEHOLDERS,
-        ")",
+        ",".join(["?"] * len(EVENT_WRITE_COLUMNS)),
+        ") ON CONFLICT(event_uid) DO NOTHING",
     ))
     count = 0
     remaining = []
     with conn:
+        ensure_v7_schema(conn)
         for evt in events:
             reason = _validate_pending_event(evt)
             if reason:
@@ -304,7 +384,7 @@ def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
                 # schema the next time a column is added.
                 conn.execute(sql, tuple(
                     restored.get(col, _PENDING_DEFAULTS.get(col))
-                    for col in AUDIT_EVENT_INSERT_COLUMNS
+                    for col in EVENT_WRITE_COLUMNS
                 ))
                 count += 1
             except sqlite3.Error as e:
@@ -313,9 +393,23 @@ def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
     return count, remaining
 
 
+def _atomic_write_json(path: str, payload) -> None:
+    """Write *payload* so that a crash leaves either the old or the new file.
+
+    The previous code opened the pending file in "w" mode and rewrote it:
+    a crash mid-write left a truncated JSON, i.e. every event it held
+    unreadable, including the ones saved by earlier sessions.
+    """
+    tmp = when_needed(f"{path}.tmp-{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def _rewrite_pending_events(pending_path: str, events: list) -> None:
-    with open(pending_path, "w", encoding="utf-8") as f:
-        json.dump(events, f, ensure_ascii=False)
+    _atomic_write_json(pending_path, events)
 
 
 def save_pending_events(db_path: str, events: list) -> None:
@@ -325,21 +419,31 @@ def save_pending_events(db_path: str, events: list) -> None:
     """
     pending_path = _get_pending_path(db_path)
     try:
-        import shutil
-        parent = os.path.dirname(pending_path)
-        if os.path.exists(parent):
-            usage = shutil.disk_usage(parent)
-            if usage.free < 10 * 1024 * 1024:
-                flog(f"integrity: skip pending save, disk free={usage.free} < 10 MB", "ERROR")
-                return
+        # No free-space guard any more: refusing below 10 MB meant refusing
+        # exactly when SQLite fails with SQLITE_FULL, i.e. dropping the batch
+        # in the one situation the fallback exists for. Try, and report.
         existing = []
         if os.path.isfile(pending_path):
             try:
                 with open(pending_path, "r", encoding="utf-8") as f:
                     existing = json.load(f)
+                if not isinstance(existing, list):
+                    raise ValueError(f"root is {type(existing).__name__}")
                 flog(f"integrity: appending to existing pending n_existing={len(existing)}")
-            except (json.JSONDecodeError, OSError) as read_err:
-                flog(f"integrity: cannot read existing pending, overwriting: {read_err}", "WARNING")
+            except (ValueError, OSError) as read_err:
+                # Never overwrite a file we cannot read: it may be the last
+                # copy of older edits. Set it aside, then start a new one.
+                aside = when_needed(
+                    f"{pending_path}.unreadable-{os.getpid()}-{len(events)}")
+                try:
+                    os.replace(pending_path, aside)
+                    flog(f"integrity: unreadable pending file set aside as "
+                         f"{aside} ({read_err})", "ERROR")
+                except OSError as mv_err:
+                    flog(f"integrity: unreadable pending file cannot be set "
+                         f"aside ({mv_err}); new events NOT saved over it",
+                         "CRITICAL")
+                    return
                 existing = []
         serializable = list(existing)
         for evt in events:
@@ -347,8 +451,7 @@ def save_pending_events(db_path: str, events: list) -> None:
                 serializable.append(_prepare_event_for_json(evt._asdict()))
             elif isinstance(evt, dict):
                 serializable.append(_prepare_event_for_json(evt))
-        with open(pending_path, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False)
+        _atomic_write_json(pending_path, serializable)
         flog(f"integrity: saved {len(serializable)} pending events "
              f"(new={len(serializable) - len(existing)})")
     except (OSError, TypeError) as e:
@@ -373,6 +476,7 @@ def get_journal_health_report(db_path: str) -> JournalHealthReport:
     newest = ""
     version = 0
 
+    db_path = when_needed(db_path)
     try:
         db_size = os.path.getsize(db_path)
     except OSError:
@@ -432,4 +536,13 @@ def _restore_event_from_json(d: dict) -> dict:
 
 
 def _get_pending_path(db_path: str) -> str:
-    return os.path.join(os.path.dirname(db_path), _PENDING_FILENAME)
+    """The pending-recovery file of the journal *db_path*.
+
+    A journal that owns its directory (<project>/.recoverland/) keeps the
+    legacy name next to it. In the profile's shared audit directory every
+    unsaved-project journal used to share that one name, so the file is
+    named after its journal there, as the capture outbox is.
+    """
+    if journal_shares_directory(db_path):
+        return when_needed(db_path + _PENDING_SUFFIX)
+    return when_needed(os.path.join(os.path.dirname(db_path), _PENDING_FILENAME))

@@ -3,19 +3,260 @@
 Displays the old geometry from an audit event as a QgsRubberBand
 on the map canvas. Manages lifecycle: one preview at a time,
 cleared on deselect or dialog close.
+
+Where a journal geometry is drawn is decided like where the Rewind writes
+it (`display_verdict`, geometry_utils.crs_verdict): the journal holds RAW
+coordinates, and the CRS the layer declared at capture is only a label.
+After a relabel (Set Layer CRS, a corrected .prj) the raw coordinates are
+already in the layer CRS; after a reprojection of the file in place they
+must be reprojected; when the evidence cannot tell, nothing is drawn and
+the refusal is named. Reprojecting by the capture CRS, as the preview
+did, drew a past state hundreds of km away from where the Rewind puts it.
+
+A display READS the stories the writes settled and never records one
+(`DisplayStories`): what the user merely looked at must not decide what a
+restore writes.
 """
-from typing import Optional
+import threading
+from contextlib import contextmanager
+from typing import NamedTuple, Optional
 
 from qgis.core import (
     QgsGeometry, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsRectangle,
 )
 from qgis.gui import QgsRubberBand, QgsMapCanvas
-from qgis.PyQt.QtCore import QTimer
+from qgis.PyQt.QtCore import QCoreApplication, QTimer
 
 from .geometry_utils import is_geometry_present
 from .logger import flog
 from ..compat import QtCompat, QgisCompat
+
+
+class DisplayVerdict(NamedTuple):
+    """Where a captured geometry is drawn (`display_verdict`).
+
+    ``geometry``: the geometry expressed in ``crs``, None when it may not
+    be drawn. ``status``: the crs_verdict status, or ``no_layer_crs`` when
+    no layer CRS can be read. ``reason_code`` and ``refusal``: empty, or
+    what names the refusal (``crs_ambiguous``, ``crs_mismatch``).
+    """
+
+    geometry: object
+    crs: object
+    status: str
+    reason_code: str = ""
+    refusal: str = ""
+
+
+def _crs_text(crs) -> str:
+    try:
+        return crs.authid() or crs.description() or "unknown CRS"
+    except (AttributeError, RuntimeError):
+        return "unknown CRS"
+
+
+class DisplayStories:
+    """The CRS stories as a display may know them: read, never recorded.
+
+    geometry_utils.crs_verdict keeps, per layer and capture CRS, the story
+    the evidence settled (relabel or reprojection, ``_CRS_STORIES``), and
+    every later geometry without evidence of its own follows it: the
+    writes of the rewind and of the event restore included. The displays
+    went through the same verdict and RECORDED what they saw. The Restore
+    preview, given one geometry of an event without the others, settled a
+    story from part of the evidence (the whole of it being a conflict), and
+    a later write with no evidence of its own then followed that story
+    instead of being refused: which rows the user had clicked decided
+    whether an unproven position was written.
+
+    A display now decides against this view (`reading_stories`). It reads
+    every story the writes settled, as they are when it asks; what it
+    settles itself stays here, so the other entities of one Review date
+    follow it as they would in a rewind to that date, and nothing reaches
+    the table the writes read. When its own story and a settled one
+    disagree, the answer is the conflict a write would reach. Only the
+    thread that installed the view goes through it (every verdict runs on
+    the GUI thread); another thread would read and write the real table.
+    """
+
+    def __init__(self):
+        self._own: dict = {}
+        self._settled = None
+        self._thread = None
+
+    def _mine(self) -> bool:
+        return threading.get_ident() == self._thread
+
+    def get(self, key, default=None):
+        settled = self._settled.get(key) if self._settled is not None else None
+        if not self._mine():
+            return settled if settled is not None else default
+        own = self._own.get(key)
+        if own is None or (settled is not None and settled[0] == own[0]):
+            return settled if settled is not None else default
+        if settled is None:
+            return own
+        return ("conflict", f"{settled[0]}({settled[1]})_vs_display_"
+                            f"{own[0]}({own[1]})")
+
+    def __getitem__(self, key):
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __contains__(self, key) -> bool:
+        return self.get(key) is not None
+
+    def __setitem__(self, key, value) -> None:
+        if not self._mine():
+            self._settled[key] = value
+            return
+        if self._own.get(key) != value:
+            scope = (f"layer={key[0]} src_crs={key[2]}"
+                     if isinstance(key, tuple) and len(key) > 2 else f"key={key!r}")
+            flog(f"display: crs_story kept to the display, not recorded "
+                 f"{scope} story={value!r} (a write follows only what a "
+                 f"write proved)", "INFO")
+        self._own[key] = value
+
+
+@contextmanager
+def reading_stories(view: DisplayStories):
+    """Run crs_verdict against *view* instead of the stories the writes read.
+
+    Yields False, and installs nothing, when the story table cannot be
+    found where crs_verdict keeps it: the caller must then not consult the
+    verdict at all, or what it sees would be recorded for the writes.
+    """
+    from . import geometry_utils  # noqa: PLC0415
+    real = getattr(geometry_utils, "_CRS_STORIES", None)
+    if isinstance(real, DisplayStories):
+        # Already reading through a view (a display inside a display):
+        # the outer one stays, nothing reaches the real table either way.
+        yield True
+        return
+    if not isinstance(real, dict):
+        yield False
+        return
+    view._settled = real
+    view._thread = threading.get_ident()
+    geometry_utils._CRS_STORIES = view
+    try:
+        yield True
+    finally:
+        geometry_utils._CRS_STORIES = real
+
+
+# crs_verdict evidence for which the geometry alone said nothing either way.
+_NO_EVIDENCE = ("no_evidence", "weak_area_uncorroborated",
+                "weak_area_disagrees_with_story")
+# crs_verdict evidence that names both stories at once.
+_CONTRADICTION = ("witness_conflict", "evidence_conflict", "story_conflict",
+                  "contradicts_story")
+
+
+def _ambiguous_text(capture_crs_authid, layer_crs, evidence: str,
+                    witnesses_given: bool) -> str:
+    """Why a crs_ambiguous geometry is not drawn, in the terms of its evidence.
+
+    The Restore preview is called with the displayed geometry alone. It
+    used to say that "the evidence available" could not tell, which is
+    false there: the evidence is the event's other captured geometry, the
+    one the Rewind decides with, and the preview was never given it.
+    """
+    head = (f"Geometry captured in {capture_crs_authid}, layer now in "
+            f"{_crs_text(layer_crs)}")
+    relabel = "a relabel (same coordinates, CRS declaration corrected)"
+    reprojection = "a reprojection (coordinates converted)"
+    if evidence in _NO_EVIDENCE and not witnesses_given:
+        return (f"{head}: not drawn. The display was given this geometry "
+                f"alone: the witnesses (the other captured geometries of its "
+                f"event, which the Rewind decides with) were not provided, "
+                f"and this geometry alone does not tell {relabel} from "
+                f"{reprojection}")
+    if evidence in _NO_EVIDENCE:
+        return (f"{head}: cannot tell {relabel} from {reprojection} from the "
+                f"evidence available (the event's captured geometries, the "
+                f"features still carrying one, the CRS area of use); not drawn")
+    if evidence in _CONTRADICTION:
+        return (f"{head}: the evidence attests both {relabel} and "
+                f"{reprojection} ({evidence}); not drawn, as the Rewind "
+                f"refuses to write it")
+    if evidence == "witness_read_failed":
+        return (f"{head}: the layer could not be read to look for the "
+                f"features still carrying a captured position; not drawn")
+    return (f"{head}: relabel or reprojection not established ({evidence}); "
+            f"not drawn")
+
+
+def display_verdict(geom, capture_crs_authid: Optional[str], layer,
+                    trace_id: str = "", witnesses=(),
+                    stories: Optional[DisplayStories] = None) -> DisplayVerdict:
+    """Place *geom*, captured under *capture_crs_authid*, for display.
+
+    The Rewind's verdict (geometry_utils.crs_verdict, same story per layer
+    and capture CRS, same witnesses: the captured geometries of the event),
+    so a past state is drawn where a rewind would put it back:
+      * same CRS, equivalent ids, relabel, no capture CRS: the raw
+        coordinates, in the layer CRS;
+      * reprojection: the reprojected geometry, in the layer CRS;
+      * crs_ambiguous, transform_failed: None, and the refusal named (in
+        the terms of the evidence: a caller that gave no witness is told
+        so, not that the evidence cannot tell).
+    The verdict reads the stories through *stories* (a fresh
+    `DisplayStories` when None: this geometry alone), never recording one
+    for the writes. Without a layer CRS to read the story from, the capture
+    CRS is the only declaration there is: the geometry in that CRS, as
+    before the verdict existed.
+    """
+    from .geometry_utils import CRS_REFUSED_STATUSES, crs_verdict  # noqa: PLC0415
+    layer_crs = None
+    try:
+        crs = layer.crs() if layer is not None else None
+        if crs is not None and crs.isValid():
+            layer_crs = crs
+    except (AttributeError, RuntimeError):
+        layer_crs = None
+    if layer_crs is None:
+        declared = QgsCoordinateReferenceSystem(capture_crs_authid or "")
+        return DisplayVerdict(geom, declared, "no_layer_crs")
+    with reading_stories(stories if stories is not None else DisplayStories()) as ok:
+        if not ok:
+            flog("display_verdict: the CRS story table was not found where "
+                 "crs_verdict keeps it; the verdict is not consulted (it "
+                 "would record what the display sees for the writes)", "ERROR")
+            return DisplayVerdict(
+                None, layer_crs, "story_unreadable", "crs_mismatch",
+                f"Geometry captured in {capture_crs_authid}: the CRS verdict "
+                f"could not be consulted without recording it; not drawn")
+        verdict = crs_verdict(geom, capture_crs_authid, layer, trace_id, witnesses)
+    if verdict.status in CRS_REFUSED_STATUSES or verdict.geometry is None:
+        if verdict.status == "crs_ambiguous":
+            code = "crs_ambiguous"
+            given = any(w is not None for w in (witnesses or ()))
+            text = _ambiguous_text(capture_crs_authid, layer_crs,
+                                   verdict.evidence, given)
+        else:
+            code = "crs_mismatch"
+            text = (f"Geometry captured in {capture_crs_authid} cannot be "
+                    f"placed in {_crs_text(layer_crs)}; not drawn")
+        return DisplayVerdict(None, layer_crs, verdict.status, code, text)
+    return DisplayVerdict(verdict.geometry, layer_crs, verdict.status)
+
+
+def _announce(title: str, text: str) -> bool:
+    """Push *text* to the QGIS message bar; False when there is none."""
+    try:
+        from qgis.utils import iface  # noqa: PLC0415
+        if iface is None:
+            return False
+        iface.messageBar().pushMessage(title, text, QgisCompat.MSG_WARNING, 0)
+        return True
+    except Exception as exc:  # noqa: BLE001 - the refusal is logged anyway
+        flog(f"GeometryPreview: refusal not announced ({exc!r})", "WARNING")
+        return False
 
 
 def _geom_band_type(geom: QgsGeometry):
@@ -37,6 +278,8 @@ class GeometryPreviewManager:
 
     def __init__(self, canvas: QgsMapCanvas):
         self._canvas = canvas
+        # Why the last show() drew nothing, "" when it drew.
+        self.last_refusal = ""
         self._band: Optional[QgsRubberBand] = None
         self._last_bbox: Optional[QgsRectangle] = None
         self._flash_timer: Optional[QTimer] = None
@@ -45,7 +288,7 @@ class GeometryPreviewManager:
         self._flash_base_width: int = 2
 
     def show(self, wkb: bytes, crs_authid: Optional[str],
-             target_layer=None) -> bool:
+             target_layer=None, witnesses=()) -> bool:
         """Render old geometry on the canvas. Returns True on success.
 
         When ``target_layer`` is provided, the rubberband adopts the
@@ -53,8 +296,16 @@ class GeometryPreviewManager:
         opacity so the user can tell at a glance "this is the geometry
         of layer X as a temporary preview". Falls back to the default
         red dash on any failure.
+
+        The position is `display_verdict` (the Rewind's CRS verdict, with
+        *witnesses*: the other captured geometries of the event). A
+        geometry it refuses, or one that cannot be transformed to the
+        canvas, is not drawn: ``last_refusal`` names why and the QGIS
+        message bar says it. Drawing it anyway (the untransformed
+        coordinates after a failed transform) put it where it never was.
         """
         self.clear()
+        self.last_refusal = ""
         if not wkb:
             flog("GeometryPreview.show: skipped reason=empty_wkb", "INFO")
             return False
@@ -65,24 +316,35 @@ class GeometryPreviewManager:
                  "WARNING")
             return False
 
-        transform_status = "no_transform"
-        if crs_authid:
+        verdict = display_verdict(geom, crs_authid, target_layer,
+                                  witnesses=witnesses)
+        if verdict.geometry is None:
+            return self._refuse(verdict.reason_code, verdict.refusal,
+                                crs_authid)
+        geom = verdict.geometry
+        src_crs = verdict.crs
+        transform_status = f"no_transform verdict={verdict.status}"
+        if src_crs is not None and src_crs.isValid():
             try:
-                src_crs = QgsCoordinateReferenceSystem(crs_authid)
                 dst_crs = self._canvas.mapSettings().destinationCrs()
-                if src_crs.isValid() and dst_crs.isValid() and src_crs != dst_crs:
+                if dst_crs.isValid() and src_crs != dst_crs:
                     xform = QgsCoordinateTransform(src_crs, dst_crs, QgsProject.instance())
-                    geom.transform(xform)
-                    transform_status = (f"transformed src={crs_authid} "
-                                        f"dst={dst_crs.authid()}")
-                elif not src_crs.isValid():
-                    transform_status = f"src_crs_invalid src={crs_authid}"
+                    geom = QgsGeometry(geom)
+                    status = geom.transform(xform)
+                    # Qgis.GeometryOperationResult on Qt6 (no int equality),
+                    # an int before: Success is 0 either way.
+                    if int(getattr(status, "value", status) or 0) != 0:
+                        raise ValueError(f"transform status {status}")
+                    transform_status = (f"transformed src={_crs_text(src_crs)} "
+                                        f"dst={dst_crs.authid()} "
+                                        f"verdict={verdict.status}")
                 else:
-                    transform_status = "same_crs"
-            except Exception as e:
-                flog(f"GeometryPreview.show: CRS transform failed: {e}",
-                     "WARNING")
-                transform_status = f"transform_failed err={e}"
+                    transform_status = f"same_crs verdict={verdict.status}"
+            except Exception as e:  # noqa: BLE001 - QgsCsException and others
+                return self._refuse(
+                    "crs_mismatch",
+                    f"Geometry of layer CRS {_crs_text(src_crs)} cannot be "
+                    f"placed on the map CRS ({e}); not drawn", crs_authid)
 
         band_type = _geom_band_type(geom)
         self._band = QgsRubberBand(self._canvas, band_type)
@@ -99,6 +361,19 @@ class GeometryPreviewManager:
             "INFO",
         )
         return True
+
+    def _refuse(self, reason_code: str, refusal: str,
+                crs_authid: Optional[str]) -> bool:
+        """Draw nothing, say why (the refusal state of the preview)."""
+        self.last_refusal = refusal or reason_code or "?"
+        flog(f"GeometryPreview.show: refused reason_code={reason_code} "
+             f"capture_crs={crs_authid or '-'} detail={self.last_refusal}",
+             "WARNING")
+        _announce(
+            QCoreApplication.translate("GeometryPreviewManager",
+                                       "Aperçu de géométrie non affiché"),
+            self.last_refusal)
+        return False
 
     def zoom_to_preview(self) -> None:
         """Center and zoom canvas to the current preview extent.

@@ -3,8 +3,8 @@
 Lance depuis la console Python QGIS (ou standalone via Python 3.10+ sans QGIS) :
 
     exec(compile(
-        Path('C:/Users/yadda/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/i18n_coverage.py').read_text(),
-        'C:/Users/yadda/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/i18n_coverage.py',
+        Path('C:/Users/<user>/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/i18n_coverage.py').read_text(),
+        'C:/Users/<user>/AppData/Roaming/QGIS/QGIS4/profiles/default/python/plugins/recoverland/scripts/validation/scenarios/i18n_coverage.py',
         'exec'
     ))
 
@@ -306,7 +306,7 @@ def run() -> dict[str, Any]:
         all_hardcoded.extend(scan["hardcoded"])
         all_tr.extend(scan["tr_calls"])
 
-    # 1. Hardcoded UI strings without tr() — only in target widget files.
+    # 1. Hardcoded UI strings without tr() - only in target widget files.
     target_hardcoded = [
         h for h in all_hardcoded if h[1] in _TARGET_WIDGET_FILES
     ]
@@ -385,7 +385,7 @@ def antithese() -> dict[str, Any]:
 
     Each antithèse creates a synthetic condition and asserts the scanner
     flags it. If any antithèse passes (i.e. the scanner misses the violation),
-    the verdict is FAIL — meaning the gate is too weak.
+    the verdict is FAIL - meaning the gate is too weak.
     """
     import tempfile
 

@@ -405,13 +405,25 @@ def assertions(ctx):
         f"apres annulation={ins_after1}: l'annulation d'un INSERT doit "
         f"supprimer l'entite inseree",
     ))
+    # Hypothesis revised (v7): the replay used to be declared a non-event
+    # by a SUCCESSFUL skip ("Already absent (no snapshot match)"). But the
+    # replay only knows that the inserted feature was not FOUND, and "not
+    # found" is not "not there": every captured value and the geometry may
+    # have been edited since, and the success was journalled as a trace
+    # that neutralised the INSERT for every later rewind. It is now a
+    # named refusal, nothing deleted (reason_code target_absent). The
+    # layer check is unchanged, and the declaration is just as explicit:
+    # never counted as done, and it says that nothing was deleted.
+    ins_r2 = ctx.data.get("ins_r2") or {}
     out.append((
         "undo_insert_replay_is_a_non_event",
         ins_after2 == ins_after1
-        and (ctx.data.get("ins_r2") or {}).get("skipped") is True,
-        f"apres rejeu={ins_after2} resultat={ctx.data.get('ins_r2')}: "
+        and ins_r2.get("success") is False
+        and ins_r2.get("reason_code") == "target_absent"
+        and "nothing deleted" in str(ins_r2.get("message", "")),
+        f"apres rejeu={ins_after2} resultat={ins_r2}: "
         f"rejouer l'annulation d'un INSERT ne doit rien supprimer d'autre "
-        f"et doit se declarer comme un non-evenement",
+        f"et doit dire, par un refus nomme, que rien n'a ete supprime",
     ))
 
     # ===== Volet C : session d'edition non validee ======================

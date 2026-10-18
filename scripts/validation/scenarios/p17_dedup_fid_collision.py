@@ -264,6 +264,18 @@ def assertions(ctx):
     return out
 
 
+def teardown(ctx):
+    """Ferme le journal en memoire ouvert par setup(ctx).
+
+    Sous Python 3.12 une sqlite3.Connection se reference elle-meme (cache
+    de requetes) : non fermee, elle restait ouverte apres le scenario,
+    jusqu'au prochain passage du ramasse-miettes, pendant un autre.
+    """
+    conn = ctx.data.pop("conn", None)
+    if conn is not None:
+        conn.close()
+
+
 if __name__ == "__main__":
     import sys
     if str(_PLUGIN_ROOT) not in sys.path:
