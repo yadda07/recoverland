@@ -899,7 +899,8 @@ def _evidence(feature, attrs: Dict[str, Any], comparable: List[tuple],
 def _state_matches(layer, attrs: Dict[str, Any], comparable: List[tuple],
                    expected_geom, exclude_fids: Optional[set] = None,
                    limit: int = 2, what: str = "",
-                   version: Any = _NO_EVENT) -> List[int]:
+                   version: Any = _NO_EVENT,
+                   baseline: Optional["_Baseline"] = None) -> List[int]:
     """FIDs of the features carrying the WHOLE captured state (up to *limit*).
 
     Geometry (when given) AND every comparable field, NULLs included.
@@ -917,6 +918,23 @@ def _state_matches(layer, attrs: Dict[str, Any], comparable: List[tuple],
             expected_wkb = bytes(expected_geom.asWkb())
         except (TypeError, ValueError):
             expected_wkb = None
+        index = _committed_index(layer, baseline) if baseline is not None else None
+        if index is not None:
+            cands = index.live_bbox_candidates(
+                layer, expected_geom.boundingBox(), what)
+            if cands is not None:
+                matches: List[int] = []
+                for fid in cands:
+                    if exclude_fids and fid in exclude_fids:
+                        continue
+                    feature = _read_one(layer, fid, what)
+                    if feature is not None and _evidence(
+                            feature, attrs, comparable, expected_geom,
+                            expected_wkb, version).full:
+                        matches.append(fid)
+                        if len(matches) >= limit:
+                            break
+                return matches
     elif expected_geom is None:
         # Attributes only (BL-RW-P1-26): skip geometry materialisation and
         # read only the compared columns -- NULL-captured ones included,
@@ -926,7 +944,7 @@ def _state_matches(layer, attrs: Dict[str, Any], comparable: List[tuple],
             request.setSubsetOfAttributes([idx for _name, idx in comparable])
         except (AttributeError, TypeError):
             pass
-    matches: List[int] = []
+    matches = []
     for feature in _scan(layer, request, what):
         if exclude_fids and feature.id() in exclude_fids:
             continue
@@ -1220,13 +1238,13 @@ def _resolve_insert_target(layer, event: AuditEvent,
     try:
         matches = _state_matches(layer, attrs, comparable, expected_geom,
                                  exclude_fids=exclude_fids, what=what,
-                                 version=version)
+                                 version=version, baseline=baseline)
         found_via = "snapshot"
         if not matches and _has_shape(expected_geom) and non_null >= 2:
             matches = _state_matches(layer, attrs, comparable, None,
                                      exclude_fids=exclude_fids,
                                      what=f"{what} (attributes)",
-                                     version=version)
+                                     version=version, baseline=baseline)
             found_via = "attr_rescue"
             if len(matches) == 1 and not _geometry_near(
                     layer, matches[0], expected_geom,
@@ -2281,6 +2299,13 @@ def _layer_key(layer) -> str:
         return f"object-{id(layer)}"
 
 
+def _box_key(bb) -> Optional[tuple]:
+    try:
+        return (bb.xMinimum(), bb.yMinimum(), bb.xMaximum(), bb.yMaximum())
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+
+
 class _CommittedIndex:
     """The committed columns a rewind session's rarity counts read."""
 
@@ -2289,6 +2314,7 @@ class _CommittedIndex:
         self.stale = False
         self._columns: Dict[str, Any] = {}
         self._geometry: Optional[Dict[int, str]] = None
+        self._box_buckets: Optional[Dict[tuple, List[int]]] = None
         self._hooks: list = []
         # identity -> (fids, via) of `_lookup_identity`, same lifetime.
         self.lookups: Dict[tuple, tuple] = {}
@@ -2324,6 +2350,7 @@ class _CommittedIndex:
                 pass
         self._columns.clear()
         self._geometry = None
+        self._box_buckets = None
         self.lookups.clear()
 
     def column(self, layer, name: str, what: str) -> Optional[_CommittedColumn]:
@@ -2338,18 +2365,110 @@ class _CommittedIndex:
     def geometry_states(self, layer, what: str) -> Dict[int, str]:
         """FID -> ``present`` / ``null`` / ``empty`` at the committed state."""
         if self._geometry is None:
-            from qgis.core import QgsFeatureRequest
-            request = QgsFeatureRequest()
-            request.setNoAttributes()
-            states = {}
-            for feature in _scan(layer, request,
-                                 f"{what} committed geometries",
-                                 provider_only=True):
-                live = feature.geometry()
-                states[feature.id()] = ("present" if is_geometry_present(live)
-                                        else _absence_kind(live))
-            self._geometry = states
+            self._load_committed_geometries(layer, what)
         return self._geometry
+
+    def box_buckets(self, layer, what: str) -> Dict[tuple, List[int]]:
+        """Bounding-box tuple -> committed FIDs."""
+        if self._box_buckets is None:
+            self._load_committed_geometries(layer, what)
+        return self._box_buckets
+
+    def _load_committed_geometries(self, layer, what: str) -> None:
+        from qgis.core import QgsFeatureRequest
+        request = QgsFeatureRequest()
+        request.setNoAttributes()
+        states: Dict[int, str] = {}
+        buckets: Dict[tuple, List[int]] = {}
+        for feature in _scan(layer, request,
+                             f"{what} committed geometries",
+                             provider_only=True):
+            fid = feature.id()
+            live = feature.geometry()
+            if is_geometry_present(live):
+                states[fid] = "present"
+                bkey = _box_key(live.boundingBox())
+                if bkey is not None:
+                    buckets.setdefault(bkey, []).append(fid)
+            else:
+                states[fid] = _absence_kind(live)
+        self._geometry = states
+        self._box_buckets = buckets
+
+    def live_bbox_candidates(self, layer, want_bb,
+                             what: str) -> Optional[List[int]]:
+        """FIDs whose live geometry bounding box equals *want_bb*."""
+        eb = layer.editBuffer() if hasattr(layer, "editBuffer") else None
+        if eb is None:
+            return None
+        want_key = _box_key(want_bb)
+        if want_key is None:
+            return None
+        buckets = self.box_buckets(layer, what)
+        deleted = set(eb.deletedFeatureIds() or ())
+        changed_geoms = eb.changedGeometries() or {}
+        added_feats = eb.addedFeatures() or {}
+        out = [fid for fid in buckets.get(want_key, ())
+               if fid not in deleted and fid not in changed_geoms]
+        for fid, g in changed_geoms.items():
+            if (fid not in deleted and is_geometry_present(g)
+                    and _box_key(g.boundingBox()) == want_key):
+                out.append(fid)
+        for tmp_fid, feat in added_feats.items():
+            if tmp_fid in deleted:
+                continue
+            g = feat.geometry()
+            if is_geometry_present(g) and _box_key(g.boundingBox()) == want_key:
+                out.append(tmp_fid)
+        return out
+
+    def live_value_holders(self, layer, idx: int, expected, what: str,
+                           version: Any = _NO_EVENT,
+                           limit: int = 2) -> Optional[int]:
+        """Count of live features whose field *idx* holds *expected*."""
+        eb = layer.editBuffer() if hasattr(layer, "editBuffer") else None
+        if eb is None:
+            return None
+        try:
+            name = layer.fields().at(idx).name()
+        except (AttributeError, RuntimeError):
+            return None
+        col = self.column(layer, name, what)
+        if col is None:
+            return None
+        base_cands = _column_candidates(col, expected, version)
+        if base_cands is None:
+            return None
+        deleted = set(eb.deletedFeatureIds() or ())
+        changed_attrs = eb.changedAttributeValues() or {}
+        added_feats = eb.addedFeatures() or {}
+        count = 0
+        for fid in base_cands:
+            if fid in deleted or (fid in changed_attrs and idx in changed_attrs[fid]):
+                continue
+            if _vals_match(col.values.get(fid), expected, version):
+                count += 1
+                if count >= limit:
+                    return count
+        for fid, attr_map in changed_attrs.items():
+            if fid in deleted or idx not in attr_map:
+                continue
+            if _vals_match(attr_map[idx], expected, version):
+                count += 1
+                if count >= limit:
+                    return count
+        for tmp_fid, feat in added_feats.items():
+            if tmp_fid in deleted:
+                continue
+            try:
+                val = feat[idx]
+            except (KeyError, IndexError):
+                continue
+            if _vals_match(val, expected, version):
+                count += 1
+                if count >= limit:
+                    return count
+        return count
 
     def others(self, layer, target_fid: int, checks: List[tuple], what: str,
                version: Any = _NO_EVENT, absence: Optional[str] = None,
@@ -2957,7 +3076,8 @@ def _journal_compensation(conn, event: AuditEvent):
 
 def _count_geometry_holders(layer, geom, checks: List[tuple], what: str,
                             limit: int = 2,
-                            version: Any = _NO_EVENT) -> int:
+                            version: Any = _NO_EVENT,
+                            baseline: Optional[_Baseline] = None) -> int:
     """Features carrying *geom* AND the values of *checks* ``[(idx, value)]``.
 
     For `NO_GEOMETRY` the features WITHOUT a geometry are counted: there is
@@ -2972,6 +3092,22 @@ def _count_geometry_holders(layer, geom, checks: List[tuple], what: str,
     if geom is not NO_GEOMETRY:
         request.setFilterRect(geom.boundingBox())
         expected_wkb = bytes(geom.asWkb())
+        index = _committed_index(layer, baseline) if baseline is not None else None
+        if index is not None:
+            cands = index.live_bbox_candidates(layer, geom.boundingBox(), what)
+            if cands is not None:
+                count = 0
+                for fid in cands:
+                    feature = _read_one(layer, fid, what)
+                    if feature is None or not feature_matches_geometry(
+                            feature, geom, expected_wkb=expected_wkb):
+                        continue
+                    if all(_vals_match(feature[idx], value, version)
+                           for idx, value in checks):
+                        count += 1
+                        if count >= limit:
+                            break
+                return count
     count = 0
     for feature in _scan(layer, request, what):
         if geom is NO_GEOMETRY:
@@ -2989,7 +3125,8 @@ def _count_geometry_holders(layer, geom, checks: List[tuple], what: str,
 
 
 def _count_value_holders(layer, idx: int, live_value, expected, what: str,
-                         limit: int = 2, version: Any = _NO_EVENT) -> int:
+                         limit: int = 2, version: Any = _NO_EVENT,
+                         baseline: Optional[_Baseline] = None) -> int:
     """Features whose field *idx* carries *expected* (up to *limit*).
 
     The provider filters first (an attribute filter is cheap where a
@@ -3000,6 +3137,13 @@ def _count_value_holders(layer, idx: int, live_value, expected, what: str,
     count, like `_count_geometry_holders`.
     """
     from qgis.core import QgsFeatureRequest, QgsExpression
+
+    index = _committed_index(layer, baseline) if baseline is not None else None
+    if index is not None:
+        cached = index.live_value_holders(
+            layer, idx, expected, what, version=version, limit=limit)
+        if cached is not None:
+            return cached
 
     def _count(request) -> int:
         count = 0
@@ -3092,7 +3236,8 @@ def _prove_update_state(layer, fid: int, event: AuditEvent, side: str,
     batch already wrote may be the very entity the FID no longer points at.
     """
     if via != "pk":
-        return _prove_update_content(layer, fid, event, side, field_mapping)
+        return _prove_update_content(layer, fid, event, side, field_mapping,
+                                     baseline=baseline)
     evidence = _update_state_evidence(layer, fid, event, side, field_mapping)
     if not isinstance(evidence, _StateEvidence):
         level, reason = evidence
@@ -3183,7 +3328,8 @@ def _update_state_evidence(layer, fid: int, event: AuditEvent, side: str,
 
 
 def _prove_update_content(layer, fid: int, event: AuditEvent, side: str,
-                          field_mapping: Dict[str, str]) -> Tuple[str, str]:
+                          field_mapping: Dict[str, str],
+                          baseline: Optional[_Baseline] = None) -> Tuple[str, str]:
     """The FID-nomination proof of `_prove_update_state` (levels there)."""
     evidence = _update_state_evidence(layer, fid, event, side, field_mapping)
     if not isinstance(evidence, _StateEvidence):
@@ -3197,7 +3343,7 @@ def _prove_update_content(layer, fid: int, event: AuditEvent, side: str,
         if geom is NO_GEOMETRY:
             holders = _count_geometry_holders(
                 layer, geom, checks, f"{tag}-state geometry absence uniqueness",
-                version=version)
+                version=version, baseline=baseline)
             if holders == 1:
                 return ID_MEDIUM, f"{shape} only_feature_without_geometry"
             if holders > 1:
@@ -3206,7 +3352,7 @@ def _prove_update_content(layer, fid: int, event: AuditEvent, side: str,
         if geom is not None:
             holders = _count_geometry_holders(
                 layer, geom, checks, f"{tag}-state geometry uniqueness",
-                version=version)
+                version=version, baseline=baseline)
             if holders == 1:
                 return ID_MEDIUM, f"{shape} geometry_unique"
             if holders > 1:
@@ -3216,7 +3362,8 @@ def _prove_update_content(layer, fid: int, event: AuditEvent, side: str,
             cur_name, idx, live, expected = evidence.single
             holders = _count_value_holders(
                 layer, idx, live, expected,
-                f"{tag}-state value uniqueness {cur_name}", version=version)
+                f"{tag}-state value uniqueness {cur_name}", version=version,
+                baseline=baseline)
             if holders == 1:
                 return ID_MEDIUM, f"{shape} value_unique:{cur_name}"
             return ID_WEAK, f"{shape} value_shared:{cur_name}"
@@ -3279,7 +3426,8 @@ def _prove_key_content(layer, fid: int, event: AuditEvent,
 
 
 def _update_state_candidates(layer, event: AuditEvent, side: str,
-                             limit: int = 2, what: str = "") -> List[int]:
+                             limit: int = 2, what: str = "",
+                             baseline: Optional[_Baseline] = None) -> List[int]:
     """Features carrying the *side* state of UPDATE *event*, for a relocation.
 
     Geometry (when captured) AND every changed value, NULL-aware. Only a
@@ -3295,7 +3443,7 @@ def _update_state_candidates(layer, event: AuditEvent, side: str,
         return []
     return _state_matches(layer, attrs, comparable, geom, limit=limit,
                           what=what or f"{side}-state relocation",
-                          version=_event_version(event))
+                          version=_event_version(event), baseline=baseline)
 
 
 def _resolve_update_target(layer, event: AuditEvent, identity: Dict[str, Any],
@@ -3347,7 +3495,8 @@ def _resolve_update_target(layer, event: AuditEvent, identity: Dict[str, Any],
     if relocate and via != "pk":
         try:
             matches = _update_state_candidates(
-                layer, event, side, what=f"{context} {side}-state relocation")
+                layer, event, side, what=f"{context} {side}-state relocation",
+                baseline=baseline)
         except TargetScanError as exc:
             return _done(TargetResolution(None, ID_UNRESOLVABLE,
                                           f"scan_failed: {exc}", via="scan",

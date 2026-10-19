@@ -990,8 +990,9 @@ def _settle_update_target(layer, event: AuditEvent,
     candidates read "target feature absent".
     """
     from .restore_service import (
-        _event_identity, _resolve_update_target, _target_already_at_old,
-        ID_AMBIGUOUS, ID_UNRESOLVABLE, ID_WEAK,
+        _event_identity, _prove_update_state, _resolve_update_target,
+        _target_already_at_old, ID_AMBIGUOUS, ID_UNRESOLVABLE, ID_WEAK,
+        WRITABLE_LEVELS,
     )
 
     eid = event.event_id
@@ -1039,11 +1040,35 @@ def _settle_update_target(layer, event: AuditEvent,
 
     identity = _event_identity(layer, event)
     baseline = _rewind_baseline(journal, fid_remap)
+    relocated_map = (fid_remap.get(_RELOCATED_SLOT)
+                     if isinstance(fid_remap, dict) else None)
+    relocated_fid = (relocated_map.get(fp)
+                     if isinstance(relocated_map, dict) and fp != "?" else None)
+    if relocated_fid is not None:
+        r_level, r_why = _prove_update_state(
+            layer, relocated_fid, event, "new", mapping, "fid", baseline)
+        if r_level in WRITABLE_LEVELS:
+            flog(f"_buffer_update: using relocated_fid eid={eid} fp={fp} "
+                 f"fid={relocated_fid} ({r_why})")
+            return relocated_fid, None
+        if r_why.startswith("scan_failed"):
+            return None, {
+                "success": False,
+                "status": "FAILED",
+                "reason_code": "scan_failed",
+                "identity_level": ID_UNRESOLVABLE,
+                "message": (f"Failed: layer read failed ({r_why}); nothing "
+                            f"written"),
+            }
+        relocated_map.pop(fp, None)
+
     res = _resolve_update_target(layer, event, identity, mapping, "new",
                                  relocate=True,
                                  context=f"BUF_UPD eid={eid} fp={fp}",
                                  baseline=baseline)
     if res.writable:
+        if isinstance(fid_remap, dict) and fp != "?" and res.fid is not None:
+            fid_remap.setdefault(_RELOCATED_SLOT, {})[fp] = res.fid
         return res.fid, None
 
     if res.reason.startswith("scan_failed"):
@@ -1115,6 +1140,9 @@ _SESSION_SLOT = ("__rewind_session__",)
 # fid_remap slot of {entity fingerprint: the DELETE-like row whose
 # re-insertion created the remap entry} (`_record_remap`).
 _REMAP_SOURCE_SLOT = ("__remap_source__",)
+# fid_remap slot of {entity fingerprint: live FID a previous UPDATE of the
+# same chain resolved/relocated onto}.
+_RELOCATED_SLOT = ("__relocated_fids__",)
 
 
 def _rewind_baseline(journal=None, fid_remap: Optional[Dict] = None):

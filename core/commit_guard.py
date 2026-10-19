@@ -180,6 +180,11 @@ def geometry_equal(actual, expected) -> bool:
 
 
 _KEY_DIGITS = 7
+_ISO_MIN_LEN = 16
+_AREA_MIN_SPAN = 1.0
+_AREA_PAD_REL = 1e-6
+_AREA_PAD_ABS = 1e-9
+_CANON_TAG = "canon"
 
 
 def _vertex_key(geom):
@@ -227,6 +232,16 @@ def _vertex_key(geom):
     return tuple(pts) if pts else None
 
 
+def _text_instant_ms(value):
+    if not isinstance(value, str) or len(value) < _ISO_MIN_LEN:
+        return None
+    from .serialization import journal_text_instant_ms
+    try:
+        return journal_text_instant_ms(value)
+    except Exception:  # noqa: BLE001 - comparison must not raise
+        return None
+
+
 def _canon_value(value):
     # Same notion of equality as `values_equal`: one instant, one key,
     # whatever the time spec the value was written or read back with. A
@@ -239,6 +254,10 @@ def _canon_value(value):
     if instant is not None:
         return ("datetime_s", instant // 1000)
     v = _norm_value(value)
+    if isinstance(v, str):
+        text_ms = _text_instant_ms(v)
+        if text_ms is not None:
+            return ("datetime_s", text_ms // 1000)
     if isinstance(v, float):
         if math.isnan(v):
             return "nan"
@@ -309,12 +328,24 @@ def _read_states(source, fids, field_names) -> Dict[int, _FeatureState]:
     return out
 
 
+def _sync_layer_encoding(src_layer, dst_layer) -> None:
+    try:
+        src_dp = src_layer.dataProvider()
+        dst_dp = dst_layer.dataProvider()
+        enc = src_dp.encoding() if src_dp is not None else ""
+        if enc and dst_dp is not None and hasattr(dst_dp, "setEncoding"):
+            dst_dp.setEncoding(enc)
+    except (RuntimeError, AttributeError, TypeError):
+        pass
+
+
 def _fresh_layer(layer):
     """A new layer on the same source: reads the file, not a provider cache."""
     from qgis.core import QgsVectorLayer
     try:
         fresh = QgsVectorLayer(layer.source(), "rl_readback", layer.providerType())
         if fresh.isValid():
+            _sync_layer_encoding(layer, fresh)
             return fresh
     except (RuntimeError, AttributeError):
         pass
@@ -687,31 +718,87 @@ class CommitGuard:
                  f"features={len(fids)} added={len(verdict.added_fids)}")
 
     # ---------------------------------------------------- unstable FIDs
+    def _attr_key(self, attrs: dict) -> tuple:
+        return tuple((n, _canon_value(attrs.get(n)))
+                     for n in self.field_names if n not in self.auto_fields)
+
     def _signature(self, state: "_FeatureState"):
-        attrs = tuple((n, _canon_value(state.attrs.get(n)))
-                      for n in self.field_names if n not in self.auto_fields)
-        return attrs, _vertex_key(state.geom), (
+        return self._attr_key(state.attrs), _vertex_key(state.geom), (
             _part_count(state.geom) if state.geom is not None else 0)
+
+    def _fast_signature(self, state: "_FeatureState") -> tuple:
+        from .geometry_utils import is_geometry_present
+        attrs = self._attr_key(state.attrs)
+        g = state.geom
+        if not is_geometry_present(g):
+            return attrs, None
+        try:
+            wkb = bytes(g.asWkb())
+            if wkb:
+                return attrs, wkb
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        return attrs, (_CANON_TAG, _vertex_key(g), _part_count(g))
+
+    def _canon_from_fast(self, fast_sig: tuple) -> tuple:
+        from .geometry_utils import rebuild_geometry
+        attrs, geom_tok = fast_sig
+        if geom_tok is None:
+            return attrs, None, 0
+        if isinstance(geom_tok, tuple) and len(geom_tok) == 3:
+            return attrs, geom_tok[1], geom_tok[2]
+        cache = self.__dict__.setdefault("_wkb_canon_cache", {})
+        cached = cache.get(geom_tok)
+        if cached is None:
+            geom = rebuild_geometry(geom_tok)
+            cached = (_vertex_key(geom),
+                      _part_count(geom) if geom is not None else 0)
+            cache[geom_tok] = cached
+        return attrs, cached[0], cached[1]
+
+    def _project_canon(self, fast_counts):
+        from collections import Counter
+        out = Counter()
+        for fast_sig, count in fast_counts.items():
+            if count > 0:
+                out[self._canon_from_fast(fast_sig)] += count
+        return out
+
+    def _resolve_canon_diff(self, expected_fast, after_fast, unmatched_pre):
+        from collections import Counter
+        missing_fast = expected_fast - after_fast
+        extra_fast = (after_fast - expected_fast) + unmatched_pre
+        if not missing_fast and not extra_fast:
+            return Counter(), Counter(), 0
+        n_res = sum(missing_fast.values()) + sum(extra_fast.values())
+        missing_canon = self._project_canon(missing_fast)
+        extra_canon = self._project_canon(extra_fast)
+        return missing_canon - extra_canon, extra_canon - missing_canon, n_res
 
     def _affected_area(self):
         from qgis.core import QgsRectangle
-        from .geometry_utils import is_geometry_present
-        rect = None
+        from .geometry_utils import _finite_box, is_geometry_present
         states = list(self._pre.values()) + list(self._projection.values())
         states += [st for _t, st in self._added_proj]
+        boxes = []
         for st in states:
-            g = st.geom
-            if not is_geometry_present(g):
+            if not st.exists:
                 continue
-            bb = g.boundingBox()
-            if rect is None:
-                rect = QgsRectangle(bb)
-            else:
-                rect.combineExtentWith(bb)
-        if rect is not None:
-            grow = max(rect.width(), rect.height(), 1e-6) * 1e-6 + 1e-9
-            rect.grow(grow)
-        return rect
+            if not is_geometry_present(st.geom):
+                return None
+            box = _finite_box(st.geom)
+            if box is None:
+                return None
+            boxes.append(box)
+        if not boxes:
+            return None
+        xmin = min(b[0] for b in boxes)
+        ymin = min(b[1] for b in boxes)
+        xmax = max(b[2] for b in boxes)
+        ymax = max(b[3] for b in boxes)
+        span = max(xmax - xmin, ymax - ymin, _AREA_MIN_SPAN)
+        grow = span * _AREA_PAD_REL + _AREA_PAD_ABS
+        return QgsRectangle(xmin - grow, ymin - grow, xmax + grow, ymax + grow)
 
     def _signatures(self, source, area):
         from collections import Counter
@@ -727,70 +814,85 @@ class CommitGuard:
                     attrs[name] = feat[name]
                 except (KeyError, IndexError):
                     attrs[name] = None
-            sigs[self._signature(_FeatureState(attrs, feat.geometry(), True))] += 1
+            sigs[self._fast_signature(_FeatureState(attrs, feat.geometry(), True))] += 1
         return sigs
 
     def _expected_after(self):
         from collections import Counter
         expected = Counter(self._before_sigs)
+        unmatched_pre = Counter()
         per_event_expect = {}
         for fid, st in self._pre.items():
             if st.exists:
-                sig = self._signature(st)
+                sig = self._fast_signature(st)
                 if expected[sig] > 0:
                     expected[sig] -= 1
+                else:
+                    unmatched_pre[sig] += 1
         for fid, st in self._projection.items():
             if st.exists:
-                expected[self._signature(st)] += 1
+                expected[self._fast_signature(st)] += 1
         for _tmp, st in self._added_proj:
-            expected[self._signature(st)] += 1
+            expected[self._fast_signature(st)] += 1
         for eid in self._all_events():
             want, gone = [], []
             for fid in self._event_fids.get(eid, ()):
                 proj = self._projection.get(fid)
                 if proj is not None and proj.exists:
-                    want.append(self._signature(proj))
+                    want.append(self._fast_signature(proj))
             for fid in self._event_deleted.get(eid, ()):
                 pre = self._pre.get(fid)
                 if pre is not None and pre.exists:
-                    gone.append(self._signature(pre))
+                    gone.append(self._fast_signature(pre))
             added = dict(self._added_proj)
             for tmp in self._event_added.get(eid, ()):
                 if tmp in added:
-                    want.append(self._signature(added[tmp]))
+                    want.append(self._fast_signature(added[tmp]))
             per_event_expect[eid] = (want, gone)
-        return +expected, per_event_expect
+        return +expected, unmatched_pre, per_event_expect
 
     def _verify_by_content(self, verdict: "CommitVerdict") -> None:
+        import time
+        t0 = time.monotonic()
         fresh = _fresh_layer(self.layer) or self.layer.dataProvider()
         after = self._signatures(fresh, self._area)
-        expected, per_event = self._expected_after()
-        missing = expected - after
-        extra = after - expected
+        expected, unmatched_pre, per_event = self._expected_after()
+        missing, extra, n_res = self._resolve_canon_diff(
+            expected, after, unmatched_pre)
         verdict.state = COMMITTED_VERIFIED if not (missing or extra) else COMMITTED_MISMATCH
+        has_diff = bool(missing or extra)
         for eid, (want, gone) in per_event.items():
+            if not has_diff:
+                verdict.per_event[eid] = EV_APPLIED_VERIFIED
+                continue
             problems = []
             for sig in want:
-                if missing.get(sig, 0) > 0:
+                if missing.get(self._canon_from_fast(sig), 0) > 0:
                     problems.append("a feature does not hold the values asked for")
             for sig in gone:
-                if extra.get(sig, 0) > 0:
+                if extra.get(self._canon_from_fast(sig), 0) > 0:
                     problems.append("a feature that should be gone is still present")
             if problems:
                 verdict.per_event[eid] = EV_FAILED_POSTCOMMIT_VERIFICATION
                 verdict.per_event_detail[eid] = "; ".join(problems)[:500]
             else:
                 verdict.per_event[eid] = EV_APPLIED_VERIFIED
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
         tag = "verified" if verdict.state == COMMITTED_VERIFIED else "mismatch"
         flog(f"{self.prefix}commit_guard: event=postcommit_{tag} "
-             f"mode=content missing={sum(missing.values())} extra={sum(extra.values())}",
+             f"mode=content missing={sum(missing.values())} "
+             f"extra={sum(extra.values())} canon_resolved={n_res} "
+             f"elapsed_ms={elapsed_ms}",
              "INFO" if verdict.state == COMMITTED_VERIFIED else "ERROR")
 
     def _refused_by_content(self, verdict: "CommitVerdict") -> None:
+        from collections import Counter
         fresh = _fresh_layer(self.layer) or self.layer.dataProvider()
         after = self._signatures(fresh, self._area)
         before = self._before_sigs
-        if after == before:
+        lost, gained, _n_res = self._resolve_canon_diff(
+            before, after, Counter())
+        if not gained and not lost:
             verdict.state = REFUSED_NOTHING_WRITTEN
             self._attribute_refusal(verdict, set(), set())
             flog(f"{self.prefix}commit_guard: event=commit_refused_nothing_written "
@@ -799,8 +901,6 @@ class CommitGuard:
         # Positional FIDs: what the refused commit wrote cannot be mapped
         # back to features reliably enough to revert it blindly. Report it
         # precisely instead of pretending the batch left nothing behind.
-        gained = after - before
-        lost = before - after
         verdict.state = REFUSED_COMPENSATION_FAILED
         verdict.left_modified = (
             [f"{n} feature(s) now in the file that were not before" for n in

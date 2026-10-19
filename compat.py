@@ -181,6 +181,10 @@ class QtCompat:
 
     # --- QPainter.CompositionMode ---
     COMPOSITION_SCREEN = _resolve_enum(QPainter, 'CompositionMode', 'CompositionMode_Screen')
+    COMPOSITION_SOURCE = _resolve_enum(QPainter, 'CompositionMode', 'CompositionMode_Source')
+    COMPOSITION_SOURCE_ATOP = _resolve_enum(
+        QPainter, 'CompositionMode', 'CompositionMode_SourceAtop'
+    )
 
     # --- QPalette.ColorRole / ColorGroup ---
     PALETTE_WINDOW = _resolve_enum(QPalette, 'ColorRole', 'Window')

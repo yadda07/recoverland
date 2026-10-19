@@ -71,8 +71,8 @@ def _change_type_labels():
     }
 
 
-_MIN_RECOVER_ANIMATION_SEC = 3.0
-_MIN_RESTORE_ANIMATION_SEC = 1.8
+_MIN_RECOVER_ANIMATION_SEC = 0.85
+_MIN_RESTORE_ANIMATION_SEC = 0.70
 # Read-your-writes barrier before a plan (see _journal_barrier): long
 # enough for a normal backlog, short enough not to freeze the dialog.
 _JOURNAL_BARRIER_TIMEOUT_S = 5.0
@@ -1808,17 +1808,9 @@ class RecoverDialog(QDialog, LoggerMixin):
         widget.installEventFilter(self)
 
     def _apply_logo_glow_effect(self) -> None:
-        effect = QGraphicsDropShadowEffect(self.logo_label)
-        effect.setBlurRadius(0)
-        effect.setOffset(0, 0)
-        gc = self._glow_color
-        effect.setColor(QColor(gc.red(), gc.green(), gc.blue(), 0))
-        self.logo_label.setGraphicsEffect(effect)
-        self.logo_label.setProperty("glow_color", gc)
-        self.logo_label.setProperty("glow_base_blur", 0)
-        self.logo_label.setProperty("glow_hover_blur", 28)
-        self.logo_label.setProperty("glow_base_alpha", 0)
-        self.logo_label.setProperty("glow_hover_alpha", min(255, gc.alpha() + 75))
+        """Retire tout QGraphicsDropShadowEffect du logo pour eviter le flou CPU par frame."""
+        if hasattr(self, "logo_label") and self.logo_label is not None:
+            self.logo_label.setGraphicsEffect(None)
 
     def _start_logo_activity(self, color: QColor, mode: str) -> None:
         if mode == "recover":
@@ -1827,33 +1819,15 @@ class RecoverDialog(QDialog, LoggerMixin):
             self.logo_label.start_restore_effect(color)
         else:
             raise ValueError(f"Unknown logo activity mode: {mode}")
-        self._pulse_logo_glow(color)
 
     def _stop_logo_activity(self) -> None:
         if not hasattr(self, 'logo_label'):
             return
         self.logo_label.stop_recovery_effect()
-        self._animate_glow(self.logo_label, hover_in=False)
 
     def _pulse_logo_glow(self, color: QColor) -> None:
-        effect = self.logo_label.graphicsEffect()
-        if not isinstance(effect, QGraphicsDropShadowEffect):
-            self._apply_logo_glow_effect()
-            effect = self.logo_label.graphicsEffect()
-        if not isinstance(effect, QGraphicsDropShadowEffect):
-            return
-
-        effect.setBlurRadius(0)
-        effect.setOffset(0, 0)
-        effect.setColor(QColor(color.red(), color.green(), color.blue(), 0))
-        self.logo_label.setProperty("glow_color", color)
-        self.logo_label.setProperty("glow_base_blur", 0)
-        self.logo_label.setProperty("glow_hover_blur", 28)
-        self.logo_label.setProperty("glow_base_alpha", 0)
-        self.logo_label.setProperty("glow_hover_alpha", min(255, color.alpha() + 75))
-
-        self._animate_glow(self.logo_label, hover_in=True)
-        QTimer.singleShot(260, lambda: self._animate_glow(self.logo_label, hover_in=False))
+        """Conserve pour compatibilite interne sans declencher une seconde animation."""
+        return
 
     def changeEvent(self, event):
         """Re-render logo and dialog theme when QGIS palette changes (dark/light mode)."""
@@ -2250,14 +2224,9 @@ class RecoverDialog(QDialog, LoggerMixin):
                 self.end_input.setDateTime(today)
 
     def pulse_progress_bar(self):
-        """Pulse progress bar to indeterminate mode.
-
-        Called by progress_timer (QTimer). No processEvents needed;
-        the timer fires within the Qt event loop.
-        """
-        value = self.progress_bar.value()
-        if value == 0:
-            self.progress_bar.setRange(0, 0)
+        """Arrete le timer de pulsation sans basculer la barre en animation indeterminee."""
+        if self.progress_timer.isActive():
+            self.progress_timer.stop()
 
     def update_progress(self, value):
         """Update progress bar value.
@@ -2275,42 +2244,19 @@ class RecoverDialog(QDialog, LoggerMixin):
         QVariantAnimation feeds intermediate floats; the progress bar
         accepts ints only, so we round here.
         """
-        # The smoother is only used when the bar is in determinate mode;
-        # if it was switched to indeterminate (maximum==0) mid-animation,
-        # silently drop the update to avoid resetting the range.
         if self.progress_bar.maximum() == 0:
             return
         self.progress_bar.setValue(int(round(float(val))))
 
     def _smooth_set_progress(self, target_value: int) -> None:
-        """Animate progress_bar from its current value to ``target_value``.
-
-        Behaviour matrix:
-        - indeterminate mode (max==0) ........ switch to determinate first
-        - target == current displayed value .. no-op
-        - target <= 0 or target >= 100 ....... immediate (reset / done),
-          stop any in-flight animation to avoid an over-shoot afterwards
-        - any other target ................... 300 ms eased interpolation;
-          if a previous animation is still running, restart from the
-          currently displayed value so the visual stays continuous.
-        """
+        """Met a jour progress_bar directement en O(1) sans QVariantAnimation concurrente."""
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, 100)
-        current = self.progress_bar.value()
-        if target_value == current:
-            return
-        running = (self._progress_smoother.state() == QtCompat.ANIM_STATE_RUNNING)
-        if target_value <= 0 or target_value >= 100:
-            if running:
-                self._progress_smoother.stop()
-            self.progress_bar.setValue(target_value)
-            return
-        if running:
+        if self._progress_smoother.state() == QtCompat.ANIM_STATE_RUNNING:
             self._progress_smoother.stop()
-            current = self.progress_bar.value()
-        self._progress_smoother.setStartValue(float(current))
-        self._progress_smoother.setEndValue(float(target_value))
-        self._progress_smoother.start()
+        clamped = max(0, min(100, int(target_value)))
+        if clamped != self.progress_bar.value():
+            self.progress_bar.setValue(clamped)
 
     def on_events_committed(self, edited_fingerprint="") -> None:
         """Auto-refresh smart bar and event table after new events are flushed.
@@ -3854,8 +3800,9 @@ class RecoverDialog(QDialog, LoggerMixin):
 
     def _recover_event_mode(self) -> None:
         """Event mode: threaded search with start/end date range."""
-        self.progress_bar.setVisible(True)
-        self.progress_timer.start(50)
+        self.progress_bar.setVisible(False)
+        if self.progress_timer.isActive():
+            self.progress_timer.stop()
 
         if self.worker_thread and self.worker_thread.isRunning():
             self.worker_thread.stop()
@@ -3959,7 +3906,7 @@ class RecoverDialog(QDialog, LoggerMixin):
              f"cutoff={cutoff_iso} include_traces={include_traces} "
              f"(the window is the complete plan, nothing undone first)")
 
-        self.progress_bar.setVisible(True)
+        self.progress_bar.setVisible(False)
         self._start_logo_activity(self._glow_color, "recover")
         self._recover_started_at = time.monotonic()
         self._version_cutoff_dt = cutoff_dt
@@ -4158,6 +4105,7 @@ class RecoverDialog(QDialog, LoggerMixin):
             qlog(msg, "WARNING")
             return
 
+        self._stop_logo_activity()
         if total_count > WARN_EVENTS_THRESHOLD:
             reply = QMessageBox.question(
                 self,
@@ -4423,6 +4371,7 @@ class RecoverDialog(QDialog, LoggerMixin):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
+        self._start_logo_activity(self._glow_color, "restore")
         self._restore_in_progress = True
         self._version_restore_events = events
         self._restore_started_at = time.monotonic()
