@@ -1278,6 +1278,12 @@ def _pair_reinserted_lifetimes(
     if not candidates:
         return active, plan_items, 0
 
+    by_ds_rows: Dict[str, List[AuditEvent]] = {}
+    for e in list(active) + list(plan_items):
+        by_ds_rows.setdefault(e.datasource_fingerprint or "", []).append(e)
+    for rows in by_ds_rows.values():
+        rows.sort(key=_order_key)
+
     def state_at(creator, r_key, r_pos, until):
         """(state, rows) of the creator's feature just before *until*."""
         snap = _full_state(creator)
@@ -1302,6 +1308,51 @@ def _pair_reinserted_lifetimes(
             between.append(row)
         return (attrs, geom), between
 
+    def shifted_state_at(creator, r_key, r_pos, until, ds):
+        """Follow a shapefile record across session-end delete renumberings."""
+        cur_fid = _fid_number(r_key)
+        snap = _full_state(creator)
+        if cur_fid is None or snap is None or is_plan_item(creator):
+            return None, []
+        attrs, geom = snap
+        between = []
+        ds_rows = [row for row in by_ds_rows.get(ds, ())
+                   if row is not creator and id(row) not in drop
+                   and r_pos < _order_key(row) <= until]
+        idx = 0
+        while idx < len(ds_rows):
+            sess = ds_rows[idx].session_id
+            end = idx + 1
+            while (end < len(ds_rows) and sess
+                   and ds_rows[end].session_id == sess):
+                end += 1
+            del_fids = []
+            for row in ds_rows[idx:end]:
+                pos = _order_key(row)
+                rfid = _fid_number(_entity_key(row))
+                if (row.operation_type == "DELETE" and not is_plan_item(row)
+                        and rfid is not None):
+                    del_fids.append(rfid)
+                if pos >= until or rfid != cur_fid:
+                    continue
+                if row.operation_type != "UPDATE":
+                    return None, []
+                sides = _update_sides(row)
+                if sides is None:
+                    return None, []
+                for field, value in sides[0].items():
+                    if field is None:
+                        geom = value
+                    else:
+                        attrs[field] = value
+                between.append(row)
+            if sess and del_fids and _order_key(ds_rows[end - 1]) < until:
+                if cur_fid in del_fids:
+                    return None, []
+                cur_fid -= sum(1 for df in del_fids if df < cur_fid)
+            idx = end
+        return (attrs, geom), between
+
     drop: set = set()
     paired = 0
     for oldest, key, attrs, geom, ds, segment in sorted(candidates,
@@ -1314,6 +1365,10 @@ def _pair_reinserted_lifetimes(
                     or not r_pos < oldest):
                 continue
             state, between = state_at(r, r_key, r_pos, oldest)
+            if state is None or (state != (attrs, geom)
+                                 and _unwound(attrs, geom, between)
+                                 != _full_state(r)):
+                state, between = shifted_state_at(r, r_key, r_pos, oldest, ds)
             if state is None or (state != (attrs, geom)
                                  and _unwound(attrs, geom, between)
                                  != _full_state(r)):

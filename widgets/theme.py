@@ -235,10 +235,10 @@ def _build_tokens_from_palette(palette: QPalette) -> ThemeTokens:
 
 
 def resolve_theme(widget: Optional[QWidget] = None) -> ThemeTokens:
-    """Calcule ou retourne en cache les ThemeTokens pour la palette courante."""
+    """Calcule ou retourne en cache les ThemeTokens depuis la palette QApplication."""
     global _LAST_LOGGED_KEY
     app = QApplication.instance()
-    palette = widget.palette() if widget is not None else (app.palette() if app else QPalette())
+    palette = app.palette() if app is not None else (widget.palette() if widget is not None else QPalette())
     key = _palette_key(palette)
     if key in _CACHE_TOKENS:
         return _CACHE_TOKENS[key]
