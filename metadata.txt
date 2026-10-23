@@ -18,6 +18,6 @@ qgisMaximumVersion=4.99
 supportsQt6=True
 experimental=False
 deprecated=False
-homepage=https://github.com/yadda07/recoverland/
+homepage=https://geodeci.xyz
 tracker=https://github.com/yadda07/recoverland/issues/
 repository=https://github.com/yadda07/recoverland/
