@@ -18,6 +18,12 @@ Technical documentation is in [`docs/`](docs/index.html). QGIS 3.40 through 4.99
 
 Source and issues stay on this repository: [github.com/yadda07/recoverland](https://github.com/yadda07/recoverland).
 
+Plugin page: [plugins.qgis.org/plugins/RecoverLand](https://plugins.qgis.org/plugins/RecoverLand/).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Credits
+
+Designed and maintained by Youcef ADDA (GEODECI, https://geodeci.xyz). Development is AI-assisted; every release is reviewed and tested by the author.
