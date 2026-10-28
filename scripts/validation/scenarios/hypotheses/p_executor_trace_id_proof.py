@@ -1,3 +1,11 @@
+# Youcef ADDA | GEODECI
+# FR : Plugins QGIS, solutions SIG et administration PostgreSQL/PostGIS ; audit, automatisation et accompagnement.
+# EN : QGIS plugins, GIS solutions and PostgreSQL/PostGIS administration; audits, automation and business support.
+# AR : تطوير إضافات QGIS وحلول نظم المعلومات الجغرافية وإدارة PostgreSQL/PostGIS، والتدقيق والأتمتة ومرافقة المؤسسات.
+# Site / Website / الموقع : https://geodeci.xyz/
+# Contact professionnel / Business enquiries / للتواصل المهني : youcef.geodesien@gmail.com | contact@geodeci.xyz
+# Détails / Details / التفاصيل : SIGNATURE.md
+# ============================================================================
 """p_executor_trace_id_proof - runtime proof for BL-RW-P3-17 + BL-RW-P2-14.
 
 Drives `_apply_via_buffer` end-to-end on an in-memory QGIS layer with a

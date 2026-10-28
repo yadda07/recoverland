@@ -1,3 +1,11 @@
+# Youcef ADDA | GEODECI
+# FR : Plugins QGIS, solutions SIG et administration PostgreSQL/PostGIS ; audit, automatisation et accompagnement.
+# EN : QGIS plugins, GIS solutions and PostgreSQL/PostGIS administration; audits, automation and business support.
+# AR : تطوير إضافات QGIS وحلول نظم المعلومات الجغرافية وإدارة PostgreSQL/PostGIS، والتدقيق والأتمتة ومرافقة المؤسسات.
+# Site / Website / الموقع : https://geodeci.xyz/
+# Contact professionnel / Business enquiries / للتواصل المهني : youcef.geodesien@gmail.com | contact@geodeci.xyz
+# Détails / Details / التفاصيل : SIGNATURE.md
+# ============================================================================
 """i18n_coverage.py - Validation i18n generique pour RecoverLand (BL-I18N-P0-01)
 
 Lance depuis la console Python QGIS (ou standalone via Python 3.10+ sans QGIS) :

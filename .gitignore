@@ -46,6 +46,7 @@ docs/support_policy.md
 docs/orchestrator*.json
 
 # Cascade workflows (local-only, never in public repo)
+AGENTS.md
 .claude/
 .windsurf/
 .devin/

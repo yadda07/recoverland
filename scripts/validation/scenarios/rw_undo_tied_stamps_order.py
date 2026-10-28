@@ -1,3 +1,11 @@
+# Youcef ADDA | GEODECI
+# FR : Plugins QGIS, solutions SIG et administration PostgreSQL/PostGIS ; audit, automatisation et accompagnement.
+# EN : QGIS plugins, GIS solutions and PostgreSQL/PostGIS administration; audits, automation and business support.
+# AR : تطوير إضافات QGIS وحلول نظم المعلومات الجغرافية وإدارة PostgreSQL/PostGIS، والتدقيق والأتمتة ومرافقة المؤسسات.
+# Site / Website / الموقع : https://geodeci.xyz/
+# Contact professionnel / Business enquiries / للتواصل المهني : youcef.geodesien@gmail.com | contact@geodeci.xyz
+# Détails / Details / التفاصيل : SIGNATURE.md
+# ============================================================================
 """rw_undo_tied_stamps_order - un journal ancien (Undo a horodatage unique) se rembobine dans l'ordre de l'Undo.
 
 Invariant : I-UNDO-ORDER (un Rewind a une date situee entre un Rewind et
