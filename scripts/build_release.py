@@ -1,3 +1,11 @@
+# Youcef ADDA | GEODECI
+# FR : Plugins QGIS, solutions SIG et administration PostgreSQL/PostGIS ; audit, automatisation et accompagnement.
+# EN : QGIS plugins, GIS solutions and PostgreSQL/PostGIS administration; audits, automation and business support.
+# AR : تطوير إضافات QGIS وحلول نظم المعلومات الجغرافية وإدارة PostgreSQL/PostGIS، والتدقيق والأتمتة ومرافقة المؤسسات.
+# Site / Website / الموقع : https://geodeci.xyz/
+# Contact professionnel / Business enquiries / للتواصل المهني : youcef.geodesien@gmail.com | contact@geodeci.xyz
+# Détails / Details / التفاصيل : SIGNATURE.md
+# ============================================================================
 """Build a release ZIP for plugins.qgis.org submission.
 
 Produces ``dist/RecoverLand.zip`` whose single top-level directory is
@@ -67,6 +75,8 @@ EXCLUDE_FILES = frozenset({
     # not part of the user-facing plugin. Root-level .md, so not caught
     # by the docs/*.md glob below.
     "AGENTS.md",
+    # Dev-only signature check/patch tool (invoked at build time, never at runtime).
+    "verifier_signature.py",
     # Validation/QA helper script moved to scripts/validation/; excluded
     # here as defense-in-depth in case it was ever tracked at root.
     "validate_zip.py",
@@ -107,6 +117,7 @@ ALLOWED_DOTFILES: frozenset = frozenset()
 REQUIRED_STAGE_FILES = (
     "__init__.py",
     "metadata.txt",
+    "SIGNATURE.md",
     "recover.py",
     "recover_dialog.py",
     "icon.svg",
@@ -439,6 +450,11 @@ def main(argv: list[str] | None = None) -> int:
         help="log every copied/skipped file at DEBUG level",
     )
     args = parser.parse_args(argv)
+    if subprocess.run(  # nosec B603
+        [sys.executable, str(PLUGIN_ROOT / "verifier_signature.py")],
+        cwd=str(PLUGIN_ROOT), check=False,
+    ).returncode:
+        return 1
 
     t0 = time.time()
 
