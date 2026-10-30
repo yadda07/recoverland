@@ -107,6 +107,8 @@ jobs:
             scripts/validation/scenarios/rw_rewind_active_trace_guard.py \
             scripts/validation/scenarios/rw_rewind_fetch_limit.py \
             scripts/validation/scenarios/rw_rewind_fid_recycle.py \
+            scripts/validation/scenarios/rw_slider_bounds_local_time.py \
             scripts/validation/scenarios/rw_trace_lifecycle.py \
             scripts/validation/scenarios/rw_truncated_window_refused.py \
-            scripts/validation/scenarios/rw_wq_atomic_enqueue.py
+            scripts/validation/scenarios/rw_wq_atomic_enqueue.py \
+            scripts/validation/scenarios/srch_results_mixed_geom_ops.py

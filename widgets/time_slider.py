@@ -140,6 +140,12 @@ class TimeSliderWidget(QWidget):
             self.disable()
             return
 
+        # The journal is UTC: the oldest bound arrives UTC-spec, "now" as
+        # local time, and toString() prints each in its own spec, so the
+        # two labels disagreed by the UTC offset. Same instants, local view.
+        oldest = oldest.toLocalTime()
+        newest = newest.toLocalTime()
+
         o_secs = int(oldest.toSecsSinceEpoch())
         n_secs = int(newest.toSecsSinceEpoch())
 
