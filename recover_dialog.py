@@ -4999,12 +4999,10 @@ class RecoverDialog(QDialog, LoggerMixin):
             ]
             geom_changed = False
             if has_geom_change:
-                is_geom_only = all((
-                    is_update,
-                    parsed_data is not None,
-                    "changed_only" in parsed_data,
-                    all(is_layer_audit_field(k) for k in parsed_data["changed_only"]),
-                ))
+                # Not all((...)): the tuple is built before all() reads it, so
+                # changed_only was read on INSERT/DELETE rows (all_attributes)
+                # and raised KeyError. The helper checks each guard in turn.
+                is_geom_only = is_geometry_only_update(event)
                 geom_changed = is_geom_only or (is_update and event.geometry_wkb is not None)
                 row_values.append(self.tr("Modifiée") if geom_changed else "")
             diff_tooltip = self._build_event_diff_tooltip(
