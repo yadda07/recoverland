@@ -199,15 +199,17 @@ class ThemedLogoWidget(QWidget):
         base.setDevicePixelRatio(dpr)
         base.fill(QColor(0, 0, 0, 0))
         painter = QPainter(base)
-        painter.setRenderHint(QtCompat.ANTIALIAS, True)
-        painter.setRenderHint(QtCompat.SMOOTH_PIXMAP, True)
-        target_rect = QRectF(0.0, 0.0, float(w), float(h))
-        if self._renderer.isValid():
-            self._renderer.render(painter, target_rect)
-        else:
-            painter.setPen(self.palette().windowText().color())
-            painter.drawText(target_rect.toRect(), QtCompat.ALIGN_CENTER, self._fallback_text)
-        painter.end()
+        try:
+            painter.setRenderHint(QtCompat.ANTIALIAS, True)
+            painter.setRenderHint(QtCompat.SMOOTH_PIXMAP, True)
+            target_rect = QRectF(0.0, 0.0, float(w), float(h))
+            if self._renderer.isValid():
+                self._renderer.render(painter, target_rect)
+            else:
+                painter.setPen(self.palette().windowText().color())
+                painter.drawText(target_rect.toRect(), QtCompat.ALIGN_CENTER, self._fallback_text)
+        finally:
+            painter.end()
         work = QPixmap(px_w, px_h)
         work.setDevicePixelRatio(dpr)
         work.fill(QColor(0, 0, 0, 0))
@@ -259,13 +261,25 @@ class ThemedLogoWidget(QWidget):
         half_w = max(w * _WAVE_WIDTH_RATIO, _WAVE_MIN_HALF_W)
         center_x = -half_w + (w + 2.0 * half_w) * progress
         wp = QPainter(self._work_pixmap)
-        wp.setRenderHint(QtCompat.ANTIALIAS, True)
-        wp.setCompositionMode(QtCompat.COMPOSITION_SOURCE)
-        wp.drawPixmap(0, 0, self._base_pixmap)
-        wp.setCompositionMode(QtCompat.COMPOSITION_SOURCE_ATOP)
-        wp.fillRect(QRectF(0.0, 0.0, w, h), self._build_wave_gradient(center_x, half_w))
-        wp.end()
+        try:
+            wp.setRenderHint(QtCompat.ANTIALIAS, True)
+            wp.setCompositionMode(QtCompat.COMPOSITION_SOURCE)
+            wp.drawPixmap(0, 0, self._base_pixmap)
+            wp.setCompositionMode(QtCompat.COMPOSITION_SOURCE_ATOP)
+            wp.fillRect(QRectF(0.0, 0.0, w, h), self._build_wave_gradient(center_x, half_w))
+        finally:
+            wp.end()
         return self._work_pixmap
+
+    def hideEvent(self, event) -> None:
+        self._smoke_active = False
+        self._anim.stop()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self._smoke_active = False
+        self._anim.stop()
+        super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -276,5 +290,8 @@ class ThemedLogoWidget(QWidget):
         if pixmap.isNull():
             return
         painter = QPainter(self)
-        painter.setRenderHint(QtCompat.SMOOTH_PIXMAP, True)
-        painter.drawPixmap(0, self._logo_top, pixmap)
+        try:
+            painter.setRenderHint(QtCompat.SMOOTH_PIXMAP, True)
+            painter.drawPixmap(0, self._logo_top, pixmap)
+        finally:
+            painter.end()

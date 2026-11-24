@@ -16,22 +16,23 @@ injection of user-controlled data into SQL structure.
 import re
 
 _SAFE_SQL_RE = re.compile(
-    r"^[a-zA-Z0-9_\s,.*?=><!()|]+$"
+    r"^[a-zA-Z0-9_\s,.*?=><!()|]+\Z"
 )
 
-_ALLOWED_KEYWORDS = frozenset({
-    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN",
-    "IS", "NULL", "ORDER", "BY", "ASC", "DESC", "LIMIT",
-    "OFFSET", "COUNT", "CASE", "WHEN", "THEN", "ELSE", "END",
-    "SUM", "DISTINCT", "AS",
+_FORBIDDEN_KEYWORDS = frozenset({
+    "UNION", "DROP", "DELETE", "INSERT", "UPDATE", "ALTER",
+    "CREATE", "ATTACH", "DETACH", "PRAGMA", "VACUUM", "REPLACE",
+    "TRIGGER", "INDEX", "REINDEX", "ANALYZE",
 })
+
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def assert_safe_fragment(fragment: str) -> str:
-    """Validate that a SQL fragment contains only safe characters.
+    """Validate that a SQL fragment contains only safe characters and tokens.
 
-    Raises ValueError if the fragment contains suspicious patterns.
-    Returns the fragment unchanged for chaining.
+    Raises ValueError if the fragment contains suspicious characters or
+    mutation/DDL/compound-query keywords. Returns the fragment unchanged.
     """
     if not fragment:
         return fragment
@@ -39,4 +40,9 @@ def assert_safe_fragment(fragment: str) -> str:
         raise ValueError(
             f"Unsafe SQL fragment detected: {fragment[:80]!r}"
         )
+    for token in _WORD_RE.findall(fragment):
+        if token.upper() in _FORBIDDEN_KEYWORDS:
+            raise ValueError(
+                f"Forbidden SQL keyword {token!r} in fragment: {fragment[:80]!r}"
+            )
     return fragment

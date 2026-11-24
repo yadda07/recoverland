@@ -183,6 +183,13 @@ def evaluate_capture_health(
                              degraded_events, disk)
 
     if not journal_open:
+        if lock_lost:
+            reasons.append("le verrou du journal a ete pris par une autre instance "
+                           "de QGIS : deux instances peuvent ecrire ce journal, les "
+                           "modifications faites ici ne sont plus protegees. Fermez "
+                           "l'autre instance puis rouvrez le projet")
+            reasons.extend(_internal_reason(t, True) for t in at_risk)
+            return _result(ERROR)
         if journal_locked:
             reasons.append(f"enregistrement inactif (journal verrouille) : "
                            f"{journal_locked}")
@@ -212,7 +219,12 @@ def evaluate_capture_health(
         reasons.append(f"etat du thread d'ecriture inconnu ({writer_error}) : "
                        f"rien ne permet de verifier que les modifications "
                        f"sont ecrites")
-    if writer is not None and wstate == "failed":
+    elif writer is None:
+        error = True
+        reasons.append("thread d'ecriture indisponible : rien ne permet de "
+                       "verifier que les modifications sont ecrites")
+    elif wstate == "failed" or (
+            not getattr(writer, "writer_alive", False) and wstate != "starting"):
         error = True
         reasons.append("thread d'ecriture arrete : les editions restent dans "
                        "l'outbox et seront integrees au prochain demarrage")

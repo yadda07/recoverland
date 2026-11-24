@@ -6,9 +6,13 @@
 # Contact professionnel / Business enquiries / للتواصل المهني : youcef.geodesien@gmail.com | contact@geodeci.xyz
 # Détails / Details / التفاصيل : SIGNATURE.md
 # ============================================================================
+import sqlite3
+import threading
 import time
 
 from qgis.PyQt.QtCore import QCoreApplication, QThread
+
+from .compat import QtCompat
 
 try:
     from qgis.core import QgsApplication, QgsTask
@@ -17,11 +21,34 @@ except ImportError:
     QgsTask = None
 
 
-# Upper bound for joining a cancelled job. Cancelling a QgsTask is only a
-# request: it is honoured at the worker's next checkpoint, and a worker
-# reading a journal on a network share can take seconds to reach it. The
-# bound keeps a wedged worker a slow shutdown instead of a frozen QGIS.
+# Upper bound for joining a cancelled job when the caller gives no bound.
 _CANCEL_JOIN_LIMIT_MS = 30000
+
+
+def open_worker_read_connection(journal, snapshot_path=None):
+    """Open a read-only SQLite connection for a background worker.
+
+    Uses the immutable *snapshot_path* captured on the GUI thread when
+    *journal* is a standard ``JournalManager`` so a concurrent
+    ``journal.close()`` cannot race ``journal.path`` to ``None``. Falls back
+    to ``journal.create_read_connection()`` for custom stubs/fakes.
+    """
+    if snapshot_path and type(journal).__name__ == "JournalManager":
+        from .core.journal_manager import sqlite_readonly_uri
+        from .core.sqlite_schema import apply_pragmas
+        conn = sqlite3.connect(
+            sqlite_readonly_uri(snapshot_path),
+            uri=True,
+            check_same_thread=False,
+        )
+        try:
+            apply_pragmas(conn, read_only=True)
+        except Exception:
+            conn.close()
+            raise
+        return conn
+    return journal.create_read_connection()
+
 
 # Pause between two pumps of the event loop while waiting.
 _JOIN_POLL_S = 0.005
@@ -75,12 +102,42 @@ class TaskEnabledThread(QThread):
         self._task = None
         self._restart_pending = False
         self._trace_id = trace_id
+        self._conn = None
+        self._conn_lock = threading.Lock()
+        self.finished.connect(self._on_qthread_finished, QtCompat.QUEUED_CONNECTION)
+
+    def _register_conn(self, conn) -> None:
+        with self._conn_lock:
+            self._conn = conn
+            if self._stopped and conn is not None:
+                try:
+                    conn.interrupt()
+                except (sqlite3.Error, AttributeError, RuntimeError):
+                    pass
+
+    def _unregister_conn(self) -> None:
+        with self._conn_lock:
+            self._conn = None
+
+    def _interrupt_conn(self) -> None:
+        with self._conn_lock:
+            conn = self._conn
+            if conn is not None:
+                try:
+                    conn.interrupt()
+                except (sqlite3.Error, AttributeError, RuntimeError):
+                    pass
+
+    def _on_qthread_finished(self) -> None:
+        if self._task is None and not self._running:
+            self._honour_pending_restart(type(self).__name__)
 
     def stop(self):
         self._stopped = True
         # A cancellation cancels the restart the caller may have queued:
         # the caller is giving up, not asking for a fresh run.
         self._restart_pending = False
+        self._interrupt_conn()
         if self._task is not None and hasattr(self._task, "cancel"):
             self._task.cancel()
 
@@ -144,7 +201,7 @@ class TaskEnabledThread(QThread):
             limit_ms = max(limit_ms, _CANCEL_JOIN_LIMIT_MS)
         deadline = time.monotonic() + limit_ms / 1000.0
         while self._running:
-            QCoreApplication.processEvents()
+            QCoreApplication.processEvents(QtCompat.EVENT_LOOP_EXCLUDE_USER_INPUT)
             if not self._running or time.monotonic() >= deadline:
                 break
             time.sleep(_JOIN_POLL_S)
@@ -162,13 +219,18 @@ class TaskEnabledThread(QThread):
 
     def _submit_task(self, description: str, function, on_finished, **kwargs) -> None:
         self._running = True
-        self._task = QgsTask.fromFunction(
-            description,
-            _boxed(function),
-            on_finished=on_finished,
-            **kwargs,
-        )
-        QgsApplication.taskManager().addTask(self._task)
+        try:
+            self._task = QgsTask.fromFunction(
+                description,
+                _boxed(function),
+                on_finished=on_finished,
+                **kwargs,
+            )
+            QgsApplication.taskManager().addTask(self._task)
+        except Exception:
+            self._running = False
+            self._task = None
+            raise
 
     def _clear_task(self) -> None:
         self._running = False

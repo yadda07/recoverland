@@ -30,7 +30,7 @@ class AppleToggleSwitch(QWidget):
         self._anim.valueChanged.connect(self._update_pos)
         self.setFixedSize(46, 26)
         self.setCursor(QtCompat.POINTING_HAND_CURSOR)
-        self.setToolTip(self.tr("Enregistrement des modifications : actif"))
+        self.setToolTip(self.tr("Enregistrement desactive"))
 
     def isChecked(self) -> bool:
         return self._checked
@@ -40,8 +40,8 @@ class AppleToggleSwitch(QWidget):
             return
         self._checked = value
         target = 1.0 if value else 0.0
+        self._anim.stop()
         if animated and should_animate():
-            self._anim.stop()
             self._anim.setStartValue(float(self._anim_pos))
             self._anim.setEndValue(float(target))
             self._anim.start()
@@ -56,7 +56,7 @@ class AppleToggleSwitch(QWidget):
         self.update()
 
     def mousePressEvent(self, event):
-        if not self.isEnabled():
+        if not self.isEnabled() or event.button() != QtCompat.LEFT_BUTTON:
             return
         self.setChecked(not self._checked, animated=True)
         self.toggled.emit(self._checked)

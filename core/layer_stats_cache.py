@@ -16,6 +16,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set
 
+from .datasource_alias import canonical_target_map
 from .logger import flog
 
 _STATS_QUERY = """
@@ -55,6 +56,7 @@ class LayerStats:
 class LayerStatsCache:
     """In-memory cache of per-layer statistics."""
     _by_fp: Dict[str, LayerStats] = field(default_factory=dict)
+    _aliases: Dict[str, str] = field(default_factory=dict)
     _global_min: Optional[str] = None
     _global_max: Optional[str] = None
     _global_ops: Set[str] = field(default_factory=set)
@@ -62,17 +64,32 @@ class LayerStatsCache:
 
     def build(self, conn: sqlite3.Connection) -> None:
         """Populate the entire cache from two lightweight queries."""
-        self._by_fp.clear()
+        self.invalidate()
         try:
+            aliases = canonical_target_map(conn)
+            self._aliases = dict(aliases)
+            merged: Dict[str, list] = {}
             for row in conn.execute(_STATS_QUERY).fetchall():
-                fp, min_d, max_d, ops_csv, count = row
+                raw_fp, min_d, max_d, ops_csv, count = row
+                fp = aliases.get(raw_fp, raw_fp)
                 ops = set(ops_csv.split(",")) if ops_csv else set()
+                cur = merged.get(fp)
+                if cur is None:
+                    merged[fp] = [min_d or "", max_d or "", ops, count or 0]
+                else:
+                    if min_d and (not cur[0] or min_d < cur[0]):
+                        cur[0] = min_d
+                    if max_d and (not cur[1] or max_d > cur[1]):
+                        cur[1] = max_d
+                    cur[2].update(ops)
+                    cur[3] += count or 0
+            for fp, (min_d, max_d, ops, count) in merged.items():
                 self._by_fp[fp] = LayerStats(
                     fingerprint=fp,
-                    min_date=min_d or "",
-                    max_date=max_d or "",
+                    min_date=min_d,
+                    max_date=max_d,
                     operation_types=ops,
-                    event_count=count or 0,
+                    event_count=count,
                 )
             g_row = conn.execute(_GLOBAL_STATS_QUERY).fetchone()
             if g_row:
@@ -91,7 +108,11 @@ class LayerStatsCache:
 
     def get(self, fingerprint: str) -> Optional[LayerStats]:
         """Return cached stats for a specific layer, or None."""
-        return self._by_fp.get(fingerprint)
+        stats = self._by_fp.get(fingerprint)
+        if stats is not None:
+            return stats
+        target = self._aliases.get(fingerprint)
+        return self._by_fp.get(target) if target else None
 
     def global_min_date(self) -> Optional[str]:
         return self._global_min
@@ -114,6 +135,7 @@ class LayerStatsCache:
     def invalidate(self) -> None:
         """Clear all cached data so next build() refreshes from DB (RW-20)."""
         self._by_fp.clear()
+        self._aliases.clear()
         self._global_min = None
         self._global_max = None
         self._global_ops = set()

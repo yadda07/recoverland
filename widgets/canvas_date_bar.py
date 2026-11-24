@@ -36,7 +36,7 @@ from qgis.PyQt.QtWidgets import (
     QSizePolicy, QTimeEdit, QWidget,
 )
 
-from ..compat import QtCompat
+from ..compat import QtCompat, is_deleted
 from ..core.logger import flog
 from ..core.time_format import journal_now, journal_today, parse_iso_date
 from .icons import theme_icon, theme_pixmap
@@ -401,7 +401,11 @@ class CanvasDateBar(QWidget):
         self._closing = True
         self._debounce.stop()
         self._reposition_timer.stop()
-        self._viewport.removeEventFilter(self)
+        if self._viewport is not None and not is_deleted(self._viewport):
+            try:
+                self._viewport.removeEventFilter(self)
+            except RuntimeError:
+                pass
         self.hide()
         self.deleteLater()
         flog("canvas_date_bar: cleanup done", "DEBUG")
@@ -435,7 +439,7 @@ class CanvasDateBar(QWidget):
         super().changeEvent(event)
         if getattr(self, "_refreshing_style", False):
             return
-        if event.type() == QtCompat.EVENT_PALETTE_CHANGE:
+        if event.type() in (QtCompat.EVENT_PALETTE_CHANGE, QtCompat.EVENT_APP_PALETTE_CHANGE):
             self._refreshing_style = True
             try:
                 self._apply_style()
@@ -450,10 +454,12 @@ class CanvasDateBar(QWidget):
         We intercept wheel events landing on the timeline here and redirect them
         to its zoom, consuming the event so the map does not zoom underneath.
         """
+        if self._closing:
+            return False
         if obj is self._viewport:
             evt = int(event.type())
             if evt in _CANVAS_EVENT_TYPES:
-                QTimer.singleShot(150, self._reposition)
+                self._reposition_timer.start()
             elif evt == int(QtCompat.EVENT_WHEEL) and self._maybe_zoom_timeline(event):
                 return True
         return super().eventFilter(obj, event)
@@ -572,15 +578,13 @@ class CanvasDateBar(QWidget):
         )
 
     def _reposition(self) -> None:
-        if self._closing:
+        if self._closing or self._viewport is None or is_deleted(self._viewport):
             return
         cw = self._viewport.width()
         ch = self._viewport.height()
         self.resize(cw, _BAR_HEIGHT)
         self.move(0, ch - _BAR_HEIGHT)
         self.raise_()
-        if not self.isVisible():
-            self.show()
         flog(
             f"canvas_date_bar: reposition cw={cw} ch={ch} "
             f"visible={self.isVisible()} pos=({self.x()},{self.y()})",
@@ -690,7 +694,11 @@ class CanvasDateBar(QWidget):
             return
         self._syncing = True
         try:
-            iso = f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}T00:00:00"
+            qt = self._time_edit.time()
+            iso = (
+                f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+                f"T{qt.hour():02d}:{qt.minute():02d}:{qt.second():02d}"
+            )
             self._timeline.set_value_iso(iso)
         finally:
             self._syncing = False
@@ -711,7 +719,8 @@ class CanvasDateBar(QWidget):
             # the user is zoomed elsewhere (e.g. Review mode on a past window).
             self._timeline.reset_view()
             self._timeline.set_value_iso(
-                f"{today.year:04d}-{today.month:02d}-{today.day:02d}T00:00:00"
+                f"{today.year:04d}-{today.month:02d}-{today.day:02d}"
+                f"T{now.hour:02d}:{now.minute:02d}:00"
             )
         finally:
             self._syncing = False
@@ -720,6 +729,11 @@ class CanvasDateBar(QWidget):
     def _on_time_changed(self, _qt: QTime) -> None:
         if self._syncing:
             return
+        self._syncing = True
+        try:
+            self._timeline.set_value_iso(self.current_date_iso())
+        finally:
+            self._syncing = False
         self._debounce.start()
 
     def _emit_date_changed(self) -> None:

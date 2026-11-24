@@ -74,7 +74,7 @@ def build_journal_audit_report(conn: sqlite3.Connection,
     with timed_op("journal_audit", trace_id):
         counts = _fetch_counts(conn)
         top_users = _fetch_top_users(conn, top_n)
-        top_layers = _fetch_top_layers(conn, top_n)
+        distinct_layers, top_layers = _fetch_top_layers(conn, top_n)
 
     return JournalAuditReport(
         total_events=counts["total"],
@@ -84,7 +84,7 @@ def build_journal_audit_report(conn: sqlite3.Connection,
         update_count=counts["update"],
         delete_count=counts["delete"],
         distinct_users=counts["users"],
-        distinct_layers=counts["layers"],
+        distinct_layers=distinct_layers,
         oldest_event=counts["oldest"],
         newest_event=counts["newest"],
         top_users=tuple(top_users),
@@ -103,10 +103,10 @@ def _fetch_counts(conn: sqlite3.Connection) -> dict:
             " SUM(CASE WHEN operation_type='INSERT' AND restored_from_event_id IS NULL THEN 1 ELSE 0 END), "
             " SUM(CASE WHEN operation_type='UPDATE' AND restored_from_event_id IS NULL THEN 1 ELSE 0 END), "
             " SUM(CASE WHEN operation_type='DELETE' AND restored_from_event_id IS NULL THEN 1 ELSE 0 END), "
-            " COUNT(DISTINCT user_name), "
-            " COUNT(DISTINCT datasource_fingerprint), "
-            " MIN(created_at), "
-            " MAX(created_at) "
+            " COUNT(DISTINCT CASE WHEN restored_from_event_id IS NULL THEN user_name END), "
+            " COUNT(DISTINCT CASE WHEN restored_from_event_id IS NULL THEN datasource_fingerprint END), "
+            " MIN(CASE WHEN restored_from_event_id IS NULL THEN created_at END), "
+            " MAX(CASE WHEN restored_from_event_id IS NULL THEN created_at END) "
             "FROM audit_event"
         ).fetchone() or (0,) * 10
     except sqlite3.Error as e:
@@ -147,7 +147,13 @@ def _fetch_top_users(conn: sqlite3.Connection, limit: int) -> List[UserActivity]
     ]
 
 
-def _fetch_top_layers(conn: sqlite3.Connection, limit: int) -> List[LayerActivity]:
+def _fetch_top_layers(conn: sqlite3.Connection,
+                      limit: int) -> Tuple[int, List[LayerActivity]]:
+    try:
+        from .datasource_alias import canonical_target_map
+        alias_map = canonical_target_map(conn)
+    except Exception:  # noqa: BLE001 - degrade to raw fingerprints
+        alias_map = {}
     try:
         rows = conn.execute(
             "SELECT datasource_fingerprint, "
@@ -156,18 +162,37 @@ def _fetch_top_layers(conn: sqlite3.Connection, limit: int) -> List[LayerActivit
             "       MAX(created_at) "
             "FROM audit_event "
             "WHERE restored_from_event_id IS NULL "
-            "GROUP BY datasource_fingerprint "
-            "ORDER BY cnt DESC "
-            "LIMIT ?",
-            (limit,),
+            "GROUP BY datasource_fingerprint"
         ).fetchall()
     except sqlite3.Error as e:
         flog(f"journal_audit._fetch_top_layers: {e}", "WARNING")
-        return []
-    return [
-        LayerActivity(datasource_fingerprint=r[0] or "",
-                      layer_name=r[1] or "",
-                      event_count=int(r[2] or 0),
-                      last_activity=r[3] or "")
-        for r in rows
+        return 0, []
+    merged = {}
+    for raw_fp, layer_name, cnt, last_at in rows:
+        fp = alias_map.get(raw_fp or "", raw_fp or "")
+        n = int(cnt or 0)
+        ts = last_at or ""
+        name = layer_name or ""
+        prev = merged.get(fp)
+        if prev is None:
+            merged[fp] = [name, n, ts]
+        else:
+            prev[1] += n
+            if ts >= prev[2]:
+                prev[2] = ts
+                if name:
+                    prev[0] = name
+    ordered = sorted(
+        merged.items(),
+        key=lambda item: (-item[1][1], item[0]),
+    )
+    top = [
+        LayerActivity(
+            datasource_fingerprint=fp,
+            layer_name=vals[0],
+            event_count=vals[1],
+            last_activity=vals[2],
+        )
+        for fp, vals in ordered[:limit]
     ]
+    return len(merged), top

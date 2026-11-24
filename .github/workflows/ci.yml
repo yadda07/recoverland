@@ -111,4 +111,8 @@ jobs:
             scripts/validation/scenarios/rw_trace_lifecycle.py \
             scripts/validation/scenarios/rw_truncated_window_refused.py \
             scripts/validation/scenarios/rw_wq_atomic_enqueue.py \
-            scripts/validation/scenarios/srch_results_mixed_geom_ops.py
+            scripts/validation/scenarios/srch_results_mixed_geom_ops.py \
+            scripts/validation/scenarios/tx_temp_memory_layer_silence.py \
+            scripts/validation/scenarios/tx_sqlite_durability_hardening.py \
+            scripts/validation/scenarios/tx_restore_and_ui_hardening.py \
+            scripts/validation/scenarios/tx_machine_de_guerre_chaos.py

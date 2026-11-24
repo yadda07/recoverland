@@ -611,7 +611,7 @@ def _assert_d(ctx):
         and first.get("recover_button") is True
         and first.get("progress_visible") is False
         and logo[-1:] == ["stop"],
-        f"etat={ {k: first.get(k) for k in ('restore_in_progress', 'run_in_flight', 'trace_id', 'restore_button', 'recover_button', 'progress_visible', 'logo')} }"
+        f"etat={({k: first.get(k) for k in ('restore_in_progress', 'run_in_flight', 'trace_id', 'restore_button', 'recover_button', 'progress_visible', 'logo')})}"
         f": tant que ce drapeau reste leve, toute action suivante est "
         f"refusee 'une restauration est en cours' jusqu'au changement de "
         f"projet.",

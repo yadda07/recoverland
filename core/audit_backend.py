@@ -92,16 +92,16 @@ class RestoreReport(NamedTuple):
     #     list of its own, so this contract cannot distinguish a complete
     #     restore from a mutilated one. Only the buffer-level path
     #     (`_apply_via_buffer` -> StrictRestoreRunner) can.
-    skipped_idempotent: List[int] = []
-    failed_target_absent: List[int] = []
-    failed_geometry_drift: List[int] = []
+    skipped_idempotent: tuple = ()
+    failed_target_absent: tuple = ()
+    failed_geometry_drift: tuple = ()
     # v7: events in `failed` whose write nevertheless reached the file (the
     # read-back contradicts it, a refused write could not be reverted, a
     # commit left part of the batch on disk). The data changed: the restore
     # paths journal a trace for each (the undo journals none, as for its
     # successes). A subset of `failed`, never of `succeeded`; empty for
     # producers that write nothing or do not know.
-    landed: List[int] = []
+    landed: tuple = ()
 
 
 class AuditBackend(ABC):

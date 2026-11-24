@@ -122,7 +122,10 @@ class LayerIndexThread(TaskEnabledThread):
 
     def run(self):
         if self._source is None:
-            self.index_ready.emit({})
+            if not self._stopped:
+                self.error_occurred.emit(
+                    f"layer snapshot unavailable for {self._label!r}"
+                )
             self._clear_task()
             return
         try:
@@ -144,6 +147,12 @@ class LayerIndexThread(TaskEnabledThread):
             self._clear_task()
 
     def _start_task(self) -> None:
+        if self._source is None:
+            if not self._stopped:
+                self.error_occurred.emit(
+                    f"layer snapshot unavailable for {self._label!r}"
+                )
+            return
         self._submit_task(
             "RecoverLand geometry index",
             _build_digests_task,

@@ -39,7 +39,7 @@ import os
 import json
 import time
 import traceback
-from typing import Optional
+from typing import List, Optional
 
 
 def _positional_limit(fn) -> Optional[int]:
@@ -90,10 +90,36 @@ def _plugin_slot(label: str, capture_at_risk: bool = True,
 
 def _same_path(first: str, second: str) -> bool:
     try:
-        return (os.path.normcase(os.path.abspath(first))
-                == os.path.normcase(os.path.abspath(second)))
+        from .core.long_paths import path_key
+        return path_key(first) == path_key(second)
     except (TypeError, ValueError):
         return False
+
+
+def _sanitize_project_label(raw: str) -> str:
+    """Scrub credentials from a project path or DB storage URI before logging."""
+    if not raw:
+        return ""
+    try:
+        from .core.datasource_registry import _strip_password_from_uri
+        return _strip_password_from_uri(raw, "")
+    except Exception:  # noqa: BLE001
+        return "<project>"
+
+
+def _read_bool_setting(settings, key: str, default: bool) -> bool:
+    """Read a boolean QgsSettings entry safely even if the INI holds a bad value."""
+    try:
+        return bool(settings.value(key, default, type=bool))
+    except (TypeError, ValueError):
+        raw = settings.value(key, default)
+        if isinstance(raw, str):
+            low = raw.strip().lower()
+            if low in ("1", "true", "yes", "on"):
+                return True
+            if low in ("0", "false", "no", "off", ""):
+                return False
+        return default
 
 
 def _detect_duplicate_recoverland(my_package: str) -> Optional[str]:
@@ -152,6 +178,7 @@ class RecoverPlugin:
         self._unverified_updates = {}
         self._alert_last = {}
         self._writer_restarts = 0
+        self._writer_restart_next_mono = 0.0
         self._project_capture_failures = 0
         self._cached_status_stats = None
         # Plugin slots that failed and are not over yet: key -> record
@@ -163,6 +190,8 @@ class RecoverPlugin:
         self._announced_lock = None
         self._lock_retry_timer = None
         self._lock_retry_path = ""
+        self._unloaded = False
+        self._initializing_backend = False
         # Refusals of that journal in a row, so the attempts space out
         # (see _retry_locked_journal); reset by a success or another project.
         self._lock_last_refusal = 0.0
@@ -172,6 +201,7 @@ class RecoverPlugin:
         self._writer_health_error = ""
 
     def initGui(self):
+        self._unloaded = False
         my_package = __package__ or os.path.basename(os.path.dirname(__file__))
         self._duplicate_of = _detect_duplicate_recoverland(my_package)
         if self._duplicate_of is not None:
@@ -222,18 +252,19 @@ class RecoverPlugin:
                 theme_icon_path,
             )
 
-        QgsProject.instance().layersAdded.connect(self._on_layers_added)
-        QgsProject.instance().layersRemoved.connect(self._on_layers_removed)
-        QgsProject.instance().readProject.connect(self._on_project_opened)
-        QgsProject.instance().cleared.connect(self._on_project_closed)
-        # projectSaved, not fileNameChanged: the latter fires before the
-        # file exists (Save As names the project, then writes it; a failed
-        # write leaves the new name and no file) and again inside every
-        # readProject, which already reinitializes the backend.
-        QgsProject.instance().projectSaved.connect(self._on_project_saved)
-
         self._init_local_backend()
         self._setup_status_bar()
+
+        if not self._unloaded:
+            QgsProject.instance().layersAdded.connect(self._on_layers_added)
+            QgsProject.instance().layersRemoved.connect(self._on_layers_removed)
+            QgsProject.instance().readProject.connect(self._on_project_opened)
+            QgsProject.instance().cleared.connect(self._on_project_closed)
+            # projectSaved, not fileNameChanged: the latter fires before the
+            # file exists (Save As names the project, then writes it; a failed
+            # write leaves the new name and no file) and again inside every
+            # readProject, which already reinitializes the backend.
+            QgsProject.instance().projectSaved.connect(self._on_project_saved)
         flog("RecoverPlugin: initGui complete")
 
     @_plugin_slot("avertissement de doublon", capture_at_risk=False)
@@ -259,6 +290,7 @@ class RecoverPlugin:
 
     def unload(self):
         flog("RecoverPlugin: unload requested")
+        self._unloaded = True
         if self._reinit_timer is not None:
             self._reinit_timer.stop()
             self._reinit_timer = None
@@ -266,53 +298,97 @@ class RecoverPlugin:
         if self._duplicate_of is not None:
             if self.action is not None:
                 self.iface.removePluginMenu("RecoverLand", self.action)
+                self.action.deleteLater()
+                self.action = None
             return
 
         # The dialog goes first, and that order is the whole point. Its
         # background readers (stats, version fetch) hold the journal, and
-        # its restore runner still has trace events to enqueue. Shutting
-        # the backend down first closed the journal under a worker that
-        # was still reading it, and stopped the write queue under a
-        # restore that was still writing: the layer edits landed, their
-        # trace events did not, and the next rewind replayed them.
-        # cleanup_resources() joins the workers and cancels the runner,
-        # which is exactly what closeEvent() does while everything is
-        # still alive.
+        # its restore runner still has trace events to enqueue.
         self._release_dialog()
 
         try:
             self._shutdown_local_backend()
         except Exception as exc:  # noqa: BLE001 - see below
-            # The signals below must be disconnected whatever the backend
-            # does on its way out: an unload stopped here left every slot
-            # of an unloaded plugin connected to QgsProject.
             flog(f"RecoverPlugin.unload: backend shutdown failed: "
                  f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
                  "CRITICAL")
 
-        # On its own: a save after unload must not find this handler still
-        # connected, whatever the other disconnections do.
-        try:
-            QgsProject.instance().projectSaved.disconnect(self._on_project_saved)
-        except (TypeError, RuntimeError) as exc:
-            flog(f"RecoverPlugin.unload: projectSaved disconnect issue: {exc}", "DEBUG")
-        try:
-            QgsProject.instance().layersAdded.disconnect(self._on_layers_added)
-            QgsProject.instance().layersRemoved.disconnect(self._on_layers_removed)
-            QgsProject.instance().readProject.disconnect(self._on_project_opened)
-            QgsProject.instance().cleared.disconnect(self._on_project_closed)
-        except (TypeError, RuntimeError) as exc:
-            flog(f"RecoverPlugin.unload: disconnect issue: {exc}", "DEBUG")
+        project = QgsProject.instance()
+        for sig_name, slot in (
+            ("projectSaved", self._on_project_saved),
+            ("layersAdded", self._on_layers_added),
+            ("layersRemoved", self._on_layers_removed),
+            ("readProject", self._on_project_opened),
+            ("cleared", self._on_project_closed),
+        ):
+            try:
+                getattr(project, sig_name).disconnect(slot)
+            except (TypeError, RuntimeError, AttributeError) as exc:
+                flog(f"RecoverPlugin.unload: {sig_name} disconnect issue: {exc}", "DEBUG")
 
+        from .compat import is_deleted
         if self._status_indicator is not None:
-            self.iface.statusBarIface().removeWidget(self._status_indicator)
+            try:
+                if not is_deleted(self._status_indicator):
+                    if hasattr(self._status_indicator, "cleanup"):
+                        self._status_indicator.cleanup()
+                    self.iface.statusBarIface().removeWidget(self._status_indicator)
+                    self._status_indicator.deleteLater()
+            except (RuntimeError, AttributeError):
+                pass
             self._status_indicator = None
 
         if self._themed_action_icon is not None:
             self._themed_action_icon.dispose()
             self._themed_action_icon = None
-        self.iface.removePluginMenu("RecoverLand", self.action)
-        self.iface.removeToolBarIcon(self.action)
+        if self.action is not None:
+            self.iface.removePluginMenu("RecoverLand", self.action)
+            self.iface.removeToolBarIcon(self.action)
+            try:
+                if not is_deleted(self.action):
+                    self.action.deleteLater()
+            except RuntimeError:
+                pass
+            self.action = None
+
+        try:
+            from . import remove_translator
+            remove_translator()
+        except Exception as exc:  # noqa: BLE001
+            flog(f"RecoverPlugin: remove_translator skipped: {exc}", "DEBUG")
+        for mod_path, fn_name, args in (
+            (".widgets.icons", "disconnect_icon_cache_hook", ()),
+            (".core.geometry_utils", "clear_caches", ()),
+            (".core.geometry_preview", "purge_lens_overlays", ("shutdown",)),
+            (".core.geometry_preview", "cleanup_temp_layers", ()),
+            (".widgets.snapshot_rebuild_worker", "clear_envelope_memo", ()),
+            (".widgets.snapshot_rebuild_worker", "cleanup_reaper", ()),
+        ):
+            try:
+                import importlib
+                mod = importlib.import_module(mod_path, package=__package__)
+                fn = getattr(mod, fn_name, None)
+                if callable(fn):
+                    fn(*args)
+            except Exception as exc:  # noqa: BLE001
+                flog(f"RecoverPlugin: unload hook {fn_name} skipped: {exc}", "DEBUG")
+        for mod_path, attr_name, method_name in (
+            (".core.snapshot_overlay_session", "_CARRIERS", "close"),
+            (".core.snapshot_overlay_session", "_REVIEW_STORIES", "clear"),
+            (".core.workflow_service", "_SINGLE_LAYER_CACHE", "clear"),
+            (".core.workflow_service", "_REFUSALS", "clear"),
+        ):
+            try:
+                import importlib
+                mod = importlib.import_module(mod_path, package=__package__)
+                obj = getattr(mod, attr_name, None)
+                method = getattr(obj, method_name, None)
+                if callable(method):
+                    method()
+            except Exception as exc:  # noqa: BLE001
+                flog(f"RecoverPlugin: unload cleanup {attr_name}.{method_name} "
+                     f"skipped: {exc}", "DEBUG")
 
     def _release_dialog(self) -> None:
         """Tear the dialog down while the journal is still open.
@@ -323,20 +399,25 @@ class RecoverPlugin:
         must finish removing the plugin from the UI whatever the dialog
         does on its way out.
         """
+        from .compat import is_deleted
         if self.dlg is None:
+            return
+        if is_deleted(self.dlg):
+            self.dlg = None
             return
         try:
             self.dlg._review_wants_persist = False
+            quiesce = getattr(self.dlg, "_quiesce_restore_runner", None)
+            if callable(quiesce):
+                quiesce("plugin_unload")
             self.dlg.cleanup_resources()
         except Exception as exc:  # noqa: BLE001
             flog(f"RecoverPlugin.unload: dlg cleanup error: {exc}", "WARNING")
         try:
-            self.dlg.close()
-            self.dlg.deleteLater()
+            if not is_deleted(self.dlg):
+                self.dlg.close()
+                self.dlg.deleteLater()
         except Exception as exc:  # noqa: BLE001
-            # Still swallowed on purpose -- unload must finish removing the
-            # plugin from the UI. But a dialog that refused to close is how
-            # a widget survives an unload and reappears after a reload.
             flog(f"RecoverPlugin.unload: dlg close/deleteLater failed, the "
                  f"widget may outlive the unload ({exc!r})", "WARNING")
         self.dlg = None
@@ -345,9 +426,12 @@ class RecoverPlugin:
     @_plugin_slot("ouverture de la fenetre RecoverLand", capture_at_risk=False,
                   recovers=True)
     def run(self):
+        from .compat import is_deleted
         if self._duplicate_of is not None:
             self._show_duplicate_warning()
             return
+        if self.dlg is not None and is_deleted(self.dlg):
+            self.dlg = None
         first_open = self.dlg is None
         flog(f"RecoverPlugin: dialog requested first_open={first_open}")
         if self.dlg is None:
@@ -387,8 +471,10 @@ class RecoverPlugin:
         self._journal_lock = None
         self._lock_lost_told = False
         self._writer_restarts = 0
+        self._writer_restart_next_mono = 0.0
         self._cached_status_stats = None
         self._slot_failures.clear()
+        self._initializing_backend = True
         try:
             project_path = QgsProject.instance().absoluteFilePath() or ""
             profile_path = QgsApplication.qgisSettingsDirPath()
@@ -407,6 +493,8 @@ class RecoverPlugin:
                     flog(f"Journal issue: {issue}", "WARNING")
                 if self._is_corrupt(integrity):
                     journal_path = self._handle_corrupt_journal(journal_path, profile_path, project_path)
+                    if not journal_path:
+                        return False
                 else:
                     self._notify_integrity_issues(integrity)
 
@@ -421,8 +509,8 @@ class RecoverPlugin:
             self._write_queue.set_early_warning_callback(self._on_queue_early_warning)
             self._write_queue.set_failure_callback(self._on_writer_failure)
             self._start_watchdog()
-            tracking_on = QgsSettings().value(
-                "RecoverLand/tracking_enabled", True, type=bool
+            tracking_on = _read_bool_setting(
+                QgsSettings(), "RecoverLand/tracking_enabled", True
             )
             if tracking_on:
                 self._tracker.activate()
@@ -433,8 +521,11 @@ class RecoverPlugin:
                 raw = settings.value("RecoverLand/tracked_layers", "[]")
             try:
                 ids = json.loads(raw if isinstance(raw, str) else "[]")
-                if (isinstance(ids, list) and ids and all(isinstance(val, str) and "::" in val for val in ids)):
-                    self._tracker.set_filter(set(ids))
+                if isinstance(ids, list) and ids:
+                    if ids == ["__NONE__"]:
+                        self._tracker.set_filter({"__NONE__"})
+                    elif all(isinstance(val, str) and "::" in val for val in ids):
+                        self._tracker.set_filter(set(ids))
             except (ValueError, TypeError) as exc:
                 flog(f"RecoverPlugin: cannot parse tracked_layer_fingerprints: {exc}", "WARNING")
 
@@ -486,11 +577,15 @@ class RecoverPlugin:
                 "_init_local_backend", "initialisation du journal", e, True,
                 text=text.format(err=f"{type(e).__name__}: {e}"))
             return False
+        finally:
+            self._initializing_backend = False
 
     def _shutdown_local_backend(self) -> None:
         """Cleanly shut down local backend, flushing pending events."""
         # First: a lock retry left running would reopen, a few seconds
         # later, the journal of a project that is no longer open.
+        if self._reinit_timer is not None:
+            self._reinit_timer.stop()
         self._stop_lock_retry()
         self._journal_lock = None
         self._announced_lock = None
@@ -507,13 +602,45 @@ class RecoverPlugin:
             self._tracker = None
         self._cached_status_stats = None
 
-        self._write_queue.stop()
+        for setter in ("set_flush_callback", "set_failure_callback",
+                       "set_early_warning_callback"):
+            fn = getattr(self._write_queue, setter, None)
+            if callable(fn):
+                try:
+                    fn(None)
+                except Exception as exc:  # noqa: BLE001
+                    flog(f"RecoverPlugin: clear callback {setter} skipped: {exc}",
+                         "DEBUG")
+
+        vacuum_done = True
+        try:
+            from .core.retention import wait_for_vacuum
+            vacuum_done = bool(wait_for_vacuum(timeout=5.0))
+        except Exception as exc:  # noqa: BLE001
+            flog(f"RecoverPlugin: wait_for_vacuum skipped: {exc}", "DEBUG")
+
+        writer_stopped = self._write_queue.stop(clear_journal=True)
+        if writer_stopped is False:
+            flog("RecoverPlugin: writer thread still alive at backend shutdown; "
+                 "journal close will skip concurrent outbox settlement", "CRITICAL")
+        if not vacuum_done:
+            flog("RecoverPlugin: VACUUM thread still alive at backend shutdown; "
+                 "keeping writer lock held", "WARNING")
 
         if self._sqlite_backend is not None:
             self._sqlite_backend.close()
             self._sqlite_backend = None
 
-        self._journal.close()
+        still_alive = (writer_stopped is False) or (not vacuum_done)
+        defer_cb = (
+            getattr(self._write_queue, "defer_on_lingering_exit", None)
+            if (writer_stopped is False and vacuum_done)
+            else None
+        )
+        self._journal.close(
+            writer_still_alive=still_alive,
+            defer_lock_release=defer_cb,
+        )
         remove_project_log_handler()
 
     def _connect_existing_layers(self) -> None:
@@ -529,8 +656,11 @@ class RecoverPlugin:
         if self._tracker is None:
             return
         from qgis.core import QgsVectorLayer
+        from .compat import is_deleted
         for layer in layers:
             if not isinstance(layer, QgsVectorLayer):
+                continue
+            if is_deleted(layer):
                 continue
             try:
                 self._tracker.connect_layer(layer)
@@ -538,7 +668,7 @@ class RecoverPlugin:
                 try:
                     name, layer_id = layer.name(), layer.id()
                 except RuntimeError:
-                    name, layer_id = "?", "?"
+                    continue
                 self._slot_failed(
                     f"connect_layer:{layer_id}",
                     f"suivi de la couche '{name}' (ses modifications ne "
@@ -550,6 +680,8 @@ class RecoverPlugin:
 
     @_plugin_slot("retrait de couches du projet", capture_at_risk=False)
     def _on_layers_removed(self, layer_ids) -> None:
+        for lid in layer_ids or ():
+            self._uncapturable_layers.discard(lid)
         if self._tracker is None:
             return
         for lid in layer_ids:
@@ -557,8 +689,14 @@ class RecoverPlugin:
 
     @_plugin_slot("ouverture du projet")
     def _on_project_opened(self) -> None:
+        if self._reinit_timer is not None:
+            self._reinit_timer.stop()
         path = QgsProject.instance().absoluteFilePath() or "<unsaved>"
         flog(f"RecoverPlugin: project_opened path={path}")
+        if self.dlg is not None:
+            quiesce = getattr(self.dlg, "_quiesce_for_project_switch", None)
+            if callable(quiesce):
+                quiesce()
         self._forget_project_facts()
         self._shutdown_local_backend()
         self._init_local_backend()
@@ -568,18 +706,16 @@ class RecoverPlugin:
     @_plugin_slot("fermeture du projet")
     def _on_project_closed(self) -> None:
         flog("RecoverPlugin: project_closed")
+        if self.dlg is not None:
+            quiesce = getattr(self.dlg, "_quiesce_for_project_switch", None)
+            if callable(quiesce):
+                quiesce()
         self._forget_project_facts()
         self._shutdown_local_backend()
         # From the facts, not set_no_project(): a failure recorded on the
         # way must stay visible.
         self._update_status_bar()
         self._notify_dialog_project_switched()
-        # File > New and Close Project emit `cleared` and nothing after: the
-        # backend used to stay down, and every edit of the new, unsaved
-        # project went unrecorded behind a grey "no project" dot. Opening a
-        # project emits `cleared` THEN `readProject` inside the same call,
-        # so a zero-delay timer runs after both: it only opens the blank
-        # project's journal when readProject did not open one.
         if self._reinit_timer is None:
             self._reinit_timer = QTimer()
             self._reinit_timer.setSingleShot(True)
@@ -588,19 +724,13 @@ class RecoverPlugin:
 
     @_plugin_slot("ouverture du journal du nouveau projet")
     def _reinit_after_clear(self) -> None:
+        if self._unloaded or self._initializing_backend:
+            return
         if self._duplicate_of is not None:
             return
         if self._journal.is_open:
             return
         if self._journal_lock is not None:
-            # readProject, in the same call as `cleared`, has just been
-            # refused this project's journal by its lock, and the lock retry
-            # watches it (the shutdown on `cleared` dropped any older
-            # refusal). Asking again here doubled every refusal: one more
-            # round trip through the other instance's lock file (and, for a
-            # network journal an older client keeps in WAL, one more open of
-            # the live journal), under a "blank project" line that was
-            # false.
             flog("RecoverPlugin: journal refused at the project read, the "
                  "lock retry watches it; no second attempt", "DEBUG")
             return
@@ -611,14 +741,7 @@ class RecoverPlugin:
         self._notify_dialog_project_switched()
 
     def _forget_project_facts(self) -> None:
-        """Facts about the history of the project being left.
-
-        Called when a project is closed or another one read, never by a
-        backend reinitialisation of the same project (a save that moves the
-        journal carries that history along, gaps included). What is dropped
-        was announced when it happened (persistent alert) and stays in the
-        log; the indicator of the next project is about its own journal.
-        """
+        """Facts about the history of the project being left."""
         if self._unverified_inserts:
             flog(f"RecoverPlugin: project left, its incomplete additions stop "
                  f"counting in the capture health "
@@ -629,6 +752,11 @@ class RecoverPlugin:
                  f"({sorted(v['name'] for v in self._unverified_updates.values())})")
         self._unverified_inserts.clear()
         self._unverified_updates.clear()
+        self._uncapturable_layers.clear()
+        self._alert_last.clear()
+        self._prepare_failures = 0
+        self._last_disk_status = None
+        self._disk_low_warned = False
         self._project_capture_failures = 0
         self._writer_restarts = 0
         self._cached_status_stats = None
@@ -704,7 +832,10 @@ class RecoverPlugin:
                         "le journal de RecoverLand."
                     ).format(err=f"{type(exc).__name__}: {exc}"))
             QTimer.singleShot(
-                0, lambda: self._on_project_saved(True, saved_name, planned))
+                0, lambda: (None if self._unloaded else
+                            self._on_project_saved(True, saved_name, planned)))
+            return
+        if self._unloaded:
             return
         if not self._journal.is_open and self._status_indicator is None:
             return
@@ -745,8 +876,9 @@ class RecoverPlugin:
                     # project, whose close carried the history.
                     flog("RecoverPlugin: project saved during a restore, "
                          "journal switch deferred")
-                    QTimer.singleShot(1000, lambda: self._resume_saved_follow_up(
-                        _saved_name, _planned))
+                    QTimer.singleShot(1000, lambda: (
+                        None if self._unloaded else
+                        self._resume_saved_follow_up(_saved_name, _planned)))
                     return
                 if not self._journal.is_open:
                     flog("RecoverPlugin: project saved while no journal is "
@@ -759,7 +891,7 @@ class RecoverPlugin:
                     return
                 flog(f"RecoverPlugin: project saved, the journal follows it "
                      f"{pending.source} -> {pending.target} "
-                     f"(project {project_path or _saved_name})")
+                     f"(project {project_path or _sanitize_project_label(_saved_name or '')})")
                 self._shutdown_local_backend()
                 self._init_local_backend()
                 self._update_status_bar()
@@ -900,7 +1032,8 @@ class RecoverPlugin:
             self._status_indicator.pulse()
         if self.dlg is not None:
             fp = datasource_fp
-            QTimer.singleShot(500, lambda: self._forward_commit_to_dialog(fp))
+            QTimer.singleShot(500, lambda: (
+                None if self._unloaded else self._forward_commit_to_dialog(fp)))
 
     @_plugin_slot("mise a jour de la fenetre apres un commit",
                   capture_at_risk=False, recovers=True)
@@ -941,7 +1074,7 @@ class RecoverPlugin:
     def _run_auto_purge_if_enabled(self) -> None:
         """P1.2 / P0.4: Execute auto-purge at startup if the setting is enabled."""
         settings = QgsSettings()
-        if not settings.value("RecoverLand/auto_purge", False, type=bool):
+        if not _read_bool_setting(settings, "RecoverLand/auto_purge", False):
             return
         if not self._journal or not self._journal.is_open:
             return
@@ -953,7 +1086,7 @@ class RecoverPlugin:
             conn = self._journal.get_connection()
             trace_id = generate_trace_id()
             flog(f"[{trace_id}] RecoverPlugin: auto-purge start days={days} max_events={max_ev}")
-            result = purge_old_events(conn, policy, trace_id=trace_id)
+            result = purge_old_events(conn, policy, trace_id=trace_id, is_auto=True)
             if result.deleted_count > 0:
                 flog(f"RecoverPlugin: auto-purge deleted {result.deleted_count} events")
         except Exception as e:
@@ -989,6 +1122,19 @@ class RecoverPlugin:
                                 "CRITICAL", duration=0)
                     self._update_status_bar()
                 return
+            if (status.free_bytes >= 150 * 1024 * 1024
+                    and _read_bool_setting(
+                        settings, "RecoverLand/tracking_disabled_by_disk", False)):
+                settings.setValue("RecoverLand/tracking_disabled_by_disk", False)
+                settings.setValue("RecoverLand/tracking_enabled", True)
+                if self._tracker and not self._tracker.is_active:
+                    self._tracker.activate()
+                qlog(QCoreApplication.translate(
+                    "RecoverPlugin",
+                    "Espace disque de nouveau suffisant : "
+                    "l'enregistrement a ete reactive."
+                ))
+                self._update_status_bar()
             if status.is_low:
                 # Early warning: below the critical threshold the
                 # recording is cut without notice, so say it once while
@@ -1000,31 +1146,13 @@ class RecoverPlugin:
                 self._update_status_bar()
                 return
             self._disk_low_warned = False
-            if not settings.value(
-                "RecoverLand/tracking_disabled_by_disk", False, type=bool,
-            ):
-                return
-            settings.setValue("RecoverLand/tracking_disabled_by_disk", False)
-            settings.setValue("RecoverLand/tracking_enabled", True)
-            if self._tracker and not self._tracker.is_active:
-                self._tracker.activate()
-            qlog(QCoreApplication.translate(
-                "RecoverPlugin",
-                "Espace disque de nouveau suffisant : "
-                "l'enregistrement a ete reactive."
-            ))
-            self._update_status_bar()
 
         def guarded_check():
-            # A timer slot, and also called right here, inside
-            # _init_local_backend: raised there, it made the init report
-            # "L'enregistrement est desactive" while the tracker was already
-            # capturing. It stops nothing; its failure is said (DEGRADED)
-            # until a later check completes.
             self._guarded_call(
                 "_check_disk", "surveillance de l'espace disque (la coupure "
                 "avant disque plein ne fonctionne plus)", False, True, _check)
 
+        self._stop_disk_monitor()
         self._disk_timer = QTimer()
         self._disk_timer.timeout.connect(guarded_check)
         self._disk_timer.start(_CHECK_INTERVAL_SEC * 1000)
@@ -1039,9 +1167,15 @@ class RecoverPlugin:
     @staticmethod
     def _is_corrupt(integrity) -> bool:
         """Return True if integrity issues indicate actual database corruption."""
+        explicit = getattr(integrity, "is_corrupt", None)
+        if explicit is not None:
+            return bool(explicit)
         for issue in integrity.issues:
             lower = issue.lower()
-            if "integrity check failed" in lower or "cannot open" in lower:
+            if ("integrity check failed" in lower
+                    or "malformed" in lower
+                    or "file is not a database" in lower
+                    or "database disk image is malformed" in lower):
                 return True
         return False
 
@@ -1062,6 +1196,7 @@ class RecoverPlugin:
 
         self._journal.close()
 
+        proj_before = QgsProject.instance().absoluteFilePath() or ""
         reply = QMessageBox.question(
             self.iface.mainWindow(),
             QCoreApplication.translate("RecoverPlugin", "Journal corrompu"),
@@ -1073,12 +1208,24 @@ class RecoverPlugin:
             ),
             QtCompat.MSG_YES | QtCompat.MSG_NO, QtCompat.MSG_YES)
 
+        if self._unloaded:
+            return ""
+        cur_proj = QgsProject.instance().absoluteFilePath() or ""
+        if cur_proj != proj_before:
+            flog("RecoverPlugin: project changed during corrupt-journal modal; aborting",
+                 "WARNING")
+            return ""
+
+        renamed_ok = False
+        stranded_files: List[str] = []
         if reply == QtCompat.MSG_YES:
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
             corrupt_path = journal_path + f".corrupt_{ts}"
             error, stranded = self._set_journal_aside(journal_path, corrupt_path)
+            stranded_files = list(stranded or [])
             tr = QCoreApplication.translate
             if not error:
+                renamed_ok = True
                 flog(f"RecoverPlugin: corrupt journal renamed to {corrupt_path}")
                 self._alert("corrupt_journal", tr(
                     "RecoverPlugin",
@@ -1107,9 +1254,18 @@ class RecoverPlugin:
                 ).format(path=journal_path, err=error, where=where),
                     "CRITICAL", duration=0)
 
+        if stranded_files:
+            flog(f"RecoverPlugin: refusing to open journal over stranded files "
+                 f"{stranded_files}", "CRITICAL")
+            return ""
+
         new_path = self._journal.open_for_project(project_path, profile_path)
         set_project_log_path(new_path)
-        flog(f"RecoverPlugin: fresh journal created at {new_path}")
+        if renamed_ok:
+            flog(f"RecoverPlugin: fresh journal created at {new_path}")
+        else:
+            flog(f"RecoverPlugin: corrupt journal kept in place and reopened at {new_path}",
+                 "WARNING")
         return new_path
 
     # The files SQLite keeps beside a journal: they belong to it and move
@@ -1131,6 +1287,7 @@ class RecoverPlugin:
         which SQLite deletes as stale, and the writes it held vanished from
         the copy kept "for analysis".
         """
+        from .core.long_paths import win_fs_retry
         moves = [(journal_path, aside)]
         for suffix in cls._JOURNAL_COMPANIONS:
             if os.path.lexists(when_needed(journal_path + suffix)):
@@ -1138,13 +1295,13 @@ class RecoverPlugin:
         done = []
         try:
             for src, dst in moves:
-                os.rename(when_needed(src), when_needed(dst))
+                win_fs_retry(os.rename, when_needed(src), when_needed(dst))
                 done.append((src, dst))
         except OSError as exc:
             stranded = []
             for src, dst in reversed(done):
                 try:
-                    os.rename(when_needed(dst), when_needed(src))
+                    win_fs_retry(os.rename, when_needed(dst), when_needed(src))
                 except OSError as back:
                     flog(f"RecoverPlugin: {dst} could not be moved back to "
                          f"{src}: {back}", "CRITICAL")
@@ -1257,23 +1414,46 @@ class RecoverPlugin:
         if self._lock_lost_told:
             return
         self._lock_lost_told = True
-        flog(f"RecoverPlugin: event=journal_lock_lost path={self._journal.path}",
+        lost_path = self._journal.path or ""
+        flog(f"RecoverPlugin: event=journal_lock_lost path={lost_path}",
              "CRITICAL")
+        # Pause capture, stop writer without flushing into the foreign DB,
+        # and close our SQLite handle so UI/maintenance cannot write to it.
+        if self._tracker is not None and self._tracker.is_active:
+            try:
+                self._tracker.deactivate()
+            except Exception as exc:  # noqa: BLE001
+                flog(f"RecoverPlugin: deactivate on lock_lost failed: {exc}", "WARNING")
+        try:
+            self._write_queue.stop(clear_journal=True, flush=False)
+        except Exception as exc:  # noqa: BLE001
+            flog(f"RecoverPlugin: write_queue.stop on lock_lost failed: {exc}", "WARNING")
+        try:
+            self._journal.close()
+        except Exception as exc:  # noqa: BLE001
+            flog(f"RecoverPlugin: journal.close on lock_lost failed: {exc}", "WARNING")
         self._alert("lock_lost", QCoreApplication.translate(
             "RecoverPlugin",
             "Le verrou du journal RecoverLand ({path}) a ete pris par une autre "
             "instance de QGIS : deux instances peuvent ecrire ce journal et "
             "les modifications faites ici ne sont plus protegees. Fermez "
             "l'autre instance puis rouvrez le projet."
-        ).format(path=self._journal.path), "CRITICAL", duration=0)
+        ).format(path=lost_path), "CRITICAL", duration=0)
 
     @_plugin_slot("reprise apres l'arret du thread d'ecriture")
     def _on_writer_failure(self, health) -> None:
         """The watchdog found the writer dead or stalled (GUI thread)."""
         state = getattr(health, "state", "?")
         err = getattr(health, "last_persistence_error", "")
-        if state == "failed" and self._writer_restarts < 3:
+        now_mono = time.monotonic()
+        if (state == "failed" and self._writer_restarts < 3
+                and now_mono >= self._writer_restart_next_mono):
             self._writer_restarts += 1
+            # Backoff across retries (15s, 45s, 120s) so a short SMB drop
+            # does not burn all 3 restart attempts in 15 seconds.
+            delays = (15.0, 45.0, 120.0)
+            self._writer_restart_next_mono = now_mono + delays[min(
+                self._writer_restarts - 1, len(delays) - 1)]
             restarted = False
             try:
                 restarted = self._write_queue.restart_writer()
@@ -1291,6 +1471,15 @@ class RecoverPlugin:
                 ).format(err=err or state), "WARNING")
                 self._update_status_bar()
                 return
+        outbox_ok = bool(getattr(health, "outbox_ok", True))
+        lost_events = int(getattr(health, "lost_events", 0) or 0)
+        if not outbox_ok or lost_events > 0:
+            flog(f"RecoverPlugin: writer AND outbox failed "
+                 f"(outbox_ok={outbox_ok} lost={lost_events} err={err!r})",
+                 "CRITICAL")
+            self._on_queue_overflow()
+            self._update_status_bar()
+            return
         self._alert("writer", QCoreApplication.translate(
             "RecoverPlugin",
             "Ecriture du journal RecoverLand en echec ({err}). Vos "
@@ -1373,6 +1562,12 @@ class RecoverPlugin:
                 "CRITICAL" if detail.get("unresolved") else "WARNING",
                 duration=0 if detail.get("unresolved") else 15)
         elif kind == "untracked_edit":
+            fp = str(detail.get("fingerprint") or "")
+            if (detail.get("provider") in ("memory", "virtual")
+                    or fp.startswith(("memory::", "virtual::"))
+                    or detail.get("support_level") == "informational"
+                    or detail.get("reason") == "ephemeral_layer"):
+                return
             self._alert(f"untracked:{detail.get('layer_id')}", tr(
                 "RecoverPlugin",
                 "La couche '{layer}' passe en edition mais RecoverLand ne la "
@@ -1382,7 +1577,7 @@ class RecoverPlugin:
                 tr("RecoverPlugin", "exclue de la selection des couches suivies")
                 if detail.get("reason") == "not_in_tracking_selection"
                 else tr("RecoverPlugin", "source non prise en charge"))),
-                "CRITICAL", duration=0)
+                "WARNING", duration=10)
         elif kind == "large_commit":
             self._alert(f"large:{detail.get('layer_id')}", tr(
                 "RecoverPlugin",
@@ -1494,12 +1689,6 @@ class RecoverPlugin:
                duration: int = 15) -> None:
         """Message bar + log, at most once per (key, severity) every _ALERT_REPEAT_S."""
         import time as _time
-        qlog(text, level)
-        try:
-            from .core.logger import jlog
-            jlog("user_alert", level, component="plugin", key=key, text=text)
-        except Exception:  # noqa: BLE001 # nosec B110 - forensic log never breaks alert
-            pass
         now = _time.monotonic()
         rank = self._ALERT_LEVEL_RANK.get(level, 2)
         prev = self._alert_last.get(key)
@@ -1508,9 +1697,22 @@ class RecoverPlugin:
         else:
             last, prev_rank = float(prev or 0.0), 4
         if last and (now - last < self._ALERT_REPEAT_S) and rank <= prev_rank:
+            flog(f"RecoverPlugin: alert suppressed key={key} level={level}", "DEBUG")
             return
         new_rank = max(rank, prev_rank) if (last and now - last < self._ALERT_REPEAT_S) else rank
+        if len(self._alert_last) > 256:
+            cutoff = now - self._ALERT_REPEAT_S
+            self._alert_last = {
+                k: v for k, v in self._alert_last.items()
+                if (v[0] if isinstance(v, tuple) else float(v or 0.0)) >= cutoff
+            }
         self._alert_last[key] = (now, new_rank)
+        qlog(text, level)
+        try:
+            from .core.logger import jlog
+            jlog("user_alert", level, component="plugin", key=key, text=text)
+        except Exception:  # noqa: BLE001 # nosec B110 - forensic log never breaks alert
+            pass
         try:
             from qgis.core import Qgis
             levels = {"INFO": Qgis.MessageLevel.Info,
@@ -1547,8 +1749,8 @@ class RecoverPlugin:
             tracker_active=bool(tracker is not None and tracker.is_active),
             writer=writer,
             disk=disk_state(self._last_disk_status),
-            disabled_by_disk=QgsSettings().value(
-                "RecoverLand/tracking_disabled_by_disk", False, type=bool),
+            disabled_by_disk=_read_bool_setting(
+                QgsSettings(), "RecoverLand/tracking_disabled_by_disk", False),
             pressure_paused=bool(tracker is not None
                                  and getattr(tracker, "_pressure_paused", False)),
             capture_failures=(
@@ -1558,8 +1760,10 @@ class RecoverPlugin:
             uncapturable_layers=len(self._uncapturable_layers),
             prepare_failures=self._prepare_failures,
             journal_locked="" if journal_open else self._lock_description(),
-            lock_lost=bool(journal_open
-                           and getattr(self._journal, "is_lock_lost", False)),
+            lock_lost=bool(
+                self._lock_lost_told
+                or (journal_open and getattr(self._journal, "is_lock_lost", False))
+            ),
             carry_fallback=self._carry_fallback_reason(),
             internal_failures=[
                 (f"{rec['label']} ({rec['error']})", rec["at_risk"])

@@ -46,6 +46,7 @@ from qgis.PyQt.QtCore import QThread, pyqtSignal
 
 from ..core.logger import flog
 from ..core.wkb_envelope import envelope_intersects, parse_envelope
+from ..qgs_task_support import open_worker_read_connection
 
 _MARKER_SCAN_LIMIT = 5000
 
@@ -197,8 +198,22 @@ class MarkerScanWorker(QThread):
     ) -> None:
         super().__init__()
         self._journal = journal
-        self._layer_infos = layer_infos
-        self._bbox_per_layer = bbox_per_layer
+        self._journal_path = getattr(journal, "path", None)
+        self._layer_infos = [dict(info) for info in (layer_infos or [])]
+        # Extract plain float tuples on the GUI thread so the worker never
+        # touches QgsRectangle C++ objects from a background thread.
+        bbox_tuples = {}
+        for fp, bbox in (bbox_per_layer or {}).items():
+            if bbox is None:
+                continue
+            if isinstance(bbox, tuple) and len(bbox) == 4:
+                bbox_tuples[fp] = tuple(float(v) for v in bbox)
+            else:
+                bbox_tuples[fp] = (
+                    float(bbox.xMinimum()), float(bbox.yMinimum()),
+                    float(bbox.xMaximum()), float(bbox.yMaximum()),
+                )
+        self._bbox_per_layer = bbox_tuples
         self._t_min = t_min
         self._t_max = t_max
         self._cancelled = False
@@ -233,8 +248,8 @@ class MarkerScanWorker(QThread):
     def _layer_marks(self, conn, info: dict, tid: str) -> Optional[set]:
         """Marks of one layer inside its bbox; None when it has no bbox."""
         ds_fp = info["fingerprint"]
-        bbox = self._bbox_per_layer.get(ds_fp)
-        if bbox is None:
+        bbox_xy = self._bbox_per_layer.get(ds_fp)
+        if bbox_xy is None:
             flog(
                 f"[{tid}] marker_scan: no_bbox layer={info.get('layer_name', '?')} "
                 f"datasource={ds_fp}",
@@ -242,7 +257,6 @@ class MarkerScanWorker(QThread):
             )
             return None
 
-        bbox_xy = (bbox.xMinimum(), bbox.yMinimum(), bbox.xMaximum(), bbox.yMaximum())
         rows = _execute_markers(
             conn,
             (ds_fp, self._t_min, self._t_max, _MARKER_SCAN_LIMIT + 1),
@@ -255,7 +269,9 @@ class MarkerScanWorker(QThread):
         marks: set = set()
         traces: list = []
         n_dropped = 0
-        for row in rows:
+        for idx, row in enumerate(rows):
+            if idx % 512 == 0 and self._cancelled:
+                return marks
             (created_at, op_type, geom_wkb, new_geom_wkb, event_id,
              restored_from, invalidated_at, schema) = row
             if restored_from is not None:
@@ -267,10 +283,16 @@ class MarkerScanWorker(QThread):
                 continue
             if not created_at:
                 continue
-            geom = geom_wkb or new_geom_wkb
-            if geom is not None:
-                env = parse_envelope(geom)
-                if not envelope_intersects(env, bbox_xy):
+            if geom_wkb is not None or new_geom_wkb is not None:
+                in_old = (
+                    geom_wkb is not None
+                    and envelope_intersects(parse_envelope(geom_wkb), bbox_xy)
+                )
+                in_new = (
+                    new_geom_wkb is not None
+                    and envelope_intersects(parse_envelope(new_geom_wkb), bbox_xy)
+                )
+                if not (in_old or in_new):
                     n_dropped += 1
                     continue
             marks.add((created_at, (op_type or "INSERT").upper()))
@@ -300,9 +322,12 @@ class MarkerScanWorker(QThread):
         )
 
         try:
-            conn = self._journal.create_read_connection()
+            conn = open_worker_read_connection(self._journal, self._journal_path)
             with self._conn_lock:
                 self._conn = conn
+            if self._cancelled:
+                flog(f"[{tid}] marker_scan: cancelled", "INFO")
+                return
             for info in self._layer_infos:
                 if self._cancelled:
                     flog(f"[{tid}] marker_scan: cancelled", "INFO")

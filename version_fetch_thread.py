@@ -17,11 +17,14 @@ from .core.event_stream_repository import (
     fetch_events_after_cutoff, count_events_after_cutoff,
 )
 from .core.logger import flog
-from .qgs_task_support import TaskEnabledThread, trace_prefix
+from .qgs_task_support import (
+    TaskEnabledThread, open_worker_read_connection, trace_prefix,
+)
 
 
 def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
-               is_cancelled, include_traces=True):
+               is_cancelled, include_traces=True,
+               journal_path=None, register_conn=None, unregister_conn=None):
     conn = None
     prefix = trace_prefix(trace_id)
     cutoff_str = cutoff.isoformat() if hasattr(cutoff, 'isoformat') else str(cutoff)
@@ -29,7 +32,13 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
          f"n_fingerprints={len(fingerprints)} "
          f"cutoff={cutoff_str} include_traces={include_traces}")
     try:
-        conn = journal.create_read_connection()
+        conn = open_worker_read_connection(journal, journal_path)
+        if register_conn is not None:
+            register_conn(conn)
+        if is_cancelled():
+            return None
+        # Hold one consistent SQLite read snapshot across count + fetch.
+        conn.execute("BEGIN")
         total = 0
         for fp in fingerprints:
             if is_cancelled():
@@ -58,6 +67,8 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
             return None
         return events
     finally:
+        if unregister_conn is not None:
+            unregister_conn()
         if conn is not None:
             try:
                 conn.close()
@@ -66,9 +77,15 @@ def _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
 
 
 def _run_fetch_task(task, journal, fingerprints, cutoff, trace_id, count_callback,
-                    include_traces=True):
-    return _run_fetch(journal, fingerprints, cutoff, trace_id, count_callback,
-                      task.isCanceled, include_traces=include_traces)
+                    include_traces=True,
+                    journal_path=None, register_conn=None, unregister_conn=None):
+    return _run_fetch(
+        journal, fingerprints, cutoff, trace_id, count_callback,
+        task.isCanceled, include_traces=include_traces,
+        journal_path=journal_path,
+        register_conn=register_conn,
+        unregister_conn=unregister_conn,
+    )
 
 
 class VersionFetchThread(TaskEnabledThread):
@@ -82,6 +99,7 @@ class VersionFetchThread(TaskEnabledThread):
                  include_traces: bool = True):
         super().__init__(trace_id=trace_id)
         self._journal = journal
+        self._journal_path = getattr(journal, "path", None)
         self._fingerprints = list(fingerprints)
         self._cutoff = cutoff
         self._include_traces = include_traces
@@ -96,6 +114,9 @@ class VersionFetchThread(TaskEnabledThread):
                 self.count_ready.emit,
                 lambda: self._stopped,
                 include_traces=self._include_traces,
+                journal_path=self._journal_path,
+                register_conn=self._register_conn,
+                unregister_conn=self._unregister_conn,
             )
             if not self._stopped and events is not None:
                 self.events_ready.emit(events)
@@ -119,6 +140,9 @@ class VersionFetchThread(TaskEnabledThread):
             trace_id=self._trace_id,
             count_callback=self.count_ready.emit,
             include_traces=self._include_traces,
+            journal_path=self._journal_path,
+            register_conn=self._register_conn,
+            unregister_conn=self._unregister_conn,
         )
         flog(f"{prefix}VersionFetchThread: submitted to QgsTaskManager")
 

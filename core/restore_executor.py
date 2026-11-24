@@ -69,6 +69,11 @@ def preflight_layer_check(plan: RestorePlan, layer) -> List[str]:
     if not hasattr(layer, 'dataProvider') or layer.dataProvider() is None:
         blocking.append("Layer has no data provider")
         return blocking
+    if (plan.datasource_fingerprint or "").startswith(("memory::", "virtual::")):
+        from .support_policy import is_restore_supported
+        if not is_restore_supported(layer):
+            blocking.append("Layer provider does not support restore")
+            return blocking
 
     caps = layer.dataProvider().capabilities()
     needed_ops = {a.compensatory_op for a in plan.actions}
@@ -182,6 +187,40 @@ def _execute_best_effort(
     return restore_batch(layer, ordered, trace_id=trace_id, journal=journal)
 
 
+def dirty_transaction_group_siblings(layer) -> List[str]:
+    """Return names of other modified layers in *layer*'s transaction group.
+
+    In QGIS AutomaticGroups / BufferedGroups mode, commitChanges() or
+    rollBack() on one layer commits or rolls back every layer in the same
+    transaction group. Refusing when a sibling has unsaved edits prevents
+    silently committing or discarding unrelated user work.
+    """
+    try:
+        from qgis.core import QgsProject, Qgis
+        project = QgsProject.instance()
+        if project is None:
+            return []
+        mode = project.transactionMode() if hasattr(project, "transactionMode") else None
+        disabled = getattr(getattr(Qgis, "TransactionMode", None), "Disabled", 0)
+        if mode is None or mode == disabled:
+            return []
+        groups = project.transactionGroups() if hasattr(project, "transactionGroups") else {}
+        if not isinstance(groups, dict):
+            return []
+        layer_id = layer.id()
+        dirty: List[str] = []
+        for group in groups.values():
+            layers = list(group.layers()) if hasattr(group, "layers") else []
+            if not any(lyr.id() == layer_id for lyr in layers):
+                continue
+            for lyr in layers:
+                if lyr.id() != layer_id and lyr.isModified():
+                    dirty.append(lyr.name())
+        return dirty
+    except (ImportError, RuntimeError, AttributeError):
+        return []
+
+
 def _execute_strict(
     plan: RestorePlan,
     events_by_id: Dict[int, AuditEvent],
@@ -215,6 +254,15 @@ def _execute_strict(
          f"actions={len(plan.actions)}")
 
     all_eids = [a.event_id for a in plan.actions]
+    dirty_siblings = dirty_transaction_group_siblings(layer)
+    if dirty_siblings:
+        names_str = ", ".join(dirty_siblings[:5])
+        msg = (f"Other layer(s) in the same QGIS transaction group have "
+               f"unsaved edits ({names_str}); save or roll back first")
+        flog(f"{prefix}strict_execute: refused transaction group conflict: "
+             f"{names_str}", "ERROR")
+        return RestoreReport(
+            [], {eid: msg for eid in all_eids}, plan.event_count)
     was_editing = layer.isEditable()
     if not was_editing:
         if not layer.startEditing():
@@ -225,7 +273,10 @@ def _execute_strict(
 
     guard = CommitGuard(layer, trace_id)
     layer.beginEditCommand("RecoverLand: temporal restore")
-    succeeded: List[int] = []
+    written: List[int] = []
+    skipped_idempotent: List[int] = []
+    soft_failed: Dict[int, str] = {}
+    failed_geometry_drift: List[int] = []
     failed: Dict[int, str] = {}
     # One remap for the whole plan, as the strict runner keeps one per
     # layer: a feature re-inserted in phase 0 is reached by the later
@@ -247,14 +298,25 @@ def _execute_strict(
         )
         guard.end_action(action.event_id, extra_fids=[result.get("fid")])
         if result["success"]:
-            succeeded.append(action.event_id)
+            is_drift = (
+                result.get("status") == "SKIPPED_GEOMETRY_DRIFT"
+                or result.get("reason_code") == RESTORE_REASON_GEOMETRY_DRIFT
+            )
+            if is_drift:
+                soft_failed[action.event_id] = result["message"]
+                failed_geometry_drift.append(action.event_id)
+            elif result.get("skipped"):
+                skipped_idempotent.append(action.event_id)
+            else:
+                written.append(action.event_id)
         else:
             failed[action.event_id] = result["message"]
             break
 
     if failed:
+        guard.detach()
         flog(f"{prefix}strict_execute: rollback_started "
-             f"applied={len(succeeded)} failed={len(failed)}", "WARNING")
+             f"applied={len(written)} failed={len(failed)}", "WARNING")
         layer.destroyEditCommand()
         if not was_editing:
             layer.rollBack()
@@ -268,14 +330,18 @@ def _execute_strict(
 
     layer.endEditCommand()
     if was_editing:
+        guard.detach()
         # The buffer belongs to an edit session the user opened: nothing is
         # written until HE commits. Claiming a restore (and journalling
         # traces) for writes that may still be discarded would be a lie.
         flog(f"{prefix}strict_execute: buffered_in_user_session "
-             f"actions={len(succeeded)} (no commit, no trace)", "WARNING")
+             f"actions={len(written)} (no commit, no trace)", "WARNING")
+        uncommitted = {eid: "written to the open edit session, not committed"
+                       for eid in written + skipped_idempotent}
+        uncommitted.update(soft_failed)
         return RestoreReport(
-            [], {eid: "written to the open edit session, not committed"
-                 for eid in succeeded}, plan.event_count)
+            [], uncommitted, plan.event_count,
+            failed_geometry_drift=failed_geometry_drift)
 
     flog(f"{prefix}strict_execute: commit_started")
     guard.prepare()
@@ -289,20 +355,27 @@ def _execute_strict(
 
     if verdict.committed:
         flog(f"{prefix}strict_execute: commit_done verdict={verdict.state}")
-        verified = [eid for eid in succeeded
+        verified = [eid for eid in written
                     if verdict.per_event.get(eid, EV_APPLIED_VERIFIED)
                     == EV_APPLIED_VERIFIED]
         mismatched = {eid: f"FAILED_POSTCOMMIT_VERIFICATION: "
                            f"{verdict.per_event_detail.get(eid, '')}"
-                      for eid in succeeded if eid not in verified}
+                      for eid in written if eid not in verified}
         # Every committed write is journalled, verified or not: the data
-        # changed, and a later rewind must know it.
-        traces = _build_traces_for_succeeded(succeeded, events_by_id, layer)
+        # changed, and a later rewind must know it. Skipped/drift actions
+        # wrote nothing and receive no trace.
+        traces = _build_traces_for_succeeded(written, events_by_id, layer)
+        all_failed = dict(soft_failed)
+        all_failed.update(mismatched)
         flog(f"{prefix}strict_execute: completed ok={len(verified)} "
+             f"skipped={len(skipped_idempotent)} drift={len(soft_failed)} "
              f"mismatch={len(mismatched)} traces={len(traces)}")
-        return RestoreReport(verified, mismatched, plan.event_count,
-                             trace_events=tuple(traces),
-                             landed=list(mismatched))
+        return RestoreReport(
+            verified + skipped_idempotent, all_failed, plan.event_count,
+            trace_events=tuple(traces),
+            skipped_idempotent=skipped_idempotent,
+            failed_geometry_drift=failed_geometry_drift,
+            landed=list(mismatched))
 
     msg = "; ".join(verdict.commit_errors) or "Commit failed"
     flog(f"{prefix}strict_execute: commit_failed verdict={verdict.state} "
@@ -458,6 +531,10 @@ def _buffer_insert(layer, event: AuditEvent,
             layer, geom, event, event.event_id, "_buffer_insert")
         if type_error is not None:
             return dict(type_error, status="FAILED")
+        storable_refusal, geom = _storability_refusal(
+            layer, geom, event, None)
+        if storable_refusal is not None:
+            return storable_refusal
     mapping, dropped = _field_mapping_report(layer, event, attrs)
     fields = layer.fields()
     unset = sorted(name for name, value in (attrs or {}).items()
@@ -470,7 +547,7 @@ def _buffer_insert(layer, event: AuditEvent,
              f"database default", "WARNING")
         attrs = {name: value for name, value in attrs.items()
                  if name not in unset}
-    specs = _time_specs(layer, _captured_from(event, "snapshot"))
+    specs = _time_specs(layer, _captured_from(event, "snapshot"), cache=fid_remap)
     refusal = _legacy_datetime_refusal(mapping, attrs, fields, event, specs,
                                        "_buffer_insert")
     if refusal is not None:
@@ -1273,9 +1350,10 @@ def _buffer_update(layer, event: AuditEvent,
     # A <= 5.x date-time whose provider spec cannot be established is
     # refused HERE, before the geometry: nothing of the event is written.
     from .restore_service import (
-        _time_specs, _captured_from, _legacy_datetime_refusal,
+        _geometry_type_refusal, _time_specs, _captured_from,
+        _legacy_datetime_refusal,
     )
-    specs = _time_specs(layer, _captured_from(event, "old"))
+    specs = _time_specs(layer, _captured_from(event, "old"), cache=fid_remap)
     refusal = _legacy_datetime_refusal(
         mapping, old_attrs if isinstance(old_attrs, dict) else {}, fields,
         event, specs, "_buffer_update")
@@ -1328,10 +1406,15 @@ def _buffer_update(layer, event: AuditEvent,
                 "reason_code": "corrupt_wkb",
                 "message": "Geometry rebuild failed (null after decode)",
             }
-        geom, crs_error = _geometry_in_layer_crs(
-            layer, geom, event, trace_id=trace_id)
-        if crs_error is not None:
-            return crs_error
+        if not geom.isEmpty():
+            geom, crs_error = _geometry_in_layer_crs(
+                layer, geom, event, trace_id=trace_id)
+            if crs_error is not None:
+                return crs_error
+        type_error = _geometry_type_refusal(
+            layer, geom, event, event.event_id, "_buffer_update")
+        if type_error is not None:
+            return dict(type_error, status="FAILED")
         storable_refusal, geom = _storability_refusal(
             layer, geom, event, target_fid)
         if storable_refusal is not None:
@@ -1421,6 +1504,7 @@ def _buffer_update(layer, event: AuditEvent,
     # refusal now leaves the feature exactly as it was found.
     attr_ok = 0
     attr_fail = 0
+    failed_fields: List[str] = []
     # Decoded with the event's schema version: pre-v6 date-time digits are
     # a local wall clock. Decoded without it, a 5.x value was written
     # shifted by the UTC offset (15:30 for 14:30 in Paris in winter) and
@@ -1433,16 +1517,21 @@ def _buffer_update(layer, event: AuditEvent,
             attr_ok += 1
         else:
             attr_fail += 1
+            if 0 <= idx < fields.count():
+                failed_fields.append(fields.at(idx).name())
 
-    if attr_fail > 0 and attr_ok == 0:
-        flog(f"_buffer_update: all attr changes REJECTED "
-             f"eid={event.event_id} fid={target_fid} attempted={attr_fail}",
-             "ERROR")
+    if attr_fail > 0:
+        flog(f"_buffer_update: attr change(s) REJECTED "
+             f"eid={event.event_id} fid={target_fid} ok={attr_ok} "
+             f"fail={attr_fail} fields={failed_fields}", "ERROR")
         return {
             "success": False,
             "status": "FAILED",
             "reason_code": "buffer_refused",
-            "message": "All attribute changes rejected",
+            "message": (
+                "All attribute changes rejected" if attr_ok == 0
+                else f"Attribute changes rejected for {failed_fields}"
+            ),
         }
 
     # BL-RW-P3-17: include trace_id on the structured BUF_UPD log.

@@ -18,10 +18,10 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
 from qgis.PyQt.QtCore import QSettings
-from qgis.PyQt.QtGui import QColor, QFont, QFontDatabase, QPalette
+from qgis.PyQt.QtGui import QColor, QFont, QPalette
 from qgis.PyQt.QtWidgets import QApplication, QWidget
 
-from ..compat import QtCompat, is_qt6
+from ..compat import QtCompat, installed_font_families, is_qt6
 from ..core.logger import flog
 
 ICONE_XS, ICONE_SM, ICONE_MD, ICONE_LG = 16, 18, 20, 24
@@ -99,10 +99,7 @@ def rgba_css(couleur: QColor, alpha: Optional[int] = None) -> str:
 
 def first_available_font(candidates: Sequence[str]) -> str:
     """Premiere famille reellement installee parmi les candidats."""
-    try:
-        installed = set(QFontDatabase.families())
-    except Exception:
-        installed = set()
+    installed = set(installed_font_families())
     for name in candidates:
         if name.strip() and name.strip() in installed:
             return name.strip()
@@ -170,17 +167,21 @@ class ThemeTokens:
     facteur_police: float
 
 
-_CACHE_TOKENS: Dict[Tuple[int, int, int, int], ThemeTokens] = {}
-_LAST_LOGGED_KEY: Optional[Tuple[int, int, int, int]] = None
+_CACHE_TOKENS: Dict[Tuple[int, int, int, int, int], ThemeTokens] = {}
+_LAST_LOGGED_KEY: Optional[Tuple[int, int, int, int, int]] = None
 
 
-def _palette_key(palette: QPalette) -> Tuple[int, int, int, int]:
+def _palette_key(palette: QPalette) -> Tuple[int, int, int, int, int]:
     grp = QtCompat.PALETTE_ACTIVE
+    app = QApplication.instance()
+    pts = app.font().pointSizeF() if app is not None else 9.0
+    pts_key = int(round((pts if pts > 0 else 9.0) * 10))
     return (
         palette.color(grp, QtCompat.PALETTE_WINDOW).rgba(),
         palette.color(grp, QtCompat.PALETTE_BASE).rgba(),
         palette.color(grp, QtCompat.PALETTE_WINDOW_TEXT).rgba(),
         palette.color(grp, QtCompat.PALETTE_HIGHLIGHT).rgba(),
+        pts_key,
     )
 
 

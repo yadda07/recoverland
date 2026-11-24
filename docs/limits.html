@@ -15,7 +15,7 @@
 <header class="bar">
   <a class="bar-logo" href="index.html">
     <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
-    <span class="bar-name">RecoverLand</span><span class="bar-ver">7.1.5</span>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">7.2.0</span>
   </a>
   <nav class="bar-nav">
     <a href="index.html">Overview</a>
@@ -453,7 +453,7 @@
 
 <p>The provider policy in <code>core/support_policy.py</code> gives <code>memory</code> an identity strength of <code>NONE</code>, with capture and restore both off. <code>EditSessionTracker.connect_layer</code> refuses every layer whose strength is <code>NONE</code> and returns before connecting a single edit signal, logging <code>action=refused reason=no_stable_identity</code>. No signal is bound, so no commit is ever seen and no event is ever written.</p>
 
-<div class="warn"><strong>You have no history for that layer, not a history you cannot restore.</strong> Nothing was recorded, so there is nothing to consult, search or export either : and the refusal is emitted through <code>flog</code> (<code>core/edit_tracker.py</code>), which writes to the debug file <code>recoverland_debug.log</code> and to nothing else. It does not reach the Log Messages panel, so the panel staying empty is not a sign the layer is being captured. Save a scratch layer to a real file before you start doing work in it you would mind losing.</div>
+<div class="info"><strong>Silent by design, automatic once saved permanently.</strong> Temporary memory layers do not trigger any error banner or clutter the tracked-layer selector. As soon as you save a scratch layer to a persistent file via <strong>Make Permanent...</strong>, RecoverLand reconnects it automatically and starts recording its subsequent commits.</div>
 </section>
 
 <!-- ====== QUARANTINE ====== -->
@@ -599,7 +599,7 @@
 </aside>
 </div>
 
-<footer>RecoverLand 7.1.5 &middot; <a href="https://geodeci.xyz/" target="_blank" rel="noopener">GEODECI (Youcef ADDA)</a> &middot; <a href="https://plugins.qgis.org/plugins/RecoverLand/" target="_blank" rel="noopener">QGIS Plugin Repository</a> &middot; <a href="https://github.com/yadda07/recoverland" target="_blank" rel="noopener">GitHub</a></footer>
+<footer>RecoverLand 7.2.0 &middot; <a href="https://geodeci.xyz/" target="_blank" rel="noopener">GEODECI (Youcef ADDA)</a> &middot; <a href="https://plugins.qgis.org/plugins/RecoverLand/" target="_blank" rel="noopener">QGIS Plugin Repository</a> &middot; <a href="https://github.com/yadda07/recoverland" target="_blank" rel="noopener">GitHub</a></footer>
 <script src="rl.js?v=22"></script>
 </body>
 </html>

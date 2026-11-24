@@ -726,8 +726,8 @@ def assertions(ctx):
             f"{prefix}_both_dates_drawn_reprojected_and_complete",
             all(r.get("n_drawn") == _N and not r.get("off") and r.get("unresolved") == 0
                 for r in (r1, r2)),
-            f"{what} : premiere={ {k: r1.get(k) for k in ('n_drawn', 'off', 'unresolved')} } "
-            f"deuxieme={ {k: r2.get(k) for k in ('n_drawn', 'off', 'unresolved')} } "
+            f"{what} : premiere={({k: r1.get(k) for k in ('n_drawn', 'off', 'unresolved')})} "
+            f"deuxieme={({k: r2.get(k) for k in ('n_drawn', 'off', 'unresolved')})} "
             f"(attendu : les {_N} entites a leur position de cette date, "
             f"reprojetee en Lambert-93, aucune non resolue){crash}",
         ))

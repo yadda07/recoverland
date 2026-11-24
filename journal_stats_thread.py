@@ -23,7 +23,9 @@ from .core import (
     evaluate_journal_health,
     get_journal_stats,
 )
-from .qgs_task_support import TaskEnabledThread, trace_prefix
+from .qgs_task_support import (
+    TaskEnabledThread, open_worker_read_connection, trace_prefix,
+)
 
 
 class StatsResult:
@@ -42,7 +44,8 @@ class StatsResult:
         self.trace_id = ""
 
 
-def _run_stats(journal, criteria, trace_id, is_cancelled):
+def _run_stats(journal, criteria, trace_id, is_cancelled,
+               journal_path=None, register_conn=None, unregister_conn=None):
     """Execute stats queries on a short-lived read connection."""
     prefix = trace_prefix(trace_id)
     conn = None
@@ -50,10 +53,11 @@ def _run_stats(journal, criteria, trace_id, is_cancelled):
     result.trace_id = trace_id
 
     try:
-        if journal is None or not journal.is_open:
-            return result
-
-        path = journal.path
+        path = journal_path or (getattr(journal, "path", None) if journal is not None else None)
+        if not path:
+            if journal is None or not getattr(journal, "is_open", False):
+                return result
+            path = journal.path
         if not path:
             return result
 
@@ -62,7 +66,11 @@ def _run_stats(journal, criteria, trace_id, is_cancelled):
         if is_cancelled():
             return result
 
-        conn = journal.create_read_connection()
+        conn = open_worker_read_connection(journal, path)
+        if register_conn is not None:
+            register_conn(conn)
+        if is_cancelled():
+            return result
 
         cache = LayerStatsCache()
         cache.build(conn)
@@ -97,9 +105,13 @@ def _run_stats(journal, criteria, trace_id, is_cancelled):
 
         return result
     except Exception as e:
+        if is_cancelled():
+            return result
         flog(f"{prefix}stats_thread: error: {e}", "ERROR")
         raise
     finally:
+        if unregister_conn is not None:
+            unregister_conn()
         if conn is not None:
             try:
                 conn.close()
@@ -112,8 +124,14 @@ def _run_stats(journal, criteria, trace_id, is_cancelled):
                      f"({exc!r})", "DEBUG")
 
 
-def _run_stats_task(task, journal, criteria, trace_id):
-    return _run_stats(journal, criteria, trace_id, task.isCanceled)
+def _run_stats_task(task, journal, criteria, trace_id,
+                    journal_path=None, register_conn=None, unregister_conn=None):
+    return _run_stats(
+        journal, criteria, trace_id, task.isCanceled,
+        journal_path=journal_path,
+        register_conn=register_conn,
+        unregister_conn=unregister_conn,
+    )
 
 
 class JournalStatsThread(TaskEnabledThread):
@@ -125,6 +143,7 @@ class JournalStatsThread(TaskEnabledThread):
     def __init__(self, journal, criteria=None, trace_id=""):
         super().__init__(trace_id=trace_id)
         self._journal = journal
+        self._journal_path = getattr(journal, "path", None)
         self._criteria = criteria
 
     def run(self):
@@ -134,6 +153,9 @@ class JournalStatsThread(TaskEnabledThread):
                 self._criteria,
                 self._trace_id,
                 lambda: self._stopped,
+                journal_path=self._journal_path,
+                register_conn=self._register_conn,
+                unregister_conn=self._unregister_conn,
             )
             if not self._stopped:
                 self.stats_ready.emit(result)
@@ -152,6 +174,9 @@ class JournalStatsThread(TaskEnabledThread):
             journal=self._journal,
             criteria=self._criteria,
             trace_id=self._trace_id,
+            journal_path=self._journal_path,
+            register_conn=self._register_conn,
+            unregister_conn=self._unregister_conn,
         )
 
     def _on_task_finished(self, exception, result=None):

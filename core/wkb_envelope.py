@@ -33,6 +33,7 @@ No QGIS, no Qt, no shapely dependency. Pure stdlib (struct).
 """
 from __future__ import annotations
 
+import math
 import struct
 from typing import Optional, Tuple
 
@@ -47,6 +48,12 @@ _EWKB_SRID_MASK = 0x20000000
 _ISO_Z_OFFSET = 1000
 _ISO_M_OFFSET = 2000
 _ISO_ZM_OFFSET = 3000
+
+_MAX_RECURSION_DEPTH = 32
+
+
+class _UnsupportedWkb(Exception):
+    """Raised on unsupported WKB geometry type, bad endianness, or depth overflow."""
 
 
 def _resolve_dims(type_code: int) -> Tuple[int, int]:
@@ -119,10 +126,14 @@ class _Reader:
         return v
 
     def skip(self, n: int) -> None:
+        if n < 0 or self._pos + n > len(self._data):
+            raise IndexError("WKB truncated")
         self._pos += n
 
 
-def _expand(env: Optional[Envelope], x: float, y: float) -> Envelope:
+def _expand(env: Optional[Envelope], x: float, y: float) -> Optional[Envelope]:
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return env
     if env is None:
         return (x, y, x, y)
     xmin, ymin, xmax, ymax = env
@@ -143,7 +154,12 @@ def _merge(a: Optional[Envelope], b: Optional[Envelope]) -> Optional[Envelope]:
 def _read_header(r: _Reader) -> Tuple[int, int]:
     """Read byteorder + type. Set reader endian. Return (base_type, n_dims)."""
     endian_byte = r.read_byte()
-    r.set_endian("<" if endian_byte == 1 else ">")
+    if endian_byte == 1:
+        r.set_endian("<")
+    elif endian_byte == 0:
+        r.set_endian(">")
+    else:
+        raise _UnsupportedWkb(f"invalid WKB endian byte: {endian_byte}")
     raw_type = r.read_uint32()
     base, n_dims = _resolve_dims(raw_type)
     if raw_type & _EWKB_SRID_MASK:
@@ -162,6 +178,9 @@ def _read_point(r: _Reader, n_dims: int) -> Tuple[float, float]:
 
 def _read_linestring_env(r: _Reader, n_dims: int) -> Optional[Envelope]:
     n = r.read_uint32()
+    stride = 8 * n_dims
+    if n > r.remaining() // stride:
+        raise IndexError("WKB linestring count exceeds buffer")
     env: Optional[Envelope] = None
     for _ in range(n):
         x, y = _read_point(r, n_dims)
@@ -171,42 +190,43 @@ def _read_linestring_env(r: _Reader, n_dims: int) -> Optional[Envelope]:
 
 def _read_polygon_env(r: _Reader, n_dims: int) -> Optional[Envelope]:
     n_rings = r.read_uint32()
+    if n_rings > r.remaining() // 4:
+        raise IndexError("WKB ring count exceeds buffer")
     env: Optional[Envelope] = None
     for _ in range(n_rings):
         env = _merge(env, _read_linestring_env(r, n_dims))
     return env
 
 
-def _read_multi_env(r: _Reader, sub_reader) -> Optional[Envelope]:
+def _read_multi_env(r: _Reader, depth: int) -> Optional[Envelope]:
     n_parts = r.read_uint32()
+    if n_parts > r.remaining() // 5:
+        raise IndexError("WKB part count exceeds buffer")
     env: Optional[Envelope] = None
     for _ in range(n_parts):
         # Each child has its own header (byteorder + type).
-        child_env = sub_reader(r)
+        child_env = _read_geometry_env(r, depth + 1)
         env = _merge(env, child_env)
     return env
 
 
-def _read_geometry_env(r: _Reader) -> Optional[Envelope]:
+def _read_geometry_env(r: _Reader, depth: int = 0) -> Optional[Envelope]:
+    if depth > _MAX_RECURSION_DEPTH:
+        raise _UnsupportedWkb("WKB nesting depth exceeded")
     base, n_dims = _read_header(r)
     if base == 1:  # POINT
         x, y = _read_point(r, n_dims)
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return None
         return (x, y, x, y)
     if base == 2:  # LINESTRING
         return _read_linestring_env(r, n_dims)
     if base == 3:  # POLYGON
         return _read_polygon_env(r, n_dims)
-    if base == 4:  # MULTIPOINT
-        return _read_multi_env(r, _read_geometry_env)
-    if base == 5:  # MULTILINESTRING
-        return _read_multi_env(r, _read_geometry_env)
-    if base == 6:  # MULTIPOLYGON
-        return _read_multi_env(r, _read_geometry_env)
-    # 7 = GEOMETRYCOLLECTION (each child is a full WKB geometry).
-    if base == 7:
-        return _read_multi_env(r, _read_geometry_env)
-    # Unknown / custom type.
-    return None
+    if base in (4, 5, 6, 7):  # MULTI* / GEOMETRYCOLLECTION
+        return _read_multi_env(r, depth)
+    # Unknown / curved / custom type: abort whole parse so caller keeps conservatively.
+    raise _UnsupportedWkb(f"unsupported WKB base type: {base}")
 
 
 def parse_envelope(wkb_data: Optional[bytes]) -> Optional[Envelope]:
@@ -214,8 +234,8 @@ def parse_envelope(wkb_data: Optional[bytes]) -> Optional[Envelope]:
 
     Returns None when:
         - wkb_data is None or empty.
-        - WKB type is not in the supported set (1..7).
-        - Buffer truncated / corrupted.
+        - WKB type (or any child in a collection) is not in the supported set (1..7).
+        - Buffer truncated / corrupted / non-finite (e.g. POINT EMPTY).
 
     Returning None is a SIGNAL to the caller; it does not mean "empty
     envelope". Conservative callers should treat None as "extent
@@ -225,8 +245,8 @@ def parse_envelope(wkb_data: Optional[bytes]) -> Optional[Envelope]:
         return None
     try:
         r = _Reader(wkb_data, "<")  # endian will be reset by _read_header
-        return _read_geometry_env(r)
-    except (struct.error, IndexError):
+        return _read_geometry_env(r, 0)
+    except (struct.error, IndexError, _UnsupportedWkb):
         return None
 
 

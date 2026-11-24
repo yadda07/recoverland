@@ -477,7 +477,7 @@ def assertions(ctx):
         not b.get("error") and not b.get("crash")
         and all(len(bym.get(m) or []) == 1 for m in b_markers),
         f"lignes par evenement dans le journal cible apres DEUX rattachements="
-        f"{ {m: len(bym.get(m) or []) for m in b_markers} } erreur="
+        f"{({m: len(bym.get(m) or []) for m in b_markers})} erreur="
         f"{b.get('error') or b.get('crash')!r} : une ligne ancienne (sans "
         f"event_uid) dupliquee est un evenement qu'un rewind appliquerait "
         f"deux fois",

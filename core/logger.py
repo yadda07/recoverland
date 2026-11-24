@@ -49,6 +49,80 @@ def _resolve_log_path() -> str:
 _LOG_FILE = _resolve_log_path()
 
 
+_LOG_KERNEL32 = None
+_LOG_KERNEL32_LOCK = threading.Lock()
+
+
+def _get_log_kernel32():
+    global _LOG_KERNEL32
+    if _LOG_KERNEL32 is not None:
+        return _LOG_KERNEL32
+    with _LOG_KERNEL32_LOCK:
+        if _LOG_KERNEL32 is not None:
+            return _LOG_KERNEL32
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        k32.CreateFileW.restype = ctypes.c_void_p
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.restype = ctypes.c_int
+        _LOG_KERNEL32 = k32
+        return _LOG_KERNEL32
+
+
+@contextmanager
+def _rollover_lock(base_filename: str):
+    """Best-effort non-blocking cross-process lock around log rotation."""
+    lock_path = base_filename + ".roll.lock"
+    fd = None
+    locked = False
+    try:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        fd = os.open(lock_path, flags, 0o644)
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            locked = True
+        else:
+            import fcntl
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        yield False
+        return
+    except ImportError:
+        locked = False
+    try:
+        yield True
+    finally:
+        if locked and fd is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.lockf(fd, fcntl.LOCK_UN)
+            except (OSError, ImportError):
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
     """RotatingFileHandler that never drops a record it cannot rotate.
 
@@ -64,40 +138,63 @@ class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
     _RETRY_DELAY_S = 60.0
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, emit_postpone_comment: bool = True, **kwargs):
         self._rollover_retry_at = 0.0
+        self._emit_postpone_comment = bool(emit_postpone_comment)
+        self._permanently_closed = False
         super().__init__(*args, **kwargs)
+
+    def emit(self, record):
+        if self._permanently_closed:
+            return
+        super().emit(record)
+
+    def close(self):
+        self.acquire()
+        try:
+            self._permanently_closed = True
+            super().close()
+        finally:
+            self.release()
 
     def _open(self):
         """Open with Win32 FILE_APPEND_DATA so multi-process appends never collide."""
         if os.name == "nt" and "a" in (self.mode or "a"):
+            handle = None
+            fd = None
             try:
                 import ctypes
                 import msvcrt
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                kernel32.CreateFileW.argtypes = [
-                    ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
-                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-                    ctypes.c_void_p,
-                ]
-                kernel32.CreateFileW.restype = ctypes.c_void_p
+                kernel32 = _get_log_kernel32()
                 handle = kernel32.CreateFileW(
                     self.baseFilename,
-                    0x0004 | 0x00100000,  # FILE_APPEND_DATA | SYNCHRONIZE
-                    0x0001 | 0x0002,      # FILE_SHARE_READ | FILE_SHARE_WRITE
+                    0x0004 | 0x00100000,         # FILE_APPEND_DATA | SYNCHRONIZE
+                    0x0001 | 0x0002 | 0x0004,    # READ | WRITE | DELETE share
                     None,
-                    4,                    # OPEN_ALWAYS
-                    0x80,                 # FILE_ATTRIBUTE_NORMAL
+                    4,                           # OPEN_ALWAYS
+                    0x80,                        # FILE_ATTRIBUTE_NORMAL
                     None,
                 )
                 invalid = ctypes.c_void_p(-1).value
                 if handle is not None and handle != invalid:
                     fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_TEXT)
-                    return os.fdopen(
+                    handle = None  # ownership transferred to fd
+                    stream = os.fdopen(
                         fd, "w", encoding=self.encoding or "utf-8",
                         errors=self.errors)
-            except Exception:  # noqa: BLE001 # nosec B110 - fall back to stdlib open
-                pass
+                    fd = None  # ownership transferred to stream
+                    return stream
+            except Exception:  # noqa: BLE001 - fall back to stdlib open
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                elif handle is not None:
+                    try:
+                        _get_log_kernel32().CloseHandle(handle)
+                    except (OSError, AttributeError):
+                        pass
         return super()._open()
 
     def doRollover(self):
@@ -117,42 +214,48 @@ class _SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
         look for it (parse_log._chain_paths). It is never deleted: the
         next rollover moves it into the chain first, and postpones itself
         while it cannot. Each failure writes a named `#` line in the live
-        file instead of being swallowed.
+        file (for text logs) instead of being swallowed.
         """
         if time.monotonic() < self._rollover_retry_at:
             return
-        if self.stream:
-            self.stream.close()
-            self.stream = None
-        aside = self.baseFilename + ".rolling"
-        if os.path.exists(aside):
+        with _rollover_lock(self.baseFilename) as got_lock:
+            if not got_lock:
+                self._rollover_retry_at = time.monotonic() + self._RETRY_DELAY_S
+                return
+            if self.stream:
+                self.stream.close()
+                self.stream = None
+            aside = self.baseFilename + ".rolling"
+            if os.path.exists(aside):
+                try:
+                    self._shift_into_chain(aside)
+                except OSError as exc:
+                    self._postpone(
+                        f"# rollover postponed (backup shift: {exc}); "
+                        f"{os.path.basename(aside)} kept, still appending here\n")
+                    return
+            try:
+                os.rename(self.baseFilename, aside)
+            except OSError as exc:
+                self._postpone(
+                    f"# rollover postponed ({exc}); still appending here\n")
+                return
+            self._rollover_retry_at = 0.0
+            self.stream = self._open()
             try:
                 self._shift_into_chain(aside)
             except OSError as exc:
-                self._postpone(
-                    f"# rollover postponed (backup shift: {exc}); "
-                    f"{os.path.basename(aside)} kept, still appending here\n")
-                return
-        try:
-            os.replace(self.baseFilename, aside)
-        except OSError as exc:
-            self._postpone(
-                f"# rollover postponed ({exc}); still appending here\n")
-            return
-        self._rollover_retry_at = 0.0
-        self.stream = self._open()
-        try:
-            self._shift_into_chain(aside)
-        except OSError as exc:
-            self.stream.write(
-                f"# backup shift postponed ({exc}); "
-                f"{os.path.basename(aside)} kept\n")
+                if self._emit_postpone_comment and self.stream:
+                    self.stream.write(
+                        f"# backup shift postponed ({exc}); "
+                        f"{os.path.basename(aside)} kept\n")
 
     def _postpone(self, line: str) -> None:
         """Keep appending to the live file, retry the rollover later."""
         self._rollover_retry_at = time.monotonic() + self._RETRY_DELAY_S
         self.stream = self._open()
-        self.stream.write(line)
+        if self._emit_postpone_comment and self.stream:
+            self.stream.write(line)
 
     def _shift_into_chain(self, aside: str) -> None:
         """Move *aside* to `.1`, pushing the backups down to the first free slot.
@@ -179,22 +282,54 @@ _file_logger = logging.getLogger("RecoverLand.FileDebug")
 _file_logger.setLevel(logging.DEBUG)
 _file_logger.propagate = False
 if not _file_logger.handlers:
-    _fh = _SharedRotatingFileHandler(
-        _LOG_FILE,
-        mode='a',
-        maxBytes=_LOG_MAX_BYTES,
-        backupCount=_LOG_BACKUP_COUNT,
-        encoding='utf-8',
-    )
-    _fh.setLevel(logging.DEBUG)
-    _fh.setFormatter(logging.Formatter(
-        '%(asctime)s.%(msecs)03d [%(levelname)-7s] [%(threadName)-15s] %(message)s',
-        datefmt='%Y-%m-%dT%H:%M:%S'
-    ))
-    _file_logger.addHandler(_fh)
+    try:
+        _fh = _SharedRotatingFileHandler(
+            _LOG_FILE,
+            mode='a',
+            maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUP_COUNT,
+            encoding='utf-8',
+        )
+        _fh.setLevel(logging.DEBUG)
+        _fh.setFormatter(logging.Formatter(
+            '%(asctime)s.%(msecs)03d [%(levelname)-7s] [%(threadName)-15s] %(message)s',
+            datefmt='%Y-%m-%dT%H:%M:%S'
+        ))
+        _file_logger.addHandler(_fh)
+    except OSError:
+        _file_logger.addHandler(logging.NullHandler())
 
 # Optional project-scoped handler (populated when a journal is opened).
 _project_log_handler: Optional[logging.handlers.RotatingFileHandler] = None
+
+
+def _clear_project_handlers() -> None:
+    """Remove and permanently close every project-scoped handler on _file_logger."""
+    global _project_log_handler
+    targets = [
+        h for h in list(_file_logger.handlers)
+        if getattr(h, "_rl_project_handler", False) or h is _project_log_handler
+    ]
+    _project_log_handler = None
+    for handler in targets:
+        try:
+            _file_logger.removeHandler(handler)
+            handler.close()
+        except Exception as exc:  # noqa: BLE001
+            _file_logger.debug("log: failed to close previous project handler: %s", exc)
+
+
+def _is_shared_audit_journal(journal_path: str) -> bool:
+    """True when *journal_path* lives inside <profile>/recoverland/audit/."""
+    try:
+        from .long_paths import plain
+        folder = os.path.dirname(os.path.abspath(plain(journal_path)))
+    except Exception:  # noqa: BLE001
+        folder = os.path.dirname(os.path.abspath(journal_path))
+    return (
+        os.path.basename(folder).lower() == "audit"
+        and os.path.basename(os.path.dirname(folder)).lower() == "recoverland"
+    )
 
 
 def set_project_log_path(journal_path: str) -> None:
@@ -202,18 +337,24 @@ def set_project_log_path(journal_path: str) -> None:
 
     The project log is written to ``<project_dir>/.recoverland/recoverland_debug.log``
     so users can retrieve diagnostics directly from the project directory.
+    Unsaved/storage journals under ``<profile>/recoverland/audit/`` already
+    share the profile debug log and do not spawn a duplicate handler.
     """
     global _project_log_handler
-    if _project_log_handler is not None:
-        try:
-            _file_logger.removeHandler(_project_log_handler)
-            _project_log_handler.close()
-        except Exception as exc:  # noqa: BLE001
-            _file_logger.debug("log: failed to close previous project handler: %s", exc)
-        _project_log_handler = None
+    _clear_project_handlers()
 
-    if not journal_path:
+    if not journal_path or _is_shared_audit_journal(journal_path):
         return
+    try:
+        from .sqlite_schema import is_network_path
+        if is_network_path(journal_path):
+            _file_logger.info(
+                "log: skipping project_log on network share path=%s",
+                journal_path,
+            )
+            return
+    except (ImportError, OSError, ValueError):
+        pass
     project_dir = os.path.dirname(os.path.dirname(journal_path))
     if not project_dir or not os.path.isdir(project_dir):
         return
@@ -232,6 +373,7 @@ def set_project_log_path(journal_path: str) -> None:
             backupCount=_LOG_BACKUP_COUNT,
             encoding='utf-8',
         )
+        handler._rl_project_handler = True
         handler.setLevel(logging.DEBUG)
         handler.setFormatter(logging.Formatter(
             '%(asctime)s.%(msecs)03d [%(levelname)-7s] [%(threadName)-15s] %(message)s',
@@ -246,16 +388,13 @@ def set_project_log_path(journal_path: str) -> None:
 
 def remove_project_log_handler() -> None:
     """Remove the project-scoped log handler (project switch / shutdown)."""
-    global _project_log_handler
-    if _project_log_handler is None:
+    had_any = _project_log_handler is not None or any(
+        getattr(h, "_rl_project_handler", False) for h in list(_file_logger.handlers)
+    )
+    if not had_any:
         return
-    try:
-        _file_logger.removeHandler(_project_log_handler)
-        _project_log_handler.close()
-        _file_logger.info("log: project_log_removed")
-    except Exception as exc:  # noqa: BLE001
-        _file_logger.debug("log: failed to remove project handler: %s", exc)
-    _project_log_handler = None
+    _clear_project_handlers()
+    _file_logger.info("log: project_log_removed")
 
 
 _file_logger.info("=" * 80)
@@ -411,7 +550,8 @@ if not _events_logger.handlers:
     try:
         _eh = _SharedRotatingFileHandler(
             _EVENTS_FILE, mode='a', maxBytes=_LOG_MAX_BYTES,
-            backupCount=_LOG_BACKUP_COUNT, encoding='utf-8')
+            backupCount=_LOG_BACKUP_COUNT, encoding='utf-8',
+            emit_postpone_comment=False)
         _eh.setLevel(logging.DEBUG)
         _eh.setFormatter(logging.Formatter('%(message)s'))
         _events_logger.addHandler(_eh)

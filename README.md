@@ -29,10 +29,11 @@ Traditional spatial versioning tools (such as Kart, GeoGig, or server-side PostG
 | **4. Selective Restore & Rewind** | Restores individual features or rewinds a layer to a cutoff timestamp, preceded by a preflight compatibility check and backed by one-click session Undo. |
 
 ### Supported Providers
-* **GeoPackage** (`.gpkg`)
+* **GeoPackage** (`.gpkg`) and **SpatiaLite** (`.sqlite`)
 * **ESRI Shapefile** (`.shp`), including deterministic FID shift tracking across OGR repacks
-* **PostgreSQL / PostGIS**, **MSSQL**, and **Oracle** (via saved QGIS connections)
-* **SpatiaLite** and **Memory** layers
+* **PostgreSQL / PostGIS**, **MSSQL**, and **Oracle** (via saved QGIS connections, preserving `authcfg=`)
+* **FlatGeobuf**, **GeoJSON**, and **CSV**
+* Temporary **Memory** scratch layers are ignored silently (no error alerts) and are tracked automatically as soon as they are saved permanently.
 
 ---
 

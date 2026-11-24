@@ -55,9 +55,9 @@ GUI thread only (reads the layer).
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import math
-import os
 import sqlite3
 import threading
 import uuid
@@ -65,6 +65,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .logger import flog
+from .long_paths import path_key
 
 
 # Commits a reconciliation of THIS process has rebuilt and handed over,
@@ -97,12 +98,15 @@ def _reconciled_uid(commit_id: str, index: int) -> str:
 
 
 def _claim_key(journal_path: str, commit_id: str) -> tuple:
-    return (os.path.normcase(os.path.abspath(journal_path)), commit_id)
+    return (path_key(journal_path), commit_id)
 
 
 def _unb64(value):
     if isinstance(value, str) and value.startswith("b64:"):
-        return base64.b64decode(value[4:])
+        try:
+            return base64.b64decode(value[4:])
+        except (binascii.Error, ValueError, TypeError):
+            return None
     return value
 
 
@@ -187,10 +191,11 @@ def _near(provider, wkb):
     from qgis.core import QgsFeatureRequest
     request = QgsFeatureRequest()
     geom = _geom(wkb)
-    if geom is not None:
+    if geom is not None and not geom.isEmpty():
         bb = geom.boundingBox()
-        bb.grow(max(bb.width(), bb.height(), 1e-6) * 1e-6 + 1e-9)
-        request.setFilterRect(bb)
+        if not bb.isNull() and bb.isFinite():
+            bb.grow(max(bb.width(), bb.height(), 1e-6) * 1e-6 + 1e-9)
+            request.setFilterRect(bb)
     return provider.getFeatures(request)
 
 
@@ -495,7 +500,11 @@ class _Source:
     def read_fid(self, fid):
         """``(feature or None, why the answer proves nothing or "")``."""
         from qgis.core import QgsFeatureRequest
-        feat = next(self.provider.getFeatures(QgsFeatureRequest(int(fid))), None)
+        try:
+            fid_int = int(fid)
+        except (TypeError, ValueError):
+            return None, "invalid_fid"
+        feat = next(self.provider.getFeatures(QgsFeatureRequest(fid_int)), None)
         if feat is None or not feat.isValid():
             return None, ("hidden_by_layer_filter" if self.fids_blind else "")
         if self.second and not fid_is_stored_key(feat, self.pk, self.rowid_fids):
@@ -689,9 +698,12 @@ def reconcile_layer(layer, write_queue, journal_path: str,
         deleted = {s.get("fid") for s in commit["snapshots"]
                    if isinstance(s, dict) and s.get("kind") == "DELETE"}
         for index, snap in enumerate(commit["snapshots"]):
+            if not isinstance(snap, dict):
+                _count(why_unresolved, "malformed_snapshot")
+                continue
             kind = snap.get("kind")
             fid = snap.get("fid")
-            attrs = snap.get("attributes") or {}
+            attrs = snap.get("attributes") if isinstance(snap.get("attributes"), dict) else {}
             old_wkb = _unb64(snap.get("geometry_wkb"))
             identity = snap.get("identity") or json.dumps({"fid": fid})
             if kind not in additions and (not stable or fid is None):
@@ -764,19 +776,36 @@ def reconcile_layer(layer, write_queue, journal_path: str,
         # Why each unresolved one is: the user is told a count, the ledger
         # and the log say what could not be proven.
         reasons = ", ".join(f"{k}={v}" for k, v in sorted(why_unresolved.items()))
-        state = "RECONCILED"
+        only_filtered = (
+            landed == 0
+            and not_applied == 0
+            and unresolved > 0
+            and set(why_unresolved.keys()) == {"hidden_by_layer_filter"}
+        )
+        state = "INTERRUPTED" if only_filtered else "RECONCILED"
         detail = (f"rebuilt from the provider after a crash: landed={landed} "
                   f"not_applied={not_applied} unresolved={unresolved}"
                   + (f" ({reasons})" if reasons else "")
                   + ("" if stable else " (positional FIDs: not guessed)"))
+        if only_filtered:
+            # Keep INTERRUPTED untouched so removing the layer filter later
+            # allows a genuine reconciliation against the provider.
+            flog(
+                f"crash_reconcile: event=commit_deferred_filtered "
+                f"commit={commit['commit_id']} layer={layer.name()!r} {detail}",
+                "WARNING",
+            )
+            totals["commits"] += 1
+            totals["unresolved"] += unresolved
+            continue
         info = CommitInfo(commit_id=commit["commit_id"], state=state,
                           layer_id=layer.id(), layer_name=layer.name(),
                           datasource_fingerprint=datasource_fp,
                           session_id=commit["session_id"],
                           prepared_at=commit["prepared_at"], detail=detail)
         # Claimed before the hand-over: from here on another layer on the
-        # source must not rebuild it. Released only when nothing was written
-        # anywhere (the ledger still says INTERRUPTED: the next connection
+        # source must not rebuild it. Released whenever the enqueue is not
+        # durable (the ledger still says INTERRUPTED: the next connection
         # tries again).
         with _CLAIM_LOCK:
             _CLAIMED.add(claim)
@@ -787,7 +816,7 @@ def reconcile_layer(layer, write_queue, journal_path: str,
             with _CLAIM_LOCK:
                 _CLAIMED.discard(claim)
             raise
-        if outcome is EnqueueOutcome.REFUSED_NO_DURABLE_PATH:
+        if not getattr(outcome, "durable", outcome is not EnqueueOutcome.REFUSED_NO_DURABLE_PATH):
             with _CLAIM_LOCK:
                 _CLAIMED.discard(claim)
         flog(f"crash_reconcile: event=commit_reconciled commit={commit['commit_id']} "

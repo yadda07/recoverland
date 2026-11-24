@@ -11,15 +11,50 @@
 Manages journal size by deleting old events and running VACUUM.
 All purge operations are explicit and confirmed; never implicit.
 """
+from contextlib import contextmanager
 import json
+import os
 import sqlite3
+import tempfile
 import threading
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, NamedTuple, Optional, Callable, Tuple
 
 from .logger import flog, timed_op
+from .long_paths import when_needed
 
 _vacuum_lock = threading.Lock()
+_vacuum_thread: Optional[threading.Thread] = None
+
+
+@contextmanager
+def _immediate_tx(conn: sqlite3.Connection):
+    """Run a write transaction under BEGIN IMMEDIATE so WAL upgrades cannot fail."""
+    started = not conn.in_transaction
+    if started:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        if started:
+            conn.commit()
+    except Exception:
+        if started and conn.in_transaction:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        raise
+
+
+def wait_for_vacuum(timeout: float = 5.0) -> bool:
+    """Wait briefly for an in-flight async VACUUM before closing the journal."""
+    t = _vacuum_thread
+    if t is None or not t.is_alive():
+        return True
+    t.join(timeout=max(0.0, float(timeout)))
+    return not t.is_alive()
+
+
 _PURGE_BATCH_SIZE = 5000
 # Distinct timestamps (i.e. whole commits) deleted per retention batch.
 _PURGE_TS_BATCH = 500
@@ -238,19 +273,27 @@ def _family(conn: sqlite3.Connection, fingerprint: str) -> set:
     return family
 
 
-def _remember_deleted_history(conn: sqlite3.Connection, deleted) -> None:
-    """Horizon of a logical purge whose loss reaches back to the start.
+def _apply_memory_horizons(horizons: Dict[str, str]) -> None:
+    if not horizons:
+        return
+    with _purge_horizon_lock:
+        for fingerprint, newest in horizons.items():
+            if newest > _purge_horizon.get(fingerprint, ""):
+                _purge_horizon[fingerprint] = newest
 
-    *deleted* is ``[(datasource_fingerprint, newest instant the row
-    mattered to)]``. Used for the orphan traces: such a trace is what says
-    that every date before it needs an event retention already purged, so
-    everything up to it is lost. Without a horizon, a rewind to such a
-    date replays what is left and announces a state that never existed;
-    with it, the preflight refuses that date by name (`coverage_refusal`,
-    `restore_planner.preflight_check`). The logical purges that only lose
-    an INTERVAL record it with `_remember_gaps`. Recorded for the whole
-    alias family, in the caller's transaction.
-    """
+
+def _apply_memory_gaps(merged: Dict[str, List[Tuple[str, str]]]) -> None:
+    if not merged:
+        return
+    with _purge_horizon_lock:
+        for member, intervals in merged.items():
+            _purge_gaps[member] = _merge_intervals(
+                _purge_gaps.get(member, []) + intervals)
+
+
+def _remember_deleted_history(conn: sqlite3.Connection, deleted,
+                              defer_memory: bool = False) -> Dict[str, str]:
+    """Horizon of a logical purge whose loss reaches back to the start."""
     horizons: Dict[str, str] = {}
     counts: Dict[str, int] = {}
     for fingerprint, stamp in deleted:
@@ -261,19 +304,16 @@ def _remember_deleted_history(conn: sqlite3.Connection, deleted) -> None:
                 horizons[member] = stamp
             counts[member] = counts.get(member, 0) + 1
     if horizons:
-        _remember_horizons(conn, horizons, counts)
+        _remember_horizons(conn, horizons, counts, defer_memory=defer_memory)
+    return horizons
 
 
-def _remember_gaps(conn: sqlite3.Connection, gaps, kind: str) -> None:
+def _remember_gaps(conn: sqlite3.Connection, gaps, kind: str,
+                   defer_memory: bool = False) -> Dict[str, List[Tuple[str, str]]]:
     """Intervals a logical purge made unrebuildable, per datasource family.
 
-    *gaps* is ``[(datasource_fingerprint, first instant, last instant)]``:
-    an INSERT/DELETE pair rebuilt the dates between its two events, an
-    invalidated trace the dates it was in effect. Only those dates are
-    refused afterwards (`coverage_refusal`), both ends included: an
-    inclusive and an exclusive cutoff at an end see different sides of
-    the event. Overlapping intervals of one datasource are merged. Session
-    memory and journal rows, in the caller's transaction.
+    Persists to SQLite first and propagates sqlite3.Error so no DELETE can
+    proceed without a durable coverage record.
     """
     per_member: Dict[str, List[Tuple[str, str]]] = {}
     for fingerprint, low, high in gaps:
@@ -284,27 +324,22 @@ def _remember_gaps(conn: sqlite3.Connection, gaps, kind: str) -> None:
         for member in _family(conn, fingerprint):
             per_member.setdefault(member, []).append((low, high))
     if not per_member:
-        return
+        return {}
     merged = {m: _merge_intervals(v) for m, v in per_member.items()}
-    with _purge_horizon_lock:
-        for member, intervals in merged.items():
-            _purge_gaps[member] = _merge_intervals(
-                _purge_gaps.get(member, []) + intervals)
     now = datetime.now(timezone.utc).isoformat()
-    try:
-        conn.execute(_GAP_DDL)
-        conn.executemany(
-            "INSERT OR IGNORE INTO journal_coverage_gap (datasource_fingerprint, "
-            "gap_from, gap_through, kind, recorded_at) VALUES (?,?,?,?,?)",
-            [(member, low, high, kind, now)
-             for member, intervals in merged.items() for low, high in intervals])
-    except sqlite3.Error as exc:
-        flog(f"retention: purged intervals NOT persisted ({exc}): after a "
-             f"restart a rewind inside them would not be refused", "ERROR")
+    conn.execute(_GAP_DDL)
+    conn.executemany(
+        "INSERT OR IGNORE INTO journal_coverage_gap (datasource_fingerprint, "
+        "gap_from, gap_through, kind, recorded_at) VALUES (?,?,?,?,?)",
+        [(member, low, high, kind, now)
+         for member, intervals in merged.items() for low, high in intervals])
+    if not defer_memory:
+        _apply_memory_gaps(merged)
     flog(f"retention: {sum(len(v) for v in merged.values())} unrebuildable "
          f"interval(s) recorded ({kind}) for {len(merged)} datasource "
          f"fingerprint(s): rewinds inside them are refused, dates outside "
          f"them stay reachable")
+    return merged
 
 
 def _merge_intervals(intervals) -> List[Tuple[str, str]]:
@@ -635,87 +670,80 @@ def coverage_refusal(conn: Optional[sqlite3.Connection], datasource_fp: str,
     return None
 
 
-def _record_purge_horizon(conn: sqlite3.Connection, before_date: str) -> None:
+def _record_purge_horizon(conn: sqlite3.Connection, before_date: str,
+                          defer_memory: bool = False,
+                          inclusive: bool = False) -> Dict[str, str]:
     """Record, per datasource, the newest date about to be deleted.
 
-    Must run BEFORE the DELETE, while the rows are still readable.
+    Must run BEFORE the DELETE inside the same transaction, while the rows
+    are still readable.
     """
-    try:
-        rows = conn.execute(
-            "SELECT datasource_fingerprint, MAX(created_at) FROM audit_event"
-            " WHERE created_at < ? GROUP BY datasource_fingerprint",
-            (before_date,),
-        ).fetchall()
-    except sqlite3.Error as e:
-        flog(f"retention: purge horizon capture failed: {e}", "WARNING")
-        return
+    op = "<=" if inclusive else "<"
+    rows = conn.execute(
+        f"SELECT datasource_fingerprint, MAX(created_at) FROM audit_event"  # nosec B608
+        f" WHERE created_at {op} ? GROUP BY datasource_fingerprint",
+        (before_date,),
+    ).fetchall()
     if not rows:
-        return
+        return {}
     from .datasource_alias import expand_fingerprints
 
     horizons: Dict[str, str] = {}
     for fingerprint, newest in rows:
         if not fingerprint or not newest:
             continue
-        # The rewind names a layer by its canonical fingerprint while the
-        # purged rows may carry an obsolete one. Recording the horizon for
-        # the whole alias family is what keeps the guard from missing the
-        # layer it is meant to protect.
         family = set(expand_fingerprints(conn, fingerprint))
         family.add(fingerprint)
         for member in family:
             if newest > horizons.get(member, ""):
                 horizons[member] = newest
     if not horizons:
-        return
-    _remember_horizons(conn, horizons)
+        return {}
+    _remember_horizons(conn, horizons, defer_memory=defer_memory)
     flog(f"retention: purge horizon recorded before {before_date} for "
          f"{len(horizons)} datasource fingerprint(s)")
+    return horizons
 
 
 def _remember_horizons(conn: sqlite3.Connection, horizons: Dict[str, str],
-                       counts: Optional[Dict[str, int]] = None) -> None:
-    """Session memory + journal row, in the caller's transaction."""
-    with _purge_horizon_lock:
-        for fingerprint, newest in horizons.items():
-            if newest > _purge_horizon.get(fingerprint, ""):
-                _purge_horizon[fingerprint] = newest
+                       counts: Optional[Dict[str, int]] = None,
+                       defer_memory: bool = False) -> None:
+    """Persist coverage horizon to SQLite; update memory only on success."""
     now = datetime.now(timezone.utc).isoformat()
-    try:
-        from .journal_writes import ensure_v7_schema
-        ensure_v7_schema(conn)
-        for fingerprint, newest in horizons.items():
-            conn.execute(
-                "INSERT INTO journal_coverage (datasource_fingerprint, "
-                "purged_through, purged_events, updated_at) VALUES (?,?,?,?) "
-                "ON CONFLICT(datasource_fingerprint) DO UPDATE SET "
-                "purged_through = MAX(journal_coverage.purged_through, "
-                "excluded.purged_through), "
-                "purged_events = journal_coverage.purged_events + excluded.purged_events, "
-                "updated_at = excluded.updated_at",
-                (fingerprint, newest, int((counts or {}).get(fingerprint, 0)), now))
-    except sqlite3.Error as exc:
-        # The session memory still guards this session; say that the
-        # journal will not remember it after a restart.
-        flog(f"retention: purge horizon NOT persisted ({exc}): after a "
-             f"restart a rewind before it would not be refused", "ERROR")
+    from .journal_writes import ensure_v7_schema
+    ensure_v7_schema(conn)
+    for fingerprint, newest in horizons.items():
+        conn.execute(
+            "INSERT INTO journal_coverage (datasource_fingerprint, "
+            "purged_through, purged_events, updated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(datasource_fingerprint) DO UPDATE SET "
+            "purged_through = MAX(journal_coverage.purged_through, "
+            "excluded.purged_through), "
+            "purged_events = journal_coverage.purged_events + excluded.purged_events, "
+            "updated_at = excluded.updated_at",
+            (fingerprint, newest, int((counts or {}).get(fingerprint, 0)), now))
+    if not defer_memory:
+        _apply_memory_horizons(horizons)
 
 
 def purge_old_events(conn: sqlite3.Connection,
                      policy: RetentionPolicy,
-                     trace_id: str = "") -> PurgeResult:
+                     trace_id: str = "",
+                     is_auto: bool = False) -> PurgeResult:
     """Delete events older than the retention period and enforce max_events.
 
     Convenience wrapper that purges only by retention/excess (no logical garbage).
     Does NOT run VACUUM inline; use vacuum_async() to reclaim space.
     """
-    return purge_old_events_with_options(conn, policy, PurgeOptions(), trace_id=trace_id)
+    return purge_old_events_with_options(
+        conn, policy, PurgeOptions(), trace_id=trace_id, is_auto=is_auto)
 
 
 def purge_old_events_with_options(conn: sqlite3.Connection,
                                   policy: RetentionPolicy,
                                   options: PurgeOptions,
-                                  trace_id: str = "") -> PurgeResult:
+                                  trace_id: str = "",
+                                  is_auto: bool = False) -> PurgeResult:
     """Delete events according to an explicit PurgeOptions scope.
 
     Deletes in batches of _PURGE_BATCH_SIZE to avoid holding the write
@@ -732,20 +760,41 @@ def purge_old_events_with_options(conn: sqlite3.Connection,
         with timed_op("purge_old_events_with_options", trace_id):
             if options.retention:
                 cutoff = _compute_cutoff(policy.retention_days)
-                with conn:
-                    _record_purge_horizon(conn, cutoff)
-                # Batches of whole timestamps, oldest first: every event of
-                # a commit shares one created_at, so no batch (and no crash
-                # between two batches) can leave half a commit behind.
-                while True:
-                    with conn:
-                        cursor = conn.execute(
-                            "DELETE FROM audit_event WHERE created_at IN "
-                            "(SELECT DISTINCT created_at FROM audit_event "
-                            "WHERE created_at < ? ORDER BY created_at LIMIT ?)",
+                skip_retention_wipe = False
+                if is_auto:
+                    row_max = conn.execute(
+                        "SELECT MAX(created_at), COUNT(*) FROM audit_event"
+                    ).fetchone()
+                    if row_max and row_max[1] and row_max[0] and cutoff > str(row_max[0]):
+                        skip_retention_wipe = True
+                        flog(
+                            f"retention: auto-purge skipped because cutoff {cutoff} "
+                            f"exceeds newest event {row_max[0]} (possible forward "
+                            f"clock jump or archived project; use manual purge)",
+                            "WARNING",
+                        )
+                while not skip_retention_wipe:
+                    batch_horizons: Dict[str, str] = {}
+                    batch_deleted = 0
+                    with _immediate_tx(conn):
+                        ts_rows = conn.execute(
+                            "SELECT DISTINCT created_at FROM audit_event "
+                            "WHERE created_at < ? ORDER BY created_at LIMIT ?",
                             (cutoff, _PURGE_TS_BATCH),
+                        ).fetchall()
+                        if not ts_rows:
+                            break
+                        batch_max_ts = ts_rows[-1][0]
+                        batch_horizons = _record_purge_horizon(
+                            conn, batch_max_ts, defer_memory=True,
+                            inclusive=True)
+                        cursor = conn.execute(
+                            "DELETE FROM audit_event WHERE created_at <= ?",
+                            (batch_max_ts,),
                         )
                         batch_deleted = cursor.rowcount
+                    if batch_horizons:
+                        _apply_memory_horizons(batch_horizons)
                     retention_deleted += batch_deleted
                     if batch_deleted <= 0:
                         break
@@ -802,7 +851,12 @@ def purge_old_events_with_options(conn: sqlite3.Connection,
 
 def purge_excess_events(conn: sqlite3.Connection, max_events: int) -> int:
     """Delete oldest events to enforce the max_events cap. Returns deleted count."""
-    return _purge_excess(conn, max_events)
+    try:
+        return _purge_excess(conn, max_events)
+    except sqlite3.Error as e:
+        flog(f"retention: excess purge error (nothing deleted, the "
+             f"transaction was rolled back): {e}", "ERROR")
+        return 0
 
 
 def _excess_cut_boundary(conn: sqlite3.Connection, to_delete: int) -> Optional[str]:
@@ -888,9 +942,10 @@ def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
                  f"{max_events} cannot be honoured without splitting it",
                  "WARNING")
             return 0
-        with conn:
-            conn.execute("CREATE TEMP TABLE IF NOT EXISTS _rl_purge_keys "
-                         "(k TEXT PRIMARY KEY, legacy INTEGER)")
+        horizons: Dict[str, str] = {}
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS _rl_purge_keys "
+                     "(k TEXT PRIMARY KEY, legacy INTEGER)")
+        with _immediate_tx(conn):
             conn.execute("DELETE FROM _rl_purge_keys")
             conn.executemany(
                 "INSERT OR IGNORE INTO _rl_purge_keys (k, legacy) VALUES (?, ?)",
@@ -905,7 +960,7 @@ def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
                 "SELECT datasource_fingerprint, MAX(created_at), COUNT(*) "  # nosec B608
                 "FROM audit_event WHERE " + where +
                 " GROUP BY datasource_fingerprint").fetchall()
-            horizons, counts = {}, {}
+            counts = {}
             from .datasource_alias import expand_fingerprints
             for fingerprint, newest, n in horizon_rows:
                 if not fingerprint or not newest:
@@ -916,10 +971,11 @@ def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
                     if newest > horizons.get(member, ""):
                         horizons[member] = newest
                     counts[member] = counts.get(member, 0) + int(n)
-            _remember_horizons(conn, horizons, counts)
+            _remember_horizons(conn, horizons, counts, defer_memory=True)
             deleted = conn.execute(
                 "DELETE FROM audit_event WHERE " + where).rowcount  # nosec B608
             conn.execute("DELETE FROM _rl_purge_keys")
+        _apply_memory_horizons(horizons)
         remaining = total - deleted
         flog(f"retention: purged {deleted} excess events in {len(chosen)} "
              f"whole commit(s) (total was {total}, max={max_events}, "
@@ -932,17 +988,29 @@ def _purge_excess(conn: sqlite3.Connection, max_events: int) -> int:
     except sqlite3.Error as e:
         flog(f"retention: excess purge error (nothing deleted, the "
              f"transaction was rolled back): {e}", "ERROR")
-        return 0
+        raise
 
 
 def purge_by_session(conn: sqlite3.Connection, session_id: str) -> int:
-    """Delete all events for a specific session. Returns deleted count."""
+    """Delete all events for a specific session, recording coverage gaps first."""
     try:
-        with conn:
+        merged_gaps = {}
+        with _immediate_tx(conn):
+            gap_rows = conn.execute(
+                "SELECT datasource_fingerprint, MIN(created_at), MAX(created_at) "
+                "FROM audit_event WHERE session_id = ? "
+                "GROUP BY datasource_fingerprint",
+                (session_id,),
+            ).fetchall()
+            if gap_rows:
+                merged_gaps = _remember_gaps(
+                    conn, gap_rows, "session_purge", defer_memory=True)
             cursor = conn.execute(
                 "DELETE FROM audit_event WHERE session_id = ?", (session_id,)
             )
-            return cursor.rowcount
+            deleted = cursor.rowcount
+        _apply_memory_gaps(merged_gaps)
+        return deleted
     except sqlite3.Error as e:
         flog(f"retention: session purge error: {e}", "ERROR")
         return 0
@@ -1027,35 +1095,73 @@ def _compute_cutoff(retention_days: int) -> str:
     return cutoff.isoformat()
 
 
+def _notify_vacuum_callback(callback, success: bool) -> None:
+    if callback is None:
+        return
+    try:
+        callback(success)
+    except Exception as cb_err:  # noqa: BLE001 - a notification
+        flog(f"retention: VACUUM completion callback failed: {cb_err}", "ERROR")
+
+
 def vacuum_async(db_path: str,
                  callback: Optional[Callable[[bool], None]] = None) -> None:
     """Run VACUUM in a dedicated thread to avoid blocking the UI.
 
-    Uses a lock to prevent concurrent VACUUM operations.
-    The callback (if provided) is called with True on success, False on error.
+    Acquires the singleton vacuum lock before spawning so a second request
+    never overwrites ``_vacuum_thread`` while the first is running. Checks
+    free space on both the journal volume and the temp directory before
+    starting VACUUM.
     """
+    global _vacuum_thread
+
+    if not _vacuum_lock.acquire(blocking=False):
+        flog("retention: VACUUM skipped, another VACUUM is already running", "WARNING")
+        _notify_vacuum_callback(callback, False)
+        return
+
     def _run():
-        if not _vacuum_lock.acquire(blocking=False):
-            flog("retention: VACUUM skipped, another VACUUM is already running", "WARNING")
-            if callback is not None:
-                callback(False)
-            return
         success = False
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            fs_path = when_needed(db_path)
             try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                flog("retention: WAL checkpoint (TRUNCATE) completed before VACUUM")
+                from .disk_monitor import check_disk_for_path
+                db_size = os.path.getsize(fs_path) if os.path.isfile(fs_path) else 0
+                wal_path = fs_path + "-wal"
+                wal_size = os.path.getsize(wal_path) if os.path.isfile(wal_path) else 0
+                need_bytes = (db_size + wal_size) * 2
+                for label, check_path in (("journal", fs_path),
+                                          ("temp", tempfile.gettempdir())):
+                    dstatus = check_disk_for_path(check_path)
+                    if dstatus.total_bytes <= 0 or dstatus.is_critical:
+                        flog(f"retention: VACUUM refused, {label} disk unavailable or "
+                             f"critical (free={dstatus.free_bytes})", "ERROR")
+                        return
+                    if need_bytes > 0 and dstatus.free_bytes < need_bytes:
+                        flog(f"retention: VACUUM refused, insufficient {label} disk space "
+                             f"(free={dstatus.free_bytes} need>={need_bytes})", "ERROR")
+                        return
+            except OSError:
+                pass
+            conn = sqlite3.connect(fs_path)
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA mmap_size=0")
+            try:
+                row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if row and len(row) >= 3 and row[0]:
+                    flog(f"retention: WAL checkpoint before VACUUM busy=1 "
+                         f"({row[2]}/{row[1]} pages)", "WARNING")
+                else:
+                    flog("retention: WAL checkpoint (TRUNCATE) completed before VACUUM")
             except sqlite3.Error as ce:
                 flog(f"retention: WAL checkpoint failed: {ce}", "WARNING")
             conn.execute("VACUUM")
-            # In WAL mode the rebuilt pages sit in the -wal file until a
-            # checkpoint: without it the journal file keeps its size while
-            # other connections are open and the dialog reports 0 bytes
-            # reclaimed after a successful compaction.
             try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if row and len(row) >= 3 and row[0]:
+                    flog(f"retention: WAL checkpoint after VACUUM busy=1 "
+                         f"({row[2]}/{row[1]} pages)", "WARNING")
             except sqlite3.Error as ce:
                 flog(f"retention: WAL checkpoint after VACUUM failed: {ce}", "WARNING")
             flog("retention: VACUUM completed (async)")
@@ -1069,112 +1175,90 @@ def vacuum_async(db_path: str,
                 except sqlite3.Error:
                     pass
             _vacuum_lock.release()
-        if callback is not None:
-            try:
-                callback(success)
-            except Exception as cb_err:  # noqa: BLE001 - a notification
-                flog(f"retention: VACUUM completion callback failed: {cb_err}", "ERROR")
+        _notify_vacuum_callback(callback, success)
 
     t = threading.Thread(target=_run, name="RecoverLand-Vacuum", daemon=True)
-    t.start()
+    _vacuum_thread = t
+    try:
+        t.start()
+    except Exception:
+        _vacuum_thread = None
+        _vacuum_lock.release()
+        raise
 
 
 def _purge_orphan_traces(conn: sqlite3.Connection) -> int:
-    """Delete trace events whose referenced row no longer exists (RW-18).
-
-    Such a trace is still the only record that a compensation happened:
-    a rewind to a date before it needs the purged event back and refuses
-    by name. Deleting it would turn that refusal into a silent wrong
-    state, so the purge records the horizon it creates first (the trace's
-    newest instant, per datasource).
-
-    Returns number of orphan traces deleted.
-    """
-    try:
-        with conn:
-            rows = conn.execute(
-                "SELECT event_id, datasource_fingerprint,"  # nosec B608
-                " MAX(created_at, COALESCE(invalidated_at, ''))"
-                " FROM audit_event WHERE " + _ORPHAN_TRACE_WHERE
-            ).fetchall()
-            _remember_deleted_history(conn, [(r[1], r[2]) for r in rows])
+    """Delete trace events whose referenced row no longer exists (RW-18)."""
+    horizons: Dict[str, str] = {}
+    with _immediate_tx(conn):
+        rows = conn.execute(
+            "SELECT event_id, datasource_fingerprint,"  # nosec B608
+            " MAX(created_at, COALESCE(invalidated_at, ''))"
+            " FROM audit_event WHERE " + _ORPHAN_TRACE_WHERE
+        ).fetchall()
+        horizons = _remember_deleted_history(
+            conn, [(r[1], r[2]) for r in rows], defer_memory=True)
+        if rows:
             conn.executemany("DELETE FROM audit_event WHERE event_id = ?",
                              [(r[0],) for r in rows])
-            deleted = len(rows)
-        if deleted:
-            flog(f"retention: purged {deleted} orphan trace event(s), "
-                 f"rewinds before them are now refused")
-        return deleted
-    except sqlite3.Error as e:
-        flog(f"retention: orphan trace purge error: {e}", "WARNING")
-        return 0
+        deleted = len(rows)
+    _apply_memory_horizons(horizons)
+    if deleted:
+        flog(f"retention: purged {deleted} orphan trace event(s), "
+             f"rewinds before them are now refused")
+    return deleted
 
 
 def _purge_invalidated_events(conn: sqlite3.Connection) -> int:
-    """Delete events marked as invalidated (invalidated_at IS NOT NULL).
-
-    An invalidated trace is a compensation that was in effect from its
-    created_at until its invalidated_at (an Undo): the state at any date
-    in between contains it. The interval recorded first makes a rewind to
-    those dates a refusal instead of a state without it; a date before
-    the compensation or after its Undo never needed the row and stays
-    reachable.
-    """
-    try:
-        with conn:
-            rows = conn.execute(
-                "SELECT datasource_fingerprint, created_at,"
-                " MAX(created_at, COALESCE(invalidated_at, ''))"
-                " FROM audit_event WHERE invalidated_at IS NOT NULL"
-            ).fetchall()
-            _remember_gaps(conn, rows, "invalidated")
-            cursor = conn.execute(
-                "DELETE FROM audit_event WHERE invalidated_at IS NOT NULL"
+    """Delete events marked as invalidated (invalidated_at IS NOT NULL)."""
+    merged_gaps: Dict[str, List[Tuple[str, str]]] = {}
+    with _immediate_tx(conn):
+        rows = conn.execute(
+            "SELECT event_id, datasource_fingerprint, created_at,"
+            " MAX(created_at, COALESCE(invalidated_at, ''))"
+            " FROM audit_event WHERE invalidated_at IS NOT NULL"
+        ).fetchall()
+        if rows:
+            merged_gaps = _remember_gaps(
+                conn, [(r[1], r[2], r[3]) for r in rows],
+                "invalidated", defer_memory=True)
+            conn.executemany(
+                "DELETE FROM audit_event WHERE event_id = ?",
+                [(r[0],) for r in rows],
             )
-            deleted = cursor.rowcount
-        if deleted:
-            flog(f"retention: purged {deleted} invalidated event(s)")
-        return deleted
-    except sqlite3.Error as e:
-        flog(f"retention: invalidated purge error: {e}", "WARNING")
-        return 0
+        deleted = len(rows)
+    _apply_memory_gaps(merged_gaps)
+    if deleted:
+        flog(f"retention: purged {deleted} invalidated event(s)")
+    return deleted
 
 
 def _purge_insert_delete_pairs(conn: sqlite3.Connection) -> int:
-    """Delete consecutive INSERT/DELETE pairs of one entity, one session.
-
-    A pair is annulled only when no UPDATE exists between the INSERT and the
-    DELETE, preserving the rewind chain for real edits; see `_PAIRS_CTE`
-    for what else it must hold (user events of ONE layer, none referenced
-    by a trace). The dates between the INSERT and the DELETE lose the
-    feature: that interval is recorded before the rows go. Before the
-    INSERT and after the DELETE the pair cancels out and nothing is lost.
-    """
+    """Delete consecutive INSERT/DELETE pairs of one entity, one session."""
     deleted = 0
-    try:
-        while True:
-            with conn:
-                rows = conn.execute(
-                    _PAIRS_CTE + " SELECT event_id, next_id,"  # nosec B608
-                    " datasource_fingerprint, created_at, next_at FROM pairs"
-                    " LIMIT ?",
-                    (_PURGE_BATCH_SIZE,),
-                ).fetchall()
-                if rows:
-                    _remember_gaps(conn, [(r[2], r[3], r[4]) for r in rows],
-                                   "insert_delete_pair")
-                    conn.executemany(
-                        "DELETE FROM audit_event WHERE event_id = ?",
-                        [(eid,) for r in rows for eid in (r[0], r[1])])
-            deleted += 2 * len(rows)
-            if len(rows) < _PURGE_BATCH_SIZE:
-                break
-        if deleted:
-            flog(f"retention: purged {deleted} event(s) from INSERT/DELETE pairs")
-        return deleted
-    except sqlite3.Error as e:
-        flog(f"retention: insert/delete pair purge error: {e}", "WARNING")
-        return deleted
+    while True:
+        merged_gaps: Dict[str, List[Tuple[str, str]]] = {}
+        with _immediate_tx(conn):
+            rows = conn.execute(
+                _PAIRS_CTE + " SELECT event_id, next_id,"  # nosec B608
+                " datasource_fingerprint, created_at, next_at FROM pairs"
+                " LIMIT ?",
+                (_PURGE_BATCH_SIZE,),
+            ).fetchall()
+            if rows:
+                merged_gaps = _remember_gaps(
+                    conn, [(r[2], r[3], r[4]) for r in rows],
+                    "insert_delete_pair", defer_memory=True)
+                conn.executemany(
+                    "DELETE FROM audit_event WHERE event_id = ?",
+                    [(eid,) for r in rows for eid in (r[0], r[1])])
+        _apply_memory_gaps(merged_gaps)
+        deleted += 2 * len(rows)
+        if len(rows) < _PURGE_BATCH_SIZE:
+            break
+    if deleted:
+        flog(f"retention: purged {deleted} event(s) from INSERT/DELETE pairs")
+    return deleted
 
 
 def _post_purge_maintenance(conn: sqlite3.Connection) -> None:

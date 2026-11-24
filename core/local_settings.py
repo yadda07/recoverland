@@ -86,8 +86,9 @@ class LocalSettings:
     @property
     def retention_days(self) -> int:
         try:
-            return int(self.get("retention_days"))
-        except ValueError:
+            val = int(self.get("retention_days"))
+            return max(1, val)
+        except (TypeError, ValueError):
             return 365
 
     def set_retention_days(self, days: int) -> None:
@@ -98,16 +99,21 @@ class LocalSettings:
     @property
     def max_events(self) -> int:
         try:
-            return int(self.get("max_events"))
-        except ValueError:
+            val = int(self.get("max_events"))
+            return max(1, val)
+        except (TypeError, ValueError):
             return 1_000_000
 
     @property
     def capture_inserts(self) -> bool:
         return self.get("capture_inserts") == "1"
 
-    def set_capture_inserts(self, enabled: str) -> None:
-        self.set("capture_inserts", enabled)
+    def set_capture_inserts(self, enabled) -> None:
+        if isinstance(enabled, bool):
+            val = "1" if enabled else "0"
+        else:
+            val = "1" if str(enabled).strip().lower() in ("1", "true", "yes") else "0"
+        self.set("capture_inserts", val)
 
     def to_dict(self) -> Dict[str, str]:
         result = dict(_SETTING_KEYS)

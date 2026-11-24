@@ -160,33 +160,35 @@ def extract_geometry_type(layer) -> str:
     """Get the geometry type string for a layer.
 
     Returns 'NoGeometry' for non-spatial layers across all QGIS versions:
-    - QGIS 3.30+ : Qgis.WkbType.NoGeometry (scoped enum)
-    - QGIS 3.22 - 3.28 : QgsWkbTypes.NoGeometry (short form)
-    - Display string via Qgis.WkbType(...).name (3.30+) or QgsWkbTypes.displayString (3.x).
+    - QGIS 3.30+ / 4.x : Qgis.WkbType.NoGeometry (scoped enum)
+    - Display string via QgsWkbTypes.displayString (consistent across Qt5/Qt6).
     """
     try:
         from qgis.core import Qgis
         wkb_type = layer.wkbType()
 
-        if hasattr(Qgis, 'WkbType'):
-            if wkb_type == Qgis.WkbType.NoGeometry:
-                return "NoGeometry"
-            try:
-                return Qgis.WkbType(wkb_type).name if isinstance(wkb_type, int) else str(wkb_type)
-            except (ValueError, AttributeError):
-                pass
+        if hasattr(Qgis, 'WkbType') and wkb_type == Qgis.WkbType.NoGeometry:
+            return "NoGeometry"
 
         try:
             from qgis.core import QgsWkbTypes
-            # QgsWkbTypes.Type.NoGeometry, scoped: measured == 100 on Qt5 and
-            # Qt6 alike, so the hasattr guard on the short name bought nothing.
             if wkb_type == QgsWkbTypes.Type.NoGeometry:
                 return "NoGeometry"
             if hasattr(QgsWkbTypes, 'displayString'):
-                return QgsWkbTypes.displayString(wkb_type)
+                label = QgsWkbTypes.displayString(wkb_type)
+                if label:
+                    return label
         except ImportError:
             pass
 
+        name = getattr(wkb_type, "name", None)
+        if name:
+            return str(name)
+        if hasattr(Qgis, 'WkbType'):
+            try:
+                return Qgis.WkbType(wkb_type).name
+            except (ValueError, AttributeError):
+                pass
         if hasattr(Qgis, 'displayString'):
             return Qgis.displayString(wkb_type)
         return str(wkb_type)
@@ -449,6 +451,15 @@ _CRS_STORIES: dict = {}
 # before: nothing else would isolate it in the log.
 _DECISIONS_LOGGED: dict = {}
 _DECISIONS_LOGGED_MAX = 4096
+
+
+def clear_caches() -> None:
+    """Release module-level CRS/transform caches on plugin unload."""
+    _WRITE_TRANSFORM_CACHE.clear()
+    _CRS_AREA_CACHE.clear()
+    _CRS_STORIES.clear()
+    _DECISIONS_LOGGED.clear()
+
 
 # `CaptureCarriers`: how many committed features one pass may read per
 # reading of its group (at least `_PASS_MIN`), and at most, whatever that
@@ -1691,6 +1702,38 @@ def _signatures_differ(a, b, rel_tol: float = 1e-9) -> bool:
     return False
 
 
+def _geom_zm_flags(geom) -> Tuple[bool, bool]:
+    """Return (has_z, has_m) for a QgsGeometry; (False, False) on stubs."""
+    try:
+        from qgis.core import QgsWkbTypes
+        wt = geom.wkbType()
+        return bool(QgsWkbTypes.hasZ(wt)), bool(QgsWkbTypes.hasM(wt))
+    except Exception:  # noqa: BLE001
+        return False, False
+
+
+def _geom_is_curved(geom) -> bool:
+    """True when *geom* uses a curved WKB type (CircularString, CurvePolygon...)."""
+    try:
+        from qgis.core import QgsWkbTypes
+        return bool(QgsWkbTypes.isCurvedType(geom.wkbType()))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _coord_key(val: float) -> tuple:
+    return (1, 0.0) if math.isnan(val) else (0, val)
+
+
+def _vertex_tuple(pt, has_z: bool, has_m: bool) -> tuple:
+    coords = [_coord_key(pt.x()), _coord_key(pt.y())]
+    if has_z:
+        coords.append(_coord_key(pt.z()))
+    if has_m:
+        coords.append(_coord_key(pt.m()))
+    return tuple(coords)
+
+
 def _canonical_ring_cycle(pts: list) -> tuple:
     """Dihedral canonical cycle of a closed polygon ring (without duplicate end)."""
     if len(pts) <= 2:
@@ -1704,15 +1747,79 @@ def _canonical_ring_cycle(pts: list) -> tuple:
     return min(candidates)
 
 
+def _canonical_rings_zm(geom, has_z: bool, has_m: bool):
+    """Canonical shape signature preserving Z/M coordinates via constGet()."""
+    try:
+        abstract = geom.constGet()
+        if abstract is None:
+            return None
+        from qgis.core import QgsWkbTypes
+        from ..compat import QgisCompat
+        flat = QgsWkbTypes.flatType(geom.wkbType())
+        if flat in (QgisCompat.WKB_POLYGON, QgisCompat.WKB_MULTIPOLYGON):
+            n_parts = (
+                abstract.numGeometries()
+                if flat == QgisCompat.WKB_MULTIPOLYGON else 1
+            )
+            out = []
+            for i in range(n_parts):
+                part = (
+                    abstract.geometryN(i)
+                    if flat == QgisCompat.WKB_MULTIPOLYGON else abstract
+                )
+                if part is None:
+                    continue
+                rings = []
+                ext = part.exteriorRing()
+                if ext is not None:
+                    rings.append(ext)
+                for j in range(part.numInteriorRings()):
+                    ir = part.interiorRing(j)
+                    if ir is not None:
+                        rings.append(ir)
+                canon = []
+                for ring in rings:
+                    pts = [_vertex_tuple(v, has_z, has_m) for v in ring.vertices()]
+                    if len(pts) > 1 and pts[0] == pts[-1]:
+                        pts = pts[:-1]
+                    canon.append(_canonical_ring_cycle(pts))
+                out.append(tuple(sorted(canon)))
+            return tuple(sorted(out)) if out else None
+        if flat in (QgisCompat.WKB_LINESTRING, QgisCompat.WKB_MULTILINESTRING):
+            n_parts = (
+                abstract.numGeometries()
+                if flat == QgisCompat.WKB_MULTILINESTRING else 1
+            )
+            out_lines = []
+            for i in range(n_parts):
+                part = (
+                    abstract.geometryN(i)
+                    if flat == QgisCompat.WKB_MULTILINESTRING else abstract
+                )
+                if part is None:
+                    continue
+                pts = tuple(_vertex_tuple(v, has_z, has_m) for v in part.vertices())
+                if pts:
+                    out_lines.append(pts)
+            return tuple(sorted(out_lines)) if out_lines else None
+        pts = [_vertex_tuple(v, has_z, has_m) for v in geom.vertices()]
+        return tuple(sorted(pts)) if pts else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _canonical_rings(geom):
     """Canonical, GEOS-free shape signature, or None when unavailable.
 
     Rebuilds polygons as sorted parts of dihedral-canonical rings, dropping
-    each ring's closing vertex. That makes the signature invariant to the
-    three things OGR rewrites when it repacks a shapefile (ring orientation,
-    starting vertex, part order) while rejecting vertex permutations and
-    preserving the direction of linear geometries.
+    each ring's closing vertex. Preserves Z and M coordinates when present,
+    and declines curved geometries so arcs are never approximated as chords.
     """
+    if _geom_is_curved(geom):
+        return None
+    has_z, has_m = _geom_zm_flags(geom)
+    if has_z or has_m:
+        return _canonical_rings_zm(geom, has_z, has_m)
     try:
         if geom.isMultipart():
             parts = geom.asMultiPolygon()
@@ -1753,39 +1860,15 @@ def _canonical_rings(geom):
 
 def feature_matches_geometry(feature, expected_geom, expected_wkb=None,
                              allow_repair: bool = False) -> bool:
-    """Return True when *feature*'s geometry matches *expected_geom*.
-
-    Comparison shared between the snapshot scanners in restore_service
-    and the buffer ops in restore_executor (DUP-10). Ordered by cost:
-
-      0. Bounding-box fast reject (BL-RW-P1-26): two geometries with
-         different bounding boxes cannot be equal, and the bbox compare
-         avoids both the WKB byte copy and the GEOS construction that
-         dominated the rewind apply phase on heavy polygons (measured
-         55s/59s on zone_mkt_rip, 2026-07-05). Tolerant, see _bbox_close.
-      1. Byte-for-byte WKB equality (fast path; the audit pipeline
-         re-serialises geometries the same way QGIS does).
-      2. Canonical ring signature (BL-RW-P5-28). Byte equality and
-         ``equals()`` are BOTH sensitive to ring orientation and starting
-         vertex, which OGR rewrites whenever it repacks a shapefile. On
-         the user's run of 2026-08-14 that cost 16 refusals on features
-         that were sitting in the layer, unchanged, under a different
-         encoding of the same vertices.
-      3. ``makeValid`` on both sides then ``isGeosEqual`` -- last resort,
-         only when *allow_repair* is set. It costs ~900 ms per pair on a
-         500 KB multipolygon, which is affordable to verify ONE candidate
-         and ruinous inside a 200-feature scan; hence the opt-in rather
-         than a default. ``equals()`` alone is not a substitute: these
-         geometries are GEOS-invalid at the source and it answers False
-         on two encodings of the same shape.
-
-    *expected_wkb* lets per-event scan loops serialise the expected
-    geometry ONCE instead of once per scanned feature.
-    """
+    """Return True when *feature*'s geometry matches *expected_geom*."""
     if not is_geometry_present(expected_geom):
         return False
     current = feature.geometry()
     if not is_geometry_present(current):
+        return False
+    cur_zm = _geom_zm_flags(current)
+    exp_zm = _geom_zm_flags(expected_geom)
+    if cur_zm != exp_zm:
         return False
     try:
         if current.boundingBox() != expected_geom.boundingBox():
@@ -1797,11 +1880,16 @@ def feature_matches_geometry(feature, expected_geom, expected_wkb=None,
     if geometries_equal(bytes(current.asWkb()), expected_wkb):
         return True
 
+    has_zm = cur_zm[0] or cur_zm[1]
     if not _signatures_differ(_cheap_shape_signature(current),
                               _cheap_shape_signature(expected_geom)):
         cur_rings = _canonical_rings(current)
         if cur_rings is not None and cur_rings == _canonical_rings(expected_geom):
             return True
+
+    # GEOS equals() / isGeosEqual() are strictly 2D and ignore Z/M differences.
+    if has_zm:
+        return False
 
     if hasattr(current, "equals") and bool(current.equals(expected_geom)):
         return True
@@ -1852,7 +1940,8 @@ def wkb_short_repr(wkb_data: Optional[bytes]) -> str:
         if not is_geometry_present(geom):
             return f"empty(len={len(wkb_data)})"
         try:
-            if geom.type() == 0:  # Point
+            from ..compat import QgisCompat
+            if geom.type() == QgisCompat.GEOM_POINT and not geom.isMultipart():
                 p = geom.asPoint()
                 return f"POINT({p.x():.3f} {p.y():.3f})"
         except Exception:  # nosec B110 # justification below
@@ -1938,16 +2027,20 @@ def reproject_bbox(
             QgsProject,
             QgsRectangle,
         )
+        src = QgsCoordinateReferenceSystem(src_crs)
+        dst = QgsCoordinateReferenceSystem(dst_crs)
+        if not src.isValid() or not dst.isValid():
+            return bbox_xy
         rect = QgsRectangle(bbox_xy[0], bbox_xy[1], bbox_xy[2], bbox_xy[3])
         geom = QgsGeometry.fromRect(rect)
-        xform = QgsCoordinateTransform(
-            QgsCoordinateReferenceSystem(src_crs),
-            QgsCoordinateReferenceSystem(dst_crs),
-            QgsProject.instance(),
-        )
-        geom.transform(xform)
-        b = geom.boundingBox()
-        return (b.xMinimum(), b.yMinimum(), b.xMaximum(), b.yMaximum())
+        xform = QgsCoordinateTransform(src, dst, QgsProject.instance())
+        if not xform.isValid():
+            return bbox_xy
+        status = geom.transform(xform)
+        if int(getattr(status, "value", status)) != 0:
+            return bbox_xy
+        b = _finite_rect(geom.boundingBox())
+        return b if b is not None else bbox_xy
     except Exception:  # noqa: BLE001
         return bbox_xy
 

@@ -62,9 +62,18 @@ def wal_checkpoint(conn: sqlite3.Connection,
         return -1
     try:
         row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
-        pages = row[2] if row and len(row) > 2 else 0
-        flog(f"maintenance: WAL checkpoint({mode}) checkpointed {pages} pages")
-        return pages
+        if not row or len(row) < 3:
+            return 0
+        busy, log_pages, checkpointed = row[0], row[1], row[2]
+        if log_pages == -1 and checkpointed == -1:
+            flog(f"maintenance: WAL checkpoint({mode}) skipped (journal not in WAL mode)", "DEBUG")
+            return 0
+        if busy:
+            flog(f"maintenance: WAL checkpoint({mode}) busy=1 ({checkpointed}/{log_pages} pages)",
+                 "WARNING")
+        else:
+            flog(f"maintenance: WAL checkpoint({mode}) checkpointed {checkpointed} pages")
+        return checkpointed
     except sqlite3.Error as e:
         flog(f"maintenance: WAL checkpoint failed: {e}", "WARNING")
         return -1
@@ -76,8 +85,11 @@ def run_maintenance(conn: sqlite3.Connection) -> MaintenanceResult:
     analyze_ok = run_analyze(conn)
     try:
         row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-        wal_pages = row[1] if row and len(row) > 1 else 0
-        checkpointed = row[2] if row and len(row) > 2 else 0
+        if row and len(row) >= 3 and row[1] == -1 and row[2] == -1:
+            wal_pages, checkpointed = 0, 0
+        else:
+            wal_pages = row[1] if row and len(row) > 1 else 0
+            checkpointed = row[2] if row and len(row) > 2 else 0
         flog(f"maintenance: WAL {wal_pages} total pages, {checkpointed} checkpointed")
     except sqlite3.Error as e:
         flog(f"maintenance: WAL checkpoint failed: {e}", "WARNING")

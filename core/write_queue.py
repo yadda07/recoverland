@@ -69,13 +69,14 @@ from .audit_backend import AuditEvent
 from .capture_outbox import (
     quarantine_backlog,
     CaptureOutbox, OutboxWriteError, event_to_record, new_event_uid,
-    outbox_dir_for, replay_outbox, fault_point,
+    outbox_dir_for, replay_outbox, replay_sealed_segments, fault_point,
 )
 from .journal_writes import (
     ensure_v7_schema, event_row, insert_events_idempotent,
     record_capture_commit, validate_event_row,
 )
 from .logger import flog
+from .long_paths import path_key
 from .sqlite_schema import apply_pragmas
 
 
@@ -110,6 +111,7 @@ _RETRY_MAX_SEC = 5.0
 _POISON_ATTEMPTS = 3
 _WAL_CHECKPOINT_INTERVAL_SEC = 60
 _STALL_SEC = 30.0
+_RAM_QUEUE_MAX_EVENTS = 250000
 
 # Old module constants, kept for scripts that import them. The hard limit
 # no longer refuses anything: every accepted batch is already durable.
@@ -210,15 +212,70 @@ class _Generation:
         self.accept_lock = threading.Lock()
         self.accepting = False
         self.stop_requested = False
+        self.skip_final_flush = False
         self.thread: Optional[threading.Thread] = None
         self.state = WriterState.STARTING
         self.queued_events = 0
         self.inflight_events = 0
         self.ack_failed = False
+        self.non_empty_since_mono = 0.0
+        self.ram_overflow_in_outbox = False
+        self.fallback_unindexed = False
+        self.overflow_epoch = 0
+        self._exit_lock = threading.Lock()
+        self._exited = False
+        self._on_exit_callbacks: List[Callable[[], None]] = []
 
     @property
     def alive(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
+
+    def add_exit_callback(self, callback: Callable[[], None]) -> None:
+        """Run *callback* once this generation's writer thread exits."""
+        run_now = False
+        with self._exit_lock:
+            if self._exited:
+                run_now = True
+            else:
+                self._on_exit_callbacks.append(callback)
+        if run_now:
+            try:
+                callback()
+            except Exception as exc:  # noqa: BLE001
+                flog(f"WriteQueue: exit callback failed: {exc}", "WARNING")
+
+    def fire_exit_callbacks(self) -> None:
+        """Mark exited and run registered exit callbacks exactly once."""
+        with self._exit_lock:
+            self._exited = True
+            callbacks = list(self._on_exit_callbacks)
+            self._on_exit_callbacks.clear()
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception as exc:  # noqa: BLE001
+                flog(f"WriteQueue: exit callback failed: {exc}", "WARNING")
+
+
+_LINGERING_LOCK = threading.Lock()
+_LINGERING_GENS: List[_Generation] = []
+
+
+def _register_lingering(gen: _Generation) -> None:
+    with _LINGERING_LOCK:
+        _LINGERING_GENS[:] = [g for g in _LINGERING_GENS if g.alive]
+        if gen.alive:
+            _LINGERING_GENS.append(gen)
+
+
+def has_lingering_writer(db_path: Optional[str]) -> bool:
+    """True when a timed-out writer thread is still alive on *db_path*."""
+    if not db_path:
+        return False
+    key = path_key(db_path)
+    with _LINGERING_LOCK:
+        _LINGERING_GENS[:] = [g for g in _LINGERING_GENS if g.alive]
+        return any(path_key(g.db_path) == key for g in _LINGERING_GENS)
 
 
 def _utc_now() -> str:
@@ -228,7 +285,7 @@ def _utc_now() -> str:
 def _same_path(a: Optional[str], b: Optional[str]) -> bool:
     if not a or not b:
         return False
-    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    return path_key(a) == path_key(b)
 
 
 class WriteQueue:
@@ -237,6 +294,7 @@ class WriteQueue:
     def __init__(self):
         self._gen: Optional[_Generation] = None
         self._gen_counter = 0
+        self._lingering_gens: List[_Generation] = []
         self._stats_lock = threading.Lock()
         self._on_early_warning: Optional[Callable[[], None]] = None
         self._on_flush_callback: Optional[Callable[[int], None]] = None
@@ -293,8 +351,30 @@ class WriteQueue:
         """Replay what a previous run left in the outbox, then start a writer."""
         if self._gen is not None:
             self.stop()
+        switching = not _same_path(self._last_db_path, db_path)
+        if switching:
+            with self._stats_lock:
+                self._lost_events = 0
+                self._degraded_events = 0
+                self._flushed_events = 0
+                self._last_flush_at = ""
+                self._last_flush_mono = 0.0
+                self._last_error = ""
+                self._journal_writable = True
+                self._outbox_ok = True
+                self._sync_mode = ""
+            self.last_replay_report = None
         self._last_db_path = db_path
-        self._replay(db_path)
+        self._lingering_gens = [g for g in self._lingering_gens if g.alive]
+        same_lingering = any(_same_path(g.db_path, db_path) for g in self._lingering_gens)
+        if same_lingering:
+            flog(
+                f"WriteQueue: event=wq_replay_deferred journal={db_path}: "
+                f"previous writer generation is still alive; skipping concurrent outbox replay",
+                "WARNING",
+            )
+        else:
+            self._replay(db_path)
         backlog = quarantine_backlog(db_path)
         with self._stats_lock:
             self._quarantined_events = backlog
@@ -304,6 +384,9 @@ class WriteQueue:
                  f"the journal", "WARNING")
         self._gen_counter += 1
         gen = _Generation(self._gen_counter, db_path, CaptureOutbox(db_path))
+        if same_lingering:
+            gen.ram_overflow_in_outbox = True
+            gen.overflow_epoch += 1
         gen.thread = threading.Thread(
             target=self._writer_loop, args=(gen,),
             name="RecoverLand-Writer", daemon=True)
@@ -335,18 +418,23 @@ class WriteQueue:
             if conn is not None:
                 conn.close()
 
-    def stop(self) -> None:
+    def stop(self, clear_journal: bool = False, flush: bool = True) -> bool:
         """Stop the current writer. Idempotent, safe when never started.
 
-        Every queued batch is already in the outbox: what the writer cannot
-        index before the timeout is replayed at the next start, and this
-        says so. A writer that outlives the timeout keeps its own
-        generation and cannot touch the next one.
+        Returns True when no writer thread remains alive, False if the writer
+        outlived the flush timeout. When *clear_journal* is True, forgets the
+        last bound journal path so post-shutdown calls do not write to it.
+        When *flush* is False (e.g. writer lock lost to another instance),
+        skips the shutdown flush and WAL checkpoint so nothing is written.
         """
         gen = self._gen
         if gen is None:
-            return
+            if clear_journal:
+                self._last_db_path = None
+            return True
         gen.stop_requested = True
+        if not flush:
+            gen.skip_final_flush = True
         with gen.accept_lock:
             gen.accepting = False
         if gen.state not in (WriterState.FAILED,):
@@ -372,11 +460,33 @@ class WriteQueue:
                  f"ram_events={ram_events} writer_alive={gen.alive}: not "
                  f"indexed in the journal yet, durable in the outbox, "
                  f"replayed at the next start", "WARNING")
-        if not gen.alive:
+        stopped_clean = not gen.alive
+        if stopped_clean:
             gen.outbox.close()
             gen.state = WriterState.STOPPED
+        else:
+            self._lingering_gens.append(gen)
+            _register_lingering(gen)
         self._gen = None
+        if clear_journal:
+            self._last_db_path = None
         flog("WriteQueue: writer thread stopped")
+        return stopped_clean
+
+    def defer_on_lingering_exit(self, db_path: str,
+                                callback: Callable[[], None]) -> bool:
+        """Attach *callback* to a lingering writer on *db_path* if one is alive.
+
+        Returns True if attached (or already invoked when the writer just
+        exited), False if no lingering generation matched *db_path*.
+        """
+        if not db_path:
+            return False
+        for g in reversed(self._lingering_gens):
+            if _same_path(g.db_path, db_path):
+                g.add_exit_callback(callback)
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Producer API (GUI thread)
@@ -433,6 +543,8 @@ class WriteQueue:
         gen = self._gen
         target = journal_path or (gen.db_path if gen is not None else self._last_db_path)
         if problems:
+            if commit is not None and gen is not None and _same_path(target, gen.db_path):
+                gen.outbox.resolve_prepare(commit.commit_id)
             if not self._quarantine_invalid(target, events, problems) and target:
                 with self._stats_lock:
                     self._lost_events += len(events)
@@ -472,24 +584,44 @@ class WriteQueue:
         if seq is not None:
             self._outbox_ok = True
         if seq is None:
-            return self._write_sync_or_refuse(target, events, commit)
+            outcome = self._write_sync_or_refuse(target, events, commit)
+            if (outcome is EnqueueOutcome.PERSISTED_JOURNAL_SYNC
+                    and commit is not None and gen is not None):
+                gen.outbox.resolve_prepare(commit.commit_id)
+            return outcome
 
         fault_point("wq_after_outbox_before_queue")
         live = False
+        ram_capped = False
         if gen is not None and foreign_outbox is None:
             with gen.accept_lock:
-                live = gen.accepting and gen.alive
+                with self._stats_lock:
+                    cur_queued = gen.queued_events
+                if cur_queued > 0 and cur_queued >= _RAM_QUEUE_MAX_EVENTS:
+                    with self._stats_lock:
+                        gen.ram_overflow_in_outbox = True
+                        gen.overflow_epoch += 1
+                    ram_capped = True
+                live = gen.accepting and gen.alive and not ram_capped
                 if live:
                     gen.queue.put(_Batch(seq, batch_id, events, commit))
                     with self._stats_lock:
+                        if gen.queued_events + gen.inflight_events == 0 and events:
+                            gen.non_empty_since_mono = time.monotonic()
                         gen.queued_events += len(events)
         if not live:
             with self._stats_lock:
                 self._degraded_events += len(events)
-            state = gen.state.value if gen is not None else "no_writer_for_journal"
+                if gen is not None and foreign_outbox is None:
+                    gen.fallback_unindexed = True
+                    gen.overflow_epoch += 1
+            state = ("ram_capped_in_outbox" if ram_capped
+                     else (gen.state.value if gen is not None
+                           else "no_writer_for_journal"))
             flog(f"WriteQueue: event=wq_enqueue_no_writer n_events={len(events)} "
                  f"state={state} journal={target}: batch durable in the "
-                 f"outbox, indexed when this journal's writer runs", "ERROR")
+                 f"outbox, indexed when this journal's writer runs",
+                 "WARNING" if ram_capped else "ERROR")
             return EnqueueOutcome.PERSISTED_FALLBACK
         self._warn_on_depth()
         return EnqueueOutcome.QUEUED_DURABLE
@@ -519,6 +651,10 @@ class WriteQueue:
                         _record_commit(conn, commit, len(events))
                 with self._stats_lock:
                     self._degraded_events += len(events)
+                    self._flushed_events += inserted
+                    self._last_flush_at = _utc_now()
+                    self._last_flush_mono = time.monotonic()
+                    self._journal_writable = True
                 flog(f"WriteQueue: event=wq_sync_fallback n_events={len(events)} "
                      f"inserted={inserted} already={present} "
                      f"rejected={len(rejected)}: outbox unavailable "
@@ -569,15 +705,30 @@ class WriteQueue:
                 flog(f"WriteQueue: batch {key} already quarantined, not counted again")
                 return True
             reasons = dict(problems)
-            tmp = target + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                for i, e in enumerate(events):
-                    fh.write(json.dumps({"reason": reasons.get(i, ""),
-                                         "e": event_to_record(e)},
-                                        ensure_ascii=False, default=str) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, target)
+            tmp = f"{target}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    for i, e in enumerate(events):
+                        fh.write(json.dumps({"reason": reasons.get(i, ""),
+                                             "e": event_to_record(e)},
+                                            ensure_ascii=False, default=str) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                for attempt in range(40 if os.name == "nt" else 1):
+                    try:
+                        os.replace(tmp, target)
+                        break
+                    except PermissionError:
+                        if attempt + 1 >= (40 if os.name == "nt" else 1):
+                            raise
+                        time.sleep(0.025)
+            except Exception:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+                raise
         except (OSError, TypeError, ValueError) as exc:
             flog(f"WriteQueue: cannot quarantine invalid batch: {exc}", "ERROR")
             return False
@@ -610,14 +761,20 @@ class WriteQueue:
         """
         gen = self._gen
         if gen is None:
-            return True
+            return False
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
+            if not gen.alive:
+                with self._stats_lock:
+                    busy = gen.queued_events + gen.inflight_events
+                flog(f"WriteQueue: event=wq_barrier_not_reached "
+                     f"n_events={busy} writer_alive=False", "WARNING")
+                return False
             with self._stats_lock:
                 busy = gen.queued_events + gen.inflight_events
-            if busy == 0:
+            if busy == 0 and not gen.ram_overflow_in_outbox and not gen.fallback_unindexed:
                 return True
-            if not gen.alive or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 flog(f"WriteQueue: event=wq_barrier_not_reached "
                      f"n_events={busy} writer_alive={gen.alive}", "WARNING")
                 return False
@@ -681,13 +838,16 @@ class WriteQueue:
         """Periodic check on the GUI thread: detects a dead or stalled writer."""
         gen = self._gen
         if gen is not None:
+            with self._stats_lock:
+                busy = gen.queued_events + gen.inflight_events
+                non_empty_since = gen.non_empty_since_mono
             if not gen.alive and not gen.stop_requested:
                 with gen.accept_lock:
                     gen.accepting = False
                 gen.state = WriterState.FAILED
             elif (gen.alive and gen.state == WriterState.RUNNING
-                  and self.pending_count > 0 and self._last_flush_mono
-                  and time.monotonic() - self._last_flush_mono > _STALL_SEC):
+                  and busy > 0 and non_empty_since > 0.0
+                  and time.monotonic() - non_empty_since > _STALL_SEC):
                 gen.state = WriterState.DEGRADED
                 self._last_error = (self._last_error or
                                     f"writer stalled for more than {_STALL_SEC:.0f}s")
@@ -741,21 +901,52 @@ class WriteQueue:
         clean_exit = False
         retry: List[_Batch] = []
         attempts = 0
+        io_err_streak = 0
         backoff = _RETRY_BASE_SEC
         try:
             conn = sqlite3.connect(gen.db_path, check_same_thread=False)
-            self._sync_mode = _durable_pragmas(conn)
-            with conn:
-                ensure_v7_schema(conn)
+            sync_mode = _durable_pragmas(conn)
+            for init_try in range(5):
+                try:
+                    with conn:
+                        ensure_v7_schema(conn)
+                    break
+                except sqlite3.OperationalError as init_exc:
+                    low = str(init_exc).lower()
+                    if (("locked" not in low and "busy" not in low)
+                            or init_try + 1 >= 5 or gen.stop_event.is_set()):
+                        raise
+                    gen.stop_event.wait(timeout=0.15 * (init_try + 1))
             gen.state = WriterState.RUNNING
-            self._journal_writable = True
+            if self._gen is gen:
+                self._sync_mode = sync_mode
+                self._journal_writable = True
             flog(f"WriteQueue: writer connection opened gen={gen.gen_id}")
             while True:
                 if gen.stop_event.is_set() and not retry and gen.queue.empty():
                     break
+                if gen.skip_final_flush:
+                    break
                 try:
                     batches = retry or self._take_batches(gen)
                     if not batches:
+                        if ((gen.ram_overflow_in_outbox or gen.fallback_unindexed)
+                                and not gen.stop_event.is_set()
+                                and not any(
+                                    g.alive and _same_path(g.db_path, gen.db_path)
+                                    for g in self._lingering_gens)):
+                            with self._stats_lock:
+                                epoch_before = gen.overflow_epoch
+                            try:
+                                rep = replay_sealed_segments(gen.outbox, conn)
+                                if rep.kept_segments == 0 and not rep.errors:
+                                    with self._stats_lock:
+                                        if gen.overflow_epoch == epoch_before:
+                                            gen.ram_overflow_in_outbox = False
+                                            gen.fallback_unindexed = False
+                            except Exception as rep_err:  # noqa: BLE001
+                                flog(f"WriteQueue: overflow outbox replay failed: {rep_err}",
+                                     "WARNING")
                         gen.stop_event.wait(timeout=0.1)
                         if time.monotonic() - last_checkpoint > _WAL_CHECKPOINT_INTERVAL_SEC:
                             _try_wal_checkpoint(conn)
@@ -764,12 +955,28 @@ class WriteQueue:
                     ok, retryable = self._write_batches(gen, conn, batches)
                     if ok:
                         retry, attempts, backoff = [], 0, _RETRY_BASE_SEC
+                        io_err_streak = 0
                         if gen.state == WriterState.DEGRADED and not gen.ack_failed:
                             gen.state = WriterState.RUNNING
                             flog("WriteQueue: event=wq_recovered journal writable again")
                         continue
                     retry = batches
                     attempts += 1
+                    if retryable:
+                        low_err = self._last_error.lower()
+                        if "disk i/o" in low_err or "ioerr" in low_err:
+                            io_err_streak += 1
+                            if io_err_streak >= 3:
+                                io_err_streak = 0
+                                try:
+                                    conn.close()
+                                except sqlite3.Error:
+                                    pass
+                                conn = sqlite3.connect(
+                                    gen.db_path, check_same_thread=False)
+                                _durable_pragmas(conn)
+                                flog(f"WriteQueue: reopened SQLite connection after "
+                                     f"disk I/O errors gen={gen.gen_id}", "WARNING")
                     if not retryable and attempts >= _POISON_ATTEMPTS:
                         # One refused batch must not take the healthy ones
                         # grouped with it down: isolate it, down to the event.
@@ -784,20 +991,24 @@ class WriteQueue:
                     # ack, checkpoint, quarantine: whatever failed outside
                     # the batch write, the batches are durable in the
                     # outbox. Keep the consumer alive and retry.
-                    self._last_error = (f"writer iteration error: "
-                                        f"{type(loop_err).__name__}: {loop_err}")
+                    err_text = (f"writer iteration error: "
+                                f"{type(loop_err).__name__}: {loop_err}")
+                    if self._gen is gen:
+                        self._last_error = err_text
                     gen.state = WriterState.DEGRADED
-                    flog(f"WriteQueue: event=wq_loop_error {self._last_error}; "
+                    flog(f"WriteQueue: event=wq_loop_error {err_text}; "
                          f"writer stays alive, batches kept durable", "ERROR")
                     gen.stop_event.wait(timeout=backoff)
                     backoff = min(backoff * 2, _RETRY_MAX_SEC)
             clean_exit = True
         except sqlite3.Error as exc:
-            self._last_error = f"fatal SQLite error: {exc}"
-            self._journal_writable = False
+            if self._gen is gen:
+                self._last_error = f"fatal SQLite error: {exc}"
+                self._journal_writable = False
             flog(f"WriteQueue: fatal SQLite error: {exc}", "ERROR")
         except BaseException as exc:  # noqa: BLE001 - record ANY death
-            self._last_error = f"fatal writer error: {type(exc).__name__}: {exc}"
+            if self._gen is gen:
+                self._last_error = f"fatal writer error: {type(exc).__name__}: {exc}"
             flog(f"WriteQueue: fatal writer error: {type(exc).__name__}: {exc}",
                  "ERROR")
             if not isinstance(exc, Exception):
@@ -806,15 +1017,18 @@ class WriteQueue:
             with gen.accept_lock:
                 gen.accepting = False
             gen.state = WriterState.STOPPED if clean_exit else WriterState.FAILED
-            self._final_flush(gen, conn, retry)
+            if not gen.skip_final_flush:
+                self._final_flush(gen, conn, retry)
             if conn is not None:
                 try:
-                    _try_wal_checkpoint(conn)
+                    if not gen.skip_final_flush:
+                        _try_wal_checkpoint(conn)
                     conn.close()
                 except sqlite3.Error:
                     pass
             if gen.stop_requested and self._gen is not gen:
                 gen.outbox.close()
+            gen.fire_exit_callbacks()
             flog(f"WriteQueue: writer connection closed gen={gen.gen_id}")
 
     def _final_flush(self, gen, conn, retry: List[_Batch]) -> None:
@@ -885,15 +1099,21 @@ class WriteQueue:
             self._on_write_error(gen, exc, n, retryable=False)
             return False, False
         fault_point("wq_after_sqlite_commit_before_ack")
+        now_mono = time.monotonic()
         with self._stats_lock:
             gen.inflight_events = max(0, gen.inflight_events - n)
-            self._flushed_events += inserted
-            self._last_flush_at = _utc_now()
-            self._last_flush_mono = time.monotonic()
+            gen.non_empty_since_mono = (
+                now_mono if (gen.queued_events + gen.inflight_events) > 0 else 0.0
+            )
+            if self._gen is gen:
+                self._flushed_events += inserted
+                self._last_flush_at = _utc_now()
+                self._last_flush_mono = now_mono
         acked = all([self._ack(gen, b) for b in batches])
-        self._journal_writable = True
-        if acked:
-            self._last_error = ""
+        if self._gen is gen:
+            self._journal_writable = True
+            if acked:
+                self._last_error = ""
         gen.ack_failed = not acked
         flog(f"WriteQueue: wrote {inserted} events"
              + (f" ({present} already present)" if present else ""))
@@ -924,9 +1144,12 @@ class WriteQueue:
             return True
         try:
             gen.outbox.ack(batch.seq, len(batch.events))
+            if hasattr(gen.outbox, "release_batch_prepare"):
+                gen.outbox.release_batch_prepare(batch.batch_id)
             return True
         except Exception as exc:  # noqa: BLE001 - contained, said
-            self._last_error = (f"outbox ack failed: {type(exc).__name__}: {exc}")
+            if self._gen is gen:
+                self._last_error = (f"outbox ack failed: {type(exc).__name__}: {exc}")
             if gen.state in (WriterState.RUNNING, WriterState.STARTING):
                 gen.state = WriterState.DEGRADED
             flog(f"WriteQueue: event=wq_ack_failed batch={batch.batch_id} "
@@ -936,69 +1159,109 @@ class WriteQueue:
             return False
 
     def _on_write_error(self, gen, exc, n_events: int, retryable: bool) -> None:
-        self._last_error = f"{type(exc).__name__}: {exc}"
-        self._journal_writable = False
+        err_text = f"{type(exc).__name__}: {exc}"
+        if self._gen is gen:
+            self._last_error = err_text
+            self._journal_writable = False
         if gen.state in (WriterState.RUNNING, WriterState.STARTING):
             gen.state = WriterState.DEGRADED
         flog(f"WriteQueue: event=wq_write_failed n_events={n_events} "
-             f"retryable={retryable} error={self._last_error}: batch kept "
+             f"retryable={retryable} error={err_text}: batch kept "
              f"durable in the outbox, retrying", "ERROR")
 
-    def _insert_one(self, conn, event) -> str:
-        """Insert a single event in its own transaction; '' or the error."""
+    def _insert_one(self, conn, event):
+        """Insert a single event in its own transaction; (err, retryable)."""
         try:
             with conn:
                 _ins, _pre, rejected = insert_events_idempotent(conn, [event_row(event)])
             if rejected:
-                return rejected[0][1]
-            return ""
+                return rejected[0][1], False
+            return "", False
+        except sqlite3.OperationalError as exc:
+            return f"{type(exc).__name__}: {exc}", True
         except Exception as exc:  # noqa: BLE001 - isolating a poison
-            return f"{type(exc).__name__}: {exc}"
+            return f"{type(exc).__name__}: {exc}", False
 
     def _isolate_poison(self, gen: _Generation, conn, batches: List[_Batch]) -> None:
         """Resolve batches the journal keeps refusing, without losing the good ones.
 
         Each batch is retried alone, then each of its events alone: every
         event the journal accepts is inserted, only the events it refuses
-        are written to the quarantine (fsync'd). A batch is acknowledged
-        out of the outbox only when ALL its events are either in the
-        journal or durably in the quarantine; otherwise it stays in the
-        outbox (replayed at the next start) and is reported.
+        are written to the quarantine (fsync'd). Retryable operational errors
+        (e.g. lock contention) abort isolation so healthy events are never
+        quarantined; the batch stays durable in the outbox. A batch is
+        acknowledged out of the outbox only when ALL its events AND its
+        commit ledger record are durably persisted.
         """
         for b in batches:
-            ok, _retryable = self._write_batches(gen, conn, [b])
+            ok, retryable = self._write_batches(gen, conn, [b])
             if ok:
                 continue
+            n = len(b.events)
+            if retryable:
+                with self._stats_lock:
+                    gen.inflight_events = max(0, gen.inflight_events - n)
+                    if gen.queued_events + gen.inflight_events == 0:
+                        gen.non_empty_since_mono = 0.0
+                    self._degraded_events += n
+                    gen.fallback_unindexed = True
+                    gen.overflow_epoch += 1
+                flog(f"WriteQueue: event=wq_poison_deferred_retryable n_events={n} "
+                     f"batch={b.batch_id}: retryable SQLite error during isolation; "
+                     f"batch kept durable in the outbox", "WARNING")
+                continue
             bad, reasons = [], []
+            aborted_retryable = False
             for event in b.events:
-                why = self._insert_one(conn, event)
+                why, is_retryable = self._insert_one(conn, event)
+                if is_retryable:
+                    aborted_retryable = True
+                    flog(f"WriteQueue: event=wq_poison_event_retryable "
+                         f"batch={b.batch_id} error={why}: keeping batch in outbox",
+                         "WARNING")
+                    break
                 if why:
                     bad.append(event)
                     reasons.append((len(bad) - 1, f"journal refused: {why}"))
+            if aborted_retryable:
+                with self._stats_lock:
+                    gen.inflight_events = max(0, gen.inflight_events - n)
+                    if gen.queued_events + gen.inflight_events == 0:
+                        gen.non_empty_since_mono = 0.0
+                    self._degraded_events += n
+                    gen.fallback_unindexed = True
+                    gen.overflow_epoch += 1
+                continue
+            commit_written = True
             if b.commit is not None:
                 try:
                     with conn:
                         _record_commit(conn, b.commit, len(b.events) - len(bad))
                 except Exception as exc:  # noqa: BLE001
+                    commit_written = False
                     flog(f"WriteQueue: commit ledger write failed during poison "
                          f"isolation: {exc}", "ERROR")
             quarantined = True
             if bad:
                 quarantined = self._quarantine_invalid(
                     gen.db_path, bad, reasons, key=str(b.batch_id or ""))
-            n = len(b.events)
-            if not quarantined:
+            if not quarantined or not commit_written:
                 with self._stats_lock:
                     gen.inflight_events = max(0, gen.inflight_events - n)
-                    self._degraded_events += len(bad)
+                    if gen.queued_events + gen.inflight_events == 0:
+                        gen.non_empty_since_mono = 0.0
+                    self._degraded_events += len(bad) if not quarantined else 0
                 flog(f"WriteQueue: event=wq_poison_parked n_events={len(bad)} "
-                     f"batch={b.batch_id}: the quarantine could not be written; "
+                     f"batch={b.batch_id} commit_written={commit_written}: "
                      f"the batch stays in the outbox and is retried at the next "
                      f"start", "CRITICAL")
                 continue
             with self._stats_lock:
                 gen.inflight_events = max(0, gen.inflight_events - n)
-                self._flushed_events += n - len(bad)
+                if gen.queued_events + gen.inflight_events == 0:
+                    gen.non_empty_since_mono = 0.0
+                if self._gen is gen:
+                    self._flushed_events += n - len(bad)
             self._ack(gen, b)
             flog(f"WriteQueue: event=wq_poison_batch_quarantined n_events={len(bad)} "
                  f"inserted={n - len(bad)} batch={b.batch_id} "

@@ -30,12 +30,14 @@ from datetime import datetime
 from functools import partial
 from typing import List
 
-from qgis.PyQt.QtCore import QThread, pyqtSignal
+from qgis.PyQt.QtCore import QCoreApplication, QObject, QThread, pyqtSignal
 
+from ..compat import QtCompat, is_deleted
 from ..core.logger import flog
 from ..core.search_service import _row_to_event
 from ..core.time_format import journal_today
 from ..core.sqlite_schema import AUDIT_EVENT_COLUMNS
+from ..qgs_task_support import open_worker_read_connection
 
 _ALIASED_COLS = ", ".join(f"ae.{c}" for c in AUDIT_EVENT_COLUMNS)
 
@@ -244,6 +246,8 @@ _CANCEL_CHECK_ROWS = 512
 # until Qt reports it finished. Nothing else decides when it dies.
 _RETAINED: dict = {}
 _RETAINED_LOCK = threading.Lock()
+_REAPER = None
+_REAPER_LOCK = threading.Lock()
 
 
 def _release_retained(key: int) -> None:
@@ -251,19 +255,78 @@ def _release_retained(key: int) -> None:
         _RETAINED.pop(key, None)
 
 
+class _RetainedThreadReaper(QObject):
+    """GUI-thread receiver that drops QThread references after run() exits."""
+
+    _release_signal = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self._release_signal.connect(self._do_release, QtCompat.QUEUED_CONNECTION)
+
+    def request_release(self, key: int) -> None:
+        self._release_signal.emit(key)
+
+    def _do_release(self, key: int) -> None:
+        _release_retained(key)
+
+
+def cleanup_reaper() -> None:
+    """Release the global QObject reaper before plugin unload or app quit."""
+    global _REAPER
+    with _REAPER_LOCK:
+        reaper, _REAPER = _REAPER, None
+    if reaper is not None:
+        try:
+            app = QCoreApplication.instance()
+            if app is not None:
+                try:
+                    app.aboutToQuit.disconnect(cleanup_reaper)
+                except (TypeError, RuntimeError):
+                    pass
+            if not is_deleted(reaper):
+                reaper.deleteLater()
+        except (RuntimeError, TypeError):
+            pass
+
+
+def _get_reaper() -> _RetainedThreadReaper:
+    global _REAPER
+    if _REAPER is not None and not is_deleted(_REAPER):
+        return _REAPER
+    with _REAPER_LOCK:
+        if _REAPER is None or is_deleted(_REAPER):
+            reaper = _RetainedThreadReaper()
+            app = QCoreApplication.instance()
+            if app is not None:
+                if reaper.thread() != app.thread():
+                    reaper.moveToThread(app.thread())
+                try:
+                    app.aboutToQuit.connect(cleanup_reaper)
+                except (TypeError, RuntimeError):
+                    pass
+            _REAPER = reaper
+        return _REAPER
+
+
 def retain_until_finished(thread) -> None:
     """Keep a strong reference on *thread* until its ``finished`` signal.
 
-    The slot is a partial on a key, not a closure on the thread: the
-    registry is the only owner, so the wrapper is released as soon as
-    the thread is done.
+    Releases the reference on the GUI thread via a queued connection so
+    ``~QThread()`` never runs on the worker thread itself while unwinding.
     """
     key = id(thread)
     with _RETAINED_LOCK:
         if key in _RETAINED:
             return
         _RETAINED[key] = thread
-    thread.finished.connect(partial(_release_retained, key))
+    reaper = _get_reaper()
+    thread.finished.connect(partial(reaper.request_release, key))
+    try:
+        if thread.isFinished():
+            reaper.request_release(key)
+    except RuntimeError:
+        _release_retained(key)
 
 
 def retained_threads() -> list:
@@ -388,6 +451,7 @@ class SnapshotRebuildWorker(QThread):
     ):
         super().__init__(parent)
         self._journal = journal
+        self._journal_path = getattr(journal, "path", None)
         self._layer_infos = [_with_fid_stability(info) for info in layer_infos]
         self._cutoff_iso = cutoff_iso
         self._bbox_per_layer = bbox_per_layer or {}
@@ -454,7 +518,7 @@ class SnapshotRebuildWorker(QThread):
         )
 
         try:
-            conn = self._journal.create_read_connection()
+            conn = open_worker_read_connection(self._journal, self._journal_path)
             with self._conn_lock:
                 self._conn = conn
             if self._cancelled:
@@ -641,6 +705,8 @@ class SnapshotRebuildWorker(QThread):
         """
         out: dict = {}
         for info in self._layer_infos:
+            if self._cancelled:
+                return out
             if info.get("fid_stable"):
                 continue
             fp = info["fingerprint"]
@@ -687,20 +753,37 @@ class SnapshotRebuildWorker(QThread):
 
 
 _ENV_MEMO: dict = {}
-_ENV_MEMO_MAX = 131072
+_ENV_MEMO_BYTES = 0
+_ENV_MEMO_LOCK = threading.Lock()
+_ENV_MEMO_MAX = 32768
+_ENV_MEMO_MAX_BYTES = 32 * 1024 * 1024
+
+
+def clear_envelope_memo() -> None:
+    """Release cached WKB blobs held by the viewport envelope memo."""
+    global _ENV_MEMO_BYTES
+    with _ENV_MEMO_LOCK:
+        _ENV_MEMO.clear()
+        _ENV_MEMO_BYTES = 0
 
 
 def _cached_envelope(wkb: bytes):
     """Cached WKB envelope so repeated viewport pans avoid re-parsing."""
+    global _ENV_MEMO_BYTES
     from ..core.wkb_envelope import parse_envelope  # noqa: PLC0415
     key = id(wkb)
-    hit = _ENV_MEMO.get(key)
-    if hit is not None and hit[0] is wkb:
-        return hit[1]
+    with _ENV_MEMO_LOCK:
+        hit = _ENV_MEMO.get(key)
+        if hit is not None and hit[0] is wkb:
+            return hit[1]
     env = parse_envelope(wkb)
-    if len(_ENV_MEMO) >= _ENV_MEMO_MAX:
-        _ENV_MEMO.clear()
-    _ENV_MEMO[key] = (wkb, env)
+    size = len(wkb) if wkb else 0
+    with _ENV_MEMO_LOCK:
+        if len(_ENV_MEMO) >= _ENV_MEMO_MAX or (_ENV_MEMO_BYTES + size) > _ENV_MEMO_MAX_BYTES:
+            _ENV_MEMO.clear()
+            _ENV_MEMO_BYTES = 0
+        _ENV_MEMO[key] = (wkb, env)
+        _ENV_MEMO_BYTES += size
     return env
 
 

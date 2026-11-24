@@ -1600,14 +1600,21 @@ def _readback_source(layer):
         name = provider.name()
     except (AttributeError, RuntimeError):
         name = ""
-    if name == "memory" or name in _SERVER_PROVIDERS:
+    if name == "memory":
+        return provider
+    has_subset = False
+    try:
+        has_subset = bool(layer.subsetString())
+    except (AttributeError, RuntimeError):
+        has_subset = False
+    if name in _SERVER_PROVIDERS and not has_subset:
         return provider
     from .commit_guard import _fresh_layer
     return _fresh_layer(layer) or provider
 
 
 def _auto_field_names(layer) -> set:
-    """Columns the provider fills itself (primary key, default clause)."""
+    """Columns the provider fills itself (primary key, default, read-only)."""
     out = set()
     try:
         provider = layer.dataProvider()
@@ -1618,6 +1625,11 @@ def _auto_field_names(layer) -> set:
         for idx in range(fields.count()):
             if provider.defaultValueClause(idx):
                 out.add(fields.at(idx).name())
+            try:
+                if fields.at(idx).isReadOnly():
+                    out.add(fields.at(idx).name())
+            except (AttributeError, RuntimeError):
+                pass
     except (AttributeError, RuntimeError):
         pass
     return out
@@ -2335,23 +2347,33 @@ class _CommittedIndex:
 
         hooks = []
         try:
-            for signal in (layer.beforeCommitChanges, layer.afterCommitChanges,
-                           layer.afterRollBack, layer.editingStopped,
-                           layer.dataProvider().dataChanged):
+            dp = layer.dataProvider()
+            pairs = [
+                (layer, layer.beforeCommitChanges),
+                (layer, layer.afterCommitChanges),
+                (layer, layer.afterRollBack),
+                (layer, layer.editingStopped),
+            ]
+            if dp is not None:
+                pairs.append((dp, dp.dataChanged))
+            for emitter, signal in pairs:
                 signal.connect(_moved)
-                hooks.append(signal)
+                hooks.append((emitter, signal))
         except (AttributeError, RuntimeError, TypeError) as exc:
             flog(f"committed index: layer signals unavailable ({exc}); the "
                  f"committed state is read at every proof", "DEBUG")
-            self._hooks = [(signal, _moved) for signal in hooks]
+            self._hooks = [(emitter, signal, _moved) for emitter, signal in hooks]
             self.release()
             return False
-        self._hooks = [(signal, _moved) for signal in hooks]
+        self._hooks = [(emitter, signal, _moved) for emitter, signal in hooks]
         return True
 
     def release(self) -> None:
+        from ..compat import is_deleted
         hooks, self._hooks = self._hooks, []
-        for signal, slot in hooks:
+        for emitter, signal, slot in hooks:
+            if is_deleted(emitter):
+                continue
             try:
                 signal.disconnect(slot)
             except (TypeError, RuntimeError):
@@ -2904,8 +2926,15 @@ def _journal_key_continuity(conn, layer, event: AuditEvent,
                     and bound.created_at >= anchor.created_at):
                 return False, f"remap_source_not_after_event:{bound.event_id}"
         marks = assert_safe_fragment(",".join("?" for _ in scope))
+        needles = []
+        for name in names:
+            raw_json = json.dumps(name, ensure_ascii=False)
+            needles.append(raw_json)
+            asc_json = json.dumps(name, ensure_ascii=True)
+            if asc_json != raw_json:
+                needles.append(asc_json)
         likes = assert_safe_fragment(
-            " OR ".join("attributes_json LIKE ?" for _ in names))
+            " OR ".join("instr(attributes_json, ?) > 0" for _ in needles))
         window = " AND event_id != ? AND (event_id > ? OR created_at >= ?)"
         params = list(scope) + [anchor.event_id, anchor.event_id,
                                 anchor.created_at]
@@ -2921,7 +2950,7 @@ def _journal_key_continuity(conn, layer, event: AuditEvent,
             " AND operation_type IN ('INSERT', 'DELETE'))"
             " OR (operation_type = 'UPDATE' AND (" + likes + ")))"
             " ORDER BY event_id",
-            params + [entity_fp] + [f'%"{name}"%' for name in names]
+            params + [entity_fp] + needles
         ).fetchall()
     except (sqlite3.Error, ValueError) as exc:
         return False, f"journal_unreadable ({exc})"
@@ -3710,7 +3739,7 @@ def _identity_fid(event: AuditEvent) -> Optional[int]:
     if not isinstance(identity, dict):
         return None
     fid = identity.get("fid")
-    return fid if isinstance(fid, int) else None
+    return fid if isinstance(fid, int) and not isinstance(fid, bool) else None
 
 
 class _Proof(tuple):
@@ -4044,6 +4073,7 @@ def validate_restore_layer_state(layer) -> Optional[str]:
     if hasattr(layer, 'isEditable') and layer.isEditable():
         if hasattr(layer, 'isModified') and layer.isModified():
             return "Target layer has uncommitted edits; commit or rollback before restore"
+        return "Target layer is in edit mode; commit or rollback before restore"
     return None
 
 
@@ -4081,26 +4111,31 @@ def build_fid_cache(layer, events: List[AuditEvent], journal=None) -> Dict:
             pk_groups[pk_field].append(pk_value)
 
     provider = layer.dataProvider()
+    if provider is None:
+        return cache
+    _PK_CHUNK = 500
     for pk_field, pk_values in pk_groups.items():
         unique_values = list(set(str(v) for v in pk_values))
         if not unique_values:
             continue
         escaped_field = QgsExpression.quotedColumnRef(str(pk_field))
-        value_list = ", ".join(QgsExpression.quotedValue(v) for v in unique_values)
-        expr = QgsExpression(f"{escaped_field} IN ({value_list})")
-        if expr.hasParserError():
-            flog(f"build_fid_cache: parse error for {pk_field}: {expr.parserErrorString()}", "WARNING")
-            continue
         field_idx = layer.fields().indexOf(pk_field)
-        request = QgsFeatureRequest(expr)
-        if field_idx >= 0:
-            request.setSubsetOfAttributes([field_idx])
-        request.setFlags(QgisCompat.NO_GEOMETRY)
-        for feat in provider.getFeatures(request):
-            key = (pk_field, str(feat[pk_field]))
-            if key in cache and cache[key] != feat.id():
-                shared.add(key)
-            cache[key] = feat.id()
+        for start in range(0, len(unique_values), _PK_CHUNK):
+            chunk_vals = unique_values[start:start + _PK_CHUNK]
+            value_list = ", ".join(QgsExpression.quotedValue(v) for v in chunk_vals)
+            expr = QgsExpression(f"{escaped_field} IN ({value_list})")
+            if expr.hasParserError():
+                flog(f"build_fid_cache: parse error for {pk_field}: {expr.parserErrorString()}", "WARNING")
+                break
+            request = QgsFeatureRequest(expr)
+            if field_idx >= 0:
+                request.setSubsetOfAttributes([field_idx])
+            request.setFlags(QgisCompat.NO_GEOMETRY)
+            for feat in provider.getFeatures(request):
+                key = (pk_field, str(feat[pk_field]))
+                if key in cache and cache[key] != feat.id():
+                    shared.add(key)
+                cache[key] = feat.id()
 
     for key in shared:
         flog(f"build_fid_cache: key {key[0]}={key[1]!r} is held by several "

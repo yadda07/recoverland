@@ -62,7 +62,9 @@ def _install_inprocess(pip_name: str) -> bool:
         cmd = InstallCommand("install", "Install packages.")
         ret = cmd.main(["--user", "--quiet", "--quiet", pip_name])
         return ret == 0
-    except Exception as exc:  # noqa: BLE001
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - pip may raise SystemExit
         _log.debug("RecoverLand.deps: in-process pip failed: %s", exc)
         return False
 
@@ -75,7 +77,9 @@ def _install_inprocess_target(pip_name: str) -> bool:
         cmd = InstallCommand("install", "Install packages.")
         ret = cmd.main(["--target", _VENDOR_DIR, "--quiet", "--quiet", pip_name])
         return ret == 0
-    except Exception as exc:  # noqa: BLE001
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - pip may raise SystemExit
         _log.debug("RecoverLand.deps: in-process target pip failed: %s", exc)
         return False
 
@@ -137,14 +141,18 @@ def _notify_user(failures: list) -> None:
             return
 
         names = ", ".join(failures)
+        if sys.platform == "win32":
+            install_hint = f"dans l'OSGeo4W Shell : python -m pip install --user {names}"
+        else:
+            install_hint = (
+                f"dans la console Python de QGIS : import subprocess, sys; "
+                f"subprocess.check_call([sys.executable, '-m', 'pip', "
+                f"'install', '--user', '{names}'])"
+            )
         msg = (
             f"RecoverLand : {names} non disponible. "
             f"Le plugin fonctionne normalement. "
-            f"Pour une securite XML optimale, executez dans la "
-            f"console Python de QGIS : "
-            f"import subprocess, sys; "
-            f"subprocess.check_call([sys.executable, '-m', 'pip', "
-            f"'install', '--user', '{names}'])"
+            f"Pour une securite XML optimale, executez {install_hint}"
         )
 
         def _show():

@@ -88,59 +88,82 @@ class IntegrityResult(NamedTuple):
     issues: List[str]
     recovered_events: int
     pending_rejected: int = 0
+    is_corrupt: bool = False
+
+
+def _is_corruption_error(exc: sqlite3.Error) -> bool:
+    """True when *exc* indicates structural SQLite corruption (never busy/ro/full)."""
+    name = str(getattr(exc, "sqlite_errorname", "") or "").upper()
+    if name.startswith(("SQLITE_CORRUPT", "SQLITE_NOTADB")):
+        return True
+    if name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED", "SQLITE_READONLY",
+                        "SQLITE_FULL", "SQLITE_IOERR", "SQLITE_CANTOPEN",
+                        "SQLITE_PERM")):
+        return False
+    msg = str(exc).lower()
+    return ("malformed" in msg
+            or "file is not a database" in msg
+            or "file is encrypted or is not a database" in msg)
 
 
 def check_journal_integrity(db_path: str, trace_id: str = "") -> IntegrityResult:
     """Run all integrity checks on a journal file.
 
-    Returns IntegrityResult with health status and any issues found.
+    Returns IntegrityResult with health status, corruption classification,
+    and any issues found.
     """
     issues: List[str] = []
     recovered = 0
     rejected = 0
+    corrupt = False
 
     with timed_op("check_journal_integrity", trace_id):
         db_path = when_needed(db_path)
         if not os.path.isfile(db_path):
-            return IntegrityResult(False, ["Journal file not found"], 0)
+            return IntegrityResult(False, ["Journal file not found"], 0, 0, False)
 
         conn = None
         try:
             conn = sqlite3.connect(db_path)
-            apply_pragmas(conn)
+            from .sqlite_schema import _is_writable
+            writable = _is_writable(conn)
+            apply_pragmas(conn, read_only=not writable)
 
-            _check_sqlite_integrity(conn, issues)
-            corrupt = any(i.startswith("Integrity check failed") for i in issues)
-            _check_wal_state(conn, issues)
+            corrupt = _check_sqlite_integrity(conn, issues)
+            if writable and not corrupt:
+                _check_wal_state(conn, issues)
             _check_schema_version(conn, issues)
-            _check_logical_integrity(conn, issues)
+            if not corrupt:
+                _check_logical_integrity(conn, issues)
             if corrupt:
-                # Importing the last copy of accepted edits into a file that
-                # is about to be renamed aside as corrupt buries them where
-                # nothing reads them. Keep the pending file for the journal
-                # that will actually be used.
                 issues.append("Pending events file kept: the journal failed "
                               "its integrity check")
-            else:
+            elif writable:
                 recovered, rejected = _recover_pending_events(db_path, conn, issues)
 
         except sqlite3.Error as e:
+            if _is_corruption_error(e):
+                corrupt = True
             issues.append(f"Cannot open journal: {e}")
         finally:
             if conn:
                 conn.close()
 
-    is_healthy = len(issues) == 0
-    return IntegrityResult(is_healthy, issues, recovered, rejected)
+    is_healthy = len(issues) == 0 and not corrupt
+    return IntegrityResult(is_healthy, issues, recovered, rejected, corrupt)
 
 
-def _check_sqlite_integrity(conn: sqlite3.Connection, issues: List[str]) -> None:
+def _check_sqlite_integrity(conn: sqlite3.Connection, issues: List[str]) -> bool:
+    """Run PRAGMA integrity_check(1). Returns True when corruption is detected."""
     try:
-        result = conn.execute("PRAGMA integrity_check").fetchone()
+        result = conn.execute("PRAGMA integrity_check(1)").fetchone()
         if result and result[0] != "ok":
             issues.append(f"Integrity check failed: {result[0]}")
+            return True
+        return False
     except sqlite3.Error as e:
         issues.append(f"Integrity check error: {e}")
+        return _is_corruption_error(e)
 
 
 def _check_wal_state(conn: sqlite3.Connection, issues: List[str]) -> None:
@@ -175,8 +198,9 @@ def _check_orphan_restored_events(conn: sqlite3.Connection, issues: List[str]) -
         row = conn.execute(
             "SELECT COUNT(*) FROM audit_event"
             " WHERE restored_from_event_id IS NOT NULL"
-            "   AND restored_from_event_id NOT IN"
-            "       (SELECT event_id FROM audit_event WHERE restored_from_event_id IS NULL)"
+            "   AND NOT EXISTS ("
+            "       SELECT 1 FROM audit_event src"
+            "       WHERE src.event_id = audit_event.restored_from_event_id)"
         ).fetchone()
         count = int(row[0] if row else 0)
         if count:
@@ -320,9 +344,18 @@ def _recover_pending_file(pending_path: str, conn: sqlite3.Connection,
             # An empty list is the one shape that provably holds nothing to
             # recover, so removing it is safe and avoids a useless read at
             # every startup.
-            os.remove(pending_path)
+            from .long_paths import win_fs_retry
+            win_fs_retry(os.remove, pending_path)
             return 0, 0
 
+        from .long_paths import win_fs_retry
+        prev_sync = None
+        try:
+            row_sync = conn.execute("PRAGMA synchronous").fetchone()
+            prev_sync = int(row_sync[0]) if row_sync else None
+            conn.execute("PRAGMA synchronous=FULL")
+        except sqlite3.Error:
+            prev_sync = None
         try:
             count, remaining = _insert_pending_events(conn, events)
         except sqlite3.Error as exc:
@@ -333,9 +366,18 @@ def _recover_pending_file(pending_path: str, conn: sqlite3.Connection,
             issues.append(f"Pending events file kept unrecovered "
                           f"(journal write failed: {exc})")
             return 0, 0
+        finally:
+            if prev_sync is not None:
+                try:
+                    conn.execute(f"PRAGMA synchronous={prev_sync}")
+                except sqlite3.Error:
+                    pass
         rejected = len(remaining)
         if remaining:
             _rewrite_pending_events(pending_path, remaining)
+            issues.append(
+                f"{rejected} pending event(s) could not be imported and remain in pending file"
+            )
             flog(
                 f"integrity: recovered {count} pending events, "
                 f"rejected {rejected} (kept in pending file)",
@@ -343,7 +385,7 @@ def _recover_pending_file(pending_path: str, conn: sqlite3.Connection,
             )
             return count, rejected
 
-        os.remove(pending_path)
+        win_fs_retry(os.remove, pending_path)
         flog(f"integrity: recovered {count} pending events")
         return count, 0
 
@@ -357,14 +399,8 @@ def _recover_pending_file(pending_path: str, conn: sqlite3.Connection,
 
 
 def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
-    """Insert recovered events into audit_event table.
-
-    Uses the shared AUDIT_EVENT_INSERT_* constants so the column list
-    stays in lockstep with WriteQueue and the schema definition.
-    """
-    from .journal_writes import ensure_v7_schema
-    # v7: keyed by event_uid, so a pending file replayed twice (a kill
-    # between the COMMIT and the file removal) cannot duplicate an edit.
+    """Insert recovered events into audit_event table."""
+    from .journal_writes import _deterministic_uid, ensure_v7_schema
     sql = "".join((
         "INSERT INTO audit_event (",  # nosec B608: column list is a module constant
         ", ".join(EVENT_WRITE_COLUMNS),
@@ -384,36 +420,39 @@ def _insert_pending_events(conn: sqlite3.Connection, events: list) -> tuple:
                 continue
             try:
                 restored = _restore_event_from_json(dict(evt))
-                # Built from the column list, not hand-written: the previous
-                # literal tuple carried 19 values for 20 columns (it predated
-                # invalidated_at), so every insert raised and was swallowed as
-                # "skip pending event". Driving it off
-                # AUDIT_EVENT_INSERT_COLUMNS keeps it in lockstep with the
-                # schema the next time a column is added.
-                conn.execute(sql, tuple(
-                    restored.get(col, _PENDING_DEFAULTS.get(col))
+                if not restored.get("event_uid"):
+                    restored["event_uid"] = _deterministic_uid(restored)
+                cur = conn.execute(sql, tuple(
+                    restored.get(col) if restored.get(col) is not None
+                    else _PENDING_DEFAULTS.get(col)
                     for col in EVENT_WRITE_COLUMNS
                 ))
-                count += 1
-            except sqlite3.Error as e:
+                if cur.rowcount and cur.rowcount > 0:
+                    count += 1
+            except (sqlite3.Error, ValueError, TypeError) as e:
                 flog(f"integrity: skip pending event: {e}", "WARNING")
                 remaining.append(evt)
     return count, remaining
 
 
 def _atomic_write_json(path: str, payload) -> None:
-    """Write *payload* so that a crash leaves either the old or the new file.
-
-    The previous code opened the pending file in "w" mode and rewrote it:
-    a crash mid-write left a truncated JSON, i.e. every event it held
-    unreadable, including the ones saved by earlier sessions.
-    """
-    tmp = when_needed(f"{path}.tmp-{os.getpid()}")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Write *payload* atomically with Windows AV retry and tmp cleanup."""
+    import threading
+    from .long_paths import win_fs_retry
+    tmp = when_needed(f"{path}.tmp-{os.getpid()}-{threading.get_ident()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        win_fs_retry(os.replace, tmp, path, attempts=6, base_delay=0.05)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                win_fs_retry(os.remove, tmp, attempts=3, base_delay=0.02)
+        except OSError:
+            pass
+        raise
 
 
 def _rewrite_pending_events(pending_path: str, events: list) -> None:
@@ -500,7 +539,7 @@ def get_journal_health_report(db_path: str) -> JournalHealthReport:
         conn = sqlite3.connect(
             sqlite_readonly_uri(db_path), uri=True, check_same_thread=False
         )
-        apply_pragmas(conn)
+        apply_pragmas(conn, read_only=True)
         version = get_schema_version(conn)
         row = conn.execute("SELECT COUNT(*) FROM audit_event").fetchone()
         total_events = row[0] if row else 0
@@ -536,10 +575,14 @@ def _prepare_event_for_json(d: dict) -> dict:
 
 def _restore_event_from_json(d: dict) -> dict:
     """Convert base64-encoded fields back to bytes after JSON deserialization."""
+    import binascii
     for key in ("geometry_wkb", "new_geometry_wkb"):
         wkb = d.get(key)
         if isinstance(wkb, str) and wkb.startswith("b64:"):
-            d[key] = base64.b64decode(wkb[4:])
+            try:
+                d[key] = base64.b64decode(wkb[4:], validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(f"invalid base64 in {key}: {exc}") from exc
     return d
 
 

@@ -222,7 +222,7 @@ def run(ctx):
         out["trace"] = traceback.format_exc()[-1500:]
     ctx.data["out"] = out
     flog(f"rs_journal_entry_points run: trace_id={ctx.trace_id} "
-         f"{ {k: v for k, v in out.items() if k != 'trace'} }")
+         f"{({k: v for k, v in out.items() if k != 'trace'})}")
 
 
 def teardown(ctx):

@@ -79,18 +79,20 @@ v7, milliseconds since), and `instants_match` at the resolution the
 stored side carries: a provider that stores whole seconds holds
 ``14:30:12.000`` for a journaled ``14:30:12.517``.
 """
-import json
 import base64
+import decimal
+import json
 import math
 import re
 from datetime import date, time, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from ..compat import utc_qtimezone
 from .audit_field_policy import is_layer_audit_field  # noqa: F401 re-export
 from .logger import flog
 
 
-_QVARIANT_NULL_TYPES = frozenset(["QVariant", "Invalid"])
+_QVARIANT_NULL_TYPES = frozenset(["Invalid", "QgsUnsetAttributeValue"])
 
 # `event_schema_version` from which date-time digits are UTC (plugin 6.0.0).
 UTC_DIGITS_SCHEMA_VERSION = 6
@@ -198,6 +200,12 @@ def serialize_value(value: Any) -> Any:
     if _is_null(value):
         return None
 
+    if type(value).__name__ == "QVariant":
+        unwrap = getattr(value, "value", None)
+        if callable(unwrap):
+            return serialize_value(unwrap())
+        return None
+
     if isinstance(value, str):
         return scrub_surrogates(value)
 
@@ -214,6 +222,9 @@ def serialize_value(value: Any) -> Any:
         # trace of the substitution. json.dumps/json.loads round-trip them.
         return value
 
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+
     if isinstance(value, datetime):
         # Same contract as a QDateTime (see the module docstring): the
         # fraction is always written, so a naive value is recognisable.
@@ -226,7 +237,7 @@ def serialize_value(value: Any) -> Any:
     if isinstance(value, time):
         return value.isoformat()
 
-    if isinstance(value, (bytes, bytearray)):
+    if isinstance(value, (bytes, bytearray, memoryview)):
         return "b64:" + base64.b64encode(bytes(value)).decode("ascii")
 
     if isinstance(value, (list, tuple)):
@@ -354,23 +365,29 @@ _BLOB_TYPE_NAMES = frozenset([
     "qbytearray", "bytes", "blob", "binary", "varbinary", "bytea",
 ])
 _DATETIME_TYPE_NAMES = frozenset([
-    "qdatetime", "datetime", "datetime2", "timestamp", "timestamptz",
+    "qdatetime", "datetime", "datetime2", "smalldatetime", "datetimeoffset",
+    "timestamp", "timestamptz", "timestampwithouttimezone",
+    "timestampwithtimezone",
 ])
 _DATE_TYPE_NAMES = frozenset(["qdate", "date"])
-_TIME_TYPE_NAMES = frozenset(["qtime", "time"])
+_TIME_TYPE_NAMES = frozenset([
+    "qtime", "time", "timetz", "timewithouttimezone", "timewithtimezone",
+])
 _TEXT_TYPE_NAMES = frozenset([
-    "qstring", "str", "string", "text", "varchar", "char",
-    "charactervarying",
+    "qstring", "str", "string", "text", "varchar", "nvarchar", "char",
+    "nchar", "character", "charactervarying", "clob", "citext", "uuid",
 ])
 _INT_TYPE_NAMES = frozenset([
-    "int", "integer", "integer64", "int2", "int4", "int8",
-    "smallint", "bigint", "qlonglong", "qulonglong",
+    "int", "integer", "integer64", "int2", "int4", "int8", "int64",
+    "tinyint", "smallint", "mediumint", "bigint", "serial", "bigserial",
+    "smallserial", "long", "longlong", "qlonglong", "qulonglong",
+    "uint", "uint64",
 ])
 _REAL_TYPE_NAMES = frozenset([
     "double", "doubleprecision", "float", "float4", "float8", "real",
-    "numeric", "decimal",
+    "numeric", "decimal", "money",
 ])
-_BOOL_TYPE_NAMES = frozenset(["bool", "boolean"])
+_BOOL_TYPE_NAMES = frozenset(["bool", "boolean", "bit"])
 
 # "2026-01-15T13:30:00.517Z" (v7 journal form), "2026-01-15T13:30:00"
 # (schema <= 6), plus the tolerated variants: space separator, any number
@@ -445,19 +462,33 @@ def _stringify(value: Any) -> Any:
 
 
 def _coerce_scalar(value: Any, kind: Any) -> Any:
-    """Return *value* as *kind* when the conversion is safe.
+    """Return *value* as *kind* when the conversion is safe and lossless.
 
-    ``type(value) is kind`` on purpose, not ``isinstance``: a bool IS an
-    int in Python, and silently turning True into 1 (or 1 into True) is
-    exactly the confusion the delta computation guards against.
-    Non-numeric input is handed back untouched rather than forced.
+    Never coerces a ``bool`` to ``int``/``float`` or an arbitrary ``int``
+    other than 0/1 to ``bool``, and never silently truncates a non-integer
+    ``float`` to ``int``.
     """
     if type(value) is kind:
         return value
-    if isinstance(value, (bool, int, float)):
+    if kind is bool:
+        if type(value) is int and value in (0, 1):
+            return bool(value)
+        return value
+    if isinstance(value, bool):
+        return value
+    if kind is int:
+        if type(value) is float:
+            if math.isfinite(value) and value.is_integer():
+                try:
+                    return int(value)
+                except (OverflowError, ValueError):
+                    return value
+            return value
+        return value
+    if kind is float and type(value) is int:
         try:
-            return kind(value)
-        except (TypeError, ValueError, OverflowError):
+            return float(value)
+        except (OverflowError, ValueError):
             return value
     return value
 
@@ -478,7 +509,7 @@ def _deserialize_blob(value: Any) -> Any:
             flog("deserialize: undecodable b64 payload left as text "
                  f"(len={len(value)})", "WARNING")
             return value
-    if isinstance(value, (bytes, bytearray)):
+    if isinstance(value, (bytes, bytearray, memoryview)):
         return _as_binary(bytes(value))
     return value
 
@@ -559,7 +590,7 @@ def _qdatetime_in_spec(qdate, qtime, spec: str):
     if spec == SPEC_LOCAL:
         return QDateTime(qdate, qtime)
     if spec == SPEC_UTC:
-        return QDateTime(qdate, qtime, QTimeZone(QTimeZone.Initialization.UTC))
+        return QDateTime(qdate, qtime, utc_qtimezone())
     if spec.startswith("tz:"):
         zone = QTimeZone(spec[3:].encode("ascii", "replace"))
         if not zone.isValid():
@@ -726,7 +757,7 @@ def _qtimezone_for_suffix(suffix: str):
         return None
     try:
         if suffix in ("Z", "z"):
-            return QTimeZone(QTimeZone.Initialization.UTC)
+            return utc_qtimezone()
         offset = _utc_offset_seconds(suffix)
         factory = getattr(QTimeZone, "fromSecondsAheadOfUtc", None)
         return factory(offset) if factory is not None else QTimeZone(offset)
@@ -1116,6 +1147,24 @@ def _is_datetime_field(fields, idx: int) -> bool:
         return False
 
 
+def _is_non_writable_field(fields, idx: int) -> bool:
+    """True when field *idx* is joined, virtual/expression, or read-only."""
+    try:
+        origin = fields.fieldOrigin(idx)
+        code = int(getattr(origin, "value", origin))
+        # QgsFields.FieldOrigin: 2=Join, 4=Expression (virtual).
+        if code in (2, 4):
+            return True
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        if fields.at(idx).isReadOnly():
+            return True
+    except (AttributeError, RuntimeError):
+        pass
+    return False
+
+
 def iter_mapped_attributes(mapping: Dict[str, str], attrs: Dict, fields,
                            event_schema_version: Any = _UNSPECIFIED,
                            time_specs: Optional[ProviderTimeSpecs] = None):
@@ -1164,7 +1213,7 @@ def iter_mapped_attributes(mapping: Dict[str, str], attrs: Dict, fields,
         if is_layer_audit_field(hist_name):
             continue
         idx = fields.indexOf(curr_name)
-        if idx < 0:
+        if idx < 0 or _is_non_writable_field(fields, idx):
             _skipped.append(curr_name)
             continue
         value = attrs[hist_name]
@@ -1231,4 +1280,12 @@ def _values_equal(val_a: Any, val_b: Any) -> bool:
         if math.isnan(val_a) and math.isnan(val_b):
             return True
         return val_a == val_b
+    if isinstance(val_a, (list, tuple)) and isinstance(val_b, (list, tuple)):
+        if len(val_a) != len(val_b):
+            return False
+        return all(_values_equal(a, b) for a, b in zip(val_a, val_b))
+    if isinstance(val_a, dict) and isinstance(val_b, dict):
+        if len(val_a) != len(val_b) or val_a.keys() != val_b.keys():
+            return False
+        return all(_values_equal(val_a[k], val_b[k]) for k in val_a)
     return val_a == val_b

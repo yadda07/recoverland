@@ -60,6 +60,11 @@ _EXPORT_INFO_TABLE = "recoverland_etat_info"
 
 _SNAP_META_FIELD_NAMES = frozenset(n for n, _t in _SNAP_META_FIELDS)
 
+# Refcounted ShowLegend defer state so overlapping async_create sessions never
+# snapshot an already-deferred flag set as the original flags.
+_LEGEND_DEFER_DEPTH = 0
+_LEGEND_SAVED_FLAGS = None
+
 
 def _is_managed_layer(layer_id: str, layer) -> bool:
     """True when *layer* is a Review memory overlay (ours or a legacy orphan)."""
@@ -173,6 +178,10 @@ class SnapshotOverlaySession:
         # Overlays taken out of the project while it is being saved.
         self._taken_for_save: list = []
         self._write_hooked: bool = False
+        self._clear_hooked: bool = False
+        self._create_gen: int = 0
+        self._legend_gen: int = 0
+        self._pending_thaw = None
 
     @property
     def is_active(self) -> bool:
@@ -204,6 +213,43 @@ class SnapshotOverlaySession:
                 flog(f"[{self.trace_id}] snapshot_overlay: writeProject "
                      f"disconnect skipped ({exc!r})", "DEBUG")
             self._write_hooked = False
+        clear_sig = getattr(project, "aboutToBeCleared", None) or getattr(project, "cleared", None)
+        if on and not self._clear_hooked and clear_sig is not None:
+            try:
+                clear_sig.connect(self._on_project_cleared)
+                self._clear_hooked = True
+            except (TypeError, RuntimeError):
+                pass
+        elif not on and self._clear_hooked and clear_sig is not None:
+            try:
+                clear_sig.disconnect(self._on_project_cleared)
+            except (TypeError, RuntimeError):
+                pass
+            self._clear_hooked = False
+
+    def _on_project_cleared(self) -> None:
+        """Drop save-deferred overlays if project clears before restore fires."""
+        self._taken_for_save = []
+        self._run_pending_thaw()
+        self._active = False
+        self._create_gen += 1
+        self._legend_gen += 1
+        self._update_gen += 1
+        self._update_done_gen = self._update_gen
+        self._hook_project_write(False)
+        _CARRIERS.close()
+        self._overlays.clear()
+        try:
+            from ..widgets.snapshot_rebuild_worker import clear_envelope_memo
+            clear_envelope_memo()
+        except (ImportError, RuntimeError):
+            pass
+
+    def _run_pending_thaw(self) -> None:
+        thaw = self._pending_thaw
+        self._pending_thaw = None
+        if callable(thaw):
+            thaw()
 
     def _resolve_overlay_layer(self, fp: str, ovl: _SnapOverlay):
         """Live memory overlay for *ovl*, or None if missing / made permanent."""
@@ -411,9 +457,13 @@ class SnapshotOverlaySession:
         Calls on_done() once all layers are created. The UI stays responsive
         because each _create_overlay() call is deferred via QTimer.singleShot(0).
         """
+        global _LEGEND_DEFER_DEPTH, _LEGEND_SAVED_FLAGS
         from qgis.PyQt.QtCore import QTimer  # noqa: PLC0415
 
+        self._run_pending_thaw()
         self.start(layer_infos, dst_crs, trace_id)
+        self._create_gen += 1
+        create_gen = self._create_gen
         pending = list(layer_infos)
         total = len(pending)
         created = [0]
@@ -434,30 +484,25 @@ class SnapshotOverlaySession:
             canvas = None
 
         # Defer legend construction by disabling ShowLegend flag on the
-        # layer tree model. This prevents QgsLayerTreeModel from building
-        # legend icons synchronously on layer insertion (which triggers
-        # network probes for SVG styles, causing 9-11s gaps per layer).
-        # The flag is restored after creation, then legends are rebuilt
-        # chunked via refreshLayerLegend() to measure the actual cost.
+        # layer tree model. Refcounted globally so overlapping sessions never
+        # overwrite saved flags with already-cleared flags.
         model = None
-        original_flags = None
+        legend_deferred = False
         try:
             from qgis.utils import iface  # noqa: PLC0415
             from qgis.core import QgsLayerTreeModel  # noqa: PLC0415
             if iface is not None:
                 model = iface.layerTreeView().layerTreeModel()
                 if model is not None:
-                    original_flags = model.flags()
-                    # Resolve ShowLegend enum safely across QGIS versions
+                    cur_flags = model.flags()
                     flag_ns = getattr(QgsLayerTreeModel, "Flag", QgsLayerTreeModel)
                     show_legend = getattr(flag_ns, "ShowLegend", None)
                     if show_legend is not None:
-                        # clear_flag, not `original_flags & ~show_legend`: on
-                        # PyQt6 that expression collapses to a bare int and
-                        # setFlags rejects it, which silently disabled this
-                        # whole optimisation on QGIS 4 (the TypeError was
-                        # swallowed by the except below).
-                        model.setFlags(clear_flag(original_flags, show_legend))
+                        model.setFlags(clear_flag(cur_flags, show_legend))
+                        if _LEGEND_DEFER_DEPTH == 0:
+                            _LEGEND_SAVED_FLAGS = cur_flags
+                        _LEGEND_DEFER_DEPTH += 1
+                        legend_deferred = True
                         flog(
                             f"[{trace_id}] snapshot_overlay: legend_defer applied "
                             f"n_layers={total} mode=show_legend_flag",
@@ -470,53 +515,57 @@ class SnapshotOverlaySession:
                             "WARNING",
                         )
                         model = None
-                        original_flags = None
         except Exception as exc:  # noqa: BLE001
-            # ERROR, not WARNING: this branch is how a cross-version break in
-            # the flag arithmetic stayed invisible for a whole release. The
-            # feature degrades silently, so the log line is the only signal.
             flog(
                 f"[{trace_id}] snapshot_overlay: legend_defer_unavailable "
                 f"reason={type(exc).__name__} msg={exc}",
                 "ERROR",
             )
             model = None
-            original_flags = None
+
+        thawed = [False]
 
         def _thaw() -> None:
+            global _LEGEND_DEFER_DEPTH, _LEGEND_SAVED_FLAGS
+            if thawed[0]:
+                return
+            thawed[0] = True
+            if self._pending_thaw is _thaw:
+                self._pending_thaw = None
             if canvas is not None:
                 try:
                     canvas.freeze(False)
                 except Exception as exc:  # noqa: BLE001
-                    # WARNING: the canvas is left frozen, so the map stops
-                    # repainting for the rest of the session.
                     flog(
                         f"[{self.trace_id}] snapshot_overlay: thaw failed, "
                         f"canvas may stay frozen ({exc!r})",
                         "WARNING",
                     )
-            if model is not None and original_flags is not None:
-                try:
-                    model.setFlags(original_flags)
-                    flog(
-                        f"[{self.trace_id}] snapshot_overlay: legend_defer restored",
-                        "DEBUG",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # WARNING: the legend keeps the deferred flags, so it
-                    # stops reflecting later layer changes.
-                    flog(
-                        f"[{self.trace_id}] snapshot_overlay: legend flag "
-                        f"restore failed, legend stays deferred ({exc!r})",
-                        "WARNING",
-                    )
+            if legend_deferred and model is not None:
+                _LEGEND_DEFER_DEPTH = max(0, _LEGEND_DEFER_DEPTH - 1)
+                if _LEGEND_DEFER_DEPTH == 0 and _LEGEND_SAVED_FLAGS is not None:
+                    saved = _LEGEND_SAVED_FLAGS
+                    _LEGEND_SAVED_FLAGS = None
+                    try:
+                        model.setFlags(saved)
+                        flog(
+                            f"[{self.trace_id}] snapshot_overlay: legend_defer restored",
+                            "DEBUG",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        flog(
+                            f"[{self.trace_id}] snapshot_overlay: legend flag "
+                            f"restore failed, legend stays deferred ({exc!r})",
+                            "WARNING",
+                        )
 
+        self._pending_thaw = _thaw
         last_end = [time.monotonic()]
 
         def _step() -> None:
             t_begin = time.monotonic()
             queue_gap_ms = int((t_begin - last_end[0]) * 1000)
-            if not self._active:
+            if create_gen != self._create_gen or not self._active:
                 _thaw()
                 flog(
                     f"[{self.trace_id}] snapshot_overlay: async_create "
@@ -532,10 +581,8 @@ class SnapshotOverlaySession:
                     f"created={created[0]}/{total}",
                     "INFO",
                 )
-                # Call on_done immediately to allow snapshot data population
                 on_done()
-                # Start chunked legend refresh independently (does not call on_done)
-                if model is not None and original_flags is not None:
+                if legend_deferred:
                     self._refresh_legends_chunked(trace_id)
                 return
             info = pending.pop(0)
@@ -599,6 +646,8 @@ class SnapshotOverlaySession:
         layer_id_to_name = {ovl.layer_id: ovl.layer_name for ovl in self._overlays.values()}
 
         # Collect overlay layer IDs in creation order
+        self._legend_gen += 1
+        leg_gen = self._legend_gen
         overlay_ids = [ovl.layer_id for ovl in self._overlays.values()]
         pending = list(overlay_ids)
         total = len(pending)
@@ -608,7 +657,7 @@ class SnapshotOverlaySession:
         def _step() -> None:
             t_begin = time.monotonic()
             queue_gap_ms = int((t_begin - last_end[0]) * 1000)
-            if not self._active:
+            if leg_gen != self._legend_gen or not self._active:
                 flog(
                     f"[{trace_id}] snapshot_overlay: legend_refresh aborted "
                     f"refreshed={refreshed[0]}/{total}",
@@ -821,10 +870,13 @@ class SnapshotOverlaySession:
 
     def stop(self) -> None:
         """Remove all overlay layers and clean up the group."""
+        self._run_pending_thaw()
         if not self._active:
             return
         tid = self.trace_id
         self._active = False
+        self._create_gen += 1
+        self._legend_gen += 1
         self._update_gen += 1
         self._update_done_gen = self._update_gen
         self._hook_project_write(False)
@@ -835,6 +887,11 @@ class SnapshotOverlaySession:
         self._remove_layers()
         n = len(self._overlays)
         self._overlays.clear()
+        try:
+            from ..widgets.snapshot_rebuild_worker import clear_envelope_memo
+            clear_envelope_memo()
+        except (ImportError, RuntimeError):
+            pass
         flog(
             f"[{tid}] snapshot_overlay: stopped freed_layers={n}",
             "INFO",
@@ -942,9 +999,14 @@ class SnapshotOverlaySession:
             "meta", "memory")
         provider = lyr.dataProvider()
         skipped = []
+        seen_names = set()
         for field in list(source_layer.fields()) + list(meta.fields()):
+            fname = field.name()
+            if fname in seen_names:
+                continue
+            seen_names.add(fname)
             if not provider.addAttributes([QgsField(field)]):
-                skipped.append(field.name())
+                skipped.append(fname)
         lyr.updateFields()
         if skipped:
             flog(
@@ -1035,7 +1097,11 @@ class SnapshotOverlaySession:
             lyr.updateExtents()
             fc = lyr.featureCount()
         finally:
-            lyr.blockSignals(False)
+            if lyr is not None:
+                try:
+                    lyr.blockSignals(False)
+                except RuntimeError:
+                    pass
 
         if total_built and total_accepted != total_built:
             flog(
@@ -1307,6 +1373,8 @@ class SnapshotOverlaySession:
         could not be done, for the caller's error list.
         """
         from qgis.core import QgsGeometry  # noqa: PLC0415
+        if not src_lyr.isSpatial() or not written.isSpatial():
+            return ""
         ranks = [i for i, f in enumerate(src_lyr.getFeatures())
                  if not f.hasGeometry()]
         if not ranks:
@@ -1514,57 +1582,52 @@ class SnapshotOverlaySession:
     def _detect_geom_family(self, source_layer) -> Optional[str]:
         """Return geometry URI token from layer wkbType - O(1), no I/O.
 
-        Returns the *Multi* variant when the source uses multi-part
-        geometries.  A memory layer created as ``"Point"`` silently
-        rejects MultiPoint features from ``addFeatures``, which causes
-        massive data loss on common Multi* source layers.
-
-        Resolution order (QGIS 3.40 → 4.x compat):
-        1. ``wkbType()`` → raw WKB code → Multi detection + base family.
-        2. ``geometryType()`` enum fallback (loses Multi info).
+        Preserves Multi, Z/M (including 25D), and NoGeometry ("None") so
+        memory overlays match the source layer schema without data loss.
         """
-        _BASE = {0: "Point", 1: "LineString", 2: "Polygon"}
-        _MULTI = {0: "MultiPoint", 1: "MultiLineString", 2: "MultiPolygon"}
-        _WKB_MULTI_CODES = frozenset({4, 5, 6, 11, 12, 1004, 1005, 1006,
-                                      2004, 2005, 2006, 3004, 3005, 3006})
+        from ..compat import QgisCompat  # noqa: PLC0415
 
-        is_multi = False
-        try:
-            raw_wkb = int(source_layer.wkbType())
-            base_code = raw_wkb % 1000
-            if base_code in _WKB_MULTI_CODES:
-                is_multi = True
-        except Exception as exc:  # noqa: BLE001
-            # WARNING: losing Multi detection is the data-loss path this
-            # method's docstring describes -- a "Point" memory layer drops
-            # every MultiPoint feature silently.
-            flog(
-                f"[{self.trace_id}] snapshot_overlay: wkbType probe failed, "
-                f"Multi detection lost for this overlay ({exc!r})",
-                "WARNING",
-            )
-
-        try:
-            gtype = int(source_layer.geometryType())
-            family = (_MULTI if is_multi else _BASE).get(gtype)
-            if family:
-                return family
-        except Exception as exc:  # noqa: BLE001
-            flog(
-                f"[{self.trace_id}] snapshot_overlay: geometryType probe "
-                f"failed, trying QgsWkbTypes ({exc!r})",
-                "DEBUG",
-            )
-
+        _BASE = {
+            QgisCompat.GEOM_POINT: "Point",
+            QgisCompat.GEOM_LINE: "LineString",
+            QgisCompat.GEOM_POLYGON: "Polygon",
+        }
+        _MULTI = {
+            QgisCompat.GEOM_POINT: "MultiPoint",
+            QgisCompat.GEOM_LINE: "MultiLineString",
+            QgisCompat.GEOM_POLYGON: "MultiPolygon",
+        }
         try:
             from qgis.core import QgsWkbTypes  # noqa: PLC0415
-            gtype = int(QgsWkbTypes.geometryType(source_layer.wkbType()))
-            return (_MULTI if is_multi else _BASE).get(gtype)
+            wkb_type = source_layer.wkbType()
+            gtype = QgsWkbTypes.geometryType(wkb_type)
+            if gtype == QgisCompat.GEOM_NULL:
+                return "None"
+            if QgsWkbTypes.isCurvedType(wkb_type):
+                disp = QgsWkbTypes.displayString(wkb_type)
+                if disp and disp != "Unknown":
+                    return disp
+            is_multi = bool(QgsWkbTypes.isMultiType(wkb_type))
+            base = (_MULTI if is_multi else _BASE).get(gtype)
+            if base:
+                suffix = ("Z" if QgsWkbTypes.hasZ(wkb_type) else "") + (
+                    "M" if QgsWkbTypes.hasM(wkb_type) else ""
+                )
+                return base + suffix
         except Exception as exc:  # noqa: BLE001
-            # WARNING: returning None means no overlay layer for this
-            # source, so its snapshot features are simply not shown.
             flog(
-                f"[{self.trace_id}] snapshot_overlay: QgsWkbTypes fallback "
+                f"[{self.trace_id}] snapshot_overlay: wkbType probe failed, "
+                f"falling back to geometryType ({exc!r})",
+                "WARNING",
+            )
+        try:
+            gtype = source_layer.geometryType()
+            if gtype == QgisCompat.GEOM_NULL:
+                return "None"
+            return _BASE.get(gtype)
+        except Exception as exc:  # noqa: BLE001
+            flog(
+                f"[{self.trace_id}] snapshot_overlay: geometryType fallback "
                 f"failed, no geometry family for this overlay ({exc!r})",
                 "WARNING",
             )
@@ -1830,9 +1893,8 @@ class _LayerWatch:
         self._crs: dict = {}
         for ds_fp, info in info_by_fp.items():
             layer = project.mapLayer(info.get("layer_id", ""))
-            key = _crs_key(layer) if layer is not None else ""
-            if layer is not None and key:
-                self._crs[ds_fp] = key
+            if layer is not None:
+                self._crs[ds_fp] = _crs_key(layer)
 
     def now(self, ds_fp: str):
         """The layer of *ds_fp* as it is now, None if absent from the start."""

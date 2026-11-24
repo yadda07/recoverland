@@ -96,27 +96,34 @@ def _entity_distribution(conn: sqlite3.Connection):
     """Return (total_entities, distribution dict).
 
     Distribution buckets: '1', '2-5', '6-10', '11-50', '51+'.
+    Bucketed directly in SQL so large journals do not load every entity
+    into Python memory.
     """
     rows = conn.execute(
-        "SELECT entity_fingerprint, COUNT(*) as cnt"
-        " FROM audit_event"
-        " WHERE restored_from_event_id IS NULL"
-        "   AND entity_fingerprint IS NOT NULL"
-        " GROUP BY entity_fingerprint"
+        "SELECT bucket, COUNT(*) FROM ("
+        "  SELECT CASE"
+        "    WHEN cnt = 1 THEN '1'"
+        "    WHEN cnt <= 5 THEN '2-5'"
+        "    WHEN cnt <= 10 THEN '6-10'"
+        "    WHEN cnt <= 50 THEN '11-50'"
+        "    ELSE '51+'"
+        "  END AS bucket"
+        "  FROM ("
+        "    SELECT COUNT(*) AS cnt"
+        "    FROM audit_event"
+        "    WHERE restored_from_event_id IS NULL"
+        "      AND entity_fingerprint IS NOT NULL"
+        "    GROUP BY entity_fingerprint"
+        "  )"
+        ") GROUP BY bucket"
     ).fetchall()
-    total = len(rows)
     buckets = {"1": 0, "2-5": 0, "6-10": 0, "11-50": 0, "51+": 0}
-    for _, cnt in rows:
-        if cnt == 1:
-            buckets["1"] += 1
-        elif cnt <= 5:
-            buckets["2-5"] += 1
-        elif cnt <= 10:
-            buckets["6-10"] += 1
-        elif cnt <= 50:
-            buckets["11-50"] += 1
-        else:
-            buckets["51+"] += 1
+    total = 0
+    for key, cnt in rows:
+        n = int(cnt or 0)
+        if key in buckets:
+            buckets[key] = n
+        total += n
     return total, buckets
 
 
@@ -169,16 +176,17 @@ def _schema_json_stats(conn: sqlite3.Connection):
     ).fetchone()
     total_bytes = int(row[0] or 0)
     distinct_count = int(row[1] or 0)
-    avg_len_row = conn.execute(
-        "SELECT AVG(LENGTH(field_schema_json))"
-        " FROM audit_event"
-        " WHERE restored_from_event_id IS NULL"
-        "   AND field_schema_json IS NOT NULL"
+    distinct_row = conn.execute(
+        "SELECT COALESCE(SUM(LENGTH(field_schema_json)), 0)"
+        " FROM ("
+        "   SELECT DISTINCT field_schema_json"
+        "   FROM audit_event"
+        "   WHERE restored_from_event_id IS NULL"
+        "     AND field_schema_json IS NOT NULL"
+        " )"
     ).fetchone()
-    avg_len = float(avg_len_row[0] or 0) if avg_len_row else 0.0
-    dedup_bytes = total_bytes - int(avg_len * distinct_count)
-    if dedup_bytes < 0:
-        dedup_bytes = 0
+    distinct_bytes = int(distinct_row[0] or 0) if distinct_row else 0
+    dedup_bytes = max(0, total_bytes - distinct_bytes)
     return total_bytes, distinct_count, dedup_bytes
 
 

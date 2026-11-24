@@ -236,7 +236,7 @@ def run(ctx):
         conn.close()
     ctx.data["out"] = out
     flog(f"rs_mode_a_double_restore run: trace_id={ctx.trace_id} "
-         f"out={ {k: v for k, v in out.items() if k != 'trace'} }")
+         f"out={({k: v for k, v in out.items() if k != 'trace'})}")
 
 
 def teardown(ctx):

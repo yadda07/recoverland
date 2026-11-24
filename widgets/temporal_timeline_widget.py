@@ -36,7 +36,7 @@ from qgis.PyQt.QtGui import (
 )
 from qgis.PyQt.QtWidgets import QToolTip, QWidget
 
-from ..compat import QtCompat
+from ..compat import QtCompat, mouse_event_pos
 from ..core.logger import flog
 from ..core.time_format import journal_now, parse_iso_date
 from .icons import couleur_etat
@@ -398,7 +398,6 @@ class TemporalTimelineWidget(QWidget):
         fm = QFontMetrics(font)
         align = int(QtCompat.ALIGN_HCENTER) | int(QtCompat.ALIGN_TOP)
         last_right = -10000
-        drawn = 0
         visible = self._deduplicate_marker_ticks([
             dt for dt in (self._marker_ticks or [])
             if self._view_start <= dt <= self._view_end
@@ -416,13 +415,6 @@ class TemporalTimelineWidget(QWidget):
             p.drawLine(int(lx), top_y, int(lx), top_y + 5)
             p.drawText(QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4), align, label)
             last_right = lleft + lw
-            drawn += 1
-        flog(
-            f"timeline: paint_ruler_marker_mode total_ticks={len(self._marker_ticks or [])} "
-            f"visible_ticks={len(visible)} drawn={drawn} "
-            f"view={self._view_start.isoformat()}..{self._view_end.isoformat()}",
-            "DEBUG",
-        )
 
     def _paint_calendar_ticks(self, p: QPainter, top_y: int, major) -> None:
         t = resolve_theme(self)
@@ -430,7 +422,6 @@ class TemporalTimelineWidget(QWidget):
         fm = QFontMetrics(p.font())
         align = int(QtCompat.ALIGN_HCENTER) | int(QtCompat.ALIGN_TOP)
         last_right = -10000
-        drawn = 0
         for tdt in _iter_ticks(self._view_start, self._view_end, major):
             lx = self._dt_to_x(tdt)
             if lx < x0 - 1 or lx > x0 + tw + 1:
@@ -444,8 +435,6 @@ class TemporalTimelineWidget(QWidget):
             p.drawLine(int(lx), top_y, int(lx), top_y + 5)
             p.drawText(QRect(int(lx) - 40, top_y + 4, 80, _RULER_H - 4), align, label)
             last_right = lleft + lw
-            drawn += 1
-        flog(f"timeline: paint_ruler_calendar_mode major={major[0]}-{major[1]} drawn={drawn}", "DEBUG")
 
     def _paint_crosshair(self, p: QPainter) -> None:
         if self._hover_pos is None or self._dragging or self._panning:
@@ -512,21 +501,25 @@ class TemporalTimelineWidget(QWidget):
     # ------------------------------------------------------------------ #
 
     def mousePressEvent(self, event) -> None:
+        if self._full_start is None or self._full_end is None:
+            return
+        pos = mouse_event_pos(event)
         btn = event.button()
         if btn == QtCompat.LEFT_BUTTON:
             self._dragging = True
-            x = event.pos().x()
+            x = pos.x()
             snapped = self._try_snap(x)
             if not snapped:
                 self._move_to_x(x, emit=True)
             flog(f"timeline: press x={x} snapped={snapped}", "DEBUG")
         elif btn in (QtCompat.RIGHT_BUTTON, QtCompat.MIDDLE_BUTTON):
             self._panning = True
-            self._pan_last_x = event.pos().x()
+            self._pan_last_x = pos.x()
             self.setCursor(QtCompat.CLOSED_HAND_CURSOR)
 
     def mouseMoveEvent(self, event) -> None:
-        x = event.pos().x()
+        pos = mouse_event_pos(event)
+        x = pos.x()
         self._hover_pos = x
         if self._panning and self._pan_last_x is not None:
             self._pan_by(self._pan_last_x - x)
@@ -542,7 +535,7 @@ class TemporalTimelineWidget(QWidget):
                 self._hover_iso = iso
                 if iso:
                     QToolTip.showText(
-                        self.mapToGlobal(event.pos()),
+                        self.mapToGlobal(pos),
                         _format_tooltip(iso),
                         self,
                     )
@@ -559,7 +552,7 @@ class TemporalTimelineWidget(QWidget):
             self.unsetCursor()
 
     def mouseDoubleClickEvent(self, event) -> None:
-        x = event.pos().x()
+        x = mouse_event_pos(event).x()
         iso = self._marker_at_x(x)
         if iso:
             self.set_value_iso(iso)
@@ -651,6 +644,8 @@ class TemporalTimelineWidget(QWidget):
         return best_iso
 
     def _zoom_at(self, x: int, factor: float) -> None:
+        if self._full_start is None or self._full_end is None:
+            return
         a, b = self._view_bounds_sec()
         x0, _, w, _ = self._track_rect()
         frac = max(0.0, min(1.0, (x - x0) / max(1, w)))
@@ -675,7 +670,7 @@ class TemporalTimelineWidget(QWidget):
         self.update()
 
     def _pan_by(self, dx_px: int) -> None:
-        if dx_px == 0:
+        if dx_px == 0 or self._full_start is None or self._full_end is None:
             return
         a, b = self._view_bounds_sec()
         _, _, w, _ = self._track_rect()

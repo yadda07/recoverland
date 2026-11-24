@@ -16,10 +16,10 @@ All QGIS object access happens on the main thread.
 Serialized data is passed to the write queue for async persistence.
 """
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List
 
-from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer
+from qgis.PyQt.QtCore import QObject, pyqtSignal, QThread, QTimer
 
 from .audit_backend import AuditEvent
 from .edit_buffer import (
@@ -38,7 +38,8 @@ from .serialization import (
     compute_update_delta, build_full_snapshot,
 )
 from .support_policy import (
-    evaluate_layer_support, SupportLevel, IdentityStrength,
+    evaluate_layer_support, is_ephemeral_layer, is_managed_overlay_layer,
+    SupportLevel, IdentityStrength,
 )
 from .user_identity import resolve_user_name
 from .logger import flog
@@ -204,6 +205,8 @@ class EditSessionTracker:
         self._suppress_depth = 0
         layers = dict(self._suppressed_layers)
         self._suppressed_layers.clear()
+        self.__dict__.get("_unconditional_suppressed_layers", {}).clear()
+        self.__dict__.get("_runner_managed_counts", {}).clear()
         self.__dict__.get("_runner_managed_layers", set()).clear()
         self.__dict__.get("_runner_step_layers", {}).clear()
         if prev > 0 or layers:
@@ -218,27 +221,71 @@ class EditSessionTracker:
         A restore only needs its own writes kept out of the journal.
         Reentrant per layer; pair with unsuppress_layers.
         """
+        uncond = self.__dict__.setdefault("_unconditional_suppressed_layers", {})
         for lid in layer_ids or ():
             if lid:
                 self._suppressed_layers[lid] = self._suppressed_layers.get(lid, 0) + 1
+                uncond[lid] = uncond.get(lid, 0) + 1
         flog(f"EditSessionTracker: layers suppressed {sorted(self._suppressed_layers)}")
 
     def suppress_runner_layer(self, layer_id: str) -> None:
         """Suppress capture on *layer_id* for a chunked runner (only during steps)."""
         if not layer_id:
             return
-        self.suppress_layers([layer_id])
+        self._suppressed_layers[layer_id] = self._suppressed_layers.get(layer_id, 0) + 1
+        rcounts = self.__dict__.setdefault("_runner_managed_counts", {})
+        rcounts[layer_id] = rcounts.get(layer_id, 0) + 1
         self.__dict__.setdefault("_runner_managed_layers", set()).add(layer_id)
+        flog(f"EditSessionTracker: layers suppressed {sorted(self._suppressed_layers)}")
+
+    def unsuppress_runner_layer(self, layer_id: str) -> None:
+        """Release one runner suppression acquired via suppress_runner_layer."""
+        if not layer_id:
+            return
+        rcounts = self.__dict__.get("_runner_managed_counts", {})
+        managed = self.__dict__.get("_runner_managed_layers", set())
+        steps = self.__dict__.get("_runner_step_layers", {})
+        rdepth = rcounts.get(layer_id, 0) - 1
+        if rdepth > 0:
+            rcounts[layer_id] = rdepth
+        else:
+            rcounts.pop(layer_id, None)
+            managed.discard(layer_id)
+            steps.pop(layer_id, None)
+        depth = self._suppressed_layers.get(layer_id, 0) - 1
+        if depth > 0:
+            self._suppressed_layers[layer_id] = depth
+        else:
+            self._suppressed_layers.pop(layer_id, None)
+        flog(f"EditSessionTracker: layers suppressed now {sorted(self._suppressed_layers)}")
 
     def unsuppress_layers(self, layer_ids) -> None:
+        uncond = self.__dict__.get("_unconditional_suppressed_layers", {})
+        rcounts = self.__dict__.get("_runner_managed_counts", {})
         managed = self.__dict__.get("_runner_managed_layers", set())
         steps = self.__dict__.get("_runner_step_layers", {})
         for lid in layer_ids or ():
+            if uncond.get(lid, 0) > 0:
+                udepth = uncond[lid] - 1
+                if udepth > 0:
+                    uncond[lid] = udepth
+                else:
+                    uncond.pop(lid, None)
+            elif rcounts.get(lid, 0) > 0:
+                rdepth = rcounts[lid] - 1
+                if rdepth > 0:
+                    rcounts[lid] = rdepth
+                else:
+                    rcounts.pop(lid, None)
+                    managed.discard(lid)
+                    steps.pop(lid, None)
             depth = self._suppressed_layers.get(lid, 0) - 1
             if depth > 0:
                 self._suppressed_layers[lid] = depth
             else:
                 self._suppressed_layers.pop(lid, None)
+                uncond.pop(lid, None)
+                rcounts.pop(lid, None)
                 managed.discard(lid)
                 steps.pop(lid, None)
         flog(f"EditSessionTracker: layers suppressed now {sorted(self._suppressed_layers)}")
@@ -264,6 +311,9 @@ class EditSessionTracker:
     def _layer_suppressed(self, layer_id) -> bool:
         if self._suppressed_layers.get(layer_id, 0) <= 0:
             return False
+        uncond = self.__dict__.get("_unconditional_suppressed_layers", {})
+        if uncond.get(layer_id, 0) > 0:
+            return True
         managed = self.__dict__.get("_runner_managed_layers", set())
         if layer_id in managed:
             steps = self.__dict__.get("_runner_step_layers", {})
@@ -346,6 +396,8 @@ class EditSessionTracker:
             flog("EditSessionTracker: activated flush_callback=registered")
         else:
             flog("EditSessionTracker: activated flush_callback=unavailable", "WARNING")
+        if self.is_suppressed:
+            return
         for lid, lyr in list(self._connected_layers.items()):
             if _layer_gone(lyr) or self._layer_suppressed(lid):
                 continue
@@ -362,6 +414,12 @@ class EditSessionTracker:
         # before capture goes quiet (disk monitor, user toggle, shutdown).
         self._finalize_all_unfinished("deactivate")
         self._active = False
+        if hasattr(self._write_queue, 'set_flush_callback'):
+            try:
+                self._write_queue.set_flush_callback(None)
+            except Exception as exc:  # noqa: BLE001
+                flog(f"EditSessionTracker: clear flush callback failed: {exc}",
+                     "DEBUG")
         flog("EditSessionTracker: deactivated")
 
     def set_filter(self, layer_fingerprints: set) -> None:
@@ -539,7 +597,7 @@ class EditSessionTracker:
         # full identity/support evaluation on each was pure overhead. Marked
         # via custom property before they ever reach the project registry.
         try:
-            if (layer.customProperty("_rl_snap_managed") == "1" or layer.customProperty("_rl_lens_managed") == "1"):
+            if is_managed_overlay_layer(layer):
                 return
         except (RuntimeError, AttributeError):
             pass
@@ -588,14 +646,14 @@ class EditSessionTracker:
             flog(
                 f"{base} action=refused reason=provider_refused "
                 f"policy_reason={policy.reason!r}",
-                "WARNING",
+                "DEBUG" if is_ephemeral_layer(layer) else "WARNING",
             )
             return
 
         if strength == IdentityStrength.NONE:
             flog(
                 f"{base} action=refused reason=no_stable_identity",
-                "WARNING",
+                "INFO" if support == SupportLevel.INFORMATIONAL else "WARNING",
             )
             return
 
@@ -692,16 +750,38 @@ class EditSessionTracker:
         if entry is None:
             return
         layer = entry[0]
+        if _layer_gone(layer):
+            self.disconnect_layer_by_id(layer_id)
+            return
         try:
             new_fp = compute_datasource_fingerprint(layer)
         except Exception as exc:  # noqa: BLE001
             flog(f"EditSessionTracker: data source changed on {layer_id}, "
                  f"fingerprint failed ({exc})", "WARNING")
+            if layer_id in self._connected_layers:
+                self.disconnect_layer(layer)
             return
         if layer_id in self._connected_layers:
             old = self._layer_fingerprints.get(layer_id)
             if new_fp != old:
                 self._finalize_unfinished(layer_id, "datasource_changed")
+                self._uncapturable_sessions.pop(layer_id, None)
+                try:
+                    policy = evaluate_layer_support(layer)
+                    supported = (
+                        not is_ephemeral_layer(layer)
+                        and policy.support_level != SupportLevel.REFUSED
+                        and policy.identity_strength != IdentityStrength.NONE
+                        and policy.capture
+                    )
+                except (RuntimeError, AttributeError):
+                    supported = False
+                if not supported:
+                    self.disconnect_layer(layer)
+                    flog(f"EditSessionTracker: data source of {layer_id} "
+                         f"changed to an unsupported/ephemeral source "
+                         f"({new_fp[-50:]}), capture released", "INFO")
+                    return
                 if not self.admit_layer(layer, new_fp):
                     # Repointed outside the tracking selection. Swapping the
                     # fingerprint alone left the layer "connected" while
@@ -717,18 +797,51 @@ class EditSessionTracker:
                 self._layer_fingerprints[layer_id] = new_fp
                 flog(f"EditSessionTracker: data source of {layer_id} changed, "
                      f"fingerprint updated ({str(old)[-50:]} -> {new_fp[-50:]})")
+                self._reconcile_interrupted(layer, new_fp)
             return
         flog(f"EditSessionTracker: data source of {layer_id} changed, "
              f"retrying the connection")
         self.connect_layer(layer)
 
     def _on_watched_editing(self, layer_id: str) -> None:
-        if not self._active or layer_id in self._connected_layers:
+        if (not self._active or self.is_suppressed
+                or layer_id in self._connected_layers
+                or self._layer_suppressed(layer_id)):
             return
         entry = self.__dict__.get("_watched", {}).get(layer_id)
         if entry is None:
             return
         layer = entry[0]
+        if _layer_gone(layer):
+            return
+        # Ephemeral layers (memory scratch layers, Processing outputs, plugin
+        # temporary layers, virtual layers, Review overlays) have no durable
+        # identity by design and must never surface an error to the user.
+        if is_ephemeral_layer(layer):
+            flog(f"EditSessionTracker: editing started on ephemeral layer "
+                 f"{_safe_layer_name(layer)!r} ({layer_id}), silently skipped",
+                 "DEBUG")
+            return
+        try:
+            policy = evaluate_layer_support(layer)
+        except (RuntimeError, AttributeError):
+            return
+        if policy.support_level == SupportLevel.INFORMATIONAL:
+            flog(f"EditSessionTracker: editing started on informational layer "
+                 f"{_safe_layer_name(layer)!r} ({layer_id}), silently skipped",
+                 "DEBUG")
+            return
+        if (policy.support_level == SupportLevel.REFUSED
+                or policy.identity_strength == IdentityStrength.NONE
+                or not policy.capture):
+            self._notify_status(
+                "untracked_edit", layer_id=layer_id,
+                layer_name=_safe_layer_name(layer),
+                reason="refused_by_support_policy",
+                provider=policy.provider_name,
+                support_level=policy.support_level.value,
+            )
+            return
         try:
             layer_fp = compute_datasource_fingerprint(layer)
         except Exception:  # noqa: BLE001
@@ -738,7 +851,10 @@ class EditSessionTracker:
         reason = ("not_in_tracking_selection" if layer_fp and not selected
                   else "refused_by_support_policy")
         self._notify_status("untracked_edit", layer_id=layer_id,
-                            layer_name=_safe_layer_name(layer), reason=reason)
+                            layer_name=_safe_layer_name(layer),
+                            reason=reason,
+                            provider=policy.provider_name,
+                            support_level=policy.support_level.value)
 
     def _reconcile_interrupted(self, layer, layer_fp) -> None:
         """Resolve, against the provider, commits a crash left INTERRUPTED."""
@@ -765,6 +881,7 @@ class EditSessionTracker:
         self._connected_layers.pop(layer_id, None)
         self._layer_fingerprints.pop(layer_id, None)
         self._sessions.pop(layer_id, None)
+        self._uncapturable_sessions.pop(layer_id, None)
 
     def disconnect_layer_by_id(self, layer_id: str) -> None:
         """Stop monitoring a layer by its ID (for layersRemoved signal).
@@ -779,6 +896,7 @@ class EditSessionTracker:
         self._finalize_unfinished(layer_id, "layer_removed")
         self._unwatch_layer(layer_id)
         self._sessions.pop(layer_id, None)
+        self._uncapturable_sessions.pop(layer_id, None)
         self._unbind_signals(layer_id, self._connected_layers.get(layer_id))
         self._buffers.pop(layer_id, None)
         self._connected_layers.pop(layer_id, None)
@@ -789,6 +907,7 @@ class EditSessionTracker:
             self._forget_destroyed(layer_id)
         self._finalize_all_unfinished("disconnect_all")
         self._sessions.clear()
+        self._uncapturable_sessions.clear()
         for lid in list(self.__dict__.get("_watched", {}).keys()):
             self._unwatch_layer(lid)
         # Every stored connection, not only those of the layers still
@@ -848,6 +967,13 @@ class EditSessionTracker:
             (layer.afterRollBack,
              lambda *_, lid=layer_id: self._on_rollback(lid)),
         ]
+        for sig_name in ("committedAttributesAdded", "committedAttributesDeleted"):
+            sig = getattr(layer, sig_name, None)
+            if sig is not None:
+                slots.append((
+                    sig,
+                    lambda *_, lid=layer_id: self._on_committed_schema_changed(lid),
+                ))
         slots = [(signal, self._guarded(signal, slot)) for signal, slot in slots]
         for signal, slot in slots:
             signal.connect(slot)
@@ -974,12 +1100,6 @@ class EditSessionTracker:
         # is journalled, what it did not is dropped, and its stale
         # snapshots can never leak into this attempt.
         self._finalize_unfinished(layer_id, "retry")
-        if layer_id in self._uncapturable_sessions:
-            self._notify_status(
-                "uncapturable", layer_id=layer_id,
-                layer_name=_safe_layer_name(layer),
-                reason="automatic_transaction_group")
-            return
         if not self._check_capturable(layer_id):
             return
         if layer_id not in self._sessions:
@@ -998,18 +1118,63 @@ class EditSessionTracker:
         self._prepare_attempt(attempt, added_payload, layer)
         from .capture_outbox import fault_point
         fault_point("capture_after_prepare")
-        # commitChanges() is synchronous: this zero-delay timer runs once it
-        # has returned to the event loop. If afterCommitChanges has not
-        # finalised the attempt by then, the commit failed, partly or wholly.
+        # commitChanges() normally returns synchronously, but providers like
+        # WFS-T or modal auth/plugin dialogs run a nested QEventLoop inside
+        # commitChanges(). Defer finalization until Qt unwinds back to
+        # base_loop_level so a slow nested loop never drops a live commit.
         commit_id = attempt.commit_id
-        QTimer.singleShot(
-            0, lambda lid=layer_id, cid=commit_id:
-                self._finalize_unfinished(lid, "commit_returned", cid))
+        base_loop_level = QThread.currentThread().loopLevel()
+        self._schedule_commit_return_check(layer_id, commit_id, base_loop_level)
+
+    def _schedule_commit_return_check(self, layer_id: str, commit_id: str,
+                                      base_loop_level: int,
+                                      delay_ms: int = 0) -> None:
+        def _check():
+            attempt = self._attempts.get(layer_id)
+            if attempt is None or attempt.finalized or attempt.commit_id != commit_id:
+                return
+            cur_level = QThread.currentThread().loopLevel()
+            if cur_level > base_loop_level:
+                # 50 ms backoff avoids spinning a CPU core at 100% during modal
+                # auth/network loops inside commitChanges().
+                self._schedule_commit_return_check(
+                    layer_id, commit_id, base_loop_level, delay_ms=50)
+                return
+            self._finalize_unfinished(layer_id, "commit_returned", commit_id)
+
+        QTimer.singleShot(delay_ms, self._guarded("commit_returned_timer", _check))
+
+    def _on_committed_schema_changed(self, layer_id: str) -> None:
+        """Refresh post-commit provider schema after column add/delete."""
+        attempt = self._attempts.get(layer_id)
+        if attempt is None or attempt.finalized:
+            return
+        layer = self._connected_layers.get(layer_id)
+        if layer is None:
+            return
+        try:
+            provider = layer.dataProvider()
+            schema_fields = provider.fields() if provider is not None else layer.fields()
+            attempt.meta["field_schema"] = serialize_field_schema(schema_fields)
+            attempt.meta["field_names"] = [f.name() for f in schema_fields]
+        except (RuntimeError, AttributeError) as exc:
+            flog(f"EditSessionTracker: schema refresh failed on {layer_id}: {exc}",
+                 "WARNING")
+
+    def _next_monotonic_iso(self) -> str:
+        """Return UTC ISO timestamp never moving backward on NTP skew."""
+        now_dt = datetime.now(timezone.utc)
+        last = getattr(self, "_last_event_dt", None)
+        if last is not None and now_dt < last:
+            now_dt = last + timedelta(microseconds=1)
+        self._last_event_dt = now_dt
+        return now_dt.isoformat()
 
     def _capture_layer_meta(self, layer) -> dict:
         """Everything event generation needs from the layer, read while alive."""
         geom_type, crs = self._get_layer_geometry_info(layer)
         provider = layer.dataProvider()
+        schema_fields = provider.fields() if provider is not None else layer.fields()
         return {
             "layer_id": layer.id(),
             "ds_fp": compute_datasource_fingerprint(layer),
@@ -1017,7 +1182,7 @@ class EditSessionTracker:
             "layer_name": extract_layer_name(layer),
             "provider_type": provider.name() if provider is not None else "unknown",
             "user": resolve_user_name(),
-            "field_schema": serialize_field_schema(layer.fields()),
+            "field_schema": serialize_field_schema(schema_fields),
             "geom_type": geom_type,
             "crs": crs,
             "field_names": self._capture_field_names(layer),
@@ -1252,18 +1417,21 @@ class EditSessionTracker:
         if layer is not None:
             self._register_datasource(layer)
         self._session_event_count += len(events)
-        ops = [e.operation_type for e in events]
+        ops = [e.operation_type for e in events[:20]]
         flog(f"EditSessionTracker: {len(events)} events for {layer_id} "
-             f"commit={attempt.commit_id} state={state} ops={ops[:20]} "
+             f"commit={attempt.commit_id} state={state} ops={ops} "
              f"created_at={events[0].created_at} "
              f"outcome={getattr(outcome, 'value', outcome)}")
         layer_name = events[0].layer_name_snapshot or layer_id
         delete_count = sum(1 for e in events if e.operation_type == "DELETE")
         is_mass_delete = delete_count >= self._MASS_DELETE_THRESHOLD
         if self._on_commit_callback is not None:
-            self._on_commit_callback(
-                len(events), layer_name, is_mass_delete, delete_count,
-                events[0].datasource_fingerprint)
+            try:
+                self._on_commit_callback(
+                    len(events), layer_name, is_mass_delete, delete_count,
+                    events[0].datasource_fingerprint)
+            except Exception as exc:  # noqa: BLE001 - callback must not break commit
+                flog(f"EditSessionTracker: commit callback failed: {exc}", "ERROR")
 
     def _pause_after_buffer_pressure(self, buf: EditSessionBuffer) -> None:
         """Stop capture after a commit whose capture blew the memory budget.
@@ -1653,6 +1821,9 @@ class EditSessionTracker:
                     try:
                         if feature is None:
                             raise KeyError(name)
+                        feat_fields = feature.fields() if hasattr(feature, "fields") else None
+                        if feat_fields is not None and feat_fields.indexOf(name) < 0:
+                            raise KeyError(name)
                         changes[fid][idx] = feature.attribute(name)
                     except KeyError:
                         unverified.setdefault(fid, []).append(name)
@@ -1761,6 +1932,7 @@ class EditSessionTracker:
         # the edit buffer. The stages the provider already wrote are on disk:
         # they are journalled here, never cleared with the rest.
         self._finalize_unfinished(layer_id, "rollback")
+        self._uncapturable_sessions.pop(layer_id, None)
         buf = self._buffers.pop(layer_id, None)
         if buf is not None:
             buf.clear()
@@ -2049,12 +2221,15 @@ class EditSessionTracker:
             geom = QgsGeometry()
             if wkb:
                 geom.fromWkb(bytes(wkb))
-            if geom.isNull():
+            if geom.isNull() or geom.isEmpty():
                 scan_entries.append(entry)
                 continue
             # Wider than the reconciliation's own box: a superset of what
             # it can match.
             bb = geom.boundingBox()
+            if bb.isNull() or not bb.isFinite():
+                scan_entries.append(entry)
+                continue
             bb.grow(max(bb.width(), bb.height(), 1.0) * 1e-3 + 1e-6)
             geo.append((entry, bb))
         if not (len(geo) >= self._TWIN_UNION_MIN
@@ -2188,19 +2363,21 @@ class EditSessionTracker:
             return
         flog(f"EditSessionTracker: capturing {len(deleted_fids)} deletions, "
              f"FIDs={deleted_fids[:20]}")
-        request = QgsFeatureRequest().setFilterFids(deleted_fids)
         captured = 0
         layer = self._connected_layers.get(buf.layer_id)
-        for feature in provider.getFeatures(request):
-            snapshot = create_snapshot_from_feature(feature, field_names)
-            if layer is not None:
-                # Same stub-based identity the DELETE event always used,
-                # computed now: the layer may be gone when the attempt is
-                # finalised (layer removed right after a refused commit).
-                snapshot.identity_json = compute_feature_identity(
-                    layer, _stub_feature(snapshot))
-            buf.record_deletion(snapshot)
-            captured += 1
+        for start in range(0, len(deleted_fids), self._READBACK_CHUNK):
+            chunk = deleted_fids[start:start + self._READBACK_CHUNK]
+            request = QgsFeatureRequest().setFilterFids(chunk)
+            for feature in provider.getFeatures(request):
+                snapshot = create_snapshot_from_feature(feature, field_names)
+                if layer is not None:
+                    # Same stub-based identity the DELETE event always used,
+                    # computed now: the layer may be gone when the attempt is
+                    # finalised (layer removed right after a refused commit).
+                    snapshot.identity_json = compute_feature_identity(
+                        layer, _stub_feature(snapshot))
+                buf.record_deletion(snapshot)
+                captured += 1
         if captured != len(deleted_fids):
             flog(f"EditSessionTracker: deletion capture mismatch: "
                  f"expected={len(deleted_fids)} captured={captured}", "WARNING")
@@ -2231,18 +2408,11 @@ class EditSessionTracker:
         excluded_added = (set(changed_geoms) | set(changed_attrs)) & added_set
         excluded_deleted = (set(changed_geoms) | set(changed_attrs)) & deleted_set
         flog(f"EditSessionTracker: capture_modifications {buf.layer_id} "
-             f"geom_fids={sorted(geom_fids)} "
-             f"attr_only_fids={sorted(attr_only_fids)} "
-             f"excluded_added={sorted(excluded_added)} "
-             f"excluded_deleted={sorted(excluded_deleted)}")
+             f"geom_fids={sorted(geom_fids)[:20]}(n={len(geom_fids)}) "
+             f"attr_only_fids={sorted(attr_only_fids)[:20]}(n={len(attr_only_fids)}) "
+             f"excluded_added={sorted(excluded_added)[:20]}(n={len(excluded_added)}) "
+             f"excluded_deleted={sorted(excluded_deleted)[:20]}(n={len(excluded_deleted)})")
 
-        # NEW geometry is read only for the features whose geometry the
-        # edit buffer actually changed. Attribute-only features get their
-        # OLD state read with NO_GEOMETRY below; reading a NEW geometry
-        # for them made _make_update_event compare None against the
-        # current position, so every attribute edit was journalled as a
-        # geometry change that never happened - and the false-commit
-        # filter, which needs geom_changed to be False, never fired.
         index_names = (view or {}).get("index_names") or field_names
         new_names = (view or {}).get("final_names") or field_names
         new_state_by_fid = self._capture_new_state(
@@ -2252,51 +2422,59 @@ class EditSessionTracker:
 
         captured_geom: set = set()
         if geom_fids:
-            request = QgsFeatureRequest().setFilterFids(list(geom_fids))
-            for feature in provider.getFeatures(request):
-                captured_geom.add(feature.id())
-                changed_names = self._extract_changed_field_names(
-                    feature.id(), changed_attrs, index_names)
-                snapshot = create_snapshot_from_feature(
-                    feature, field_names, changed_names)
-                self._attach_new_state_and_identity(
-                    snapshot, layer, feature, new_state_by_fid)
-                buf.record_modification(snapshot)
-                new_attrs_proj, new_wkb_proj = new_state_by_fid.get(
-                    feature.id(), (None, None))
-                flog(f"TRACE_CAPTURE: layer={buf.layer_id} fid={feature.id()} "
-                     f"OLD_geom={wkb_short_repr(snapshot.geometry_wkb)} "
-                     f"NEW_geom_projected={wkb_short_repr(new_wkb_proj)}")
+            geom_list = list(geom_fids)
+            for start in range(0, len(geom_list), self._READBACK_CHUNK):
+                chunk = geom_list[start:start + self._READBACK_CHUNK]
+                request = QgsFeatureRequest().setFilterFids(chunk)
+                for feature in provider.getFeatures(request):
+                    captured_geom.add(feature.id())
+                    changed_names = self._extract_changed_field_names(
+                        feature.id(), changed_attrs, index_names)
+                    snapshot = create_snapshot_from_feature(
+                        feature, field_names, changed_names)
+                    self._attach_new_state_and_identity(
+                        snapshot, layer, feature, new_state_by_fid)
+                    buf.record_modification(snapshot)
+                    new_attrs_proj, new_wkb_proj = new_state_by_fid.get(
+                        feature.id(), (None, None))
+                    flog(f"TRACE_CAPTURE: layer={buf.layer_id} fid={feature.id()} "
+                         f"OLD_geom={wkb_short_repr(snapshot.geometry_wkb)} "
+                         f"NEW_geom_projected={wkb_short_repr(new_wkb_proj)}")
             missing = geom_fids - captured_geom
             if missing:
                 flog(f"EditSessionTracker: geom-modification OLD UNCAPTURED "
-                     f"layer={buf.layer_id} fids={sorted(missing)} "
+                     f"layer={buf.layer_id} fids={sorted(missing)[:20]} "
+                     f"(total={len(missing)}) "
                      f"(provider lookup returned no row; UPDATE events for "
                      f"these fids cannot be generated)", "ERROR")
 
         captured_attr: set = set()
         if attr_only_fids:
             from ..compat import QgisCompat
-            request = QgsFeatureRequest().setFilterFids(list(attr_only_fids))
-            request.setFlags(QgisCompat.NO_GEOMETRY)
-            for feature in provider.getFeatures(request):
-                captured_attr.add(feature.id())
-                changed_names = self._extract_changed_field_names(
-                    feature.id(), changed_attrs, index_names)
-                snapshot = create_snapshot_from_feature(
-                    feature, field_names, changed_names)
-                self._attach_new_state_and_identity(
-                    snapshot, layer, feature, new_state_by_fid)
-                buf.record_modification(snapshot)
+            attr_list = list(attr_only_fids)
+            for start in range(0, len(attr_list), self._READBACK_CHUNK):
+                chunk = attr_list[start:start + self._READBACK_CHUNK]
+                request = QgsFeatureRequest().setFilterFids(chunk)
+                request.setFlags(QgisCompat.NO_GEOMETRY)
+                for feature in provider.getFeatures(request):
+                    captured_attr.add(feature.id())
+                    changed_names = self._extract_changed_field_names(
+                        feature.id(), changed_attrs, index_names)
+                    snapshot = create_snapshot_from_feature(
+                        feature, field_names, changed_names)
+                    self._attach_new_state_and_identity(
+                        snapshot, layer, feature, new_state_by_fid)
+                    buf.record_modification(snapshot)
             missing = attr_only_fids - captured_attr
             if missing:
                 flog(f"EditSessionTracker: attr-modification OLD UNCAPTURED "
-                     f"layer={buf.layer_id} fids={sorted(missing)} "
+                     f"layer={buf.layer_id} fids={sorted(missing)[:20]} "
+                     f"(total={len(missing)}) "
                      f"(provider lookup returned no row; UPDATE events for "
                      f"these fids cannot be generated)", "ERROR")
 
-    @staticmethod
-    def _capture_new_state(layer, fids, field_names,
+    @classmethod
+    def _capture_new_state(cls, layer, fids, field_names,
                            with_geometry: bool = True) -> Dict[int, tuple]:
         """Return {fid: (new_attrs_dict, new_geom_wkb)} read from layer+buffer.
 
@@ -2309,18 +2487,22 @@ class EditSessionTracker:
             return {}
         from qgis.core import QgsFeatureRequest
         result: Dict[int, tuple] = {}
-        request = QgsFeatureRequest().setFilterFids(list(fids))
-        if not with_geometry:
-            from ..compat import QgisCompat
-            request.setFlags(QgisCompat.NO_GEOMETRY)
-        for feature in layer.getFeatures(request):
-            attrs = serialize_attributes(feature, field_names)
-            wkb = geometry_to_wkb(feature.geometry()) if with_geometry else None
-            result[feature.id()] = (attrs, wkb)
+        fid_list = list(fids)
+        for start in range(0, len(fid_list), cls._READBACK_CHUNK):
+            chunk = fid_list[start:start + cls._READBACK_CHUNK]
+            request = QgsFeatureRequest().setFilterFids(chunk)
+            if not with_geometry:
+                from ..compat import QgisCompat
+                request.setFlags(QgisCompat.NO_GEOMETRY)
+            for feature in layer.getFeatures(request):
+                attrs = serialize_attributes(feature, field_names)
+                wkb = geometry_to_wkb(feature.geometry()) if with_geometry else None
+                result[feature.id()] = (attrs, wkb)
         missing = set(fids) - set(result.keys())
         if missing:
             flog(f"EditSessionTracker: _capture_new_state missing fids "
-                 f"layer={layer.id()} fids={sorted(missing)} "
+                 f"layer={layer.id()} fids={sorted(missing)[:20]} "
+                 f"(total={len(missing)}) "
                  f"(post-commit lookup will fail; identity may be stale)",
                  "WARNING")
         return result
@@ -2385,7 +2567,7 @@ class EditSessionTracker:
         layer_name = meta["layer_name"]
         provider_type = meta["provider_type"]
         user = meta["user"]
-        now = datetime.now(timezone.utc).isoformat()
+        now = self._next_monotonic_iso()
         field_schema = meta["field_schema"]
         geom_type, crs = meta["geom_type"], meta["crs"]
         field_names = meta["field_names"]
@@ -2408,8 +2590,9 @@ class EditSessionTracker:
                  f"(buffer requested but no committedFeaturesRemoved fired)",
                  "WARNING")
 
+        deleted_snaps = buf.get_deleted_snapshots()
         for fid in deleted_to_emit:
-            snap = buf.get_deleted_snapshots().get(fid)
+            snap = deleted_snaps.get(fid)
             if snap is None:
                 continue
             events.append(self._make_delete_event(
@@ -2418,8 +2601,9 @@ class EditSessionTracker:
                 session_id,
             ))
 
+        modified_snaps = buf.get_modified_snapshots()
         for fid in net["modified"]:
-            snap = buf.get_modified_snapshots().get(fid)
+            snap = modified_snaps.get(fid)
             if snap is None:
                 continue
             event = self._make_update_event(
@@ -2543,7 +2727,18 @@ class EditSessionTracker:
 
         old_attrs = snap.attributes
         new_attrs = new_attrs if new_attrs is not None else old_attrs
-        changed_field_names = snap.changed_field_names or snap.field_names
+        changed_field_names = list(snap.changed_field_names or snap.field_names)
+        if committed_attrs:
+            seen_fields = set(changed_field_names)
+            for idx in committed_attrs:
+                fname = (
+                    idx if isinstance(idx, str)
+                    else (field_names[idx] if isinstance(idx, int)
+                          and 0 <= idx < len(field_names) else None)
+                )
+                if fname and fname not in seen_fields:
+                    changed_field_names.append(fname)
+                    seen_fields.add(fname)
         delta_json = compute_update_delta(
             old_attrs, new_attrs, changed_field_names)
         geom_changed = not geometries_equal(snap.geometry_wkb, new_wkb)

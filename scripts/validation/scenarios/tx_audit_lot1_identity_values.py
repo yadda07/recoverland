@@ -216,13 +216,13 @@ def assertions(ctx):
          and d.get("GPKG_match") is True and d.get("GPKG_collision") is True
          and d.get("GPKG_sel_bare_to_named") is True
          and d.get("GPKG_sel_named_to_bare") is True,
-         f"GPKG mono-couche divise : { {k: d.get(k) for k in d if k.startswith('GPKG_')} }"),
+         f"GPKG mono-couche divise : {({k: d.get(k) for k in d if k.startswith('GPKG_')})}"),
         ("fgb_single_layer_unified",
          d.get("FlatGeobuf_fp_equal") is True and d.get("FlatGeobuf_canon_equal") is True
          and d.get("FlatGeobuf_match") is True and d.get("FlatGeobuf_collision") is True
          and d.get("FlatGeobuf_sel_bare_to_named") is True
          and d.get("FlatGeobuf_sel_named_to_bare") is True,
-         f"FlatGeobuf mono-couche divise : { {k: d.get(k) for k in d if k.startswith('FlatGeobuf_')} }"),
+         f"FlatGeobuf mono-couche divise : {({k: d.get(k) for k in d if k.startswith('FlatGeobuf_')})}"),
         ("multi_gpkg_tables_stay_distinct",
          d.get("multi_gpkg_distinct") is True,
          f"multi_gpkg_distinct={d.get('multi_gpkg_distinct')}"),
@@ -246,7 +246,7 @@ def assertions(ctx):
          d.get("qtime_subsec_rejected_against_whole") is True
          and d.get("qtime_subsec_matches_exact") is True
          and d.get("qtime_whole_matches_truncated_subsec") is True,
-         f"qtime={ {k: d.get(k) for k in d if k.startswith('qtime_')} }"),
+         f"qtime={({k: d.get(k) for k in d if k.startswith('qtime_')})}"),
         assert_log_contains(
             ctx.records,
             pattern=rf"tx_audit_lot1_identity_values.*trace_id={ctx.trace_id}",

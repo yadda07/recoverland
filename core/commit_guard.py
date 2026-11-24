@@ -147,6 +147,8 @@ def values_equal(a, b) -> bool:
     if as_datetimes is not None:
         return as_datetimes
     if isinstance(va, bool) or isinstance(vb, bool):
+        if isinstance(va, bool) != isinstance(vb, bool):
+            return False
         return va == vb
     if isinstance(va, (int, float)) and isinstance(vb, (int, float)):
         if isinstance(va, float) or isinstance(vb, float):
@@ -160,11 +162,15 @@ def values_equal(a, b) -> bool:
 
 def geometry_equal(actual, expected) -> bool:
     """Same shape, tolerant to ring start/orientation and rounding re-encoding."""
-    from .geometry_utils import is_geometry_present, feature_matches_geometry
+    from .geometry_utils import (
+        is_geometry_present, feature_matches_geometry, _geom_zm_flags,
+    )
     a_present = is_geometry_present(actual)
     e_present = is_geometry_present(expected)
     if not a_present or not e_present:
         return a_present == e_present
+    if _geom_zm_flags(actual) != _geom_zm_flags(expected):
+        return False
     try:
         if bytes(actual.asWkb()) == bytes(expected.asWkb()):
             return True
@@ -195,17 +201,93 @@ _AREA_PAD_ABS = 1e-9
 _CANON_TAG = "canon"
 
 
+def _round_coord(val: float):
+    if math.isnan(val):
+        return (1, 0.0)
+    return (0, round(val, _KEY_DIGITS))
+
+
+def _round_vertex(pt, has_z: bool, has_m: bool) -> tuple:
+    coords = [_round_coord(pt.x()), _round_coord(pt.y())]
+    if has_z:
+        coords.append(_round_coord(pt.z()))
+    if has_m:
+        coords.append(_round_coord(pt.m()))
+    return tuple(coords)
+
+
 def _vertex_key(geom):
     """Rounded canonical shape key: equal for two encodings of one shape.
 
     Invariant to ring start, ring orientation, part order and to the
     single/multi wrapping providers apply on write; tolerant to the
     coordinate rounding of text formats (GeoJSON, CSV WKT) at 1e-7,
-    while preserving vertex order on linear geometries.
+    while preserving vertex order on linear geometries and Z/M dimensions.
     """
-    from .geometry_utils import is_geometry_present, _canonical_ring_cycle
+    from .geometry_utils import (
+        is_geometry_present, _canonical_ring_cycle, _geom_zm_flags,
+        _geom_is_curved,
+    )
     if not is_geometry_present(geom):
         return None
+    if _geom_is_curved(geom):
+        return None
+    has_z, has_m = _geom_zm_flags(geom)
+    dim_tag = (has_z, has_m)
+    if has_z or has_m:
+        try:
+            from qgis.core import QgsWkbTypes
+            from ..compat import QgisCompat
+            abstract = geom.constGet()
+            if abstract is None:
+                return None
+            flat = QgsWkbTypes.flatType(geom.wkbType())
+            if flat in (QgisCompat.WKB_POLYGON, QgisCompat.WKB_MULTIPOLYGON):
+                n_parts = (abstract.numGeometries()
+                           if flat == QgisCompat.WKB_MULTIPOLYGON else 1)
+                out_polys = []
+                for i in range(n_parts):
+                    part = (abstract.geometryN(i)
+                            if flat == QgisCompat.WKB_MULTIPOLYGON else abstract)
+                    if part is None:
+                        continue
+                    rings = []
+                    ext = part.exteriorRing()
+                    if ext is not None:
+                        rings.append(ext)
+                    for j in range(part.numInteriorRings()):
+                        ir = part.interiorRing(j)
+                        if ir is not None:
+                            rings.append(ir)
+                    canon = []
+                    for ring in rings:
+                        pts = [_round_vertex(v, has_z, has_m)
+                               for v in ring.vertices()]
+                        if len(pts) > 1 and pts[0] == pts[-1]:
+                            pts = pts[:-1]
+                        if pts:
+                            canon.append(_canonical_ring_cycle(pts))
+                    if canon:
+                        out_polys.append(tuple(sorted(canon)))
+                return (dim_tag, "poly", tuple(sorted(out_polys))) if out_polys else None
+            if flat in (QgisCompat.WKB_LINESTRING, QgisCompat.WKB_MULTILINESTRING):
+                n_parts = (abstract.numGeometries()
+                           if flat == QgisCompat.WKB_MULTILINESTRING else 1)
+                parts = []
+                for i in range(n_parts):
+                    sub = (abstract.geometryN(i)
+                           if flat == QgisCompat.WKB_MULTILINESTRING else abstract)
+                    if sub is not None:
+                        seq = tuple(_round_vertex(v, has_z, has_m)
+                                    for v in sub.vertices())
+                        if seq:
+                            parts.append(seq)
+                return (dim_tag, "line", tuple(sorted(parts))) if parts else None
+            pts = sorted(_round_vertex(v, has_z, has_m)
+                         for v in geom.vertices())
+            return (dim_tag, "pts", tuple(pts)) if pts else None
+        except (AttributeError, RuntimeError, TypeError):
+            return None
     try:
         polys = geom.asMultiPolygon() if geom.isMultipart() else (
             [geom.asPolygon()] if geom.asPolygon() else [])
@@ -222,7 +304,7 @@ def _vertex_key(geom):
                     pts = pts[:-1]
                 canon.append(_canonical_ring_cycle(pts))
             out_polys.append(tuple(sorted(canon)))
-        return tuple(sorted(out_polys)) if out_polys else None
+        return (dim_tag, tuple(sorted(out_polys))) if out_polys else None
     try:
         lines = geom.asMultiPolyline() if geom.isMultipart() else (
             [geom.asPolyline()] if geom.asPolyline() else [])
@@ -231,13 +313,13 @@ def _vertex_key(geom):
     if lines:
         out_lines = [tuple((round(p.x(), _KEY_DIGITS), round(p.y(), _KEY_DIGITS))
                            for p in line) for line in lines if line]
-        return tuple(sorted(out_lines)) if out_lines else None
+        return (dim_tag, tuple(sorted(out_lines))) if out_lines else None
     try:
         pts = sorted((round(v.x(), _KEY_DIGITS), round(v.y(), _KEY_DIGITS))
                      for v in geom.vertices())
     except (AttributeError, RuntimeError, TypeError):
         return None
-    return tuple(pts) if pts else None
+    return (dim_tag, tuple(pts)) if pts else None
 
 
 def _text_instant_ms(value):
@@ -348,12 +430,17 @@ def _sync_layer_encoding(src_layer, dst_layer) -> None:
 
 
 def _fresh_layer(layer):
-    """A new layer on the same source: reads the file, not a provider cache."""
+    """A new unfiltered layer on the same source: reads the file, not a cache."""
     from qgis.core import QgsVectorLayer
     try:
         fresh = QgsVectorLayer(layer.source(), "rl_readback", layer.providerType())
         if fresh.isValid():
             _sync_layer_encoding(layer, fresh)
+            if fresh.subsetString():
+                try:
+                    fresh.setSubsetString("")
+                except (RuntimeError, AttributeError):
+                    pass
             return fresh
     except (RuntimeError, AttributeError):
         pass
@@ -361,14 +448,16 @@ def _fresh_layer(layer):
 
 
 def _diff(actual: _FeatureState, expected: _FeatureState, field_names,
-          auto_fields=()) -> List[str]:
+          auto_fields=(), readonly_fields=()) -> List[str]:
+    from .audit_field_policy import is_layer_audit_field
     if actual.exists != expected.exists:
         return [f"exists={actual.exists} expected={expected.exists}"]
     if not actual.exists:
         return []
     out = []
     for name in field_names:
-        if name not in expected.attrs:
+        if (name not in expected.attrs or is_layer_audit_field(name)
+                or name in readonly_fields):
             continue
         if name in auto_fields and _norm_value(expected.attrs.get(name)) is None:
             continue
@@ -414,6 +503,7 @@ class CommitGuard:
         # a projection that leaves them NULL is not contradicted by the
         # value the provider assigned.
         self.auto_fields = set()
+        self.readonly_fields = set()
         try:
             fields = provider.fields()
             for idx in provider.pkAttributeIndexes():
@@ -422,14 +512,25 @@ class CommitGuard:
             for idx in range(fields.count()):
                 if provider.defaultValueClause(idx):
                     self.auto_fields.add(fields.at(idx).name())
+                try:
+                    if fields.at(idx).isReadOnly():
+                        self.readonly_fields.add(fields.at(idx).name())
+                except (RuntimeError, AttributeError):
+                    pass
         except (RuntimeError, AttributeError):
             pass
         self.fid_stable = fid_is_stable(layer)
         self._event_fids: Dict[int, Set[int]] = {}
         self._event_added: Dict[int, Set[int]] = {}
+        self._event_added_touched: Dict[int, Set[int]] = {}
         self._event_deleted: Dict[int, Set[int]] = {}
         self._cur: Optional[int] = None
         self._before_keys = None
+        self._in_action = 0
+        self._foreign_fids: Set[int] = set()
+        self._eb_attached = None
+        self._eb_conns = []
+        self._conns = []
 
     # ------------------------------------------------------------------
     def _buffer_keys(self):
@@ -480,26 +581,71 @@ class CommitGuard:
             changed |= set(filter(is_geom, added))
         return changed, added, deleted
 
+    def _attach_edit_buffer(self) -> None:
+        """Listen to editBuffer mutations outside begin_action/end_action."""
+        eb = self.layer.editBuffer()
+        if eb is None or eb is self._eb_attached:
+            return
+        self._disconnect_eb()
+        self._eb_attached = eb
+
+        def _mark_foreign(fid, *_args):
+            if self._in_action <= 0:
+                try:
+                    self._foreign_fids.add(int(fid))
+                except (TypeError, ValueError):
+                    self._foreign_fids.add(-1)
+
+        for sig_name in ("attributeValueChanged", "geometryChanged",
+                         "featureAdded", "featureDeleted"):
+            sig = getattr(eb, sig_name, None)
+            if sig is not None:
+                try:
+                    sig.connect(_mark_foreign)
+                    self._eb_conns.append((eb, sig, _mark_foreign))
+                except (TypeError, RuntimeError):
+                    pass
+
+    def _disconnect_eb(self) -> None:
+        from ..compat import is_deleted
+        for emitter, sig, slot in getattr(self, "_eb_conns", []):
+            if is_deleted(emitter):
+                continue
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._eb_conns = []
+        self._eb_attached = None
+
     def begin_action(self, event_id: int) -> None:
+        self._attach_edit_buffer()
+        self._in_action += 1
         self._cur = int(event_id)
         self._before_keys = self._buffer_keys()
 
     def end_action(self, event_id: int, extra_fids=()) -> None:
-        if self._before_keys is None:
-            return
-        changed0, added0, deleted0 = self._before_keys
-        changed1, added1, deleted1 = self._buffer_keys()
-        eid = int(event_id)
-        fids = (changed1 - changed0) | set(int(f) for f in extra_fids if f is not None)
-        # A feature already changed by an earlier action of the same batch
-        # does not show up as a NEW key: fall back on the target the
-        # action reported, when it did.
-        self._event_fids.setdefault(eid, set()).update(
-            f for f in fids if f >= 0)
-        self._event_added.setdefault(eid, set()).update(added1 - added0)
-        self._event_deleted.setdefault(eid, set()).update(deleted1 - deleted0)
-        self._before_keys = None
-        self._cur = None
+        try:
+            if self._before_keys is None:
+                return
+            changed0, added0, deleted0 = self._before_keys
+            changed1, added1, deleted1 = self._buffer_keys()
+            eid = int(event_id)
+            fids = (changed1 - changed0) | set(int(f) for f in extra_fids if f is not None)
+            # A feature already changed by an earlier action of the same batch
+            # does not show up as a NEW key: fall back on the target the
+            # action reported, when it did.
+            self._event_fids.setdefault(eid, set()).update(
+                f for f in fids if f >= 0)
+            self._event_added.setdefault(eid, set()).update(added1 - added0)
+            neg_added = {f for f in fids if f < 0 and f in added1}
+            if neg_added:
+                self._event_added_touched.setdefault(eid, set()).update(neg_added)
+            self._event_deleted.setdefault(eid, set()).update(deleted1 - deleted0)
+            self._before_keys = None
+            self._cur = None
+        finally:
+            self._in_action = max(0, self._in_action - 1)
 
     def foreign_changes(self) -> List[int]:
         """Edit-buffer entries no action of this run produced.
@@ -507,13 +653,13 @@ class CommitGuard:
         The run holds the layer in edit mode across QTimer ticks; anything
         the user digitises there meanwhile lands in the same buffer and
         would be committed as part of the restore, suppressed from the
-        journal. Fids changed or deleted, and fids added (temporary in a
-        buffered session, the provider's own in a transaction group), that
-        no action recorded, are returned.
+        journal. Fids changed or deleted, fids added, and any external
+        mutation of an already-touched fid (Ctrl+Z, Processing, attribute
+        table) that no action recorded are returned.
         """
         eb = self.layer.editBuffer()
         if eb is None:
-            return []
+            return sorted(self._foreign_fids)
         changed, added, deleted = self._buffer_keys()
         known = set()
         for fids in self._event_fids.values():
@@ -523,7 +669,12 @@ class CommitGuard:
         known_added = set()
         for fids in self._event_added.values():
             known_added |= fids
-        foreign = sorted((changed | deleted) - known) + sorted(added - known_added)
+        foreign = (
+            sorted((changed | deleted) - known)
+            + sorted(added - known_added)
+            + sorted(self._foreign_fids - ((changed | deleted) - known)
+                     - (added - known_added))
+        )
         return foreign
 
     # ------------------------------------------------------------------
@@ -539,6 +690,7 @@ class CommitGuard:
 
     def prepare(self) -> None:
         """Read pre-images and the projection, start listening to committed*."""
+        self._disconnect_eb()
         layer = self.layer
         eb = layer.editBuffer()
         changed = (set(eb.changedAttributeValues().keys())
@@ -588,20 +740,28 @@ class CommitGuard:
         def _on_added(_lid, feats):
             applied["added"].extend(int(f.id()) for f in feats)
 
-        self._conns = [(layer.committedAttributeValuesChanges, _on_attr),
-                       (layer.committedGeometriesChanges, _on_geom),
-                       (layer.committedFeaturesRemoved, _on_removed),
-                       (layer.committedFeaturesAdded, _on_added)]
-        for sig, slot in self._conns:
+        self._conns = [(layer, layer.committedAttributeValuesChanges, _on_attr),
+                       (layer, layer.committedGeometriesChanges, _on_geom),
+                       (layer, layer.committedFeaturesRemoved, _on_removed),
+                       (layer, layer.committedFeaturesAdded, _on_added)]
+        for _emitter, sig, slot in self._conns:
             sig.connect(slot)
 
     def _disconnect(self) -> None:
-        for sig, slot in getattr(self, "_conns", []):
+        from ..compat import is_deleted
+        self._disconnect_eb()
+        for emitter, sig, slot in getattr(self, "_conns", []):
+            if is_deleted(emitter):
+                continue
             try:
                 sig.disconnect(slot)
             except (TypeError, RuntimeError):
                 pass
         self._conns = []
+
+    def detach(self) -> None:
+        """Release all Qt signal hooks held by this guard (safe on abort)."""
+        self._disconnect()
 
     def finish(self, ok: bool) -> CommitVerdict:
         """Establish what the provider really holds after commitChanges() == ok."""
@@ -652,8 +812,10 @@ class CommitGuard:
             layer.rollBack()
         fresh = _fresh_layer(layer) or provider
         now = _read_states(fresh, touched, self.field_names)
-        really_changed = [fid for fid in touched
-                          if _diff(now[fid], pre[fid], self.field_names, self.auto_fields)]
+        really_changed = [
+            fid for fid in touched
+            if _diff(now[fid], pre[fid], self.field_names, self.auto_fields,
+                     self.readonly_fields)]
         landed_added = list(applied["added"])
         if not really_changed and not landed_added:
             verdict.state = REFUSED_NOTHING_WRITTEN
@@ -685,7 +847,8 @@ class CommitGuard:
         now = _read_states(fresh, fids, self.field_names)
         mismatched: Dict[int, List[str]] = {}
         for fid in fids:
-            d = _diff(now[fid], projection[fid], self.field_names, self.auto_fields)
+            d = _diff(now[fid], projection[fid], self.field_names,
+                      self.auto_fields, self.readonly_fields)
             if d:
                 mismatched[fid] = d
         added_now = _read_states(fresh, verdict.added_fids, self.field_names)
@@ -697,7 +860,8 @@ class CommitGuard:
             match = None
             for real in unmatched:
                 if not _diff(added_now.get(real, _FeatureState(exists=False)),
-                             proj, self.field_names, self.auto_fields):
+                             proj, self.field_names, self.auto_fields,
+                             self.readonly_fields):
                     match = real
                     break
             if match is not None:
@@ -710,7 +874,8 @@ class CommitGuard:
             problems = []
             for fid in self._event_fids.get(eid, ()) | self._event_deleted.get(eid, ()):
                 problems.extend(f"fid {fid}: {p}" for p in mismatched.get(fid, []))
-            for tmp in self._event_added.get(eid, ()):
+            for tmp in (self._event_added.get(eid, set())
+                        | self._event_added_touched.get(eid, set())):
                 problems.extend(f"new feature: {p}" for p in added_bad.get(tmp, []))
             if problems:
                 verdict.per_event[eid] = EV_FAILED_POSTCOMMIT_VERIFICATION
@@ -727,8 +892,12 @@ class CommitGuard:
 
     # ---------------------------------------------------- unstable FIDs
     def _attr_key(self, attrs: dict) -> tuple:
+        from .audit_field_policy import is_layer_audit_field
         return tuple((n, _canon_value(attrs.get(n)))
-                     for n in self.field_names if n not in self.auto_fields)
+                     for n in self.field_names
+                     if n not in self.auto_fields
+                     and n not in self.readonly_fields
+                     and not is_layer_audit_field(n))
 
     def _signature(self, state: "_FeatureState"):
         return self._attr_key(state.attrs), _vertex_key(state.geom), (
@@ -853,7 +1022,8 @@ class CommitGuard:
                 if pre is not None and pre.exists:
                     gone.append(self._fast_signature(pre))
             added = dict(self._added_proj)
-            for tmp in self._event_added.get(eid, ()):
+            for tmp in (self._event_added.get(eid, set())
+                        | self._event_added_touched.get(eid, set())):
                 if tmp in added:
                     want.append(self._fast_signature(added[tmp]))
             per_event_expect[eid] = (want, gone)
@@ -925,14 +1095,43 @@ class CommitGuard:
              "CRITICAL")
 
     def _all_events(self):
-        return sorted(set(self._event_fids) | set(self._event_added) | set(self._event_deleted))
+        return sorted(
+            set(self._event_fids) | set(self._event_added)
+            | set(self._event_added_touched) | set(self._event_deleted))
 
     def _attribute_refusal(self, verdict: CommitVerdict, changed: set,
                            added: set, compensated: bool = True) -> None:
         errors = "; ".join(verdict.commit_errors[:4]) or "commit refused"
+        matched_tmps = None
+        if added and len(self._added_proj) > 1 and len(added) < len(self._added_proj):
+            try:
+                fresh = _fresh_layer(self.layer) or self.layer.dataProvider()
+                added_now = _read_states(fresh, sorted(added), self.field_names)
+                unmatched_real = list(sorted(added))
+                matched: Set[int] = set()
+                for tmp_fid, proj in self._added_proj:
+                    hit = None
+                    for real in unmatched_real:
+                        cur = added_now.get(real, _FeatureState(exists=False))
+                        if not _diff(cur, proj, self.field_names, self.auto_fields):
+                            hit = real
+                            break
+                    if hit is not None:
+                        unmatched_real.remove(hit)
+                        matched.add(tmp_fid)
+                if not unmatched_real:
+                    matched_tmps = matched
+            except Exception:  # noqa: BLE001 - conservative fallback below
+                matched_tmps = None
         for eid in self._all_events():
             touched = self._event_fids.get(eid, set()) | self._event_deleted.get(eid, set())
-            wrote = bool(touched & changed) or bool(self._event_added.get(eid) and added)
+            ev_added = (self._event_added.get(eid, set())
+                        | self._event_added_touched.get(eid, set()))
+            if matched_tmps is not None:
+                added_hit = bool(ev_added & matched_tmps)
+            else:
+                added_hit = bool(ev_added and added)
+            wrote = bool(touched & changed) or added_hit
             if wrote:
                 verdict.per_event[eid] = (EV_LANDED_THEN_COMPENSATED if compensated
                                           else EV_LANDED_NOT_COMPENSATED)
@@ -953,12 +1152,20 @@ class CommitGuard:
         if not layer.startEditing():
             return [f"fid {fid}" for fid in changed] + [f"added fid {f}" for f in added]
         fields = layer.fields()
+        unfiltered = _fresh_layer(layer) if layer.subsetString() else None
         for fid in changed:
             state = pre[fid]
             if not state.exists:
                 continue
-            if layer.getFeature(fid).isValid():
+            exists_now = (
+                unfiltered.getFeature(fid).isValid()
+                if unfiltered is not None
+                else layer.getFeature(fid).isValid()
+            )
+            if exists_now:
                 for name, value in state.attrs.items():
+                    if name in self.readonly_fields:
+                        continue
                     idx = fields.indexFromName(name)
                     if idx >= 0:
                         layer.changeAttributeValue(fid, idx, value)
@@ -967,6 +1174,8 @@ class CommitGuard:
             else:
                 feat = QgsFeature(fields)
                 for name, value in state.attrs.items():
+                    if name in self.readonly_fields:
+                        continue
                     idx = fields.indexFromName(name)
                     if idx >= 0:
                         feat.setAttribute(idx, value)
@@ -991,7 +1200,8 @@ class CommitGuard:
                 if not self._pre_image_present(fresh, state):
                     left.append(f"fid {fid}: deleted, not restored")
                 continue
-            d = _diff(cur, state, self.field_names, self.auto_fields)
+            d = _diff(cur, state, self.field_names, self.auto_fields,
+                      self.readonly_fields)
             if d:
                 left.append(f"fid {fid}: {'; '.join(d)}")
         for fid in added:
@@ -1001,8 +1211,15 @@ class CommitGuard:
         return left
 
     def _pre_image_present(self, source, state: _FeatureState) -> bool:
+        from .audit_field_policy import is_layer_audit_field
         for feat in source.getFeatures():
-            if all(values_equal(feat[n], v) for n, v in state.attrs.items()
-                   if n in self.field_names):
+            if not all(
+                values_equal(feat[n], v) for n, v in state.attrs.items()
+                if n in self.field_names
+                and n not in self.auto_fields
+                and not is_layer_audit_field(n)
+            ):
+                continue
+            if geometry_equal(feat.geometry(), state.geom):
                 return True
         return False

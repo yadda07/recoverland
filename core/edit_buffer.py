@@ -112,7 +112,9 @@ class EditSessionBuffer:
 
     def record_deletion(self, snapshot: FeatureSnapshot) -> None:
         """Record initial state of a deleted feature."""
-        self._modified.pop(snapshot.fid, None)
+        prev = self._modified.pop(snapshot.fid, None)
+        if prev is not None:
+            self._approx_bytes = max(0, self._approx_bytes - _estimate_snapshot_size(prev))
         if snapshot.fid in self._deleted:
             return
         self._deleted[snapshot.fid] = snapshot
@@ -125,6 +127,7 @@ class EditSessionBuffer:
     def record_committed_addition(self, data: Dict) -> None:
         """Store full feature data captured from committedFeaturesAdded signal."""
         self._committed_additions.append(data)
+        self._approx_bytes += _estimate_dict_size(data)
 
     def get_committed_additions(self) -> List[Dict]:
         return list(self._committed_additions)
@@ -132,7 +135,12 @@ class EditSessionBuffer:
     def record_committed_geom_change(self, fid: int,
                                      geom_wkb: Optional[bytes]) -> None:
         """Store authoritative post-commit geometry from committedGeometriesChanges."""
+        prev = self._committed_geom_changes.get(fid)
+        if isinstance(prev, (bytes, bytearray)):
+            self._approx_bytes = max(0, self._approx_bytes - len(prev))
         self._committed_geom_changes[fid] = geom_wkb
+        if isinstance(geom_wkb, (bytes, bytearray)):
+            self._approx_bytes += len(geom_wkb) + 40
 
     def record_committed_attr_change(self, fid: int,
                                      idx_to_value: Dict[int, Any]) -> None:
@@ -145,6 +153,7 @@ class EditSessionBuffer:
         """
         existing = self._committed_attr_changes.setdefault(fid, {})
         existing.update(idx_to_value)
+        self._approx_bytes += _ENTRY_OVERHEAD * len(idx_to_value)
 
     def record_committed_deletion(self, fid: int) -> None:
         """Mark a feature as authoritatively deleted by the provider."""
@@ -245,17 +254,32 @@ def _estimate_snapshot_size(snapshot: FeatureSnapshot) -> int:
     return size
 
 
+def _estimate_dict_size(data: Dict) -> int:
+    size = _DICT_BASE_OVERHEAD
+    for key, val in data.items():
+        size += _ENTRY_OVERHEAD + (len(key) if isinstance(key, str) else 16)
+        if isinstance(val, str):
+            size += len(val) + 50
+        elif isinstance(val, (bytes, bytearray)):
+            size += len(val) + 40
+        elif isinstance(val, dict):
+            size += _estimate_dict_size(val)
+        else:
+            size += 28
+    return size
+
+
 def create_snapshot_from_feature(feature, field_names: List[str],
                                  changed_field_names: Optional[List[str]] = None) -> FeatureSnapshot:
     """Build a FeatureSnapshot from a QgsFeature.
 
     Reads attributes and geometry WKB. Must be called from the main thread.
     """
-    from .serialization import serialize_value
+    from .serialization import read_attribute, serialize_value
     attrs = {}
     for name in field_names:
         try:
-            attrs[name] = serialize_value(feature[name])
+            attrs[name] = serialize_value(read_attribute(feature, name))
         except (KeyError, IndexError):
             attrs[name] = None
 

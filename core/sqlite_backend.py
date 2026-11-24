@@ -12,6 +12,7 @@ Implements AuditBackend using the local SQLite journal.
 Delegates actual queries to search_service and write_queue.
 """
 import sqlite3
+import threading
 from typing import List, Dict, Optional
 
 from .audit_backend import AuditBackend, AuditEvent, SearchCriteria, SearchResult
@@ -31,47 +32,53 @@ class SQLiteAuditBackend(AuditBackend):
         self._journal = journal
         self._write_queue = write_queue
         self._read_conn: Optional[sqlite3.Connection] = None
+        self._conn_lock = threading.Lock()
 
     def write_events(self, events: List[AuditEvent]) -> int:
         accepted = self._write_queue.enqueue(events)
         return len(events) if accepted else 0
 
     def search(self, criteria: SearchCriteria) -> SearchResult:
-        conn = self._get_read_conn()
-        return search_events(conn, criteria)
+        with self._conn_lock:
+            return search_events(self._get_read_conn_locked(), criteria)
 
     def count(self, criteria: SearchCriteria) -> int:
-        conn = self._get_read_conn()
-        return count_events(conn, criteria)
+        with self._conn_lock:
+            return count_events(self._get_read_conn_locked(), criteria)
 
     def get_event(self, event_id: int) -> Optional[AuditEvent]:
-        conn = self._get_read_conn()
-        return get_event_by_id(conn, event_id)
+        with self._conn_lock:
+            return get_event_by_id(self._get_read_conn_locked(), event_id)
 
     def get_distinct_layers(self) -> List[Dict[str, str]]:
-        conn = self._get_read_conn()
-        return get_distinct_layers(conn)
+        with self._conn_lock:
+            return get_distinct_layers(self._get_read_conn_locked())
 
     def get_distinct_users(self) -> List[str]:
-        conn = self._get_read_conn()
-        return get_distinct_users(conn)
+        with self._conn_lock:
+            return get_distinct_users(self._get_read_conn_locked())
 
     def is_available(self) -> bool:
         return self._journal.is_open
 
     def invalidate_read_cache(self) -> None:
         """Close cached read connection so the next query sees fresh WAL data."""
-        if self._read_conn is not None:
-            try:
-                self._read_conn.close()
-            except sqlite3.Error as exc:
-                flog(f"SQLiteAuditBackend.invalidate_read_cache: close failed: {exc}", "DEBUG")
-            self._read_conn = None
+        with self._conn_lock:
+            if self._read_conn is not None:
+                try:
+                    self._read_conn.close()
+                except sqlite3.Error as exc:
+                    flog(f"SQLiteAuditBackend.invalidate_read_cache: close failed: {exc}", "DEBUG")
+                self._read_conn = None
 
     def close(self) -> None:
         self.invalidate_read_cache()
 
-    def _get_read_conn(self) -> sqlite3.Connection:
+    def _get_read_conn_locked(self) -> sqlite3.Connection:
         if self._read_conn is None:
             self._read_conn = self._journal.create_read_connection()
         return self._read_conn
+
+    def _get_read_conn(self) -> sqlite3.Connection:
+        with self._conn_lock:
+            return self._get_read_conn_locked()

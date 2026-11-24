@@ -719,8 +719,8 @@ def assertions(ctx):
         "b_rattachement_depuis_une_source_en_lecture_seule",
         all(firsts.get(k, {}).get("ok") is True for k in ("b1", "b2"))
         and all(marks.get(m) == n for m, n in expected.items()),
-        f"premier rattachement : ok={ {k: v.get('ok') for k, v in firsts.items()} } "
-        f"erreurs={ {k: v.get('error') for k, v in firsts.items()} } ; lignes "
+        f"premier rattachement : ok={({k: v.get('ok') for k, v in firsts.items()})} "
+        f"erreurs={({k: v.get('error') for k, v in firsts.items()})} ; lignes "
         f"dans la cible={marks} (attendu une de chaque) crash={bpart.get('crash')} : "
         f"un journal archive refusait tout rattachement, et chaque nouvel essai "
         f"echouait de la meme facon",
@@ -732,7 +732,7 @@ def assertions(ctx):
         and bpart.get("digest_before") == bpart.get("digest_after")
         and bool(bpart.get("digest_before")),
         f"second rattachement : inseres="
-        f"{ {k: v.get('events_inserted') for k, v in seconds.items()} } (attendu "
+        f"{({k: v.get('events_inserted') for k, v in seconds.items()})} (attendu "
         f"0) ; source inchangee={bpart.get('digest_before') == bpart.get('digest_after')} "
         f": une identite tiree au hasard a chaque lecture dupliquerait les lignes "
         f"anciennes, et une source en lecture seule ne doit pas etre ecrite",

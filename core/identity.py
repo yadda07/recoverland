@@ -537,7 +537,8 @@ def _normalize_source_uri(provider_name: str, raw_source: str) -> str:
         return _normalize_spatialite_source(raw_source)
     if provider_name in _FILE_PROVIDERS:
         return _normalize_file_source(raw_source)
-    return raw_source.strip()
+    from .datasource_registry import _strip_password_from_uri
+    return _strip_password_from_uri((raw_source or "").strip(), provider_name)
 
 
 # Token that names the connection SERVICE of a DB fingerprint. It LEADS the
@@ -696,7 +697,7 @@ def _is_filesystem_path(raw: str) -> bool:
     text = (raw or "").strip()
     if not text:
         return False
-    if "://" in text:
+    if "://" in text or text.lower().startswith("/vsi"):
         return False
     if _KEY_VALUE_HEAD_RE.match(text):
         return False
@@ -753,9 +754,11 @@ def _resolve_candidate_path(path: str, abs_home: str = "") -> str:
 def _gpkg_single_table(cand_fs: str) -> str:
     """Single vector/attribute table name of a GeoPackage, or ''."""
     import sqlite3
+    from .journal_manager import sqlite_readonly_uri
     conn = None
     try:
-        conn = sqlite3.connect(cand_fs, timeout=0.5)
+        conn = sqlite3.connect(
+            sqlite_readonly_uri(cand_fs), uri=True, timeout=0.5)
         rows = conn.execute(
             "SELECT table_name FROM gpkg_contents "
             "WHERE data_type IN ('features', 'attributes') LIMIT 2"
@@ -862,11 +865,12 @@ def _ogr_single_layer_bare_match(stored_src: str, current_src: str,
 
 def _normalize_v6_file_source(raw: str) -> str:
     """File source normalization as v6 produced it (without single-layer suffix)."""
+    from .long_paths import plain
     head, _sep, tail = raw.partition("|")
     suffix = _identifying_suffix(tail)
     if not _is_filesystem_path(head):
         return head.strip() + suffix
-    path = head.strip().replace("\\", "/")
+    path = plain(head.strip()).replace("\\", "/")
     if _get_fingerprint_mode() == "relative":
         rel_path = _try_relative_to_project_home(path)
         if rel_path is not None:
@@ -1040,6 +1044,18 @@ def _try_relative_to_project_home(path: str) -> Optional[str]:
     return rel.replace("\\", "/")
 
 
+def _provider_fields(layer, provider):
+    """Provider fields (matching pkAttributeIndexes), with layer.fields fallback."""
+    if provider is not None:
+        try:
+            pf = provider.fields()
+            if pf is not None and pf.count() > 0:
+                return pf
+        except (AttributeError, RuntimeError):
+            pass
+    return layer.fields()
+
+
 def compute_feature_identity(layer, feature) -> str:
     """Compute feature identity JSON for a given feature.
 
@@ -1083,17 +1099,21 @@ def compute_feature_identity(layer, feature) -> str:
     """
     identity: Dict[str, Any] = {"fid": feature.id()}
 
-    pk_indices = list(layer.dataProvider().pkAttributeIndexes() or [])
+    provider = layer.dataProvider()
+    if provider is None:
+        return json.dumps(identity, ensure_ascii=False)
+    pk_indices = list(provider.pkAttributeIndexes() or [])
     if len(pk_indices) == 1:
-        fields = layer.fields()
+        fields = _provider_fields(layer, provider)
         idx = pk_indices[0]
         if 0 <= idx < fields.count():
             name, val = _read_pk_column(feature, fields.at(idx).name())
-            if val is not None:
+            if (val is not None and not _is_null_variant(val)
+                    and type(val).__name__ != "QgsUnsetAttributeValue"):
                 identity["pk_field"] = name
                 identity["pk_value"] = _safe_pk_value(val)
     elif len(pk_indices) > 1:
-        _add_composite_key(identity, layer, feature, pk_indices)
+        _add_composite_key(identity, layer, feature, pk_indices, provider)
 
     return json.dumps(identity, ensure_ascii=False)
 
@@ -1111,8 +1131,8 @@ def _read_pk_column(feature, name: str) -> Tuple[str, Any]:
 
 
 def _add_composite_key(identity: Dict[str, Any], layer, feature,
-                       pk_indices) -> None:
-    fields = layer.fields()
+                       pk_indices, provider=None) -> None:
+    fields = _provider_fields(layer, provider or layer.dataProvider())
     names: List[str] = []
     values: List[Any] = []
     complete = True
@@ -1123,6 +1143,7 @@ def _add_composite_key(identity: Dict[str, Any], layer, feature,
         name, val = _read_pk_column(feature, fields.at(idx).name())
         names.append(name)
         text = (None if val is None or _is_null_variant(val)
+                or type(val).__name__ == "QgsUnsetAttributeValue"
                 else _key_value_text(val))
         if text is None:
             complete = False
@@ -1214,7 +1235,8 @@ def _decode_key_repr(value: Any) -> Any:
                 else _TIMESPEC_NAMES[named.group(2)])
     try:
         numbers = [int(part) for part in parts]
-        from qgis.PyQt.QtCore import QDate, QDateTime, QTime, QTimeZone
+        from qgis.PyQt.QtCore import QDate, QDateTime, QTime
+        from ..compat import utc_qtimezone
     except (ValueError, ImportError):
         return _UNDECODABLE
     from .serialization import serialize_value
@@ -1227,7 +1249,7 @@ def _decode_key_repr(value: Any) -> Any:
             clock = QTime(*(numbers[3:] + [0] * (7 - len(numbers))))
             day = QDate(*numbers[:3])
             decoded = (QDateTime(day, clock) if spec == 0 else QDateTime(
-                day, clock, QTimeZone(QTimeZone.Initialization.UTC)))
+                day, clock, utc_qtimezone()))
         else:
             return _UNDECODABLE
     except (TypeError, ValueError):
@@ -1389,8 +1411,10 @@ def effective_identity(identity: Dict[str, Any], layer) -> Dict[str, Any]:
         return identity
     try:
         provider = layer.dataProvider()
+        if provider is None:
+            return identity
         pk_indices = list(provider.pkAttributeIndexes() or [])
-        fields = layer.fields()
+        fields = _provider_fields(layer, provider)
         pk_names = [fields.at(i).name() for i in pk_indices
                     if 0 <= i < fields.count()]
     except Exception as exc:  # noqa: BLE001 - uninspectable: caller decides
@@ -1474,7 +1498,12 @@ def get_identity_strength_for_layer(layer) -> IdentityStrength:
     raising on `None.name()`.
     """
     provider = layer.dataProvider()
-    provider_name = provider.name() if provider is not None else ""
+    if provider is None:
+        return IdentityStrength.NONE
+    if hasattr(layer, "isValid") and hasattr(layer, "isTemporary"):
+        from .support_policy import evaluate_layer_support
+        return evaluate_layer_support(layer).identity_strength
+    provider_name = provider.name()
     if provider_name == "ogr":
         return refine_ogr_identity(layer.source())
     return get_provider_policy(provider_name).identity_strength
@@ -1487,7 +1516,7 @@ def compute_project_fingerprint() -> str:
         project = QgsProject.instance()
         path = project.absoluteFilePath()
         if path:
-            normalized = os.path.abspath(path).replace("\\", "/")
+            normalized = os.path.normcase(os.path.abspath(path)).replace("\\", "/")
             return f"project::{normalized}"
         return "project::unsaved"
     except Exception:

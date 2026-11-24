@@ -952,10 +952,6 @@ The map does NOT show the state at this date.</translation>
 <context>
     <name>AppleToggleSwitch</name>
     <message>
-        <source>Enregistrement des modifications : actif</source>
-        <translation>Change recording: active</translation>
-    </message>
-    <message>
         <source>Enregistrement actif</source>
         <translation>Recording active</translation>
     </message>

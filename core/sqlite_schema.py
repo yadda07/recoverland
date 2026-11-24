@@ -13,9 +13,11 @@ All PRAGMAs are applied at every connection open.
 """
 import os
 import sqlite3
+import threading
 from typing import List, Optional, Tuple
 
 from .logger import flog
+from .long_paths import path_key, when_needed
 
 CURRENT_SCHEMA_VERSION = 7
 
@@ -67,19 +69,37 @@ def build_lightweight_select_sql() -> str:
 _LOCAL_MMAP_SIZE = 0 if os.name == "nt" else 268435456
 
 _PRAGMAS = [
+    "PRAGMA busy_timeout=5000",
+    # page_size only takes effect on a new database before journal_mode is set.
+    "PRAGMA page_size=4096",
     "PRAGMA journal_mode=WAL",
     # WAL + synchronous=NORMAL: performance/durability trade-off.
     # An OS crash may lose the last committed events.
     # Acceptable for a local audit journal (source data remains intact).
     "PRAGMA synchronous=NORMAL",
-    "PRAGMA busy_timeout=5000",
     "PRAGMA cache_size=-8000",
-    # page_size only takes effect on a new database; ignored on existing files.
-    "PRAGMA page_size=4096",
     "PRAGMA foreign_keys=OFF",
     "PRAGMA temp_store=MEMORY",
     "PRAGMA journal_size_limit=67108864",
     f"PRAGMA mmap_size={_LOCAL_MMAP_SIZE}",
+    "PRAGMA analysis_limit=1000",
+]
+
+_READ_ONLY_LOCAL_PRAGMAS = [
+    "PRAGMA busy_timeout=5000",
+    "PRAGMA cache_size=-8000",
+    "PRAGMA foreign_keys=OFF",
+    "PRAGMA temp_store=MEMORY",
+    f"PRAGMA mmap_size={_LOCAL_MMAP_SIZE}",
+    "PRAGMA analysis_limit=1000",
+]
+
+_READ_ONLY_NETWORK_PRAGMAS = [
+    "PRAGMA busy_timeout=5000",
+    "PRAGMA cache_size=-8000",
+    "PRAGMA foreign_keys=OFF",
+    "PRAGMA temp_store=MEMORY",
+    "PRAGMA mmap_size=0",
     "PRAGMA analysis_limit=1000",
 ]
 
@@ -127,29 +147,27 @@ _NETWORK_FS_TYPES = frozenset({
     "gpfs", "davfs", "fuse.davfs2", "fuse.rclone",
 })
 
-# Journals already announced as network journals (once per path, not once
-# per connection: the dialog opens a read connection per search).
+_NETWORK_LOG_LOCK = threading.Lock()
 _NETWORK_JOURNALS_LOGGED: set = set()
-# Network journals already reported as read in WAL mode by a read-only
-# connection (same reason: one line per journal, not per search).
 _NETWORK_WAL_READERS_LOGGED: set = set()
+_WIN_KERNEL32 = None
 
 
 def _warn_once(seen: set, path: str) -> bool:
-    key = os.path.normcase(path)
-    if key in seen:
-        return False
-    seen.add(key)
-    return True
+    key = path_key(path)
+    with _NETWORK_LOG_LOCK:
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
 
 
 class NetworkJournalBusyError(sqlite3.OperationalError):
-    """A network journal still in WAL mode that it is not safe to write.
+    """A network journal still in WAL mode that it is not safe to write."""
 
-    Raised to a connection that would write: another client keeps the
-    journal open in WAL mode, so it cannot be switched to DELETE, and
-    writing it in WAL from a second machine would corrupt it.
-    """
+
+class NewerSchemaError(sqlite3.DatabaseError):
+    """Raised when opening a journal created by a newer plugin schema version."""
 
 
 _TABLE_DDL = [
@@ -238,6 +256,9 @@ _INDEX_DDL = [
     """CREATE INDEX IF NOT EXISTS idx_event_snap_lookup
        ON audit_event(datasource_fingerprint, entity_fingerprint, created_at)
        WHERE invalidated_at IS NULL""",
+    """CREATE INDEX IF NOT EXISTS idx_event_invalidated
+       ON audit_event(invalidated_at)
+       WHERE invalidated_at IS NOT NULL""",
     """CREATE INDEX IF NOT EXISTS idx_datasource_alias_target
        ON datasource_alias(target_fingerprint)""",
 ]
@@ -246,23 +267,22 @@ _INDEX_DDL = [
 def apply_pragmas(conn: sqlite3.Connection, read_only: bool = False) -> None:
     """Apply all required PRAGMAs to an open connection.
 
-    The set depends on where the journal file lives: see _NETWORK_PRAGMAS.
-    Every connection of a journal (JournalManager, writer thread, readers,
-    Time Lens) goes through here, so they all agree on the journal mode.
-
-    `read_only`: the connection only reads (search, Time Lens). On a
-    network journal it never tries to change the journal mode of the file:
-    it cannot (SQLITE_IOERR_LOCK), and a failed attempt used to make the
-    whole read fail. The mode is the writer's business.
-
-    Raises NetworkJournalBusyError to a writing connection when a network
-    journal cannot leave WAL because another client keeps it open.
+    When *read_only* is True (or the underlying file is not writable), only
+    read-safe PRAGMAs are executed so DELETE-mode or read-only local/network
+    journals never fail with SQLITE_READONLY on ``PRAGMA journal_mode=...``.
     """
     path = _main_db_path(conn)
     network = bool(path) and is_network_path(path)
     if not network:
-        for pragma in _PRAGMAS:
+        pragmas = _READ_ONLY_LOCAL_PRAGMAS if read_only else _PRAGMAS
+        for pragma in pragmas:
             conn.execute(pragma)
+        return
+    if read_only:
+        for pragma in _READ_ONLY_NETWORK_PRAGMAS:
+            conn.execute(pragma)
+        _leave_wal_on_share(conn, path, read_only=True)
+        _log_network_journal(conn, path)
         return
     for pragma in _NETWORK_PRAGMAS:
         if pragma == _NETWORK_JOURNAL_MODE:
@@ -304,7 +324,9 @@ def _leave_wal_on_share(conn: sqlite3.Connection, path: str,
     busy = str(getattr(error, "sqlite_errorname", "") or "").startswith(
         ("SQLITE_BUSY", "SQLITE_LOCKED"))
     shown = (mode or "unknown").upper()
-    if not busy and not _is_writable(conn):
+    readonly_err = str(getattr(error, "sqlite_errorname", "") or "").startswith(
+        "SQLITE_READONLY")
+    if not busy and (readonly_err or not _is_writable(conn)):
         flog(f"sqlite_schema: read-only journal on a network share ({path}) "
              f"stays in {shown} mode ({reason}): it is served read-only as "
              f"it is, nothing is written to it from this connection.",
@@ -323,10 +345,8 @@ def _leave_wal_on_share(conn: sqlite3.Connection, path: str,
 
 
 def _log_network_journal(conn: sqlite3.Connection, path: str) -> None:
-    key = os.path.normcase(path)
-    if key in _NETWORK_JOURNALS_LOGGED:
+    if not _warn_once(_NETWORK_JOURNALS_LOGGED, path):
         return
-    _NETWORK_JOURNALS_LOGGED.add(key)
     try:
         mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).upper()
     except sqlite3.Error as exc:
@@ -355,24 +375,40 @@ def is_network_path(path: str) -> bool:
     return _is_network_path_posix(path)
 
 
-def _is_network_path_windows(path: str) -> bool:
-    p = path.replace("/", "\\")
-    if p.upper().startswith("\\\\?\\UNC\\"):
-        return True
-    if p.startswith("\\\\?\\") or p.startswith("\\\\.\\"):
-        p = p[4:]
-    elif p.startswith("\\\\"):
-        return True
-    drive = os.path.splitdrive(p)[0]
-    if len(drive) != 2 or drive[1] != ":":
-        return False
-    try:
+def _win_kernel32():
+    global _WIN_KERNEL32
+    if _WIN_KERNEL32 is None:
         import ctypes
-        drive_remote = 4
-        return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == drive_remote
-    except (AttributeError, OSError) as exc:
-        flog(f"sqlite_schema: drive type of {drive} unknown ({exc})", "DEBUG")
-        return False
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetDriveTypeW.argtypes = (wintypes.LPCWSTR,)
+        k32.GetDriveTypeW.restype = wintypes.UINT
+        _WIN_KERNEL32 = k32
+    return _WIN_KERNEL32
+
+
+def _is_network_path_windows(path: str) -> bool:
+    try:
+        resolved = os.path.realpath(path)
+    except OSError:
+        resolved = path
+    for candidate in (path, resolved):
+        p = candidate.replace("/", "\\")
+        if p.upper().startswith("\\\\?\\UNC\\"):
+            return True
+        if p.startswith("\\\\?\\") or p.startswith("\\\\.\\"):
+            p = p[4:]
+        elif p.startswith("\\\\"):
+            return True
+        drive = os.path.splitdrive(p)[0]
+        if len(drive) == 2 and drive[1] == ":":
+            try:
+                drive_remote = 4
+                if _win_kernel32().GetDriveTypeW(drive + "\\") == drive_remote:
+                    return True
+            except (AttributeError, OSError) as exc:
+                flog(f"sqlite_schema: drive type of {drive} unknown ({exc})", "DEBUG")
+    return False
 
 
 def _is_network_path_posix(path: str) -> bool:
@@ -394,20 +430,16 @@ def _is_network_path_posix(path: str) -> bool:
 
 
 def initialize_schema(conn: sqlite3.Connection) -> None:
-    """Create all tables and indexes if they don't exist. Idempotent.
+    """Create all tables and indexes if they don't exist. Idempotent and atomic.
 
-    Read-only journals (network share mounted read-only, file marked
-    read-only) are detected BEFORE anything tries to write and served as
-    they are: raising here would take the whole project down at the very
-    moment the user upgrades the plugin, for a schema change he did not
-    ask for. The history stays readable, only its evolution is deferred.
-
-    A journal that is writable but LOCKED by another instance is a
-    different story: the error is propagated so the caller can name the
-    lock instead of silently working on a journal it cannot update.
+    Read-only journals are detected BEFORE applying write PRAGMAs or DDL and
+    served as they are. Journals created by a newer plugin schema version
+    (version > CURRENT_SCHEMA_VERSION) are refused with NewerSchemaError
+    rather than mutated.
     """
-    apply_pragmas(conn)
-    if not _is_writable(conn):
+    writable = _is_writable(conn)
+    apply_pragmas(conn, read_only=not writable)
+    if not writable:
         flog(
             f"sqlite_schema: journal is read-only "
             f"(path={_main_db_path(conn)!r}); schema left at version "
@@ -416,20 +448,45 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             "WARNING",
         )
         return
-    with conn:
+    existing_ver = get_schema_version(conn)
+    if existing_ver > CURRENT_SCHEMA_VERSION:
+        raise NewerSchemaError(
+            f"Journal schema version {existing_ver} is newer than supported "
+            f"version {CURRENT_SCHEMA_VERSION}; upgrade RecoverLand to open "
+            f"this journal for writing."
+        )
+    # Explicit BEGIN IMMEDIATE: Python's default isolation_level="" runs DDL
+    # outside any transaction under `with conn:`, which broke atomicity
+    # between CREATE TABLE journal_coverage and stamping coverage_origin.
+    started_tx = not conn.in_transaction
+    if started_tx:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
         for ddl in _TABLE_DDL:
             conn.execute(ddl)
         current = get_schema_version(conn)
+        if current > CURRENT_SCHEMA_VERSION:
+            raise NewerSchemaError(
+                f"Journal schema version {current} is newer than supported "
+                f"version {CURRENT_SCHEMA_VERSION}."
+            )
         if current < CURRENT_SCHEMA_VERSION:
             _run_migrations(conn, current)
         for ddl in _INDEX_DDL:
             conn.execute(ddl)
-        # Idempotent, cheap, and run on every open: a journal stamped v7 by
-        # an interrupted or foreign tool must still get its idempotency index.
         from .journal_writes import ensure_v7_schema
         ensure_v7_schema(conn)
         _record_schema_version(conn)
         _reconcile_datasources(conn)
+        if started_tx:
+            conn.commit()
+    except Exception:
+        if started_tx and conn.in_transaction:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        raise
 
 
 def _main_db_path(conn: sqlite3.Connection) -> str:
@@ -446,19 +503,28 @@ def _main_db_path(conn: sqlite3.Connection) -> str:
 def _is_writable(conn: sqlite3.Connection) -> bool:
     """True when the journal file can actually be written to.
 
-    Checked on the FILE, not by attempting a write: `BEGIN IMMEDIATE`
-    succeeds on a read-only WAL database, so a probe transaction proves
-    nothing, and a real probe write would dirty a file we were asked not
-    to touch. An unknown path (memory / temp database) counts as
-    writable so nothing regresses in tests and tooling.
+    Probes real OS write permission via open(..., 'r+b') because Windows
+    os.access(path, os.W_OK) ignores NTFS/SMB ACLs and only checks the
+    legacy DOS read-only attribute.
     """
     path = _main_db_path(conn)
     if not path:
         return True
+    fs_path = when_needed(path)
     try:
-        if not os.path.isfile(path):
+        if not os.path.isfile(fs_path):
             return True
-        return os.access(path, os.W_OK)
+        if os.name == "nt":
+            from .long_paths import win_fs_retry
+            try:
+                fh = win_fs_retry(open, fs_path, "r+b", attempts=4, base_delay=0.02)
+                fh.close()
+                return True
+            except PermissionError:
+                return False
+            except OSError:
+                return os.access(fs_path, os.W_OK)
+        return os.access(fs_path, os.W_OK)
     except OSError as exc:
         flog(f"sqlite_schema: writability check failed on {path!r}: {exc}",
              "DEBUG")
@@ -575,13 +641,6 @@ def _run_migrations(conn: sqlite3.Connection, current_version: int) -> None:
                     except sqlite3.OperationalError as e:
                         if "duplicate column" not in str(e).lower():
                             raise
-        for ddl in _INDEX_DDL:
-            try:
-                conn.execute(ddl)
-            except sqlite3.OperationalError as exc:
-                # Index may already exist or column may be missing on older
-                # schema. Log at DEBUG so upgrade issues stay traceable.
-                flog(f"sqlite_schema: index DDL skipped: {exc} ({ddl[:60]}...)", "DEBUG")
         conn.execute(
             "INSERT OR REPLACE INTO schema_version "
             "(version_number, applied_at, description) VALUES (?, ?, ?)",
@@ -600,22 +659,25 @@ _BACKFILL_BATCH = 50000
 def _backfill_entity_fingerprint(conn: sqlite3.Connection) -> int:
     """Best-effort backfill of entity_fingerprint from feature_identity_json.
 
-    Reuses identity.compute_entity_fingerprint as the single source of
-    truth for the fingerprint format. Lazy import to avoid any chance
-    of import cycle during early schema initialisation.
+    Uses a monotonic event_id cursor so rows whose identity JSON cannot yield
+    a fingerprint never cause an infinite loop.
     """
     from .identity import compute_entity_fingerprint
     total = 0
+    last_id = 0
     while True:
         rows = conn.execute(
             "SELECT event_id, feature_identity_json FROM audit_event "
             "WHERE entity_fingerprint IS NULL "
             "AND feature_identity_json IS NOT NULL "
+            "AND event_id > ? "
+            "ORDER BY event_id "
             "LIMIT ?",
-            (_BACKFILL_BATCH,)
+            (last_id, _BACKFILL_BATCH)
         ).fetchall()
         if not rows:
             break
+        last_id = rows[-1][0]
         updates = []
         for event_id, identity_json in rows:
             fp = compute_entity_fingerprint(identity_json)

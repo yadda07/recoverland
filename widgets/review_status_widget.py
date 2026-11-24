@@ -23,7 +23,7 @@ from qgis.PyQt.QtWidgets import (
     QGraphicsOpacityEffect, QHBoxLayout, QLabel, QPushButton, QWidget,
 )
 
-from ..compat import QtCompat
+from ..compat import QtCompat, is_deleted
 from ..core.logger import flog
 from .icons import theme_icon
 from .theme import resolve_theme
@@ -71,6 +71,10 @@ class ReviewStatusWidget(QWidget):
         self._alert_timer.setSingleShot(True)
         self._alert_timer.timeout.connect(self._dismiss_alert)
 
+        self._unlock_timer = QTimer(self)
+        self._unlock_timer.setSingleShot(True)
+        self._unlock_timer.timeout.connect(self._unlock_stop_btn)
+
         self._last_refresh_ts: Optional[float] = None
         self._n_entities = 0
         self._n_layers = 0
@@ -113,12 +117,16 @@ class ReviewStatusWidget(QWidget):
             f"QPushButton:hover {{ background: {t.surface_survol.name()}; }}"
         )
 
+    def _unlock_stop_btn(self) -> None:
+        if not is_deleted(self._stop_btn):
+            self._stop_btn.setEnabled(True)
+
     def activate(self) -> None:
         """Review mode ON - semantic green pill, entity count, stop button."""
         self._active = True
         self._stop_btn.setVisible(True)
         self._stop_btn.setEnabled(False)
-        QTimer.singleShot(600, lambda: self._stop_btn.setEnabled(True))
+        self._unlock_timer.start(600)
         self._apply_pill_theme("active")
         self._update_text()
         self.setToolTip(self._build_tooltip())
@@ -128,6 +136,10 @@ class ReviewStatusWidget(QWidget):
     def deactivate(self) -> None:
         """Review mode OFF - back to idle."""
         self._active = False
+        self._unlock_timer.stop()
+        self._alert_timer.stop()
+        if self._pulse_anim is not None:
+            self._pulse_anim.stop()
         self._n_entities = 0
         self._n_layers = 0
         self._last_refresh_ts = None
@@ -236,13 +248,20 @@ class ReviewStatusWidget(QWidget):
             f"max-width: 8px; max-height: 8px;"
         )
 
+    def hideEvent(self, event) -> None:
+        if self._pulse_anim is not None:
+            self._pulse_anim.stop()
+        super().hideEvent(event)
+
     def _pulse(self) -> None:
         """Subtle opacity pulse on the dot (refresh feedback)."""
         if self._pulse_anim is not None:
             if self._pulse_anim.state() == QtCompat.ANIM_STATE_RUNNING:
                 return
+            self._pulse_anim.start()
+            return
         self._pulse_anim = QPropertyAnimation(
-            self._opacity_effect, b"opacity",
+            self._opacity_effect, b"opacity", self,
         )
         self._pulse_anim.setDuration(400)
         self._pulse_anim.setKeyValueAt(0.0, 1.0)

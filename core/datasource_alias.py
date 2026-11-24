@@ -418,7 +418,7 @@ def canonicalize_event_fingerprints(conn: sqlite3.Connection, events: list) -> l
     for event in events:
         raw_fp = event.datasource_fingerprint
         target = mapping.get(raw_fp) if mapping else None
-        if not target and raw_fp and raw_fp.startswith("ogr::"):
+        if not target and raw_fp and raw_fp.startswith(("ogr::", "spatialite::")):
             canon = canonicalize_fingerprint(raw_fp)
             if canon != raw_fp:
                 target = mapping.get(canon, canon) if mapping else canon
@@ -849,18 +849,47 @@ def _key_columns(conn: sqlite3.Connection, fingerprint: str) -> set:
             "AND feature_identity_json IS NOT NULL LIMIT 20",
             (fingerprint,)).fetchall()
     except sqlite3.Error as e:
-        flog(f"datasource_alias.reconcile: key column probe failed: {e}",
-             "WARNING")
-        return set()
+        flog(f"datasource_alias.reconcile: key column probe fallback ({e})",
+             "DEBUG")
+        return _key_columns_python(conn, fingerprint)
     keys = set()
     for single, several in rows:
         if single:
             keys.add(str(single))
         if several:
             try:
-                keys.update(str(name) for name in json.loads(several))
+                parsed = json.loads(several)
+                if isinstance(parsed, list):
+                    keys.update(str(name) for name in parsed if name)
             except (ValueError, TypeError):
                 continue
+    return keys
+
+
+def _key_columns_python(conn: sqlite3.Connection, fingerprint: str) -> set:
+    """Safe fallback when a row holds malformed feature_identity_json."""
+    keys = set()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT feature_identity_json FROM audit_event "
+            "WHERE datasource_fingerprint = ? "
+            "AND feature_identity_json IS NOT NULL LIMIT 50",
+            (fingerprint,),
+        ).fetchall()
+    except sqlite3.Error:
+        return keys
+    for (raw,) in rows:
+        try:
+            ident = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(ident, dict):
+            continue
+        if ident.get("pk_field"):
+            keys.add(str(ident["pk_field"]))
+        pks = ident.get("pk_fields")
+        if isinstance(pks, list):
+            keys.update(str(n) for n in pks if n)
     return keys
 
 
@@ -963,9 +992,11 @@ def _geometry_family(geometry_type: str) -> str:
     FAMILY is compared, which is what tells two tables apart.
     """
     text = (geometry_type or "").strip().lower()
+    # Polygon/surface BEFORE line/curve so CurvePolygon and MultiSurface
+    # are classified as polygon, not line.
     for family, markers in (("point", ("point",)),
-                            ("line", ("line", "curve")),
                             ("polygon", ("polygon", "surface")),
+                            ("line", ("line", "curve")),
                             ("none", ("nogeometry", "null", "none"))):
         if any(marker in text for marker in markers):
             return family

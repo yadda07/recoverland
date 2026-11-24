@@ -29,7 +29,7 @@ def resolve_user_name(plugin_config_user: Optional[str] = None) -> str:
     global _cached_user
 
     if plugin_config_user and plugin_config_user.strip():
-        _cached_user = plugin_config_user.strip()
+        _cached_user = _sanitize(plugin_config_user)
         return _cached_user
 
     if _cached_user is not None:

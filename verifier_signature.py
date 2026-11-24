@@ -210,9 +210,9 @@ def analyser(racine, exclusions):
             )
     for dossier, sous_dossiers, noms in os.walk(racine, followlinks=False):
         sous_dossiers[:] = sorted(nom for nom in sous_dossiers
-                                 if nom.lower() not in DOSSIERS_EXCLUS
-                                 and not nom.startswith(".")
-                                 and not (Path(dossier) / nom).is_symlink())
+                                  if nom.lower() not in DOSSIERS_EXCLUS
+                                  and not nom.startswith(".")
+                                  and not (Path(dossier) / nom).is_symlink())
         for nom in sorted(noms):
             chemin = Path(dossier) / nom
             if chemin.suffix.lower() not in EXTENSIONS:

@@ -21,6 +21,7 @@ from typing import Any, List, Dict, Optional, Callable
 
 from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 
+from .compat import is_deleted
 from .core.audit_backend import AuditEvent
 from .core.restore_service import (
     restore_batch,
@@ -496,7 +497,9 @@ def _release_group_suppression(runner) -> None:
     if tracker is None:
         return
     try:
-        if hasattr(tracker, "unsuppress_layers"):
+        if hasattr(tracker, "unsuppress_runner_layer"):
+            tracker.unsuppress_runner_layer(layer_id)
+        elif hasattr(tracker, "unsuppress_layers"):
             tracker.unsuppress_layers([layer_id])
         else:
             tracker.unsuppress()
@@ -602,7 +605,10 @@ def _release_run_suppression(runner, tracker) -> None:
     if tracker is None or not ids:
         return
     try:
-        if hasattr(tracker, "unsuppress_layers"):
+        if hasattr(tracker, "unsuppress_runner_layer"):
+            for lid in ids:
+                tracker.unsuppress_runner_layer(lid)
+        elif hasattr(tracker, "unsuppress_layers"):
             tracker.unsuppress_layers(ids)
         else:
             for _ in ids:
@@ -700,6 +706,17 @@ def _resolve_runner_layer(
             for event in group
         ]
 
+    from .core.restore_executor import dirty_transaction_group_siblings
+    dirty_siblings = dirty_transaction_group_siblings(layer)
+    if dirty_siblings:
+        sib_names = ", ".join(dirty_siblings[:5])
+        flog(f"{prefix}{runner_name}: transaction group sibling(s) modified "
+             f"name='{name}' siblings={sib_names}", "ERROR")
+        return None, [
+            f"Evt {event.event_id or 0}: {uncommitted_msg} ({sib_names})"
+            for event in group
+        ]
+
     if runner_owner is not None:
         # From here the run writes this layer. Suppressed BEFORE the
         # auto-commit below, which is a write too.
@@ -708,7 +725,16 @@ def _resolve_runner_layer(
         flog(f"{prefix}{runner_name}: auto-closing edit session "
              f"name='{name}' fp={fp}")
         with _runner_step_ctx(runner_owner, layer):
-            layer.commitChanges()
+            closed = layer.commitChanges()
+        if not closed or (hasattr(layer, 'isEditable') and layer.isEditable()):
+            if runner_owner is not None:
+                _release_group_suppression(runner_owner)
+            flog(f"{prefix}{runner_name}: auto-close commitChanges FAILED "
+                 f"name='{name}' fp={fp}", "ERROR")
+            return None, [
+                f"Evt {event.event_id or 0}: {uncommitted_msg}"
+                for event in group
+            ]
 
     return layer, []
 
@@ -930,6 +956,27 @@ class RestoreRunner(QObject):
         _fp, group = self._groups[self._group_idx]
         layer = self._current_layer
         start = self._event_idx
+        if hasattr(layer, 'isEditable') and layer.isEditable():
+            msg = ("Couche passee en edition pendant la restauration ; "
+                   "evenements restants abandonnes")
+            prefix = f"[{self._trace_id}] " if self._trace_id else ""
+            flog(f"{prefix}RestoreRunner: layer became editable mid-group "
+                 f"fp={_fp}", "ERROR")
+            rest = group[start:]
+            for ev in rest:
+                eid = ev.event_id or 0
+                self._errors.append(f"Evt {eid}: {msg}")
+            self._failed_other += len(rest)
+            self._total_fail += len(rest)
+            self._processed += len(rest)
+            self._event_idx = len(group)
+            _emit_progress(self, self._processed, len(self._events))
+            _release_group_suppression(self)
+            _close_group_journal(self)
+            self._group_fid_cache = {}
+            self._group_idx += 1
+            QTimer.singleShot(0, self._advance_group)
+            return
         end = min(start + _CHUNK_SIZE, len(group))
         chunk = group[start:end]
 
@@ -1363,9 +1410,10 @@ class StrictRestoreRunner(QObject):
                 target.append(text)
 
     def _bind_strict_external_commit_watch(self, layer) -> None:
-        """Watch *layer* for a user Save while the run holds it in edit mode."""
+        """Watch *layer* for a user Save or Rollback while held in edit mode."""
         self._unbind_strict_external_commit_watch()
         self._strict_external_committed = False
+        self._strict_external_rolled_back = False
         if layer is None:
             return
         step_entered = [False]
@@ -1374,8 +1422,15 @@ class StrictRestoreRunner(QObject):
         except (RuntimeError, AttributeError):
             return
 
+        def _leave_step_if_entered():
+            if step_entered[0]:
+                step_entered[0] = False
+                leave = getattr(self._tracker, "leave_runner_step", None)
+                if callable(leave):
+                    leave(lid)
+
         def _on_before(*_args):
-            if self._strict_commit_stage == "committing":
+            if self._strict_commit_stage in ("committing", "compensating"):
                 return
             guard = self._strict_guard
             foreign = guard.foreign_changes() if guard is not None else []
@@ -1384,29 +1439,52 @@ class StrictRestoreRunner(QObject):
                 if callable(enter):
                     enter(lid)
                     step_entered[0] = True
+                    # Release on next tick if external save fails without afterCommitChanges.
+                    QTimer.singleShot(0, _leave_step_if_entered)
 
         def _on_after(*_args):
-            if step_entered[0]:
-                step_entered[0] = False
-                leave = getattr(self._tracker, "leave_runner_step", None)
-                if callable(leave):
-                    leave(lid)
-            if self._strict_commit_stage != "committing":
+            _leave_step_if_entered()
+            if self._strict_commit_stage not in ("committing", "compensating"):
                 self._strict_external_committed = True
 
+        def _on_rollback(*_args):
+            _leave_step_if_entered()
+            if self._strict_commit_stage not in ("committing", "compensating"):
+                self._strict_external_rolled_back = True
+
+        slots = []
         try:
             layer.beforeCommitChanges.connect(_on_before)
+            slots.append((layer, layer.beforeCommitChanges, _on_before))
             layer.afterCommitChanges.connect(_on_after)
-            self._strict_ext_slots = [
-                (layer, layer.beforeCommitChanges, _on_before),
-                (layer, layer.afterCommitChanges, _on_after),
-            ]
+            slots.append((layer, layer.afterCommitChanges, _on_after))
+            for sig_name in ("beforeRollBack", "afterRollBack"):
+                sig = getattr(layer, sig_name, None)
+                if sig is not None and hasattr(sig, "connect"):
+                    sig.connect(_on_rollback)
+                    slots.append((layer, sig, _on_rollback))
+            self._strict_ext_slots = slots
+            self._strict_ext_cleanup = _leave_step_if_entered
         except (RuntimeError, AttributeError, TypeError):
+            for _lyr, sig, slot in slots:
+                if is_deleted(_lyr):
+                    continue
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError, AttributeError):
+                    pass
             self._strict_ext_slots = []
+            self._strict_ext_cleanup = None
 
     def _unbind_strict_external_commit_watch(self) -> None:
+        cleanup = getattr(self, "_strict_ext_cleanup", None)
+        self._strict_ext_cleanup = None
+        if callable(cleanup):
+            cleanup()
         slots, self._strict_ext_slots = getattr(self, "_strict_ext_slots", []), []
         for _lyr, sig, slot in slots:
+            if is_deleted(_lyr):
+                continue
             try:
                 sig.disconnect(slot)
             except (RuntimeError, TypeError, AttributeError):
@@ -1415,6 +1493,9 @@ class StrictRestoreRunner(QObject):
     def _end_strict_layer(self) -> None:
         """Give back the layer the run has just finished. Idempotent."""
         self._unbind_strict_external_commit_watch()
+        guard = getattr(self, "_strict_guard", None)
+        if guard is not None and hasattr(guard, "detach"):
+            guard.detach()
         self._strict_group_open = False
         self._strict_opened_edit = False
         self._strict_command_open = False
@@ -1736,9 +1817,16 @@ class StrictRestoreRunner(QObject):
         start = self._strict_action_idx
         chunk_t0 = time.monotonic()
 
-        if (getattr(self, "_strict_external_committed", False)
-                or (not self._strict_was_editing and not layer.isEditable())):
+        if getattr(self, "_strict_external_committed", False):
             self._handle_external_commit_strict(prefix)
+            return
+        if (getattr(self, "_strict_external_rolled_back", False)
+                or (not self._strict_was_editing and not layer.isEditable())):
+            self._errors.append(
+                f"Couche '{self._strict_layer_name}' : session d'edition "
+                f"annulee par l'utilisateur pendant le rewind ; rien n'a ete "
+                f"ecrit")
+            self._rollback_strict(prefix, "external_rollback")
             return
         if self._cancelled:
             self._rollback_strict(prefix, "cancel_requested")
@@ -1784,7 +1872,8 @@ class StrictRestoreRunner(QObject):
                      f"skipped={skipped} reason={reason} "
                      f"fid={result.get('fid', '?')}")
                 if skipped:
-                    self._strict_skipped.append(action.event_id)
+                    if reason not in ("target_absent", "geometry_drift"):
+                        self._strict_skipped.append(action.event_id)
                 else:
                     self._strict_succeeded.append(action.event_id)
                     self._all_succeeded_ids.add(action.event_id)
@@ -2100,9 +2189,16 @@ class StrictRestoreRunner(QObject):
         layer_name = self._strict_layer_name
         apply_ms = int((time.monotonic() - self._strict_apply_start) * 1000)
 
-        if (getattr(self, "_strict_external_committed", False)
-                or (not self._strict_was_editing and not layer.isEditable())):
+        if getattr(self, "_strict_external_committed", False):
             self._handle_external_commit_strict(prefix)
+            return
+        if (getattr(self, "_strict_external_rolled_back", False)
+                or (not self._strict_was_editing and not layer.isEditable())):
+            self._errors.append(
+                f"Couche '{self._strict_layer_name}' : session d'edition "
+                f"annulee par l'utilisateur pendant le rewind ; rien n'a ete "
+                f"ecrit")
+            self._rollback_strict(prefix, "external_rollback")
             return
 
         layer.endEditCommand()
@@ -2129,8 +2225,9 @@ class StrictRestoreRunner(QObject):
             self._strict_commit_stage = "committing"
             with _runner_step_ctx(self, layer):
                 ok = layer.commitChanges()
-            self._strict_commit_stage = "committed" if ok else "refused"
-            verdict = guard.finish(ok)
+            self._strict_commit_stage = "committed" if ok else "compensating"
+            with _runner_step_ctx(self, layer):
+                verdict = guard.finish(ok)
             if not verdict.committed:
                 self._strict_commit_stage = "refused"
                 errors = verdict.commit_errors
@@ -2140,30 +2237,21 @@ class StrictRestoreRunner(QObject):
                 # What the refused commit wrote was reverted and verified
                 # (core.commit_guard). What could NOT be reverted is in the
                 # file: it is journalled and kept in the undo scope, and
-                # the user is told, never "0 restored" over changed data.
+                # counted unverified, never announced as restored.
                 left = set(verdict.events_with(EV_LANDED_NOT_COMPENSATED))
                 for eid in self._strict_succeeded:
                     if eid not in left:
                         self._all_succeeded_ids.discard(eid)
                 for eid in left:
                     self._all_succeeded_ids.add(eid)
-                # BL-RW-P4-21: commit failure rolls back every action
-                # in the layer; per-group bucket accumulators no longer
-                # represent reality. Credit the whole layer as
-                # failed_other and discard the per-group counters.
-                # Claimed here: from now on the group is accounted.
                 self._strict_group_open = False
                 self._strict_commit_stage = "refused_accounted"
                 total_actions = len(self._strict_plan.actions)
-                # The writes the compensation could not revert ARE in the
-                # file, traced and in the undo scope: counting them failed
-                # announced "0 restored" over data the run had changed.
                 landed = min(len(left), total_actions)
-                self._applied += landed
-                self._total_ok += landed
+                self._failed_postcommit_verification += landed
                 self._failed_other += total_actions - landed
                 self._reset_group_buckets()
-                self._total_fail += total_actions - landed
+                self._total_fail += total_actions
                 self._strict_commit_traces = sorted(left)
                 if left:
                     self._errors.append(
@@ -2173,7 +2261,8 @@ class StrictRestoreRunner(QObject):
                 self._errors.append(
                     f"Commit failed ({verdict.state}): {msg}")
                 if layer.isEditable():
-                    layer.rollBack()
+                    with _runner_step_ctx(self, layer):
+                        layer.rollBack()
                 self._journal_committed_writes(prefix)
                 layer.triggerRepaint()
                 self._close_committed_layer()
@@ -2430,7 +2519,8 @@ class StrictRestoreRunner(QObject):
         layer = self._strict_layer
         try:
             if layer is not None and layer.isEditable():
-                layer.rollBack()
+                with _runner_step_ctx(self, layer):
+                    layer.rollBack()
         except Exception as rb_exc:  # noqa: BLE001 - layer may be gone
             flog(f"{prefix}StrictRestoreRunner: rollBack after commit crash "
                  f"failed: {rb_exc}", "ERROR")

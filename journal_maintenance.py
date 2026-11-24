@@ -60,6 +60,14 @@ class JournalMaintenanceDialog(QDialog):
         self._vacuum_running = False
         self._vacuum_size_before = 0
         self._vacuum_timer = QElapsedTimer()
+        self._vacuum_bridge = None
+        self._closed = False
+        self._save_reset_timer = QTimer(self)
+        self._save_reset_timer.setSingleShot(True)
+        self._save_reset_timer.timeout.connect(self._reset_save_btn)
+        self._size_reset_timer = QTimer(self)
+        self._size_reset_timer.setSingleShot(True)
+        self._size_reset_timer.timeout.connect(self._reset_size_label_style)
         self.setWindowTitle(self.tr("RecoverLand - Maintenance du journal"))
         self.setMinimumWidth(520)
         self.setMinimumHeight(400)
@@ -340,9 +348,12 @@ class JournalMaintenanceDialog(QDialog):
         btn.setIcon(theme_icon("check-circle", color=t.acheve, size=ICONE_XS))
         btn.setStyleSheet(f"color: {t.acheve.name()}; font-weight: 600;")
         btn.setEnabled(False)
-        QTimer.singleShot(2000, self._reset_save_btn)
+        self._save_reset_timer.start(2000)
 
     def _reset_save_btn(self) -> None:
+        from .compat import is_deleted
+        if is_deleted(self) or getattr(self, "_closed", False):
+            return
         t = resolve_theme(self)
         btn = self._save_retention_btn
         btn.setText(self.tr("Enregistrer"))
@@ -388,6 +399,14 @@ class JournalMaintenanceDialog(QDialog):
         try:
             conn = self._journal.get_connection()
             result = purge_old_events_with_options(conn, policy, options)
+            if result.error:
+                flog(f"purge error: {result.error}", "ERROR")
+                QMessageBox.warning(
+                    self, self.tr("Erreur de purge"),
+                    self.tr("Une erreur est survenue lors de la purge. "
+                            "Consultez le journal de logs."))
+                self._refresh_stats()
+                return
             msg = self.tr("{count} evenement(s) supprime(s).").format(count=result.deleted_count)
             if result.deleted_count > 0:
                 parts = []
@@ -505,9 +524,13 @@ class JournalMaintenanceDialog(QDialog):
         bbox.accepted.connect(dlg.accept)
         bbox.rejected.connect(dlg.reject)
         lay.addWidget(bbox)
-        if dlg.exec() != QtCompat.DIALOG_ACCEPTED:
+        accepted = dlg.exec() == QtCompat.DIALOG_ACCEPTED
+        kw = {"retention": False}
+        if accepted:
+            kw.update({name: chk.isChecked() for name, chk in checks})
+        dlg.deleteLater()
+        if not accepted:
             return None
-        kw = {name: chk.isChecked() for name, chk in checks}
         return PurgeOptions(**kw)
 
     def _vacuum_journal(self) -> None:
@@ -581,11 +604,54 @@ class JournalMaintenanceDialog(QDialog):
         self._progress.setVisible(True)
         flog(f"vacuum: user initiated, size_before={size_before}", "INFO")
 
-        self._vacuum_bridge = _VacuumBridge(self)
-        self._vacuum_bridge.finished.connect(self._on_vacuum_finished)
-        vacuum_async(path, callback=self._vacuum_bridge.finished.emit)
+        bridge = _VacuumBridge(self)
+        self._vacuum_bridge = bridge
+        bridge.finished.connect(self._on_vacuum_finished)
+
+        def _notify_vacuum_done(ok: bool, b=bridge) -> None:
+            from .compat import is_deleted
+            try:
+                if not is_deleted(b):
+                    b.finished.emit(ok)
+            except RuntimeError:
+                pass
+
+        vacuum_async(path, callback=_notify_vacuum_done)
+
+    def _cleanup_on_close(self) -> None:
+        self._closed = True
+        for timer in (getattr(self, "_save_reset_timer", None),
+                      getattr(self, "_size_reset_timer", None)):
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+        bridge = getattr(self, "_vacuum_bridge", None)
+        if bridge is not None:
+            try:
+                bridge.finished.disconnect(self._on_vacuum_finished)
+            except (TypeError, RuntimeError):
+                pass
+            self._vacuum_bridge = None
+
+    def closeEvent(self, event) -> None:
+        self._cleanup_on_close()
+        super().closeEvent(event)
+
+    def done(self, result: int) -> None:
+        self._cleanup_on_close()
+        super().done(result)
+
+    def showEvent(self, event) -> None:
+        self._closed = False
+        super().showEvent(event)
 
     def _on_vacuum_finished(self, success: bool) -> None:
+        from .compat import is_deleted
+        if is_deleted(self) or getattr(self, "_closed", False):
+            self._vacuum_running = False
+            return
         t = resolve_theme(self)
         elapsed_ms = self._vacuum_timer.elapsed()
         self._progress.setVisible(False)
@@ -643,11 +709,11 @@ class JournalMaintenanceDialog(QDialog):
         """Return (freelist_count, page_size) from SQLite PRAGMAs."""
         conn = None
         try:
-            conn = sqlite3.connect(path)
+            conn = self._journal.create_read_connection()
             free = conn.execute("PRAGMA freelist_count").fetchone()[0]
             psize = conn.execute("PRAGMA page_size").fetchone()[0]
             return (free, psize)
-        except (sqlite3.Error, TypeError) as exc:
+        except (sqlite3.Error, TypeError, RuntimeError) as exc:
             flog(f"vacuum: free pages of {path} unreadable ({exc})", "WARNING")
             return (0, 4096)
         finally:
@@ -682,9 +748,12 @@ class JournalMaintenanceDialog(QDialog):
             f"background-color: {t.acheve_doux.name()}; border: 1px solid {t.acheve.name()}; "
             f"border-radius: 10px; padding: 2px 8px; font-weight: 700; font-size: 12px;"
         )
-        QTimer.singleShot(4000, self._reset_size_label_style)
+        self._size_reset_timer.start(4000)
 
     def _reset_size_label_style(self) -> None:
+        from .compat import is_deleted
+        if is_deleted(self) or getattr(self, "_closed", False):
+            return
         t = resolve_theme(self)
         self._size_label.setStyleSheet(
             f"font-family: '{t.police_titre}'; font-size: 11px; font-weight: 700; "
@@ -708,44 +777,82 @@ class JournalMaintenanceDialog(QDialog):
     def _export_journal(self) -> None:
         if not self._journal or not self._journal.path:
             return
+        import uuid
+        from .core.long_paths import path_key, when_needed, win_fs_retry
+        from .core.disk_monitor import check_disk_for_path
         dest, _ = QFileDialog.getSaveFileName(
             self, self.tr("Exporter le journal"), "",
             self.tr("SQLite (*.sqlite);;Tous les fichiers (*)"))
         if not dest:
             return
-        src_conn = None
-        dst_conn = None
-        try:
-            src_conn = self._journal.create_read_connection()
-            dst_conn = sqlite3.connect(dest)
-            src_conn.backup(dst_conn)
-            QMessageBox.information(
-                self, self.tr("Export"),
-                self.tr("Journal exporte vers {name}.").format(
-                    name=os.path.basename(dest)))
-        except (sqlite3.Error, OSError) as e:
-            flog(f"_export_journal: backup failed: {e}", "ERROR")
+        if path_key(dest) == path_key(self._journal.path):
+            flog("_export_journal: refused overwrite of active journal", "WARNING")
             QMessageBox.warning(
                 self, self.tr("Erreur d'export"),
                 self.tr("Une erreur est survenue lors de l'export. "
                         "Consultez le journal de logs."))
+            return
+        src_size = get_journal_size_bytes(self._journal.path)
+        dstatus = check_disk_for_path(dest)
+        if dstatus.total_bytes > 0 and src_size > 0 and dstatus.free_bytes < src_size:
+            flog(f"_export_journal: insufficient disk space free={dstatus.free_bytes} "
+                 f"need>={src_size}", "ERROR")
+            QMessageBox.warning(
+                self, self.tr("Erreur d'export"),
+                self.tr("Une erreur est survenue lors de l'export. "
+                        "Consultez le journal de logs."))
+            return
+        src_conn = None
+        dst_conn = None
+        dest_fs = when_needed(dest)
+        tmp_fs = when_needed(f"{dest}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+        export_ok = False
+        try:
+            src_conn = self._journal.create_read_connection()
+            dst_conn = sqlite3.connect(tmp_fs)
+            src_conn.backup(dst_conn)
+            dst_conn.close()
+            dst_conn = None
+            src_conn.close()
+            src_conn = None
+            win_fs_retry(os.replace, tmp_fs, dest_fs)
+            export_ok = True
+        except (sqlite3.Error, OSError) as e:
+            flog(f"_export_journal: backup failed: {e}", "ERROR")
+            try:
+                if dst_conn is not None:
+                    dst_conn.close()
+                    dst_conn = None
+            except sqlite3.Error:
+                pass
+            try:
+                if os.path.exists(tmp_fs):
+                    win_fs_retry(os.remove, tmp_fs, attempts=3, base_delay=0.02)
+            except OSError:
+                pass
         finally:
-            if dst_conn:
+            if dst_conn is not None:
                 try:
                     dst_conn.close()
                 except Exception as exc:  # noqa: BLE001
-                    # WARNING: the success dialog has already been shown,
-                    # so an unflushed destination means the user keeps an
-                    # export he believes is complete.
                     flog(f"_export_journal: destination connection close "
-                         f"failed, exported file may be incomplete "
-                         f"({exc!r})", "WARNING")
-            if src_conn:
+                         f"failed ({exc!r})", "WARNING")
+            if src_conn is not None:
                 try:
                     src_conn.close()
                 except Exception as exc:  # noqa: BLE001
                     flog(f"_export_journal: source read connection close "
                          f"failed ({exc!r})", "DEBUG")
+        if export_ok:
+            QMessageBox.information(
+                self, self.tr("Export"),
+                self.tr("Journal exporte vers {name}.").format(
+                    name=os.path.basename(dest)))
+        else:
+            QMessageBox.warning(
+                self, self.tr("Erreur d'export"),
+                self.tr("Une erreur est survenue lors de l'export. "
+                        "Consultez le journal de logs."))
 
     def _analyze_journal(self) -> None:
         """Run BL-OPT-08 diagnostic and display the report."""

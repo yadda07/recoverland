@@ -206,10 +206,12 @@ class _IconCache:
         pixmap.fill(QColor(0, 0, 0, 0))
         pixmap.setDevicePixelRatio(dpr)
         painter = QPainter(pixmap)
-        painter.setRenderHint(QtCompat.ANTIALIAS, True)
-        painter.setRenderHint(QtCompat.SMOOTH_PIXMAP, True)
-        rend.render(painter, QRectF(0.0, 0.0, float(logical), float(logical)))
-        painter.end()
+        try:
+            painter.setRenderHint(QtCompat.ANTIALIAS, True)
+            painter.setRenderHint(QtCompat.SMOOTH_PIXMAP, True)
+            rend.render(painter, QRectF(0.0, 0.0, float(logical), float(logical)))
+        finally:
+            painter.end()
 
         cost = px * px * 4
         with self._lock:
@@ -222,8 +224,40 @@ class _IconCache:
             self._bytes += cost
         return pixmap
 
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+            self._renderers.clear()
+            self._bytes = 0
+
 
 _GLOBAL_ICON_CACHE = _IconCache()
+
+
+def clear_icon_cache() -> None:
+    """Release cached QPixmap/QSvgRenderer instances before shutdown/unload."""
+    _GLOBAL_ICON_CACHE.clear()
+
+
+def disconnect_icon_cache_hook() -> None:
+    """Disconnect the aboutToQuit hook on plugin unload to avoid module retention."""
+    clear_icon_cache()
+    try:
+        from qgis.PyQt.QtWidgets import QApplication as _QApp  # noqa: PLC0415
+        app_inst = _QApp.instance()
+        if app_inst is not None:
+            app_inst.aboutToQuit.disconnect(clear_icon_cache)
+    except (TypeError, RuntimeError, ImportError):
+        pass
+
+
+try:
+    from qgis.PyQt.QtWidgets import QApplication as _QApp  # noqa: PLC0415
+    _app_inst = _QApp.instance()
+    if _app_inst is not None:
+        _app_inst.aboutToQuit.connect(clear_icon_cache)
+except (ImportError, RuntimeError, AttributeError):
+    pass
 
 
 def draw_svg_icon(painter: QPainter, name: str, rect: QRectF, color: QColor) -> None:
@@ -297,4 +331,7 @@ def couleur_etat(code: str, tokens: Optional[ThemeTokens] = None) -> QColor:
 
 flog("module=widgets.icons fn=init n_glyphs=" + str(len(_DESSINS_CORPS)), "DEBUG")
 
-__all__ = ["couleur_etat", "draw_svg_icon", "icone_etat", "theme_icon", "theme_pixmap"]
+__all__ = [
+    "clear_icon_cache", "couleur_etat", "draw_svg_icon",
+    "icone_etat", "theme_icon", "theme_pixmap",
+]

@@ -40,15 +40,21 @@ with zipfile.ZipFile(str(zip_path), 'r') as z:
     # Check for forbidden files
     _FORBIDDEN = ['.git', '.github', '.claude', '.devin', '.windsurf',
                   'controllers/', 'scripts/', 'tests/', 'build/', 'dist/',
-                  '_vendor/', '__pycache__', '.pyc', '.log', 'AGENTS.md',
-                  'orchestrator',
+                  '_vendor/', '__pycache__', '.pyc', '.pyo', '.log', '.bak',
+                  '.tmp', 'Thumbs.db', '.DS_Store', 'desktop.ini',
+                  'AGENTS.md', 'orchestrator',
                   # The runtime never compiles a catalogue; shipping the
                   # compiler is what allowed classFactory to overwrite a
                   # correct .qm with a dead one, and it carries every bandit
                   # finding of the package. Build input, not runtime asset:
                   # the .ts goes with it.
                   'compile_translations.py', 'recoverland_en.ts']
-    forbidden = [p for p in entries if any(x in p for x in _FORBIDDEN)]
+    forbidden = [
+        p for p in entries
+        if any(x in p for x in _FORBIDDEN)
+        or p.lower().endswith('.md')
+        or any(part.startswith('.') for part in p.split('/'))
+    ]
     if forbidden:
         print("FORBIDDEN_FOUND:", forbidden[:10])
         failures.append(f"forbidden_entries={forbidden[:10]}")

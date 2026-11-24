@@ -30,7 +30,12 @@ Two spellings, two uses:
 `plain(path)` undoes the prefix for display and comparison: both forms
 name the same file.
 """
+import errno
 import os
+import time
+
+# Win32 transient sharing/access lock errors (AV scanners, indexers, Explorer).
+_WIN_TRANSIENT_ERRORS = (5, 32, 33)
 
 EXTENDED_PREFIX = "\\\\?\\"          # the 4 characters  \\?\
 _UNC_PREFIX = EXTENDED_PREFIX + "UNC\\"
@@ -48,9 +53,9 @@ LONG_PATH_THRESHOLD = 250
 
 def extended(path: str) -> str:
     """Windows extended-length form of *path* (unchanged elsewhere)."""
-    if os.name != "nt":
+    if os.name != "nt" or not path:
         return path
-    p = os.path.abspath(path)
+    p = os.path.abspath(plain(path))
     if p.startswith(EXTENDED_PREFIX):
         return p
     if p.startswith("\\\\"):       # UNC share \\server\share
@@ -63,6 +68,8 @@ def when_needed(path: str) -> str:
     if os.name != "nt" or not path:
         return path
     if path.startswith(EXTENDED_PREFIX):
+        if "/" in path or "\\..\\" in path or path.endswith("\\.."):
+            return extended(path)
         return path
     if len(os.path.abspath(path)) <= LONG_PATH_THRESHOLD:
         return path
@@ -83,3 +90,33 @@ def plain(path: str) -> str:
 def path_key(path: str) -> str:
     """One comparison key per file, whatever its spelling."""
     return os.path.normcase(os.path.abspath(plain(path)))
+
+
+def is_transient_win_lock(exc: OSError) -> bool:
+    """Return True if *exc* is a transient Windows file-sharing/AV lock."""
+    if os.name != "nt":
+        return False
+    winerr = getattr(exc, "winerror", None)
+    if winerr in _WIN_TRANSIENT_ERRORS:
+        return True
+    return exc.errno in (errno.EACCES, errno.EBUSY)
+
+
+def win_fs_retry(fn, *args, attempts: int = 6, base_delay: float = 0.02, **kwargs):
+    """Run filesystem operation *fn* retrying transient Windows sharing locks.
+
+    Anti-virus scanners, Search Indexer, and OneDrive briefly hold handles on
+    freshly written or unlinked files on Windows (WinError 5, 32, 33). On
+    POSIX this runs *fn* once without delay.
+    """
+    if os.name != "nt":
+        return fn(*args, **kwargs)
+    delay = base_delay
+    for attempt in range(max(1, attempts)):
+        try:
+            return fn(*args, **kwargs)
+        except OSError as exc:
+            if not is_transient_win_lock(exc) or attempt + 1 >= attempts:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2.0, 0.25)

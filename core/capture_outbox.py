@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from .logger import flog
+from .long_paths import win_fs_retry
 
 OUTBOX_SUFFIX = ".outbox"
 QUARANTINE_DIRNAME = "quarantine"
@@ -122,13 +123,49 @@ def event_to_record(event) -> dict:
     return data
 
 
+_MAX_SEGMENT_BYTES = 16 * 1024 * 1024
+
+
+def _share_replace(tmp: str, target: str) -> None:
+    """Atomic replace with brief Windows AV/indexer retry and tmp cleanup."""
+    import time as _time
+    last_err = None
+    for attempt in range(6):
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError as exc:
+            last_err = exc
+            if os.name != "nt" or attempt == 5:
+                break
+            _time.sleep(0.05 * (attempt + 1))
+        except OSError:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+    if last_err is not None:
+        raise last_err
+
+
 def record_to_row_values(record: dict) -> dict:
     """Inverse of :func:`event_to_record` for the columns we insert."""
+    import binascii
     out = dict(record)
     for key in _BYTES_FIELDS:
         value = out.get(key)
         if isinstance(value, str) and value.startswith("b64:"):
-            out[key] = base64.b64decode(value[4:])
+            try:
+                out[key] = base64.b64decode(value[4:], validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(f"invalid base64 in {key}: {exc}") from exc
     return out
 
 
@@ -165,6 +202,7 @@ class CaptureOutbox:
         self._outstanding: Dict[int, int] = {}
         self._unacked_events = 0
         self._prepare_seg: Dict[str, int] = {}
+        self._batch_prepare_seq: Dict[str, int] = {}
         self._closed = False
         self.last_error: str = ""
         self.last_append_at: str = ""
@@ -227,7 +265,13 @@ class CaptureOutbox:
             self._outstanding[seq] = self._outstanding.get(seq, 0) + 1
             self._unacked_events += len(records)
             if commit_id and commit_state:
-                self._resolve_prepare_locked(commit_id)
+                prep_seq = self._prepare_seg.pop(commit_id, None)
+                if prep_seq is not None:
+                    if prep_seq == seq:
+                        self._release_locked(prep_seq)
+                    else:
+                        # Keep prepare segment pinned until batch is committed.
+                        self._batch_prepare_seq[batch_id] = prep_seq
             self.appended_batches += 1
             self.appended_events += len(records)
             return seq
@@ -235,35 +279,79 @@ class CaptureOutbox:
     def _write_lines(self, lines: List[dict]) -> int:
         if self._closed:
             raise OutboxWriteError("outbox is closed")
+        pre_pos: Optional[int] = None
         try:
+            if self._fh is not None:
+                try:
+                    if self._fh.tell() >= _MAX_SEGMENT_BYTES:
+                        self._fh.close()
+                        self._fh = None
+                except OSError:
+                    try:
+                        self._fh.close()
+                    except OSError:
+                        pass
+                    self._fh = None
             if self._fh is None:
                 os.makedirs(self.dir, exist_ok=True)
                 self._cur_seq = self._next_seq
                 self._next_seq += 1
                 path = os.path.join(
                     self.dir, f"{_SEGMENT_PREFIX}{self._cur_seq:08d}{_SEGMENT_SUFFIX}")
-                self._fh = open(path, "a", encoding="utf-8", newline="\n")
+                self._fh = win_fs_retry(
+                    open, path, "a", encoding="utf-8", newline="\n")
             encode = _LINE_ENCODER.encode
-            payload = "".join(encode(line) + "\n" for line in lines)
             _fault("outbox_before_write")
+            pre_pos = self._fh.tell()
             if _fault_active("outbox_torn_write"):
+                payload = "".join(encode(line) + "\n" for line in lines)
                 self._fh.write(payload[: max(1, len(payload) // 2)])
                 self._fh.flush()
                 os.fsync(self._fh.fileno())
                 _fault("outbox_torn_write")
-            self._fh.write(payload)
+            for line in lines:
+                self._fh.write(encode(line) + "\n")
             self._fh.flush()
             os.fsync(self._fh.fileno())
             _fault("outbox_after_fsync")
         except OutboxWriteError:
             raise
         except (OSError, ValueError, TypeError) as exc:
+            if isinstance(exc, OSError) and self._fh is not None:
+                if pre_pos is not None:
+                    try:
+                        self._fh.seek(pre_pos)
+                        self._fh.truncate(pre_pos)
+                        self._fh.flush()
+                    except OSError:
+                        pass
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
             self.last_error = f"{type(exc).__name__}: {exc}"
             flog(f"CaptureOutbox: event=outbox_write_failed dir={self.dir} "
                  f"error={self.last_error}", "ERROR")
             raise OutboxWriteError(self.last_error) from exc
         self.last_append_at = _utc_now()
         return self._cur_seq
+
+    def resolve_prepare(self, commit_id: str) -> None:
+        """Release a prepared commit segment reference when no outbox batch follows."""
+        if not commit_id:
+            return
+        with self._lock:
+            self._resolve_prepare_locked(commit_id)
+
+    def release_batch_prepare(self, batch_id: str) -> None:
+        """Release a cross-segment prepare pinned until *batch_id* is committed."""
+        if not batch_id:
+            return
+        with self._lock:
+            prep_seq = self._batch_prepare_seq.pop(batch_id, None)
+            if prep_seq is not None:
+                self._release_locked(prep_seq)
 
     def _resolve_prepare_locked(self, commit_id: str) -> None:
         seq = self._prepare_seg.pop(commit_id, None)
@@ -278,9 +366,9 @@ class CaptureOutbox:
         """One batch of segment *seq* is committed in the journal."""
         with self._lock:
             self._unacked_events = max(0, self._unacked_events - int(n_events or 0))
-            self._release_locked(seq)
+            self._release_locked(seq, raise_on_error=True)
 
-    def _release_locked(self, seq: int) -> None:
+    def _release_locked(self, seq: int, raise_on_error: bool = False) -> None:
         left = self._outstanding.get(seq, 0) - 1
         if left > 0:
             self._outstanding[seq] = left
@@ -296,7 +384,7 @@ class CaptureOutbox:
                 self._fh.flush()
                 os.fsync(self._fh.fileno())
             elif os.path.isfile(path):
-                os.remove(path)
+                win_fs_retry(os.remove, path)
         except OSError as exc:
             # Not a loss: the segment is replayed idempotently at the next
             # start. Say it, since the outbox then keeps growing.
@@ -304,6 +392,42 @@ class CaptureOutbox:
             flog(f"CaptureOutbox: cannot release segment {seq} "
                  f"({self.last_error}), it will be replayed idempotently",
                  "WARNING")
+            if raise_on_error:
+                raise
+
+    def seal_for_replay(self) -> Tuple[List[Tuple[int, str]], set]:
+        """Close the active handle and return sealed segments safe to replay.
+
+        Returns ``(segments, pinned_seqs)`` where *segments* are all on-disk
+        segments up to the sealed boundary (excluding none; *pinned_seqs* lists
+        segments that still hold an in-flight prepare and must NOT be unlinked
+        while the GUI thread has a commit open).
+        """
+        with self._lock:
+            if self._closed:
+                return [], set()
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+                self._cur_seq = None
+            cutoff = self._next_seq
+            pinned = set(self._prepare_seg.values()) | set(self._batch_prepare_seq.values())
+            segs = [(s, p) for s, p in list_segments(self.dir) if s < cutoff]
+            return segs, pinned
+
+    def mark_segment_replayed(self, seq: int, n_events: int = 0) -> None:
+        """Clear accounting for a sealed segment that was replayed and removed."""
+        with self._lock:
+            self._outstanding.pop(seq, None)
+            if n_events > 0:
+                self._unacked_events = max(0, self._unacked_events - n_events)
+            if not self._outstanding:
+                self._unacked_events = 0
+            for bid in [k for k, v in self._batch_prepare_seq.items() if v == seq]:
+                self._batch_prepare_seq.pop(bid, None)
 
     # ------------------------------------------------------------------
 
@@ -455,11 +579,19 @@ def _quarantine(outbox_dir: str, seg_path: str, torn: List[str],
     if os.path.exists(target):
         report.quarantined.append(target)
         return
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.writelines(torn)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, target)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(torn)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _share_replace(tmp, target)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
     report.quarantined.append(target)
 
 
@@ -581,6 +713,23 @@ def _commit_recorded(conn: sqlite3.Connection, commit_id: str) -> bool:
         return False
 
 
+def replay_sealed_segments(outbox: CaptureOutbox, conn: sqlite3.Connection,
+                           trace_id: str = "") -> ReplayReport:
+    """Integrate only sealed segments of a live *outbox* into *conn*.
+
+    Safe while the GUI thread continues appending to *outbox*: closes and
+    rotates the active handle under ``outbox._lock``, skips segments holding
+    an in-flight prepare, never records false INTERRUPTED commits, and never
+    removes the outbox directory.
+    """
+    segments, pinned_seqs = outbox.seal_for_replay()
+    if not segments:
+        return ReplayReport()
+    return _replay_segments(
+        outbox.dir, outbox.journal_path, conn, segments,
+        live_outbox=outbox, pinned_seqs=pinned_seqs, trace_id=trace_id)
+
+
 def replay_outbox(journal_path: str, conn: sqlite3.Connection,
                   trace_id: str = "") -> ReplayReport:
     """Integrate every durable outbox segment into the journal.
@@ -590,19 +739,37 @@ def replay_outbox(journal_path: str, conn: sqlite3.Connection,
     are committed; a segment that fails is kept for the next attempt.
     Must not run while a live CaptureOutbox writes the same directory.
     """
+    outbox_dir = outbox_dir_for(journal_path)
+    segments = list_segments(outbox_dir)
+    if not segments:
+        return ReplayReport()
+    return _replay_segments(
+        outbox_dir, journal_path, conn, segments,
+        live_outbox=None, pinned_seqs=frozenset(), trace_id=trace_id)
+
+
+def _replay_segments(
+    outbox_dir: str,
+    journal_path: str,
+    conn: sqlite3.Connection,
+    segments: List[Tuple[int, str]],
+    *,
+    live_outbox: Optional[CaptureOutbox],
+    pinned_seqs,
+    trace_id: str = "",
+) -> ReplayReport:
     from .journal_writes import (
         insert_events_idempotent, record_capture_commit, ensure_v7_schema,
     )
     report = ReplayReport()
-    outbox_dir = outbox_dir_for(journal_path)
-    segments = list_segments(outbox_dir)
     report.segments = len(segments)
-    if not segments:
-        return report
     prefix = f"[{trace_id}] " if trace_id else ""
     prepares: Dict[str, dict] = {}
+    prepare_path_by_cid: Dict[str, str] = {}
     finalized: Dict[str, dict] = {}
+    finalize_cids_by_path: Dict[str, List[str]] = {}
     parsed = []
+    parse_failed = False
     # Segments that must survive this replay: something in them could not
     # be put anywhere durable yet. Their valid rows are still integrated
     # (idempotently, by event_uid), so a blocked quarantine never holds
@@ -612,6 +779,7 @@ def replay_outbox(journal_path: str, conn: sqlite3.Connection,
         try:
             lines, torn = _parse_segment(path)
         except OSError as exc:
+            parse_failed = True
             report.errors.append(f"{os.path.basename(path)}: {exc}")
             report.kept_segments += 1
             continue
@@ -625,9 +793,15 @@ def replay_outbox(journal_path: str, conn: sqlite3.Connection,
         parsed.append((seq, path, lines))
         for line in lines:
             if line.get("t") == "prepare":
-                prepares[line.get("c", "")] = line
+                cid = line.get("c", "")
+                prepares[cid] = line
+                if cid:
+                    prepare_path_by_cid[cid] = path
             elif line.get("t") == "finalize":
-                finalized[line.get("c", "")] = line
+                cid = line.get("c", "")
+                finalized[cid] = line
+                if cid:
+                    finalize_cids_by_path.setdefault(path, []).append(cid)
 
     try:
         with conn:
@@ -639,25 +813,32 @@ def replay_outbox(journal_path: str, conn: sqlite3.Connection,
              f"{len(segments)} segment(s) kept for the next attempt", "ERROR")
         return report
     in_quarantine = quarantined_uids(outbox_dir)
+    removable_paths: List[Tuple[int, str, int]] = []
+    failed_paths = set()
     for seq, path, lines in parsed:
         records = []
+        bad_decode = []
         for line in lines:
             if line.get("t") == "ev" and isinstance(line.get("e"), dict):
                 if line["e"].get("event_uid") in in_quarantine:
                     report.events_already_quarantined += 1
                     continue
-                records.append(line["e"])
-        report.events_seen += len(records)
+                try:
+                    records.append(record_to_row_values(line["e"]))
+                except (ValueError, TypeError) as exc:
+                    bad_decode.append((line["e"], str(exc)))
+        n_seg_events = len(records) + len(bad_decode)
+        report.events_seen += n_seg_events
         try:
             with conn:
-                inserted, present, rejected = insert_events_idempotent(
-                    conn, [record_to_row_values(r) for r in records])
-                if rejected:
+                inserted, present, rejected = insert_events_idempotent(conn, records)
+                all_rejected = list(rejected) + bad_decode
+                if all_rejected:
                     try:
                         _quarantine(outbox_dir, path, [
                             json.dumps({"reason": why, "e": rec}, ensure_ascii=False,
                                        default=str) + "\n"
-                            for rec, why in rejected], report, kind="rejected")
+                            for rec, why in all_rejected], report, kind="rejected")
                     except OSError as exc:
                         # The refused rows stay in the segment, which is
                         # kept; the valid ones are committed below.
@@ -688,104 +869,142 @@ def replay_outbox(journal_path: str, conn: sqlite3.Connection,
                                 else None))
             report.events_inserted += inserted
             report.events_already_present += present
-            report.events_rejected += len(rejected)
+            report.events_rejected += len(all_rejected)
         except sqlite3.Error as exc:
             report.errors.append(f"{os.path.basename(path)}: {exc}")
             report.kept_segments += 1
+            failed_paths.add(path)
             flog(f"{prefix}replay_outbox: segment {seq} kept, journal write "
                  f"failed: {exc}", "ERROR")
             continue
         if path in keep:
             report.kept_segments += 1
+            failed_paths.add(path)
             flog(f"{prefix}replay_outbox: segment {seq} kept: part of it could "
                  f"not be quarantined, its valid rows are integrated", "ERROR")
             continue
-        try:
-            os.remove(path)
-        except OSError as exc:
-            report.errors.append(f"remove {os.path.basename(path)}: {exc}")
+        removable_paths.append((seq, path, n_seg_events))
 
-    # A batch whose "end" line never made it to disk was being written when
-    # the process died. Its complete lines are real edits and are kept; the
-    # commit they belong to is recorded INCOMPLETE so nothing downstream
-    # takes it for a whole commit (a prepared commit is reported as
-    # INTERRUPTED below, with its pre-edit state).
-    seen_batches: Dict[str, dict] = {}
-    for _seq, _path, lines in parsed:
-        for line in lines:
-            b = line.get("b")
-            if not b:
-                continue
-            info = seen_batches.setdefault(b, {"events": 0, "end": None, "commits": set()})
-            if line.get("t") == "ev" and isinstance(line.get("e"), dict):
-                info["events"] += 1
-                if line["e"].get("commit_id"):
-                    info["commits"].add(line["e"]["commit_id"])
-            elif line.get("t") == "end":
-                info["end"] = line.get("n")
-    for b, info in seen_batches.items():
-        if info["end"] is None and info["events"]:
-            report.incomplete_batches.append({"batch": b, "events": info["events"],
-                                              "commits": sorted(info["commits"])})
-    if report.incomplete_batches:
-        try:
-            with conn:
-                for inc in report.incomplete_batches:
-                    for cid in inc["commits"]:
-                        if cid in prepares:
-                            continue
+    # Protect prepare segments whose finalize lives in a failed/kept segment
+    # (or could live in an unreadable segment, or is still open in live mode).
+    protected_paths = set()
+    for fpath in failed_paths:
+        for cid in finalize_cids_by_path.get(fpath, ()):
+            ppath = prepare_path_by_cid.get(cid)
+            if ppath:
+                protected_paths.add(ppath)
+    if parse_failed or live_outbox is not None:
+        for cid, ppath in prepare_path_by_cid.items():
+            if cid not in finalized and not _commit_recorded(conn, cid):
+                protected_paths.add(ppath)
+
+    ledger_failed = False
+    if live_outbox is None:
+        # Cold startup recovery: record torn batches and interrupted commits.
+        seen_batches: Dict[str, dict] = {}
+        for _seq, _path, lines in parsed:
+            for line in lines:
+                b = line.get("b")
+                if not b:
+                    continue
+                info = seen_batches.setdefault(
+                    b, {"events": 0, "end": None, "commits": set()})
+                if line.get("t") == "ev" and isinstance(line.get("e"), dict):
+                    info["events"] += 1
+                    if line["e"].get("commit_id"):
+                        info["commits"].add(line["e"]["commit_id"])
+                elif line.get("t") == "end":
+                    info["end"] = line.get("n")
+        for b, info in seen_batches.items():
+            if info["end"] is None and info["events"]:
+                report.incomplete_batches.append({
+                    "batch": b, "events": info["events"],
+                    "commits": sorted(info["commits"])})
+        if report.incomplete_batches:
+            try:
+                with conn:
+                    for inc in report.incomplete_batches:
+                        for cid in inc["commits"]:
+                            if cid in prepares:
+                                continue
+                            record_capture_commit(
+                                conn, cid, "INCOMPLETE", finalized_at=None,
+                                n_events=inc["events"],
+                                detail=(f"torn write: {inc['events']} event(s) of the "
+                                        f"batch recovered, its end marker is missing; "
+                                        f"the commit may lack events"))
+            except sqlite3.Error as exc:
+                ledger_failed = True
+                report.errors.append(f"incomplete batches: {exc}")
+
+        # Never declare INTERRUPTED if another segment could not be read:
+        # the matching finalize may live in the unreadable segment.
+        interrupted = [] if parse_failed else [
+            cid for cid in prepares
+            if cid not in finalized and not _commit_recorded(conn, cid)]
+        if interrupted:
+            try:
+                with conn:
+                    for cid in interrupted:
+                        prep = prepares[cid]
                         record_capture_commit(
-                            conn, cid, "INCOMPLETE", finalized_at=None,
-                            n_events=inc["events"],
-                            detail=(f"torn write: {inc['events']} event(s) of the "
-                                    f"batch recovered, its end marker is missing; "
-                                    f"the commit may lack events"))
-        except sqlite3.Error as exc:
-            report.errors.append(f"incomplete batches: {exc}")
+                            conn, cid, "INTERRUPTED",
+                            layer_id=prep.get("layer_id"),
+                            layer_name=prep.get("layer_name"),
+                            datasource_fingerprint=prep.get("ds"),
+                            session_id=prep.get("session_id"),
+                            prepared_at=prep.get("at"),
+                            finalized_at=None,
+                            n_snapshots=len(prep.get("snapshots") or []),
+                            n_events=0,
+                            detail=("QGIS stopped between the pre-commit capture "
+                                    "and the end of the provider commit: the "
+                                    "pre-edit state of these features is kept, "
+                                    "whether the provider applied the edit is "
+                                    "unknown"),
+                            snapshots_json=json.dumps(
+                                _preserved_state(prep), ensure_ascii=True))
+                        report.interrupted_commits.append({
+                            "commit_id": cid,
+                            "layer_name": prep.get("layer_name"),
+                            "n_snapshots": len(prep.get("snapshots") or []),
+                            "prepared_at": prep.get("at"),
+                        })
+            except sqlite3.Error as exc:
+                ledger_failed = True
+                report.errors.append(f"interrupted commits: {exc}")
+                flog(f"{prefix}replay_outbox: cannot record interrupted commits: "
+                     f"{exc}", "ERROR")
 
-    interrupted = [cid for cid in prepares
-                   if cid not in finalized and not _commit_recorded(conn, cid)]
-    if interrupted:
-        try:
-            with conn:
-                for cid in interrupted:
-                    prep = prepares[cid]
-                    record_capture_commit(
-                        conn, cid, "INTERRUPTED",
-                        layer_id=prep.get("layer_id"),
-                        layer_name=prep.get("layer_name"),
-                        datasource_fingerprint=prep.get("ds"),
-                        session_id=prep.get("session_id"),
-                        prepared_at=prep.get("at"),
-                        finalized_at=None,
-                        n_snapshots=len(prep.get("snapshots") or []),
-                        n_events=0,
-                        detail=("QGIS stopped between the pre-commit capture "
-                                "and the end of the provider commit: the "
-                                "pre-edit state of these features is kept, "
-                                "whether the provider applied the edit is "
-                                "unknown"),
-                        snapshots_json=json.dumps(
-                            _preserved_state(prep), ensure_ascii=True))
-                    report.interrupted_commits.append({
-                        "commit_id": cid,
-                        "layer_name": prep.get("layer_name"),
-                        "n_snapshots": len(prep.get("snapshots") or []),
-                        "prepared_at": prep.get("at"),
-                    })
-        except sqlite3.Error as exc:
-            report.errors.append(f"interrupted commits: {exc}")
-            flog(f"{prefix}replay_outbox: cannot record interrupted commits: "
-                 f"{exc}", "ERROR")
+    # Unlink segments ONLY after ledger entries are persisted and cross-segment
+    # prepares are no longer needed.
+    if ledger_failed:
+        report.kept_segments += len(removable_paths)
+        flog(f"{prefix}replay_outbox: keeping {len(removable_paths)} segment(s) "
+             f"because commit ledger persistence failed", "ERROR")
+    else:
+        for seq, path, n_seg_events in removable_paths:
+            if seq in pinned_seqs or path in protected_paths:
+                report.kept_segments += 1
+                continue
+            try:
+                win_fs_retry(os.remove, path)
+                if live_outbox is not None:
+                    live_outbox.mark_segment_replayed(seq, n_seg_events)
+            except OSError as exc:
+                report.kept_segments += 1
+                report.errors.append(f"remove {os.path.basename(path)}: {exc}")
     report.finalized_commits = len(finalized)
-    try:
-        if not list_segments(outbox_dir):
-            leftovers = [n for n in os.listdir(outbox_dir) if n != QUARANTINE_DIRNAME]
-            if not leftovers and not os.path.isdir(
-                    os.path.join(outbox_dir, QUARANTINE_DIRNAME)):
-                shutil.rmtree(outbox_dir, ignore_errors=True)
-    except OSError:
-        pass
+    if live_outbox is None:
+        try:
+            if not list_segments(outbox_dir):
+                leftovers = [n for n in os.listdir(outbox_dir)
+                             if n != QUARANTINE_DIRNAME]
+                if not leftovers and not os.path.isdir(
+                        os.path.join(outbox_dir, QUARANTINE_DIRNAME)):
+                    shutil.rmtree(outbox_dir, ignore_errors=True)
+        except OSError:
+            pass
     level = "WARNING" if (report.events_inserted or report.interrupted_commits
                           or report.torn_lines or report.errors) else "INFO"
     try:

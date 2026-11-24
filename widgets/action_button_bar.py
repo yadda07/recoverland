@@ -212,7 +212,11 @@ class ActionButtonBar(QWidget):
         if idx != self._hover_idx:
             self._hover_idx = idx
             self.setToolTip(self._segments[idx].tooltip if idx >= 0 else "")
-        self._move_slider(self._visual_index(idx) if idx >= 0 else -1, self._hover_anim, self._hover_pos)
+            self._move_slider(
+                self._visual_index(idx) if idx >= 0 else -1,
+                self._hover_anim,
+                self._hover_pos,
+            )
 
     def leaveEvent(self, _event):
         self._hover_idx = -1
@@ -220,12 +224,16 @@ class ActionButtonBar(QWidget):
         self._move_slider(-1, self._hover_anim, self._hover_pos)
 
     def mousePressEvent(self, event):
+        if event.button() != QtCompat.LEFT_BUTTON:
+            return
         idx = self._logical_index_at(self._event_x(event))
         if idx >= 0 and self._segments[idx].enabled:
             self._press_idx = idx
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if event.button() != QtCompat.LEFT_BUTTON:
+            return
         idx = self._logical_index_at(self._event_x(event))
         prev = self._press_idx
         self._press_idx = -1

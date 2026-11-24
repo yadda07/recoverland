@@ -33,8 +33,10 @@ Usage :
 import sys
 from typing import NamedTuple
 
-from qgis.PyQt.QtCore import Qt, QEvent, QEasingCurve, QAbstractAnimation
-from qgis.PyQt.QtGui import QPainter, QPalette
+from qgis.PyQt.QtCore import (
+    Qt, QEvent, QEasingCurve, QAbstractAnimation, QEventLoop, QTimeZone,
+)
+from qgis.PyQt.QtGui import QFontDatabase, QPainter, QPalette
 from qgis.PyQt.QtWidgets import (
     QSizePolicy, QAbstractItemView, QMessageBox, QVBoxLayout,
     QSlider, QFrame, QDialogButtonBox, QDialog,
@@ -122,6 +124,7 @@ class QtCompat:
     EVENT_MOVE = _resolve_enum(QEvent, 'Type', 'Move')
     EVENT_LAYOUT_REQUEST = _resolve_enum(QEvent, 'Type', 'LayoutRequest')
     EVENT_WHEEL = _resolve_enum(QEvent, 'Type', 'Wheel')
+    EVENT_MOUSE_PRESS = _resolve_enum(QEvent, 'Type', 'MouseButtonPress')
 
     # --- QEasingCurve.Type ---
     EASE_IN_OUT_QUAD = _resolve_enum(QEasingCurve, 'Type', 'InOutQuad')
@@ -235,6 +238,14 @@ class QtCompat:
     # --- Qt.TimeSpec ---
     UTC = _resolve_enum(Qt, 'TimeSpec', 'UTC')
 
+    # --- Qt.ConnectionType ---
+    QUEUED_CONNECTION = _resolve_enum(Qt, 'ConnectionType', 'QueuedConnection')
+
+    # --- QEventLoop.ProcessEventsFlag ---
+    EVENT_LOOP_EXCLUDE_USER_INPUT = _resolve_enum(
+        QEventLoop, 'ProcessEventsFlag', 'ExcludeUserInputEvents'
+    )
+
 
 def _resolve_geometry_type(name: str):
     """Resolve a geometry type enum across QGIS versions.
@@ -320,8 +331,12 @@ class QgisCompat:
     GEOM_UNKNOWN = _resolve_geometry_type('Unknown')
     GEOM_NULL = _resolve_geometry_type('Null')
 
-    # --- Qgis.WkbType.NoGeometry / QgsWkbTypes.NoGeometry ---
+    # --- Qgis.WkbType (scoped in 3.30+ / 4.x) ---
     WKB_NO_GEOMETRY = _resolve_wkb_no_geometry()
+    WKB_LINESTRING = Qgis.WkbType.LineString
+    WKB_POLYGON = Qgis.WkbType.Polygon
+    WKB_MULTILINESTRING = Qgis.WkbType.MultiLineString
+    WKB_MULTIPOLYGON = Qgis.WkbType.MultiPolygon
 
 
 def clear_flag(flags, flag):
@@ -382,19 +397,74 @@ def qgis_version_info() -> QgisVersion:
         return QgisVersion(0, 0, 0)
 
 
+_INSTALLED_FONT_FAMILIES = None
+
+
+def utc_qtimezone() -> QTimeZone:
+    """Return a UTC QTimeZone across Qt 5.15 and Qt 6.x (including Qt 6.5+)."""
+    init_ns = getattr(QTimeZone, 'Initialization', None)
+    utc_enum = getattr(init_ns, 'UTC', None) if init_ns is not None else None
+    if utc_enum is not None:
+        return QTimeZone(utc_enum)
+    return QTimeZone.utc()
+
+
+def is_deleted(obj) -> bool:
+    """Return True when a wrapped C++ QObject has already been destroyed."""
+    if obj is None:
+        return True
+    try:
+        from qgis.PyQt import sip
+        return bool(sip.isdeleted(obj))
+    except (ImportError, AttributeError, TypeError):
+        return False
+
+
+def installed_font_families() -> set:
+    """Return installed font family names across PyQt5 and PyQt6 (cached)."""
+    global _INSTALLED_FONT_FAMILIES
+    if _INSTALLED_FONT_FAMILIES is not None:
+        return _INSTALLED_FONT_FAMILIES
+    try:
+        if is_qt6():
+            families = set(QFontDatabase.families())
+        else:
+            families = set(QFontDatabase().families())
+    except Exception:  # noqa: BLE001
+        try:
+            families = set(QFontDatabase.families())
+        except Exception:  # noqa: BLE001
+            families = set()
+    if families:
+        _INSTALLED_FONT_FAMILIES = families
+    return families
+
+
+def mouse_event_pos(event):
+    """Return QPoint from a QMouseEvent on both Qt5 (.pos()) and Qt6 (.position())."""
+    pos_fn = getattr(event, 'position', None)
+    if callable(pos_fn):
+        return pos_fn().toPoint()
+    return event.pos()
+
+
 def is_qt6() -> bool:
     """Return True if running under PyQt6/Qt6, False under PyQt5/Qt5.
 
     PyQt 5.15 exposes Qt.AlignmentFlag as a forward-compat alias,
     so hasattr(Qt, 'AlignmentFlag') alone is unreliable.
-    Primary check: PYQT_VERSION_STR major digit.
-    Fallback: attribute presence (for unknown builds).
+    Primary check: PYQT_VERSION_STR major digit, then QT_VERSION_STR.
     """
     try:
         from qgis.PyQt.QtCore import PYQT_VERSION_STR
         return int(PYQT_VERSION_STR.split('.')[0]) >= 6
-    except Exception:
-        return hasattr(Qt, 'AlignmentFlag')
+    except (ImportError, AttributeError, ValueError):
+        pass
+    try:
+        from qgis.PyQt.QtCore import QT_VERSION_STR
+        return int(QT_VERSION_STR.split('.')[0]) >= 6
+    except (ImportError, AttributeError, ValueError):
+        return False
 
 
 def get_environment_info() -> str:

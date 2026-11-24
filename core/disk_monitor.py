@@ -14,15 +14,17 @@ import os
 import shutil
 from typing import NamedTuple
 
-from qgis.PyQt.QtCore import QCoreApplication
-
 from .logger import flog
 from .health_monitor import _format_size
 from .long_paths import when_needed, plain
 
 
 def _tr(msg):
-    return QCoreApplication.translate("DiskMonitor", msg)
+    try:
+        from qgis.PyQt.QtCore import QCoreApplication
+        return QCoreApplication.translate("DiskMonitor", msg)
+    except ImportError:
+        return msg
 
 
 _CHECK_INTERVAL_SEC = 300  # 5 minutes
@@ -118,6 +120,8 @@ def format_disk_message(status: DiskStatus) -> str:
 def _find_existing_parent(path: str) -> str:
     current = path
     for _ in range(50):
+        if os.path.ismount(current):
+            return current if os.path.exists(current) else ""
         parent = os.path.dirname(current)
         if parent == current:
             break

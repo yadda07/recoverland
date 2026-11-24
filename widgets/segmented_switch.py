@@ -70,8 +70,6 @@ class SegmentedSwitch(QWidget):
         return self._current
 
     def setCurrentIndex(self, idx: int, animated: bool = False) -> None:
-        if self._emitting:
-            return
         idx = max(0, min(idx, self._n_segments - 1))
         if idx == self._current:
             return
@@ -106,7 +104,7 @@ class SegmentedSwitch(QWidget):
             self.update()
 
     def mousePressEvent(self, event) -> None:
-        if not self.isEnabled():
+        if not self.isEnabled() or event.button() != QtCompat.LEFT_BUTTON:
             return
         x = self._event_x(event)
         if x < 0 or x >= self.width():
@@ -117,8 +115,10 @@ class SegmentedSwitch(QWidget):
         self._current = idx
         self._move_slider(idx, animated=should_animate())
         self._emitting = True
-        self.segmentClicked.emit(idx)
-        self._emitting = False
+        try:
+            self.segmentClicked.emit(idx)
+        finally:
+            self._emitting = False
 
     @staticmethod
     def _event_x(event) -> float:

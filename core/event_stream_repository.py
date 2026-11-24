@@ -13,6 +13,7 @@ All queries use parameterized SQL and respect volume limits.
 No QGIS dependency.
 """
 import sqlite3
+import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from .audit_backend import AuditEvent
@@ -536,6 +537,7 @@ def fetch_events_in_zone(
           by datasource membership.
     """
     with timed_op("fetch_events_in_zone", trace_id):
+        t0 = time.monotonic()
         scope = resolve_scope(conn, datasource_fp) or [datasource_fp]
         placeholders = ",".join("?" for _ in scope)
         assert_safe_fragment(_EVENT_COLUMNS)
@@ -560,23 +562,31 @@ def fetch_events_in_zone(
         n_dropped_bbox = 0
         for row in rows:
             ev = _row_to_event(row)
-            geom_wkb = ev.geometry_wkb or getattr(ev, "new_geometry_wkb", None)
-            if geom_wkb is None:
+            old_wkb = ev.geometry_wkb
+            new_wkb = getattr(ev, "new_geometry_wkb", None)
+            has_old = bool(old_wkb)
+            has_new = bool(new_wkb)
+            if not has_old and not has_new:
                 # Audit-only attribute event: keep it (conservative).
                 events.append(ev)
                 continue
-            env = parse_envelope(geom_wkb)
-            if envelope_intersects(env, bbox_xy):
+            hit = False
+            if has_old and envelope_intersects(parse_envelope(old_wkb), bbox_xy):
+                hit = True
+            elif has_new and envelope_intersects(parse_envelope(new_wkb), bbox_xy):
+                hit = True
+            if hit:
                 events.append(ev)
             else:
                 n_dropped_bbox += 1
 
         events = _canonicalize_events(conn, events)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
         stats = FetchStats(
             n_events_total=n_total,
             n_events_returned=len(events),
             n_events_truncated=truncated,
-            elapsed_ms=0,  # filled by `timed_op` log already; field is for UI.
+            elapsed_ms=elapsed_ms,
         )
         flog(
             f"lens_fetch_events_in_zone trace_id={trace_id} "
@@ -671,18 +681,24 @@ def fetch_events_by_ids(
     """
     if not event_ids:
         return []
-    placeholders = ",".join("?" for _ in event_ids)
+    unique_ids = sorted({int(i) for i in event_ids if i is not None})
+    if not unique_ids:
+        return []
     assert_safe_fragment(_EVENT_COLUMNS)
-    assert_safe_fragment(placeholders)
-    # B608: `placeholders` is only `?,?,...`; event_ids bound via params.
-    query = (
-        "SELECT " + _EVENT_COLUMNS + " FROM audit_event"  # nosec B608
-        " WHERE event_id IN (" + placeholders + ")"
-        " ORDER BY created_at DESC, event_id DESC"
-    )
-    events = _canonicalize_events(
-        conn, [_row_to_event(r) for r in conn.execute(query, event_ids).fetchall()])
-    asked = set(event_ids)
+    raw: List[AuditEvent] = []
+    for start in range(0, len(unique_ids), _ID_CHUNK):
+        chunk = unique_ids[start:start + _ID_CHUNK]
+        placeholders = ",".join("?" for _ in chunk)
+        assert_safe_fragment(placeholders)
+        # B608: `placeholders` is only `?,?,...`; chunk bound via params.
+        query = (
+            "SELECT " + _EVENT_COLUMNS + " FROM audit_event"  # nosec B608
+            " WHERE event_id IN (" + placeholders + ")"
+        )
+        raw.extend(_row_to_event(r) for r in conn.execute(query, chunk).fetchall())
+    raw.sort(key=lambda e: (e.created_at or "", e.event_id or 0), reverse=True)
+    events = _canonicalize_events(conn, raw)
+    asked = set(unique_ids)
     missing = sorted(asked - {e.event_id for e in events})
     if missing:
         flog(f"fetch_events_by_ids: {len(missing)} of {len(asked)} event(s) "
@@ -923,9 +939,12 @@ def _cutoff_instant(conn: sqlite3.Connection,
         value = cutoff.value
         return value if isinstance(value, str) and value else None
     if cutoff.cutoff_type == CutoffType.BY_EVENT_ID:
+        op = ">=" if cutoff.inclusive else ">"
+        assert_safe_fragment(op)
         try:
+            # B608: `op` is a static branch checked by assert_safe_fragment.
             row = conn.execute(
-                "SELECT created_at FROM audit_event WHERE event_id >= ? "
+                "SELECT created_at FROM audit_event WHERE event_id " + op + " ? "  # nosec B608
                 "ORDER BY event_id LIMIT 1", (int(cutoff.value),)).fetchone()
         except (TypeError, ValueError):
             return None

@@ -57,19 +57,26 @@ def parse_field_schema(field_schema_json: str) -> List[FieldInfo]:
         return []
     result = []
     for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
         result.append(FieldInfo(
-            name=entry.get("name", ""),
-            type_name=entry.get("type", ""),
-            length=entry.get("length", 0),
-            precision=entry.get("precision", 0),
+            name=str(name),
+            type_name=str(entry.get("type") or ""),
+            length=int(entry.get("length") or 0),
+            precision=int(entry.get("precision") or 0),
         ))
     return result
 
 
 def extract_current_schema(layer) -> List[FieldInfo]:
-    """Extract current field schema from a QgsVectorLayer."""
+    """Extract current field schema from a QgsVectorLayer (provider fields preferred)."""
+    provider = getattr(layer, "dataProvider", lambda: None)()
+    fields = provider.fields() if provider is not None else layer.fields()
     result = []
-    for field in layer.fields():
+    for field in fields:
         result.append(FieldInfo(
             name=field.name(),
             type_name=field.typeName(),
@@ -129,13 +136,19 @@ def _types_compatible(hist: FieldInfo, curr: FieldInfo) -> bool:
         # integer field of every shapefile look retyped, so every integer
         # was skipped in silence at each restore (RLU-053).
         {"int4", "integer", "int", "int8", "bigint", "smallint", "int2",
-         "integer64", "int64", "long", "longlong"},
-        {"float8", "double", "real", "float4", "numeric", "decimal"},
-        {"varchar", "text", "string", "char", "character varying"},
-        {"bool", "boolean"},
+         "tinyint", "mediumint", "integer64", "int64", "long", "longlong",
+         "serial", "bigserial", "smallserial"},
+        {"float8", "double", "double precision", "real", "float", "float4",
+         "numeric", "decimal"},
+        {"varchar", "nvarchar", "text", "string", "char", "nchar",
+         "character", "character varying", "clob", "citext", "uuid"},
+        {"bool", "boolean", "bit"},
         {"date"},
-        {"time", "timetz"},
-        {"timestamp", "timestamptz", "datetime"},
+        {"time", "timetz", "time without time zone", "time with time zone"},
+        {"timestamp", "timestamptz", "datetime", "datetime2", "smalldatetime",
+         "timestamp without time zone", "timestamp with time zone"},
+        {"blob", "binary", "varbinary", "bytea", "qbytearray"},
+        {"json", "jsonb"},
     ]
     h_lower = hist.type_name.lower()
     c_lower = curr.type_name.lower()

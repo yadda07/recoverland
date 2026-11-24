@@ -64,8 +64,9 @@ def search_events(conn: sqlite3.Connection,
     when needed (e.g. restore or geometry preview).
     """
     with timed_op("search_events", trace_id):
-        page_size = min(criteria.page_size or _DEFAULT_PAGE_SIZE, _MAX_PAGE_SIZE)
-        page = max(criteria.page, 1)
+        raw_ps = criteria.page_size if criteria.page_size is not None else _DEFAULT_PAGE_SIZE
+        page_size = max(1, min(int(raw_ps) or _DEFAULT_PAGE_SIZE, _MAX_PAGE_SIZE))
+        page = max(int(criteria.page or 1), 1)
         offset = (page - 1) * page_size
 
         where_clause, params = _build_where_clause(
@@ -80,7 +81,7 @@ def search_events(conn: sqlite3.Connection,
             "SELECT ", cols,  # nosec B608
             " FROM audit_event ",
             where_clause,
-            " ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            " ORDER BY created_at DESC, event_id DESC LIMIT ? OFFSET ?",
         ))
         all_params = params + [page_size, offset]
         rows = conn.execute(query, all_params).fetchall()
@@ -124,7 +125,7 @@ def get_event_by_id(conn: sqlite3.Connection, event_id: int) -> Optional[AuditEv
     row = conn.execute(query, (event_id,)).fetchone()
     if row is None:
         return None
-    return _row_to_event(row)
+    return canonicalize_event_fingerprints(conn, [_row_to_event(row)])[0]
 
 
 _MAX_DISTINCT_RESULTS = 1000
@@ -205,6 +206,15 @@ def summarize_scope(conn: sqlite3.Connection, criteria: SearchCriteria) -> Journ
     row = conn.execute(query, params).fetchone() or (0, 0, 0, 0, 0, 0)
     total_count = int(row[0] or 0)
     selected_count = count_events(conn, criteria) if criteria.operation_type else total_count
+    layer_count = int(row[2] or 0)
+    if layer_count > 1:
+        aliases = canonical_target_map(conn)
+        if aliases:
+            fp_rows = conn.execute(
+                "SELECT DISTINCT datasource_fingerprint FROM audit_event "  # nosec B608
+                + where_clause, params,
+            ).fetchall()
+            layer_count = len({aliases.get(r[0], r[0]) for r in fp_rows})
     return JournalScopeSummary(
         total_count=total_count,
         selected_count=selected_count,
@@ -212,7 +222,7 @@ def summarize_scope(conn: sqlite3.Connection, criteria: SearchCriteria) -> Journ
         delete_count=int(row[4] or 0),
         insert_count=int(row[5] or 0),
         user_count=int(row[1] or 0),
-        layer_count=int(row[2] or 0),
+        layer_count=layer_count,
     )
 
 
@@ -322,13 +332,19 @@ def reconstruct_attributes(event: AuditEvent) -> Dict[str, Any]:
         data = json.loads(event.attributes_json)
     except (json.JSONDecodeError, TypeError):
         return {}
+    if not isinstance(data, dict):
+        return {}
 
     if "all_attributes" in data:
-        return data["all_attributes"]
+        attrs = data["all_attributes"]
+        return attrs if isinstance(attrs, dict) else {}
 
     if "changed_only" in data:
+        changed = data["changed_only"]
+        if not isinstance(changed, dict):
+            return {}
         result = {}
-        for key, change in data["changed_only"].items():
+        for key, change in changed.items():
             if is_layer_audit_field(key):
                 continue
             result[key] = extract_delta_old(change)
@@ -347,13 +363,19 @@ def reconstruct_new_attributes(event: AuditEvent) -> Dict[str, Any]:
         data = json.loads(event.attributes_json)
     except (json.JSONDecodeError, TypeError):
         return {}
+    if not isinstance(data, dict):
+        return {}
 
     if "all_attributes" in data:
-        return data["all_attributes"]
+        attrs = data["all_attributes"]
+        return attrs if isinstance(attrs, dict) else {}
 
     if "changed_only" in data:
+        changed = data["changed_only"]
+        if not isinstance(changed, dict):
+            return {}
         result = {}
-        for key, change in data["changed_only"].items():
+        for key, change in changed.items():
             if is_layer_audit_field(key):
                 continue
             result[key] = extract_delta_new(change)
@@ -368,9 +390,12 @@ def is_geometry_only_update(event: AuditEvent) -> bool:
         return False
     try:
         data = json.loads(event.attributes_json)
-        if "changed_only" not in data:
+        if not isinstance(data, dict) or "changed_only" not in data:
             return False
-        for key in data["changed_only"].keys():
+        changed = data["changed_only"]
+        if not isinstance(changed, dict):
+            return False
+        for key in changed.keys():
             if not is_layer_audit_field(key):
                 return False
         return True

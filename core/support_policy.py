@@ -11,6 +11,7 @@
 Determines which QGIS layers are supported for audit capture and restoration.
 Each provider gets a policy with support level, identity strength, and phase.
 """
+import os
 from enum import Enum
 from typing import NamedTuple
 
@@ -100,12 +101,68 @@ def get_provider_policy(provider_name: str) -> ProviderPolicy:
     return _PROVIDER_POLICIES.get(provider_name, _DEFAULT_POLICY)
 
 
+def _is_truthy_custom_prop(val) -> bool:
+    """Interpret QGIS customProperty values safely (XML stores 'false'/'0' as str)."""
+    if val is None or val is False or val == 0:
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() not in ("", "0", "false", "no", "none")
+    return bool(val)
+
+
+def is_managed_overlay_layer(layer) -> bool:
+    """Return True if *layer* is a RecoverLand Review/Lens managed overlay."""
+    if layer is None:
+        return False
+    try:
+        return (
+            _is_truthy_custom_prop(layer.customProperty("_rl_snap_managed"))
+            or _is_truthy_custom_prop(layer.customProperty("_rl_lens_managed"))
+        )
+    except (RuntimeError, AttributeError):
+        return False
+
+
+def is_ephemeral_layer(layer) -> bool:
+    """Return True for non-persisted temporary, memory, virtual, or plugin overlay layers.
+
+    Temporary scratch layers, Processing memory outputs, virtual layers, and
+    RecoverLand's own Review/Lens overlays carry no durable on-disk identity
+    and must never trigger user-facing error banners when edited.
+    """
+    if layer is None:
+        return False
+    if is_managed_overlay_layer(layer):
+        return True
+    try:
+        if hasattr(layer, "isTemporary") and layer.isTemporary():
+            return True
+    except (RuntimeError, AttributeError):
+        pass
+    try:
+        provider = layer.dataProvider()
+        if provider is not None and provider.name() in ("memory", "virtual"):
+            return True
+    except (RuntimeError, AttributeError):
+        pass
+    return False
+
+
 def evaluate_layer_support(layer) -> ProviderPolicy:
     """Evaluate support level for a QgsVectorLayer."""
     if layer is None:
         return _DEFAULT_POLICY
 
-    provider = layer.dataProvider()
+    try:
+        if hasattr(layer, "isValid") and not layer.isValid():
+            return _DEFAULT_POLICY
+    except (RuntimeError, AttributeError):
+        return _DEFAULT_POLICY
+
+    try:
+        provider = layer.dataProvider()
+    except (RuntimeError, AttributeError):
+        return _DEFAULT_POLICY
     if provider is None:
         return _DEFAULT_POLICY
 
@@ -114,6 +171,18 @@ def evaluate_layer_support(layer) -> ProviderPolicy:
 
     if policy.support_level == SupportLevel.REFUSED:
         return policy
+
+    if policy.support_level == SupportLevel.INFORMATIONAL:
+        return policy
+
+    try:
+        if hasattr(layer, "isReadOnly") and layer.isReadOnly():
+            return ProviderPolicy(
+                provider_name, SupportLevel.REFUSED, IdentityStrength.NONE,
+                False, False, policy.phase, "Layer is read-only"
+            )
+    except (RuntimeError, AttributeError):
+        pass
 
     if not _has_edit_capabilities(provider):
         return ProviderPolicy(
@@ -133,27 +202,35 @@ def _has_edit_capabilities(provider) -> bool:
     return bool(caps & _edit_capabilities_mask())
 
 
+_OGR_EXT_STRENGTH = {
+    ".gpkg": IdentityStrength.STRONG,
+    ".sqlite": IdentityStrength.STRONG,
+    ".db": IdentityStrength.STRONG,
+    ".gdb": IdentityStrength.STRONG,
+    ".fgb": IdentityStrength.STRONG,
+    ".shp": IdentityStrength.MEDIUM,
+    ".dbf": IdentityStrength.MEDIUM,
+    ".geojson": IdentityStrength.MEDIUM,
+    ".json": IdentityStrength.MEDIUM,
+    ".csv": IdentityStrength.WEAK,
+    ".xlsx": IdentityStrength.WEAK,
+    ".ods": IdentityStrength.WEAK,
+    ".kml": IdentityStrength.WEAK,
+    ".kmz": IdentityStrength.WEAK,
+}
+
+
 def refine_ogr_identity(source_uri: str) -> IdentityStrength:
-    """Refine identity strength for OGR sub-formats."""
-    lower = source_uri.lower()
-    if '.gpkg' in lower:
-        return IdentityStrength.STRONG
-    if '.sqlite' in lower:
-        return IdentityStrength.STRONG
-    if '.dbf' in lower:
+    """Refine identity strength for OGR sub-formats using file extension."""
+    if not source_uri:
         return IdentityStrength.MEDIUM
-    if '.db' in lower:
-        return IdentityStrength.STRONG
-    if '.shp' in lower:
-        return IdentityStrength.MEDIUM
-    if '.fgb' in lower:
-        return IdentityStrength.STRONG
-    if '.geojson' in lower or '.json' in lower:
-        return IdentityStrength.MEDIUM
-    if '.csv' in lower or '.xlsx' in lower or '.ods' in lower:
-        return IdentityStrength.WEAK
-    if '.kml' in lower or '.kmz' in lower:
-        return IdentityStrength.WEAK
+    head = source_uri.split("|", 1)[0].strip()
+    if head.startswith("/vsizip/") or head.startswith("/vsigzip/"):
+        head = head.rsplit("/", 1)[-1]
+    _, ext = os.path.splitext(head.rstrip("/\\"))
+    ext_lower = ext.lower()
+    if ext_lower in _OGR_EXT_STRENGTH:
+        return _OGR_EXT_STRENGTH[ext_lower]
     return IdentityStrength.MEDIUM
 
 

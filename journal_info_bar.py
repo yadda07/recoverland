@@ -170,7 +170,7 @@ class JournalInfoBar(QWidget):
         self._health_label.setWordWrap(True)
         self._health_label.setVisible(False)
         self._health_label.setCursor(QtCompat.POINTING_HAND_CURSOR)
-        self._health_label.mousePressEvent = lambda _e: self.maintenanceRequested.emit()
+        self._health_label.installEventFilter(self)
         self._current_health = "healthy"
         self._current_mode = "ready"
         self._refreshing = False
@@ -237,6 +237,13 @@ class JournalInfoBar(QWidget):
         key = tile.property("metric_key") if tile is not None else None
         if key:
             self.metricActivated.emit(key)
+
+    def eventFilter(self, obj, event):
+        if obj is self._health_label and event.type() == QtCompat.EVENT_MOUSE_PRESS:
+            if event.button() == QtCompat.LEFT_BUTTON:
+                self.maintenanceRequested.emit()
+                return True
+        return super().eventFilter(obj, event)
 
     def changeEvent(self, event):
         super().changeEvent(event)

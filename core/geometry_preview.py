@@ -38,7 +38,7 @@ from qgis.PyQt.QtCore import QCoreApplication, QTimer
 
 from .geometry_utils import is_geometry_present
 from .logger import flog
-from ..compat import QtCompat, QgisCompat
+from ..compat import QtCompat, QgisCompat, is_deleted
 
 
 class DisplayVerdict(NamedTuple):
@@ -293,6 +293,7 @@ class GeometryPreviewManager:
         self._flash_timer: Optional[QTimer] = None
         self._flash_remaining: int = 0
         self._flash_base_color = None
+        self._flash_base_fill_color = None
         self._flash_base_width: int = 2
 
     def show(self, wkb: bytes, crs_authid: Optional[str],
@@ -314,6 +315,8 @@ class GeometryPreviewManager:
         """
         self.clear()
         self.last_refusal = ""
+        if self._canvas is None or is_deleted(self._canvas):
+            return False
         if not wkb:
             flog("GeometryPreview.show: skipped reason=empty_wkb", "INFO")
             return False
@@ -393,7 +396,7 @@ class GeometryPreviewManager:
         For point geometries the bounding box has zero area, so we
         synthesize a small window around the centroid.
         """
-        if self._last_bbox is None:
+        if self._last_bbox is None or self._canvas is None or is_deleted(self._canvas):
             flog("zoom_to_preview: skipped reason=no_cached_bbox", "WARNING")
             return
         rect = QgsRectangle(self._last_bbox)
@@ -431,13 +434,10 @@ class GeometryPreviewManager:
         ``n_blinks`` times. Safe to call when no band is shown (no-op).
         Cancels any in-flight flash to avoid color leakage between rows.
         """
-        if self._band is None:
+        if self._band is None or is_deleted(self._band) or self._canvas is None or is_deleted(self._canvas):
             flog("GeometryPreview.flash: skipped reason=no_band", "DEBUG")
             return
         self._stop_flash()
-        # Note: QgsRubberBand has no public color()/width() getters, so we
-        # rely on _flash_base_color and _flash_base_width which are set by
-        # _apply_layer_style / _apply_default_style at show() time.
         self._flash_remaining = n_blinks * 2
         self._flash_timer = QTimer(self._canvas)
         self._flash_timer.setInterval(interval_ms)
@@ -449,39 +449,62 @@ class GeometryPreviewManager:
             "DEBUG",
         )
 
+    def _restore_band_base_style(self) -> None:
+        base_color = self._flash_base_color or self._style_color()
+        self._band.setColor(base_color)
+        if self._flash_base_fill_color is not None:
+            try:
+                self._band.setFillColor(self._flash_base_fill_color)
+            except (AttributeError, RuntimeError):
+                pass
+        self._band.setWidth(self._flash_base_width)
+
     def _flash_tick(self) -> None:
         """One step of the flash animation."""
-        if self._band is None or self._flash_remaining <= 0:
+        if (self._band is None or is_deleted(self._band)
+                or self._canvas is None or is_deleted(self._canvas)
+                or self._flash_remaining <= 0):
             self._stop_flash()
             return
-        base_color = self._flash_base_color or self._style_color()
-        if self._flash_remaining % 2 == 0:
-            self._band.setColor(self._flash_highlight_color())
-            self._band.setWidth(max(self._flash_base_width + 2, 4))
-        else:
-            self._band.setColor(base_color)
-            self._band.setWidth(self._flash_base_width)
-        self._band.update()
-        self._flash_remaining -= 1
-        if self._flash_remaining <= 0:
-            self._band.setColor(base_color)
-            self._band.setWidth(self._flash_base_width)
+        try:
+            if self._flash_remaining % 2 == 0:
+                self._band.setColor(self._flash_highlight_color())
+                self._band.setWidth(max(self._flash_base_width + 2, 4))
+            else:
+                self._restore_band_base_style()
             self._band.update()
+            self._flash_remaining -= 1
+            if self._flash_remaining <= 0:
+                self._restore_band_base_style()
+                self._band.update()
+                self._stop_flash()
+        except RuntimeError:
+            self._band = None
             self._stop_flash()
 
     def _stop_flash(self) -> None:
         """Stop any in-flight flash animation and release the timer."""
-        if self._flash_timer is not None:
-            self._flash_timer.stop()
-            self._flash_timer = None
+        timer, self._flash_timer = self._flash_timer, None
+        if timer is not None and not is_deleted(timer):
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except RuntimeError:
+                pass
         self._flash_remaining = 0
 
     def clear(self) -> None:
         """Remove the current preview from the canvas."""
         self._stop_flash()
-        if self._band is not None:
-            self._canvas.scene().removeItem(self._band)
-            self._band = None
+        band, self._band = self._band, None
+        if band is not None and not is_deleted(band):
+            try:
+                if self._canvas is not None and not is_deleted(self._canvas):
+                    scene = self._canvas.scene()
+                    if scene is not None:
+                        scene.removeItem(band)
+            except RuntimeError:
+                pass
         self._last_bbox = None
 
     @staticmethod
@@ -514,18 +537,21 @@ class GeometryPreviewManager:
         primary = QColor(color)
         primary.setAlpha(180)
         band.setColor(primary)
+        fill = None
         if geom.type() == QgisCompat.GEOM_POLYGON:
             fill = QColor(color)
             fill.setAlpha(70)
             try:
                 band.setFillColor(fill)
             except Exception as exc:  # noqa: BLE001
+                fill = None
                 flog("GeometryPreview._apply_layer_style: rubberband refused "
                      f"setFillColor, preview stays outline-only ({exc!r})",
                      "DEBUG")
         band.setWidth(2)
         band.setLineStyle(QtCompat.DASH_LINE)
         self._flash_base_color = primary
+        self._flash_base_fill_color = fill
         self._flash_base_width = 2
         return f"layer_color={primary.name()}"
 
@@ -536,6 +562,7 @@ class GeometryPreviewManager:
         band.setWidth(2)
         band.setLineStyle(QtCompat.DASH_LINE)
         self._flash_base_color = base
+        self._flash_base_fill_color = None
         self._flash_base_width = 2
 
     @staticmethod

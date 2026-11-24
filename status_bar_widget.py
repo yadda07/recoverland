@@ -144,13 +144,20 @@ class StatusBarIndicator(QWidget):
     def set_no_project(self) -> None:
         self._apply_state("no_project", self.tr("RecoverLand : aucun projet ouvert"))
 
+    def hideEvent(self, event) -> None:
+        if self._pulse_anim is not None:
+            self._pulse_anim.stop()
+        super().hideEvent(event)
+
     def pulse(self) -> None:
         """Subtle opacity pulse on the dot (event commit feedback)."""
         if self._pulse_anim is not None:
             if self._pulse_anim.state() == QtCompat.ANIM_STATE_RUNNING:
                 return
+            self._pulse_anim.start()
+            return
         self._pulse_anim = QPropertyAnimation(
-            self._opacity_effect, b"opacity",
+            self._opacity_effect, b"opacity", self,
         )
         self._pulse_anim.setDuration(600)
         self._pulse_anim.setKeyValueAt(0.0, 1.0)

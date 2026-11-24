@@ -11,6 +11,7 @@
 Qt5/Qt6 compatible via qgis.PyQt. Shows plan summary, warnings,
 blocking reasons, and asks for user confirmation before execution.
 """
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout,
 )
@@ -24,6 +25,7 @@ from .theme import (
     RAYON_CONTROLE,
     RAYON_PANNEAU,
     build_dialog_stylesheet,
+    contrast_ratio,
     resolve_theme,
     rgba_css,
 )
@@ -119,14 +121,16 @@ class RestorePreflightDialog(QDialog):
         )
         self._cancel_btn.setIcon(theme_icon("close", color=t.texte, size=ICONE_XS))
         is_enabled = self._proceed_btn.isEnabled()
-        fg = t.texte_accent if is_enabled else t.tertiaire
+        noir, blanc = QColor("#000000"), QColor("#ffffff")
+        proceed_fg = blanc if contrast_ratio(blanc, t.acheve) >= contrast_ratio(noir, t.acheve) else noir
+        fg = proceed_fg if is_enabled else t.tertiaire
         ic_name = "check-circle" if is_enabled else "stop"
         self._proceed_btn.setIcon(theme_icon(ic_name, color=fg, size=ICONE_XS))
         self._proceed_btn.setStyleSheet(
             f"QPushButton {{ background-color: {t.acheve.name()}; "
-            f"color: {t.texte_accent.name()}; border: none; "
+            f"color: {proceed_fg.name()}; border: none; "
             f"border-radius: {RAYON_CONTROLE}px; padding: 6px 18px; font-weight: 700; }}"
-            f"QPushButton:hover {{ background-color: {t.accent.name()}; }}"
+            f"QPushButton:hover {{ background-color: {t.accent.name()}; color: {t.texte_accent.name()}; }}"
             f"QPushButton:disabled {{ background-color: {t.surface_douce.name()}; "
             f"color: {t.tertiaire.name()}; border: 1px solid {t.ligne.name()}; }}"
         )

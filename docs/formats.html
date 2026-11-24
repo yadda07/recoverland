@@ -15,7 +15,7 @@
 <header class="bar">
   <a class="bar-logo" href="index.html">
     <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M4 12V6l4-4 4 4v6H9V9H7v3Z" stroke-linejoin="round"/></svg></div>
-    <span class="bar-name">RecoverLand</span><span class="bar-ver">7.1.5</span>
+    <span class="bar-name">RecoverLand</span><span class="bar-ver">7.2.0</span>
   </a>
   <nav class="bar-nav">
     <a href="index.html">Overview</a>
@@ -77,7 +77,7 @@
   <tr><td><strong>FlatGeobuf (.fgb)</strong></td><td>Yes</td><td>Yes</td><td><span class="strength s-strong">STRONG</span></td><td>Full</td></tr>
   <tr><td><strong>CSV / Text</strong></td><td>Yes</td><td>Yes (risky)</td><td><span class="strength s-weak">WEAK</span></td><td>Partial</td></tr>
   <tr><td><strong>WFS-T</strong></td><td>Yes</td><td>Yes</td><td><span class="strength s-medium">MEDIUM</span></td><td>Partial</td></tr>
-  <tr><td><strong>Memory layer</strong></td><td>Yes</td><td>No</td><td><span class="strength s-none">NONE</span></td><td>Informational</td></tr>
+  <tr><td><strong>Memory layer</strong></td><td>No (silent)</td><td>No</td><td><span class="strength s-none">NONE</span></td><td>Ignored until permanent</td></tr>
   <tr><td><strong>Virtual layer</strong></td><td>No</td><td>No</td><td><span class="strength s-none">NONE</span></td><td>Refused</td></tr>
 </tbody>
 </table></div>
@@ -216,7 +216,7 @@
 
 <p>Memory layers have no source file. They exist only in the current QGIS session and disappear when it is closed.</p>
 
-<p>RecoverLand captures changes for audit purposes only (the history is visible), but restore is impossible: there is no persistent target to re-apply the data to.</p>
+<p>RecoverLand ignores temporary memory layers silently (no error banners, hidden from the tracked-layer selector) because they have no persistent identity. As soon as you make a scratch layer permanent (<strong>Make Permanent...</strong>), RecoverLand detects the datasource change and starts capturing its edits automatically.</p>
 </section>
 
 <!-- ====== WFS ====== -->
@@ -302,7 +302,7 @@
 </aside>
 </div>
 
-<footer>RecoverLand 7.1.5 &middot; <a href="https://geodeci.xyz/" target="_blank" rel="noopener">GEODECI (Youcef ADDA)</a> &middot; <a href="https://plugins.qgis.org/plugins/RecoverLand/" target="_blank" rel="noopener">QGIS Plugin Repository</a> &middot; <a href="https://github.com/yadda07/recoverland" target="_blank" rel="noopener">GitHub</a></footer>
+<footer>RecoverLand 7.2.0 &middot; <a href="https://geodeci.xyz/" target="_blank" rel="noopener">GEODECI (Youcef ADDA)</a> &middot; <a href="https://plugins.qgis.org/plugins/RecoverLand/" target="_blank" rel="noopener">QGIS Plugin Repository</a> &middot; <a href="https://github.com/yadda07/recoverland" target="_blank" rel="noopener">GitHub</a></footer>
 <script src="rl.js?v=20"></script>
 </body>
 </html>

@@ -25,6 +25,17 @@ except ImportError:
 _translator = None
 
 
+def remove_translator() -> None:
+    """Uninstall any QTranslator previously installed by RecoverLand."""
+    global _translator
+    if _translator is not None and _HAS_QGIS:
+        try:
+            QCoreApplication.removeTranslator(_translator)
+        except (RuntimeError, TypeError):
+            pass
+        _translator = None
+
+
 def _resolve_locale() -> str:
     """Return the locale QGIS itself would use for the UI.
 
@@ -82,6 +93,7 @@ def classFactory(iface):
     #
     # A locale with no shipped catalogue (no recoverland_<xx>.qm) installs
     # nothing and the plugin speaks French: unchanged behaviour.
+    remove_translator()
     if os.path.exists(qm_path):
         candidate = QTranslator()
         if candidate.load(qm_path) and not candidate.isEmpty():

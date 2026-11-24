@@ -539,14 +539,14 @@ def purge_lens_overlays(context: str = "manual") -> int:
     """
     try:
         from qgis.core import QgsProject  # noqa: PLC0415
+        from .support_policy import is_managed_overlay_layer  # noqa: PLC0415
         project = QgsProject.instance()
         ids = [
             lyr.id() for lyr in project.mapLayers().values()
             if any((
                 lyr.name().startswith(_LENS_LAYER_PREFIX),
                 lyr.name().startswith("__rl_snap_"),
-                lyr.customProperty("_rl_lens_managed") == "1",
-                lyr.customProperty("_rl_snap_managed") == "1",
+                is_managed_overlay_layer(lyr),
             ))
         ]
         if ids:

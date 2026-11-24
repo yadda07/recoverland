@@ -103,24 +103,59 @@ def has_v7_columns(conn: sqlite3.Connection) -> bool:
     return all(c in cols for c in EVENT_EXT_COLUMNS)
 
 
-def ensure_v7_schema(conn: sqlite3.Connection) -> None:
-    """Add event_uid / commit_id and the commit ledger. Idempotent.
+def _has_index(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,),
+    ).fetchone()
+    return row is not None
 
-    Runs inside the caller's transaction when there is one. Old rows keep
-    NULL in both columns: NULLs are distinct in a SQLite UNIQUE index, so
-    history written before v7 is untouched. The transaction that creates
-    journal_coverage also stamps the instant this journal starts to
-    record every purge (see coverage_origin).
+
+def _is_v7_schema_ready(conn: sqlite3.Connection) -> bool:
+    """Fast read-only check so already-v7 journals skip BEGIN IMMEDIATE."""
+    try:
+        return (
+            has_v7_columns(conn)
+            and _has_table(conn, "capture_commit")
+            and _has_table(conn, "journal_coverage")
+            and _has_index(conn, "idx_event_uid")
+            and _has_index(conn, "idx_event_commit")
+            and _has_index(conn, "idx_capture_commit_state")
+        )
+    except sqlite3.Error:
+        return False
+
+
+def ensure_v7_schema(conn: sqlite3.Connection) -> None:
+    """Add event_uid / commit_id and the commit ledger. Idempotent and atomic.
+
+    Opens an explicit BEGIN IMMEDIATE transaction when the caller is not
+    already inside a transaction so DDL (CREATE TABLE journal_coverage) and
+    the coverage start stamp commit or roll back together.
     """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(audit_event)")}
-    for col in EVENT_EXT_COLUMNS:
-        if col not in cols:
-            conn.execute(f"ALTER TABLE audit_event ADD COLUMN {col} TEXT")  # nosec B608
-    recording = _has_table(conn, "journal_coverage")
-    for ddl in V7_DDL:
-        conn.execute(ddl)
-    if not recording:
-        _stamp_coverage_start(conn)
+    if _is_v7_schema_ready(conn):
+        return
+    started_tx = not conn.in_transaction
+    if started_tx:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(audit_event)")}
+        for col in EVENT_EXT_COLUMNS:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE audit_event ADD COLUMN {col} TEXT")  # nosec B608
+        recording = _has_table(conn, "journal_coverage")
+        for ddl in V7_DDL:
+            conn.execute(ddl)
+        if not recording:
+            _stamp_coverage_start(conn)
+        if started_tx:
+            conn.commit()
+    except Exception:
+        if started_tx and conn.in_transaction:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        raise
 
 
 # ----------------------------------------------------------------------
@@ -221,6 +256,8 @@ def _stamp_coverage_start(conn: sqlite3.Connection) -> None:
                 "updated_at) VALUES (?, ?, ?)",
                 (COVERAGE_ORIGIN_KEY, ORIGIN_CREATED, now))
     except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
         # No backend_settings: not a whole journal. The readers keep their
         # inference for it.
         flog(f"journal_writes: coverage start not stamped ({exc})", "WARNING")
@@ -366,7 +403,30 @@ def validate_event_row(row: dict) -> str:
     return ""
 
 
+def _deterministic_uid(row: dict) -> str:
+    """Stable fallback event_uid when a replayed row carries NULL/empty event_uid."""
+    import hashlib
+    h = hashlib.sha256()
+    for key in (
+        "datasource_fingerprint", "operation_type", "entity_fingerprint",
+        "feature_identity_json", "attributes_json", "created_at", "session_id",
+        "commit_id", "restored_from_event_id",
+    ):
+        val = row.get(key)
+        h.update(f"{key}={val!r}\0".encode("utf-8", "replace"))
+    for key in ("geometry_wkb", "new_geometry_wkb"):
+        blob = row.get(key)
+        if isinstance(blob, (bytes, bytearray)):
+            h.update(key.encode("ascii"))
+            h.update(bytes(blob))
+    return "fallback-" + h.hexdigest()[:32]
+
+
 def _row_tuple(row: dict) -> tuple:
+    uid = row.get("event_uid")
+    if not uid:
+        row = dict(row)
+        row["event_uid"] = _deterministic_uid(row)
     return tuple(
         row.get(col) if row.get(col) is not None else _ROW_DEFAULTS.get(col)
         for col in EVENT_WRITE_COLUMNS)
@@ -428,7 +488,12 @@ def record_capture_commit(conn: sqlite3.Connection, commit_id: str, state: str,
         "n_snapshots, n_events, detail, snapshots_json, recorded_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(commit_id) DO UPDATE SET "
-        "state = excluded.state, "
+        "state = CASE "
+        "WHEN capture_commit.state IN ('COMMITTED', 'PARTIAL', 'NO_WRITE', "
+        "'ROLLED_BACK', 'RECONCILED') "
+        "AND excluded.state IN ('INTERRUPTED', 'INCOMPLETE') "
+        "THEN capture_commit.state "
+        "ELSE excluded.state END, "
         "layer_id = COALESCE(excluded.layer_id, capture_commit.layer_id), "
         "layer_name = COALESCE(excluded.layer_name, capture_commit.layer_name), "
         "datasource_fingerprint = COALESCE(excluded.datasource_fingerprint, "

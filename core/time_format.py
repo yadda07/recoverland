@@ -14,11 +14,13 @@ Pure Python, no Qt dependency.
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from qgis.PyQt.QtCore import QCoreApplication
-
 
 def _tr(msg):
-    return QCoreApplication.translate("TimeFormat", msg)
+    try:
+        from qgis.PyQt.QtCore import QCoreApplication
+        return QCoreApplication.translate("TimeFormat", msg)
+    except Exception:  # noqa: BLE001 - pure-Python fallback outside Qt
+        return msg
 
 
 def journal_now() -> datetime:
@@ -69,12 +71,13 @@ def format_relative_time(iso_timestamp: str) -> str:
     if minutes < 60:
         return _tr("il y a {n} min").format(n=minutes)
     hours = minutes // 60
-    if hours < 24:
+    cal_days = (now.date() - dt.date()).days
+    if hours < 24 and cal_days == 0:
         return _tr("il y a {n}h").format(n=hours)
 
-    days = delta.days
-    if days == 1:
+    if cal_days == 1:
         return _tr("hier {time}").format(time=dt.strftime('%H:%M'))
+    days = max(cal_days, delta.days)
     if days < 7:
         return _tr("il y a {n}j").format(n=days)
 
@@ -108,6 +111,8 @@ def compute_history_span(oldest: str, newest: str) -> str:
     if dt_old is None or dt_new is None:
         return ""
     delta = dt_new - dt_old
+    if delta.total_seconds() < 0:
+        return _tr("< 1 heure")
     days = delta.days
     if days == 0:
         hours = int(delta.total_seconds() // 3600)
@@ -127,12 +132,21 @@ def compute_history_span(oldest: str, newest: str) -> str:
 
 
 def _parse_iso(timestamp: str) -> Optional[datetime]:
-    """Parse ISO timestamp string to timezone-aware datetime."""
+    """Parse ISO timestamp string to UTC timezone-aware datetime."""
     if not timestamp or not isinstance(timestamp, str):
         return None
     cleaned = timestamp.strip()
     if not cleaned:
         return None
+    if cleaned.endswith(("Z", "z")):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
     for fmt in (
         "%Y-%m-%dT%H:%M:%S.%f%z",
         "%Y-%m-%dT%H:%M:%S%z",
@@ -144,8 +158,8 @@ def _parse_iso(timestamp: str) -> Optional[datetime]:
         try:
             dt = datetime.strptime(cleaned, fmt)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
         except ValueError:
             continue
     return None

@@ -13,11 +13,13 @@ diagnostic messages. Pure logic module with no Qt dependency.
 """
 from typing import NamedTuple, Optional
 
-from qgis.PyQt.QtCore import QCoreApplication
-
 
 def _tr(msg):
-    return QCoreApplication.translate("HealthMonitor", msg)
+    try:
+        from qgis.PyQt.QtCore import QCoreApplication
+        return QCoreApplication.translate("HealthMonitor", msg)
+    except ImportError:
+        return msg
 
 
 class HealthLevel:

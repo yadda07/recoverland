@@ -13,7 +13,7 @@ from qgis.PyQt.QtCore import QByteArray, QObject, QRectF
 from qgis.PyQt.QtGui import QColor, QIcon, QPainter, QPixmap
 from qgis.PyQt.QtSvg import QSvgRenderer
 
-from .compat import QtCompat
+from .compat import QtCompat, is_deleted
 from .core.logger import flog
 
 _ICON_SIZES = (16, 24, 32, 48)
@@ -30,16 +30,23 @@ class ThemedActionIconController(QObject):
         self.refresh()
 
     def dispose(self):
-        if self._host_widget is not None:
+        host, self._host_widget = self._host_widget, None
+        self._action = None
+        if host is not None and not is_deleted(host):
             try:
-                self._host_widget.removeEventFilter(self)
+                host.removeEventFilter(self)
             except (AttributeError, RuntimeError, TypeError):
                 pass
-        self._host_widget = None
-        self._action = None
+        if not is_deleted(self):
+            try:
+                self.deleteLater()
+            except RuntimeError:
+                pass
 
     def refresh(self):
-        if self._action is None or not self._svg_template:
+        if (self._action is None or is_deleted(self._action)
+                or self._host_widget is None or is_deleted(self._host_widget)
+                or not self._svg_template):
             return
         text_color = _resolve_window_text_color(self._host_widget)
         if text_color is None:
@@ -47,10 +54,14 @@ class ThemedActionIconController(QObject):
         icon = _build_icon(self._svg_template, text_color, self._host_widget)
         if icon is None or icon.isNull():
             return
-        self._action.setIcon(icon)
+        try:
+            self._action.setIcon(icon)
+        except RuntimeError:
+            self._action = None
 
     def eventFilter(self, watched, event):
-        if watched is self._host_widget and event.type() == QtCompat.EVENT_PALETTE_CHANGE:
+        if (watched is self._host_widget
+                and event.type() in (QtCompat.EVENT_PALETTE_CHANGE, QtCompat.EVENT_APP_PALETTE_CHANGE)):
             if not getattr(self, '_refreshing', False):
                 self._refreshing = True
                 try:

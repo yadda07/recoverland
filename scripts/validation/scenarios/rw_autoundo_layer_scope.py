@@ -239,7 +239,7 @@ def assertions(ctx):
          f"l'utilisateur avait recuperees sur A."),
         ("S_unchecked_layer_traces_stay_active",
          st.get(s["a1"]) == "active" and st.get(s["a2"]) == "active",
-         f"traces de A={ {k: st.get(s[k]) for k in ('a1', 'a2')} } : A "
+         f"traces de A={({k: st.get(s[k]) for k in ('a1', 'a2')})} : A "
          f"n'a pas bouge, ses compensations sont toujours dans la couche ; "
          f"invalider leurs traces les ferait rejouer."),
         # Hypothesis revised (v7): b1 (t=110) is after T=50 and its

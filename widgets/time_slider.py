@@ -159,32 +159,34 @@ class TimeSliderWidget(QWidget):
         self._oldest_secs = o_secs
         self._newest_secs = n_secs
 
-        steps = max(1, range_secs // self._granularity)
+        steps = max(1, (range_secs + self._granularity - 1) // self._granularity)
 
         init_step = 0
         init_dt = oldest
         if initial is not None and initial.isValid():
             i_secs = max(o_secs, min(int(initial.toSecsSinceEpoch()), n_secs))
-            init_step = (i_secs - o_secs) // self._granularity
+            init_step = min(steps, (i_secs - o_secs) // self._granularity)
             init_dt = QDateTime.fromSecsSinceEpoch(
-                o_secs + init_step * self._granularity)
+                min(o_secs + init_step * self._granularity, n_secs))
 
         self._syncing = True
-        self._slider.setMinimum(0)
-        self._slider.setMaximum(steps)
-        self._slider.setTickInterval(max(1, steps // 10))
-        self._slider.setPageStep(max(1, steps // 20))
-        self._slider.setValue(init_step)
-        self._slider.setEnabled(True)
+        try:
+            self._slider.setMinimum(0)
+            self._slider.setMaximum(steps)
+            self._slider.setTickInterval(max(1, steps // 10))
+            self._slider.setPageStep(max(1, steps // 20))
+            self._slider.setValue(init_step)
+            self._slider.setEnabled(True)
 
-        self._date_edit.setMinimumDateTime(oldest)
-        self._date_edit.setMaximumDateTime(newest)
-        self._date_edit.setDateTime(init_dt)
-        self._date_edit.setEnabled(True)
+            self._date_edit.setMinimumDateTime(oldest)
+            self._date_edit.setMaximumDateTime(newest)
+            self._date_edit.setDateTime(init_dt)
+            self._date_edit.setEnabled(True)
 
-        self._oldest_label.setText(oldest.toString("dd/MM/yy HH:mm"))
-        self._newest_label.setText(newest.toString("dd/MM/yy HH:mm"))
-        self._syncing = False
+            self._oldest_label.setText(oldest.toString("dd/MM/yy HH:mm"))
+            self._newest_label.setText(newest.toString("dd/MM/yy HH:mm"))
+        finally:
+            self._syncing = False
 
         flog(
             f"time_slider: bounds set [{oldest.toString('yyyy-MM-ddTHH:mm:ss')}"
@@ -212,29 +214,37 @@ class TimeSliderWidget(QWidget):
         if self._syncing:
             return
         self._syncing = True
-        secs = min(self._oldest_secs + value * self._granularity, self._newest_secs)
-        dt = QDateTime.fromSecsSinceEpoch(secs)
-        self._date_edit.setDateTime(dt)
-        self._syncing = False
+        try:
+            secs = min(self._oldest_secs + value * self._granularity, self._newest_secs)
+            dt = QDateTime.fromSecsSinceEpoch(secs)
+            self._date_edit.setDateTime(dt)
+        finally:
+            self._syncing = False
         self.cutoffChanged.emit(dt)
 
     def _on_date_edited(self, dt: QDateTime) -> None:
         if self._syncing:
             return
         self._syncing = True
-        secs = max(self._oldest_secs, min(int(dt.toSecsSinceEpoch()), self._newest_secs))
-        step = (secs - self._oldest_secs) // self._granularity
-        self._slider.setValue(step)
-        self._syncing = False
+        try:
+            secs = max(self._oldest_secs, min(int(dt.toSecsSinceEpoch()), self._newest_secs))
+            step = (secs - self._oldest_secs) // self._granularity
+            self._slider.setValue(step)
+        finally:
+            self._syncing = False
         self.cutoffChanged.emit(dt)
 
     def disable(self) -> None:
-        self._slider.setEnabled(False)
-        self._slider.setMinimum(0)
-        self._slider.setMaximum(0)
-        self._date_edit.setEnabled(False)
-        self._oldest_label.setText("")
-        self._newest_label.setText("")
-        self._count_label.setText("")
-        self._count_label.setVisible(False)
-        self.setToolTip(self.tr("Aucun evenement enregistre"))
+        self._syncing = True
+        try:
+            self._slider.setEnabled(False)
+            self._slider.setMinimum(0)
+            self._slider.setMaximum(0)
+            self._date_edit.setEnabled(False)
+            self._oldest_label.setText("")
+            self._newest_label.setText("")
+            self._count_label.setText("")
+            self._count_label.setVisible(False)
+            self.setToolTip(self.tr("Aucun evenement enregistre"))
+        finally:
+            self._syncing = False

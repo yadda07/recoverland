@@ -26,6 +26,7 @@ Rules:
   length form, every other path exactly as before (core/long_paths.py).
 - Never returns an uninitialized database.
 """
+import errno
 import os
 import hashlib
 import json
@@ -43,7 +44,7 @@ from .sqlite_schema import (
     initialize_schema, apply_pragmas, get_schema_version,
     NetworkJournalBusyError,
 )
-from .long_paths import when_needed, plain, path_key
+from .long_paths import when_needed, plain, path_key, is_transient_win_lock
 from .logger import flog, qlog
 
 _JOURNAL_FILENAME = "recoverland_audit.sqlite"
@@ -108,59 +109,146 @@ class JournalLockError(RuntimeError):
 _WAL_HELD_REASON = "network journal kept in WAL mode by another client"
 
 
-def _is_pid_alive(pid: int) -> bool:
-    """Return True if the given PID is a running process on this machine.
+_KERNEL32 = None
+_KERNEL32_LOCK = threading.Lock()
+
+
+def _get_kernel32():
+    """Return a cached private kernel32 WinDLL with configured prototypes."""
+    global _KERNEL32
+    if _KERNEL32 is not None:
+        return _KERNEL32
+    with _KERNEL32_LOCK:
+        if _KERNEL32 is not None:
+            return _KERNEL32
+        import ctypes
+        from ctypes import wintypes
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [
+                ("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = (
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetExitCodeProcess.argtypes = (
+            wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD))
+        k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k32.GetProcessTimes.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+            ctypes.POINTER(_FILETIME),
+        )
+        k32.GetProcessTimes.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32._RL_FILETIME = _FILETIME
+        _KERNEL32 = k32
+        return _KERNEL32
+
+
+def _probe_pid(pid: int) -> Tuple[bool, bool]:
+    """Return (alive, access_denied) for *pid* on this machine.
 
     Platform split is mandatory: on Windows, os.kill(pid, 0) is NOT a
-    benign signal check; it calls TerminateProcess() and would kill the
-    target (including ourselves when pid == getpid()). We use OpenProcess
-    via ctypes there. On POSIX, os.kill(pid, 0) is the canonical probe.
+    benign signal check; it calls TerminateProcess().
     """
     if pid <= 0:
-        return False
+        return False, False
     if os.name == "nt":
-        return _is_pid_alive_windows(pid)
+        return _probe_pid_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return False, False
     except PermissionError:
-        # Process exists but we cannot signal it; still alive.
-        return True
+        return True, True
     except OSError:
-        return False
-    return True
+        return False, False
+    return True, False
 
 
-def _is_pid_alive_windows(pid: int) -> bool:
-    """Windows-only PID liveness check using OpenProcess + GetExitCodeProcess."""
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if the given PID is a running process on this machine."""
+    alive, _denied = _probe_pid(pid)
+    return alive
+
+
+def _probe_pid_windows(pid: int) -> Tuple[bool, bool]:
+    """Windows-only PID liveness probe returning (alive, access_denied)."""
     import ctypes
     from ctypes import wintypes
 
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     STILL_ACTIVE = 259
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
+    kernel32 = _get_kernel32()
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         # ERROR_INVALID_PARAMETER (87) = no such process;
         # ERROR_ACCESS_DENIED (5) = process exists but locked down.
-        return ctypes.get_last_error() == 5
+        denied = ctypes.get_last_error() == 5
+        return denied, denied
     try:
         exit_code = wintypes.DWORD()
         ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
         if not ok:
-            return False
-        return exit_code.value == STILL_ACTIVE
+            return False, False
+        return exit_code.value == STILL_ACTIVE, False
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _is_pid_alive_windows(pid: int) -> bool:
+    """Windows-only PID liveness check using OpenProcess + GetExitCodeProcess."""
+    alive, _denied = _probe_pid_windows(pid)
+    return alive
+
+
+def _process_start_token(pid: int) -> str:
+    """Stable start-time token for *pid* to detect PID reuse, or ''."""
+    if pid <= 0:
+        return ""
+    if os.name != "nt":
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as fh:
+                raw = fh.read()
+            rparen = raw.rfind(")")
+            if rparen < 0:
+                return ""
+            fields = raw[rparen + 2:].split()
+            # Field 22 (1-based) is starttime -> index 19 after comm.
+            return fields[19] if len(fields) > 19 else ""
+        except OSError:
+            return ""
+    try:
+        import ctypes
+        kernel32 = _get_kernel32()
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ""
+        try:
+            ft_cls = kernel32._RL_FILETIME
+            created, exited, kernel, user = ft_cls(), ft_cls(), ft_cls(), ft_cls()
+            if not kernel32.GetProcessTimes(
+                    handle, ctypes.byref(created), ctypes.byref(exited),
+                    ctypes.byref(kernel), ctypes.byref(user)):
+                return ""
+            val = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+            return str(val) if val > 0 else ""
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, ValueError):
+        return ""
 
 
 def _process_image_name(pid: int) -> str:
@@ -177,21 +265,15 @@ def _process_image_name(pid: int) -> str:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.QueryFullProcessImageNameW.argtypes = (
-            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
-            ctypes.POINTER(wintypes.DWORD))
-        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32 = _get_kernel32()
         handle = kernel32.OpenProcess(0x1000, False, pid)
         if not handle:
             return ""
         try:
             size = wintypes.DWORD(1024)
             buf = ctypes.create_unicode_buffer(size.value)
-            if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            if not kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buf, ctypes.byref(size)):
                 return ""
             return os.path.basename(buf.value)
         finally:
@@ -207,7 +289,7 @@ def _looks_like_qgis(image: str) -> bool:
 
 
 def _read_lock_file(lock_path: str) -> Optional[tuple]:
-    """Parse a lock-file. Returns (pid:int, host:str, ts:int) or None."""
+    """Parse a lock-file. Returns (pid, host, ts[, start_tok]) or None."""
     try:
         with open(lock_path, "r", encoding="utf-8") as fh:
             content = fh.read().strip()
@@ -229,6 +311,8 @@ def _parse_lock(content: str) -> Optional[tuple]:
         ts = int(parts[2])
     except (ValueError, IndexError):
         return None
+    if len(parts) >= 4 and parts[3]:
+        return (pid, host, ts, parts[3])
     return (pid, host, ts)
 
 
@@ -246,16 +330,16 @@ def sqlite_readonly_uri(path: str) -> str:
         while every read sees an empty database, so rewind reports "nothing
         to restore" on a full journal and drops a ghost file next to it.
       * `%41` is decoded to `A`, pointing the read at another directory.
+      * On Windows, forward-slash UNC paths (`//server/share/...`) are
+        normalized to backslashes (`\\\\server\\share\\...`) so SQLite does
+        not interpret `server` as a URI authority and fail.
 
-    Only the three characters SQLite gives URI meaning to are escaped. The
-    rest of the path is left untouched on purpose: `Path.as_uri()` would
-    rewrite a UNC path `\\\\server\\share\\x` into the authority form
-    `file://server/share/x`, which SQLite rejects, and network shares are a
-    normal place to keep a project.
+    Only the three characters SQLite gives URI meaning to are escaped.
     """
+    norm = path.replace("/", "\\") if os.name == "nt" else path
     # Order matters: '%' first, or the escapes introduced below get escaped.
     return "file:" + (
-        path.replace("%", "%25").replace("#", "%23").replace("?", "%3F")
+        norm.replace("%", "%25").replace("#", "%23").replace("?", "%3F")
     ) + "?mode=ro"
 
 
@@ -294,7 +378,18 @@ class _HeldLock:
 
 
 _HELD_LOCKS: Dict[str, _HeldLock] = {}
+_KEY_LOCKS: Dict[str, threading.Lock] = {}
 _HELD_GUARD = threading.Lock()
+_MY_START_TOKEN: Optional[str] = None
+
+
+def _key_lock(key: str) -> threading.Lock:
+    with _HELD_GUARD:
+        lock = _KEY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _KEY_LOCKS[key] = lock
+        return lock
 
 
 def _lock_key(lock_path: str) -> str:
@@ -312,7 +407,12 @@ def _me() -> Tuple[int, str]:
 
 
 def _lock_payload() -> bytes:
+    global _MY_START_TOKEN
     pid, host = _me()
+    if _MY_START_TOKEN is None:
+        _MY_START_TOKEN = _process_start_token(pid)
+    if _MY_START_TOKEN:
+        return f"{pid}|{host}|{int(time.time())}|{_MY_START_TOKEN}\n".encode("utf-8")
     return f"{pid}|{host}|{int(time.time())}\n".encode("utf-8")
 
 
@@ -354,11 +454,13 @@ def _os_unlock(fd: int) -> None:
         flog(f"JournalManager: OS unlock failed: {exc}", "DEBUG")
 
 
-def _read_fd(fd: int) -> Optional[tuple]:
+def _read_fd(fd: int, raise_on_error: bool = False) -> Optional[tuple]:
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         data = os.read(fd, 512)
     except OSError:
+        if raise_on_error:
+            raise
         return None
     return _parse_lock(data.decode("utf-8", errors="replace"))
 
@@ -381,24 +483,51 @@ def _heartbeat_age(info: tuple, lock_path: str) -> float:
     return time.time() - ts
 
 
-def _judge_lock(info: tuple, lock_path: str) -> Tuple[bool, str, float]:
+_FUTURE_SKEW_GUARD_SEC = -120.0
+
+
+def _is_readonly_lock_error(exc: OSError) -> bool:
+    """True when *exc* indicates a read-only filesystem or denied ACL."""
+    if exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM):
+        return True
+    return getattr(exc, "winerror", None) in (5, 19)
+
+
+def _judge_lock(info: tuple, lock_path: str,
+                os_lock_acquired: bool = False) -> Tuple[bool, str, float]:
     """(live, reason, heartbeat_age_s) for the content of a lock file."""
-    pid, host, _ts = info
+    pid, host = info[0], info[1]
+    start_tok = info[3] if len(info) >= 4 else ""
     me_pid, me_host = _me()
     age = _heartbeat_age(info, lock_path)
     if host == me_host:
         if pid == me_pid:
             return False, "left by this process id", age
-        if not _is_pid_alive(pid):
+        alive, access_denied = _probe_pid(pid)
+        if not alive:
             return False, "dead pid", age
-        if age <= _LOCK_TTL_SEC:
-            return True, "live pid, fresh heartbeat", age
+        if start_tok:
+            cur_start = _process_start_token(pid)
+            if cur_start and cur_start != start_tok:
+                return False, "pid recycled (different start time)", age
         image = _process_image_name(pid)
         if image and not _looks_like_qgis(image):
             return False, f"pid recycled by {image}", age
+        if age < _FUTURE_SKEW_GUARD_SEC and os_lock_acquired:
+            return False, "future heartbeat skew with OS lock free", age
+        if age <= _LOCK_TTL_SEC:
+            return True, "live pid, fresh heartbeat", age
+        if access_denied and os_lock_acquired:
+            return (
+                False,
+                "stale heartbeat, pid inaccessible (likely recycled system process)",
+                age,
+            )
         # A QGIS-like process that does not refresh: an older plugin version
         # or a frozen instance. Writing next to it is the one thing to avoid.
         return True, f"live pid ({image or 'image unknown'}), stale heartbeat", age
+    if age < _FUTURE_SKEW_GUARD_SEC and os_lock_acquired:
+        return False, "other host future clock skew with OS lock free", age
     if age <= _LOCK_TTL_SEC:
         return True, "other host, fresh heartbeat", age
     return False, "other host, heartbeat expired", age
@@ -435,10 +564,12 @@ def writer_lock_holder(journal_path: str) -> Optional[dict]:
     if not os.path.isfile(lock_path):
         return None
     info = _read_lock_file(lock_path)
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
     try:
-        fd = os.open(lock_path, os.O_RDWR)
+        fd = os.open(lock_path, flags)
     except OSError:
         fd = None
+    os_acquired = False
     try:
         if fd is not None:
             state = _os_lock(fd)
@@ -448,13 +579,14 @@ def writer_lock_holder(journal_path: str) -> Optional[dict]:
                         "heartbeat_age_s": _heartbeat_age(info, lock_path) if info else None,
                         "reason": "OS lock held"}
             if state == "locked":
+                os_acquired = True
                 _os_unlock(fd)
     finally:
         if fd is not None:
             os.close(fd)
     if info is None:
         return None
-    live, reason, age = _judge_lock(info, lock_path)
+    live, reason, age = _judge_lock(info, lock_path, os_lock_acquired=os_acquired)
     if not live:
         return None
     return {"pid": info[0], "host": info[1], "heartbeat_age_s": age,
@@ -471,75 +603,143 @@ def _acquire_lock(journal_path: str) -> Optional[_HeldLock]:
     """
     lock_path = _lock_path_of(journal_path)
     key = _lock_key(lock_path)
-    with _HELD_GUARD:
-        held = _HELD_LOCKS.get(key)
-        if held is not None and not held.lost:
-            held.refs += 1
-            return held
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError as exc:
-        info = _read_lock_file(lock_path)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    with _key_lock(key):
+        with _HELD_GUARD:
+            held = _HELD_LOCKS.get(key)
+            if held is not None and not held.lost:
+                held.refs += 1
+                return held
+        fd = None
+        state = ""
+        for _inode_try in range(3):
+            try:
+                fd = _share_retry(lambda: os.open(lock_path, flags, 0o644))
+            except OSError as exc:
+                info = _read_lock_file(lock_path)
+                if info is not None:
+                    live, reason, age = _judge_lock(info, lock_path)
+                    if live:
+                        raise _lock_error(journal_path, info, reason, age) from exc
+                if not _is_readonly_lock_error(exc):
+                    raise
+                flog(f"JournalManager: cannot write lock-file {lock_path}: {exc}. "
+                     f"Multi-writer protection disabled for this session.", "ERROR")
+                return None
+            state = _os_lock(fd)
+            if state == "busy":
+                info = _read_fd(fd)
+                os.close(fd)
+                age = _heartbeat_age(info, lock_path) if info else None
+                raise _lock_error(
+                    journal_path, info, "OS lock held by another instance", age)
+            if os.name != "nt" and state == "locked":
+                # POSIX unlink-while-locked race: verify fd matches path inode.
+                try:
+                    st_fd = os.fstat(fd)
+                    st_path = os.stat(lock_path)
+                    if st_fd.st_ino != st_path.st_ino or st_fd.st_dev != st_path.st_dev:
+                        _os_unlock(fd)
+                        os.close(fd)
+                        fd = None
+                        continue
+                except OSError:
+                    _os_unlock(fd)
+                    os.close(fd)
+                    fd = None
+                    continue
+            break
+        if fd is None:
+            raise JournalLockError(
+                f"{journal_path} lock file rotated concurrently during acquisition",
+                journal_path=journal_path, reason="inode race")
+        info = _read_fd(fd)
         if info is not None:
-            live, reason, age = _judge_lock(info, lock_path)
+            live, reason, age = _judge_lock(
+                info, lock_path, os_lock_acquired=(state == "locked"))
             if live:
-                raise _lock_error(journal_path, info, reason, age) from exc
-        flog(f"JournalManager: cannot write lock-file {lock_path}: {exc}. "
-             f"Multi-writer protection disabled for this session.", "ERROR")
-        return None
-    state = _os_lock(fd)
-    info = _read_fd(fd)
-    if state == "busy":
-        os.close(fd)
-        age = _heartbeat_age(info, lock_path) if info else None
-        raise _lock_error(journal_path, info, "OS lock held by another instance", age)
-    if info is not None:
-        live, reason, age = _judge_lock(info, lock_path)
-        if live:
+                if state == "locked":
+                    _os_unlock(fd)
+                os.close(fd)
+                raise _lock_error(journal_path, info, reason, age)
+            flog(
+                f"JournalManager: stale writer lock reclaimed "
+                f"(pid={info[0]}, host={info[1]}, heartbeat_age_s={age:.0f}, "
+                f"reason={reason}) on {journal_path}",
+                "WARNING",
+            )
+        if state != "locked":
+            flog(f"JournalManager: OS lock unavailable on {lock_path} ({state}); "
+                 f"the heartbeat alone protects this journal", "WARNING")
+        try:
+            _share_retry(lambda: _write_fd(fd))
+        except OSError as exc:
             if state == "locked":
                 _os_unlock(fd)
             os.close(fd)
-            raise _lock_error(journal_path, info, reason, age)
-        flog(
-            f"JournalManager: stale writer lock reclaimed "
-            f"(pid={info[0]}, host={info[1]}, heartbeat_age_s={age:.0f}, "
-            f"reason={reason}) on {journal_path}",
-            "WARNING",
-        )
-    if state != "locked":
-        flog(f"JournalManager: OS lock unavailable on {lock_path} ({state}); "
-             f"the heartbeat alone protects this journal", "WARNING")
+            if not _is_readonly_lock_error(exc):
+                raise
+            flog(f"JournalManager: cannot write lock-file {lock_path}: {exc}. "
+                 f"Multi-writer protection disabled for this session.", "ERROR")
+            return None
+        held = _HeldLock(lock_path, fd, state == "locked")
+        held.thread = threading.Thread(
+            target=_heartbeat_loop, args=(held, journal_path),
+            name="RecoverLand-LockHeartbeat", daemon=True)
+        with _HELD_GUARD:
+            _HELD_LOCKS[key] = held
+        held.thread.start()
+        return held
+
+
+def _close_lost_fd_locked(held: _HeldLock) -> None:
+    """Unlock and close *held.fd* without deleting the foreign lock file."""
+    fd, held.fd = held.fd, None
+    if fd is None:
+        return
+    if held.os_locked:
+        _os_unlock(fd)
     try:
-        _write_fd(fd)
-    except OSError as exc:
-        if state == "locked":
-            _os_unlock(fd)
         os.close(fd)
-        flog(f"JournalManager: cannot write lock-file {lock_path}: {exc}. "
-             f"Multi-writer protection disabled for this session.", "ERROR")
-        return None
-    held = _HeldLock(lock_path, fd, state == "locked")
-    held.thread = threading.Thread(
-        target=_heartbeat_loop, args=(held, journal_path),
-        name="RecoverLand-LockHeartbeat", daemon=True)
-    with _HELD_GUARD:
-        _HELD_LOCKS[key] = held
-    held.thread.start()
-    return held
+    except OSError:
+        pass
 
 
 def _heartbeat_loop(held: _HeldLock, journal_path: str) -> None:
     me = _me()
     failures = 0
+    first_fail_mono: Optional[float] = None
+    max_fail_s = _LOCK_TTL_SEC / 2.0
     while not held.stop.wait(_LOCK_HEARTBEAT_SEC):
         with held.io_lock:
             if held.fd is None:
                 return
-            info = _read_fd(held.fd)
+            try:
+                info = _read_fd(held.fd, raise_on_error=True)
+            except OSError as exc:
+                failures += 1
+                now_m = time.monotonic()
+                if first_fail_mono is None:
+                    first_fail_mono = now_m
+                if failures == 1 or failures % 10 == 0:
+                    flog(f"JournalManager: heartbeat read of {held.lock_path} "
+                         f"failed ({failures}x): {exc}", "WARNING")
+                if now_m - first_fail_mono >= max_fail_s:
+                    held.lost = True
+                    held.lost_reason = f"heartbeat unreachable ({exc})"
+                    _close_lost_fd_locked(held)
+                    flog(
+                        f"JournalManager: writer lock of {journal_path} lost "
+                        f"after sustained heartbeat errors ({exc}); stopping",
+                        "CRITICAL",
+                    )
+                    return
+                continue
             if info is None or (info[0], info[1]) != me:
                 held.lost = True
                 held.lost_reason = (
                     f"host={info[1]} pid={info[0]}" if info else "lock emptied")
+                _close_lost_fd_locked(held)
                 flog(
                     f"JournalManager: writer lock of {journal_path} taken over "
                     f"({held.lost_reason}): another instance may be writing "
@@ -551,11 +751,25 @@ def _heartbeat_loop(held: _HeldLock, journal_path: str) -> None:
             try:
                 _write_fd(held.fd)
                 failures = 0
+                first_fail_mono = None
             except OSError as exc:
                 failures += 1
+                now_m = time.monotonic()
+                if first_fail_mono is None:
+                    first_fail_mono = now_m
                 if failures == 1 or failures % 10 == 0:
                     flog(f"JournalManager: heartbeat of {held.lock_path} "
                          f"failed ({failures}x): {exc}", "WARNING")
+                if now_m - first_fail_mono >= max_fail_s:
+                    held.lost = True
+                    held.lost_reason = f"heartbeat write unreachable ({exc})"
+                    _close_lost_fd_locked(held)
+                    flog(
+                        f"JournalManager: writer lock of {journal_path} lost "
+                        f"after sustained heartbeat write errors ({exc})",
+                        "CRITICAL",
+                    )
+                    return
 
 
 def _release_lock(held: _HeldLock) -> None:
@@ -578,6 +792,17 @@ def _release_lock(held: _HeldLock) -> None:
     if not ours:
         flog(f"JournalManager: lock-file not owned by us "
              f"(pid={info[0] if info else '?'}); skipping remove", "DEBUG")
+    if ours:
+        # Mark released on disk before unlocking so a transient Windows AV
+        # handle blocking os.remove() never causes a false lockout.
+        try:
+            marker = b"RELEASED\n"
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, marker)
+            os.ftruncate(fd, len(marker))
+            os.fsync(fd)
+        except OSError:
+            pass
     if ours and os.name != "nt":
         # POSIX: unlink while the OS lock is still ours, so nobody can take
         # the file between the unlock and the removal.
@@ -596,7 +821,9 @@ def _release_lock(held: _HeldLock) -> None:
 
 def _remove_quietly(path: str) -> None:
     try:
-        os.remove(path)
+        _share_retry(lambda: os.remove(path))
+    except FileNotFoundError:
+        pass
     except OSError as exc:
         flog(f"JournalManager: cannot remove lock-file {path}: {exc}", "DEBUG")
 
@@ -1015,6 +1242,7 @@ class JournalManager:
         self._unsaved_session_key: Optional[str] = None
         self._lock_acquired: bool = False
         self._held_lock: Optional[_HeldLock] = None
+        self._lock_lost_recorded: bool = False
         self._reconciliation = None
         self._kind = ""
         self._event_id_at_open = 0
@@ -1080,11 +1308,15 @@ class JournalManager:
     def is_lock_lost(self) -> bool:
         """True when another instance took this journal's lock over.
 
-        Detected by the heartbeat. From then on two instances may write the
-        journal: the interface must say so.
+        Detected by the heartbeat. Remains True after close() until the next
+        open_for_project() / _open_target(), so capture health and the UI keep
+        reporting the lock takeover once writing has been halted.
         """
         held = self._held_lock
-        return bool(self.is_open and held is not None and held.lost)
+        return bool(
+            self._lock_lost_recorded
+            or (self.is_open and held is not None and held.lost)
+        )
 
     @property
     def is_reconciliation_degraded(self) -> bool:
@@ -1135,6 +1367,7 @@ class JournalManager:
         (a save followed by a crash of QGIS) is carried into it.
         """
         self.close()
+        self._lock_lost_recorded = False
         owed, self._owed_carry = self._owed_carry, None
         self.last_lock_error = None
         target = _resolve_target(project_path, profile_path)
@@ -1280,6 +1513,7 @@ class JournalManager:
         self._path = target.path
         self._kind = target.kind
         self._unsaved_session_key = target.session_key or None
+        self._lock_lost_recorded = False
         # Unreadable right after the open (it just initialized): 0, as ever.
         self._event_id_at_open = _max_event_id(self._conn) or 0
         self._opened_at = _utc_now()
@@ -1375,7 +1609,8 @@ class JournalManager:
             raise RuntimeError("Journal is not open")
         return self._conn
 
-    def close(self) -> None:
+    def close(self, writer_still_alive: bool = False,
+              defer_lock_release=None) -> None:
         """Close the journal; carry out the history carry planned for it.
 
         The caller has stopped the writer first (_shutdown_local_backend),
@@ -1383,6 +1618,11 @@ class JournalManager:
         carry (which replays that outbox) sees the whole session. It runs
         before the writer lock is released: nobody can take the source in
         between.
+
+        When *writer_still_alive* is True (the writer thread timed out on
+        shutdown), skip concurrent outbox settlement and keep the process
+        writer lock held until the writer exits via *defer_lock_release*
+        (callable ``(journal_path, release_cb) -> bool``).
         """
         if self._conn is None:
             return
@@ -1395,10 +1635,56 @@ class JournalManager:
         except sqlite3.Error as e:
             flog(f"JournalManager: close error: {e}", "WARNING")
         finally:
+            if self._held_lock is not None and self._held_lock.lost:
+                self._lock_lost_recorded = True
             if carry is not None:
-                self._settle_carry(carry)
+                if writer_still_alive:
+                    report = HistoryCarryReport(
+                        carry.source, carry.target, carry.since_event_id)
+                    report.failure_side = "source"
+                    report.error = "writer thread still alive at close"
+                    report.owed = _is_owed(carry)
+                    self.last_carry_report = report
+                    self._owed_carry = carry
+                    flog(
+                        f"JournalManager: deferring history carry "
+                        f"{carry.source} -> {carry.target} because writer "
+                        f"thread is still alive",
+                        "WARNING",
+                    )
+                else:
+                    self._settle_carry(carry)
             if self._path is not None:
-                self._release_writer_lock(self._path)
+                if writer_still_alive:
+                    held, self._held_lock = self._held_lock, None
+                    attached = False
+                    if held is not None and callable(defer_lock_release):
+                        try:
+                            attached = bool(defer_lock_release(
+                                self._path, lambda h=held: _release_lock(h)))
+                        except Exception as exc:  # noqa: BLE001
+                            flog(f"JournalManager: defer_lock_release failed: {exc}",
+                                 "WARNING")
+                    if held is not None and not attached:
+                        # Writer already exited or no callback: release now if
+                        # lock was lost, else keep it attached only if caller
+                        # explicitly kept ownership without a callback.
+                        if held.lost or callable(defer_lock_release):
+                            _release_lock(held)
+                        else:
+                            flog(
+                                f"JournalManager: keeping writer lock on {self._path} "
+                                f"because writer thread is still alive",
+                                "WARNING",
+                            )
+                    elif held is not None and attached:
+                        flog(
+                            f"JournalManager: deferred writer lock release on "
+                            f"{self._path} until lingering writer exits",
+                            "WARNING",
+                        )
+                else:
+                    self._release_writer_lock(self._path)
             self._conn = None
             self._path = None
             self._unsaved_session_key = None
@@ -1517,6 +1803,12 @@ class JournalManager:
                          f"{carry.target} kept for a later open: the source "
                          f"journal is unreachable", "WARNING")
                 continue
+            from .write_queue import has_lingering_writer
+            if has_lingering_writer(carry.source):
+                flog(f"JournalManager: owed carry {carry.source} -> "
+                     f"{carry.target} deferred: previous writer is still alive",
+                     "WARNING")
+                continue
             report = carry_journal_history(
                 carry.source, self._conn, self._path,
                 since_event_id=carry.since_event_id, opened_at=carry.opened_at,
@@ -1529,6 +1821,13 @@ class JournalManager:
                      f"owed, the source is kept", "WARNING")
                 continue
             _forget_owed(profile_path, carry.source, carry.target)
+            if (self.last_carry_report is not None
+                    and not self.last_carry_report.ok
+                    and _same_file(self.last_carry_report.source, carry.source)
+                    and _same_file(self.last_carry_report.target, carry.target)):
+                report.capture_journal = self._path or ""
+                report.capture_write_ok = True
+                self.last_carry_report = report
             flog(f"JournalManager: event=owed_history_carried source="
                  f"{carry.source} target={carry.target} planned_at="
                  f"{carry.planned_at} inserted={report.events_inserted}",
@@ -1631,7 +1930,7 @@ class JournalManager:
             apply_pragmas(conn, read_only=True)
             # apply_pragmas may reset query_only; re-apply to be safe.
             conn.execute("PRAGMA query_only=ON")
-        except sqlite3.Error:
+        except Exception:
             conn.close()
             raise
         flog(
@@ -1651,7 +1950,7 @@ class JournalManager:
         )
         try:
             apply_pragmas(conn, read_only=True)
-        except sqlite3.Error:
+        except Exception:
             conn.close()
             raise
         return conn
@@ -1661,7 +1960,11 @@ class JournalManager:
         if self._path is None:
             raise RuntimeError("Journal is not open")
         conn = sqlite3.connect(self._path, check_same_thread=False)
-        apply_pragmas(conn)
+        try:
+            apply_pragmas(conn)
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     def _open_connection(self, path: str) -> None:
@@ -1715,10 +2018,14 @@ class JournalManager:
         keeping this under 50ms even on journals with 10^6+ events.
         """
         try:
+            qo = conn.execute("PRAGMA query_only").fetchone()
+            if qo and int(qo[0] or 0) != 0:
+                return
             conn.execute("ANALYZE")
             flog("JournalManager: startup ANALYZE completed")
         except sqlite3.Error as exc:
-            flog(f"JournalManager: startup ANALYZE failed: {exc}", "WARNING")
+            level = "DEBUG" if _is_readonly_error(exc) else "WARNING"
+            flog(f"JournalManager: startup ANALYZE failed: {exc}", level)
 
     @staticmethod
     def _ensure_directory(path: str) -> None:
@@ -1886,14 +2193,18 @@ def _provably_absent(path: str) -> bool:
 
     FileNotFoundError alone is no proof: Windows answers it for a share
     that is not reachable right now too. The nearest ancestor that can be
-    listed decides; none (drive or share gone) means "unknown", not absent.
+    listed decides; never crosses a mount point boundary when unreadable.
     """
     child = os.path.abspath(plain(path))
     parent = os.path.dirname(child)
     while parent and parent != child:
+        if os.path.ismount(child):
+            return False
         try:
             names = os.listdir(when_needed(parent))
         except OSError:
+            if os.path.ismount(parent):
+                return False
             child, parent = parent, os.path.dirname(parent)
             continue
         wanted = os.path.normcase(os.path.basename(child))
@@ -2044,8 +2355,8 @@ def _owed_lock(profile_path: str):
     with _OWED_GUARD:
         lock_path = when_needed(_owed_path(profile_path) + _OWED_LOCK_SUFFIX)
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0),
-                     0o600)
+        fd = _share_retry(lambda: os.open(
+            lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600))
         state = ""
         try:
             deadline = time.monotonic() + _OWED_LOCK_WAIT_SEC
@@ -2080,7 +2391,10 @@ def _share_retry(action):
     for attempt in range(_OWED_SHARE_TRIES):
         try:
             return action()
-        except PermissionError:
+        except OSError as exc:
+            if (not isinstance(exc, PermissionError)
+                    and not is_transient_win_lock(exc)):
+                raise
             if attempt + 1 >= _OWED_SHARE_TRIES:
                 raise
             time.sleep(_OWED_SHARE_PAUSE_SEC)
@@ -2174,10 +2488,25 @@ def _remember_owed(carry: HistoryCarry) -> bool:
     key = _owed_key(carry.source, carry.target)
     try:
         with _owed_lock(carry.profile_path):
-            entries = [e for e in _read_owed(carry.profile_path)
-                       if _owed_key(e["source"], e["target"]) != key]
-            entries.append(carry.as_dict())
-            _store_owed(carry.profile_path, entries)
+            existing = _read_owed(carry.profile_path)
+            kept = []
+            for e in existing:
+                if _owed_key(e["source"], e["target"]) != key:
+                    kept.append(e)
+                    continue
+                # Preserve earlier unsettled bounds so a later save does not
+                # drop an earlier failed carry for the same (source, target).
+                old_since = int(e.get("since_event_id") or 0)
+                if old_since < carry.since_event_id:
+                    carry.since_event_id = old_since
+                old_opened = str(e.get("opened_at") or "")
+                if old_opened and (not carry.opened_at or old_opened < carry.opened_at):
+                    carry.opened_at = old_opened
+                carry.until_event_id = None
+                carry.until_at = ""
+                carry.until_uids = None
+            kept.append(carry.as_dict())
+            _store_owed(carry.profile_path, kept)
             return True
     except OSError as exc:
         flog(f"JournalManager: cannot record the history carry "
@@ -2252,6 +2581,9 @@ def _carry_into_journal(carry: HistoryCarry) -> HistoryCarryReport:
     """
     report = HistoryCarryReport(carry.source, carry.target, carry.since_event_id)
     report.failure_side = "target"
+    lock_path = _lock_path_of(carry.target)
+    previous = _read_lock_file(lock_path)
+    previous_raw = _read_lock_raw(lock_path) if previous is not None else None
     try:
         os.makedirs(os.path.dirname(carry.target), exist_ok=True)
         held = _acquire_lock(carry.target)
@@ -2267,6 +2599,24 @@ def _carry_into_journal(carry: HistoryCarry) -> HistoryCarryReport:
     try:
         conn = sqlite3.connect(carry.target, check_same_thread=False)
         _initialize_journal(conn)
+    except NetworkJournalBusyError as exc:
+        report.error = f"{type(exc).__name__}: {exc}"
+        flog(f"JournalManager: history carry into {carry.target} refused "
+             f"(network WAL busy): {report.error}", "WARNING")
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        if previous is not None and (previous[0], previous[1]) == _me():
+            previous = None
+        if previous is not None and previous_raw is not None:
+            _put_lock_content_back(held, previous_raw)
+        if held is not None:
+            _release_lock(held)
+        if previous is not None and previous_raw is not None:
+            _restore_lock_times(lock_path, previous_raw)
+        return report
     except Exception as exc:  # noqa: BLE001 - reported, the source is kept
         report.error = f"{type(exc).__name__}: {exc}"
         flog(f"JournalManager: history carry into {carry.target} failed: "
@@ -2368,9 +2718,20 @@ def _select_carry_rows(src: sqlite3.Connection, select: str, cols: List[str],
     have = {r[i_id] for r in rows}
     refs = sorted(({r[i_ref] for r in rows if r[i_ref] is not None}
                    | {int(i) for i in extra_ids or ()}) - have)
-    for chunk in _chunks(refs):
-        rows.extend(src.execute(
-            base + f"event_id IN ({','.join(['?'] * len(chunk))})", chunk).fetchall())
+    hops = 0
+    while refs and hops < 32:
+        hops += 1
+        fetched = []
+        for chunk in _chunks(refs):
+            fetched.extend(src.execute(
+                base + f"event_id IN ({','.join(['?'] * len(chunk))})",
+                chunk).fetchall())
+        if not fetched:
+            break
+        rows.extend(fetched)
+        have.update(r[i_id] for r in fetched)
+        refs = sorted(
+            {r[i_ref] for r in fetched if r[i_ref] is not None} - have)
     rows.sort(key=lambda r: r[i_id])
     return rows
 
@@ -2554,7 +2915,11 @@ def _session_outbox_rows(box: _SessionOutbox,
     from .journal_writes import EVENT_WRITE_COLUMNS, _row_tuple, validate_event_row
     rows, refused, seen = [], [], set()
     for rec in box.records:
-        values = record_to_row_values(rec)
+        try:
+            values = record_to_row_values(rec)
+        except (ValueError, TypeError) as exc:
+            refused.append(str(exc))
+            continue
         why = validate_event_row(values)
         if not why and not values.get("event_uid"):
             why = "no event_uid"
@@ -2688,7 +3053,10 @@ def _count_out_of_order(target_conn: sqlite3.Connection, rows: list,
             "AND e.entity_fingerprint = f.ent AND e.created_at > f.at)").fetchone()
         return int(row[0] or 0)
     finally:
-        target_conn.execute("DELETE FROM rl_carry_first")
+        try:
+            target_conn.execute("DELETE FROM rl_carry_first")
+        except sqlite3.Error:
+            pass
 
 
 def carry_journal_history(source_path: str, target_conn: sqlite3.Connection,
@@ -2764,6 +3132,13 @@ def carry_journal_history(source_path: str, target_conn: sqlite3.Connection,
              f"now: the source journal is unreachable (not provably gone); "
              f"the history carry stays owed", "ERROR")
         return report
+    from .write_queue import has_lingering_writer
+    if has_lingering_writer(source_path):
+        report.failure_side = "source"
+        report.error = "source journal still has a live lingering writer"
+        flog(f"{prefix}JournalManager: carry from {source_path} deferred: "
+             f"{report.error}", "WARNING")
+        return report
     try:
         src_held = _acquire_lock(source_path)
     except JournalLockError as exc:
@@ -2773,11 +3148,16 @@ def carry_journal_history(source_path: str, target_conn: sqlite3.Connection,
         return report
     src = None
     in_target_tx = False
+    prev_target_sync = None
     side = "source"
     try:
         writable = _journal_file_writable(source_path)
         src = _open_source(source_path, writable)
         if writable:
+            try:
+                src.execute("PRAGMA synchronous=FULL")
+            except sqlite3.Error:
+                pass
             try:
                 with src:
                     ensure_v7_schema(src)
@@ -2874,6 +3254,12 @@ def carry_journal_history(source_path: str, target_conn: sqlite3.Connection,
             f"ON CONFLICT(event_uid) DO NOTHING")
 
         side = "target"
+        try:
+            row_sync = target_conn.execute("PRAGMA synchronous").fetchone()
+            prev_target_sync = int(row_sync[0]) if row_sync else None
+            target_conn.execute("PRAGMA synchronous=FULL")
+        except sqlite3.Error:
+            prev_target_sync = None
         target_conn.execute("BEGIN IMMEDIATE")
         in_target_tx = True
         ensure_v7_schema(target_conn)
@@ -2999,6 +3385,11 @@ def carry_journal_history(source_path: str, target_conn: sqlite3.Connection,
              f"{target_path} failed ({side} side), nothing written to the "
              f"target: {report.error}", "ERROR")
     finally:
+        if prev_target_sync is not None and not in_target_tx:
+            try:
+                target_conn.execute(f"PRAGMA synchronous={prev_target_sync}")
+            except sqlite3.Error:
+                pass
         if src is not None:
             try:
                 src.close()
@@ -3230,10 +3621,12 @@ def _orphan_verdict(content: dict) -> str:
     return "holds"
 
 
-def _remove_journal_files(full: str) -> None:
-    os.remove(full)
-    for suffix in ("-wal", "-shm", "-journal", _LOCK_SUFFIX):
-        sidecar = full + suffix
+def _remove_journal_files(full: str, remove_lock: bool = True) -> None:
+    os.remove(when_needed(full))
+    suffixes = ("-wal", "-shm", "-journal", _LOCK_SUFFIX) if remove_lock else (
+        "-wal", "-shm", "-journal")
+    for suffix in suffixes:
+        sidecar = when_needed(full + suffix)
         if os.path.exists(sidecar):
             os.remove(sidecar)
     # An outbox directory is only ever removed EMPTY (checked by the
@@ -3247,6 +3640,19 @@ def _remove_journal_files(full: str) -> None:
     except (OSError, ImportError) as exc:
         flog(f"JournalManager: empty outbox of {full} left in place: {exc}",
              "DEBUG")
+
+
+def _journal_latest_mtime(full: str) -> float:
+    """Latest mtime across the main journal file and its active -wal file."""
+    best = os.path.getmtime(when_needed(full))
+    wal = when_needed(full + "-wal")
+    try:
+        wal_mt = os.path.getmtime(wal)
+        if wal_mt > best:
+            best = wal_mt
+    except OSError:
+        pass
+    return best
 
 
 def cleanup_orphan_journals(profile_path: str,
@@ -3274,36 +3680,45 @@ def cleanup_orphan_journals(profile_path: str,
     for filename in sorted(os.listdir(audit_dir)):
         if not filename.endswith(".sqlite") or filename.startswith(_STORAGE_PREFIX):
             continue
-        full = os.path.join(audit_dir, filename)
+        full = when_needed(os.path.join(audit_dir, filename))
         if current_norm and path_key(full) == current_norm:
             continue
         try:
-            if os.path.getmtime(full) >= cutoff:
+            if _journal_latest_mtime(full) >= cutoff:
                 continue
         except OSError as e:
             flog(f"JournalManager: cannot stat orphan {filename}: {e}", "WARNING")
             continue
         if writer_lock_holder(full) is not None:
             continue
-        content = _orphan_content(full)
-        verdict = _orphan_verdict(content)
-        if verdict == "holds":
-            kept.append((filename, content))
-            flog(f"JournalManager: orphan journal kept (history no project "
-                 f"opens) path={full} events={content['events']} "
-                 f"commits={content['commits']} "
-                 f"outbox_files={content['outbox_files']} "
-                 f"pending_file={content['pending_file']} "
-                 f"error={content['error']!r}", "WARNING")
+        held = None
+        try:
+            held = _acquire_lock(full)
+        except JournalLockError:
             continue
         try:
-            _remove_journal_files(full)
-            removed += 1
-            detail = (f", its events live in {content['carried_into']}"
-                      if verdict == "carried" else "")
-            flog(f"JournalManager: removed orphan {filename} ({verdict}{detail})")
-        except OSError as e:
-            flog(f"JournalManager: cannot remove orphan {filename}: {e}", "WARNING")
+            content = _orphan_content(full)
+            verdict = _orphan_verdict(content)
+            if verdict == "holds":
+                kept.append((filename, content))
+                flog(f"JournalManager: orphan journal kept (history no project "
+                     f"opens) path={full} events={content['events']} "
+                     f"commits={content['commits']} "
+                     f"outbox_files={content['outbox_files']} "
+                     f"pending_file={content['pending_file']} "
+                     f"error={content['error']!r}", "WARNING")
+                continue
+            try:
+                _remove_journal_files(full, remove_lock=(held is None))
+                removed += 1
+                detail = (f", its events live in {content['carried_into']}"
+                          if verdict == "carried" else "")
+                flog(f"JournalManager: removed orphan {filename} ({verdict}{detail})")
+            except OSError as e:
+                flog(f"JournalManager: cannot remove orphan {filename}: {e}", "WARNING")
+        finally:
+            if held is not None:
+                _release_lock(held)
     if removed:
         flog(f"JournalManager: cleaned {removed} orphan journal(s) from {audit_dir}")
     _report_kept_orphans(audit_dir, kept)

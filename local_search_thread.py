@@ -10,17 +10,24 @@
 from qgis.PyQt.QtCore import pyqtSignal
 
 from .core import flog, search_events
-from .qgs_task_support import TaskEnabledThread, trace_prefix
+from .qgs_task_support import (
+    TaskEnabledThread, open_worker_read_connection, trace_prefix,
+)
 
 
-def _run_search(journal, criteria, trace_id, phase_callback, is_cancelled):
+def _run_search(journal, criteria, trace_id, phase_callback, is_cancelled,
+                journal_path=None, register_conn=None, unregister_conn=None):
     conn = None
     prefix = trace_prefix(trace_id)
     try:
         phase_callback("Connexion au journal local...")
         if is_cancelled():
             return None
-        conn = journal.create_read_connection()
+        conn = open_worker_read_connection(journal, journal_path)
+        if register_conn is not None:
+            register_conn(conn)
+        if is_cancelled():
+            return None
         phase_callback("Recherche en cours...")
         flog(
             f"{prefix}LocalSearchThread: criteria fp={criteria.datasource_fingerprint}"
@@ -34,6 +41,8 @@ def _run_search(journal, criteria, trace_id, phase_callback, is_cancelled):
             return None
         return result
     finally:
+        if unregister_conn is not None:
+            unregister_conn()
         if conn is not None:
             try:
                 conn.close()
@@ -41,8 +50,14 @@ def _run_search(journal, criteria, trace_id, phase_callback, is_cancelled):
                 flog(f"{prefix}LocalSearchThread: close error: {e}", "WARNING")
 
 
-def _run_search_task(task, journal, criteria, trace_id, phase_callback):
-    return _run_search(journal, criteria, trace_id, phase_callback, task.isCanceled)
+def _run_search_task(task, journal, criteria, trace_id, phase_callback,
+                     journal_path=None, register_conn=None, unregister_conn=None):
+    return _run_search(
+        journal, criteria, trace_id, phase_callback, task.isCanceled,
+        journal_path=journal_path,
+        register_conn=register_conn,
+        unregister_conn=unregister_conn,
+    )
 
 
 class LocalSearchThread(TaskEnabledThread):
@@ -55,6 +70,7 @@ class LocalSearchThread(TaskEnabledThread):
     def __init__(self, journal, criteria, trace_id: str = ""):
         super().__init__(trace_id=trace_id)
         self._journal = journal
+        self._journal_path = getattr(journal, "path", None)
         self._criteria = criteria
 
     def run(self):
@@ -65,6 +81,9 @@ class LocalSearchThread(TaskEnabledThread):
                 self._trace_id,
                 self.phase_changed.emit,
                 lambda: self._stopped,
+                journal_path=self._journal_path,
+                register_conn=self._register_conn,
+                unregister_conn=self._unregister_conn,
             )
             if not self._stopped:
                 self.results_ready.emit(result)
@@ -85,6 +104,9 @@ class LocalSearchThread(TaskEnabledThread):
             criteria=self._criteria,
             trace_id=self._trace_id,
             phase_callback=self.phase_changed.emit,
+            journal_path=self._journal_path,
+            register_conn=self._register_conn,
+            unregister_conn=self._unregister_conn,
         )
         flog(f"{prefix}LocalSearchThread: submitted to QgsTaskManager")
 

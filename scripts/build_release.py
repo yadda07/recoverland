@@ -98,9 +98,17 @@ EXCLUDE_GLOBS = (
     "*.pyc",
     "*.pyo",
     "*.log",
+    "*.bak",
+    "*.tmp",
+    "*~",
+    "*-wal",
+    "*-shm",
+    "Thumbs.db",
+    "desktop.ini",
     "flake8_report.*",
-    # All .md inside docs/ are internal working documents; only HTML/CSS/JS
-    # assets are user-facing documentation.
+    # Never ship Markdown files in the deliverable archive (runtime files only).
+    "*.md",
+    "*.MD",
     "docs/*.md",
     "docs/orchestrator*.json",
 )
@@ -117,7 +125,6 @@ ALLOWED_DOTFILES: frozenset = frozenset()
 REQUIRED_STAGE_FILES = (
     "__init__.py",
     "metadata.txt",
-    "SIGNATURE.md",
     "recover.py",
     "recover_dialog.py",
     "icon.svg",

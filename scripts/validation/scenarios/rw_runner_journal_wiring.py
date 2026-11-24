@@ -661,7 +661,7 @@ def assertions(ctx):
         "l1_one_connection_per_layer_group",
         set(by_layer) == {"a", "b"} and all(len(v) == 1 for v in by_layer.values())
         and len(by_layer.get("a", set()) | by_layer.get("b", set())) == 2,
-        f"connexions par couche={ {k: len(v) for k, v in by_layer.items()} } "
+        f"connexions par couche={({k: len(v) for k, v in by_layer.items()})} "
         f"(couche a : deux morceaux de 5 et 2 evenements). Une par couche, "
         f"la meme pour tous ses morceaux : le cache de l'executeur la garde "
         f"d'un morceau a l'autre.",

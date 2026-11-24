@@ -291,6 +291,7 @@ def reconstruct_snapshot_at(
 
     trace_counters = {"resolved": 0, "missing": 0}
 
+    cancelled = False
     for ds_fp, events in event_cache.items():
         if should_cancel is not None and should_cancel():
             flog(f"[{trace_id}] review_snapshot: reconstruct cancelled", "DEBUG")
@@ -308,6 +309,7 @@ def reconstruct_snapshot_at(
             if (should_cancel is not None and n_done % _CANCEL_CHECK_EVERY == 0
                     and should_cancel()):
                 flog(f"[{trace_id}] review_snapshot: reconstruct cancelled", "DEBUG")
+                cancelled = True
                 break
             ev_list = _materialize_traces(ev_list, trace_counters)
             visible, later = _timeline_at_cutoff(ev_list, cutoff_utc,
@@ -346,6 +348,8 @@ def reconstruct_snapshot_at(
         if ds_feats:
             features[ds_fp] = ds_feats
             n_entities += len(ds_feats)
+        if cancelled:
+            break
 
     n_unresolved = count_unresolved(features)
     n_trace_ref_missing = count_reason(features, REASON_TRACE_SOURCE_MISSING)
@@ -621,6 +625,10 @@ def _effective_trace(trace, src):
             crs_authid=src.crs_authid,
         )
     if op == "UPDATE":
+        if src.geometry_wkb is None and src.new_geometry_wkb is not None:
+            # Source carries only one geometry side (e.g. trace of pre-v2
+            # UPDATE): reversing it would invent an unknown geometry state.
+            return None
         changed = _parsed_attrs(src).get("changed_only", {})
         if not isinstance(changed, dict):
             changed = {}
@@ -809,8 +817,11 @@ def _timeline_at_cutoff(ev_list: list, cutoff_utc: datetime,
         if ev.restored_from_event_id is None or ev.event_id in applied:
             visible.append(ev)
     ties = [_tie_event(group) for group in _tied_groups(traces)]
-    ties = [tie for tie in ties
-            if (_parse_created_at(tie.created_at) or cutoff_utc) <= cutoff_utc]
+    ties = [
+        tie for tie in ties
+        if _parse_created_at(tie.created_at) is not None
+        and _parse_created_at(tie.created_at) <= cutoff_utc
+    ]
     if ties:
         # At or before T every trace of the tie is out of effect (stamped),
         # and the unknown row stands for what that Undo left.
@@ -825,8 +836,11 @@ def _timeline_at_cutoff(ev_list: list, cutoff_utc: datetime,
             at, position = undo_position(trace)
             rows.append(((at, 1, position), _undo_event(trace)))
     rows.sort(key=lambda row: row[0])
-    later = [ev for _position, ev in rows
-             if (_parse_created_at(ev.created_at) or cutoff_utc) > cutoff_utc]
+    later = []
+    for _position, ev in rows:
+        dt = _parse_created_at(ev.created_at)
+        if dt is not None and dt > cutoff_utc:
+            later.append(ev)
     return visible, _drop_neutral_unknowns(later)
 
 
@@ -939,13 +953,21 @@ def _segment_at_repacks(visible: list, later: list, bounds: tuple) -> tuple:
     """
     lo, his = bounds
     if lo is not None:
-        visible = [ev for ev in visible if _parse_created_at(ev.created_at) > lo]
+        filtered = []
+        for ev in visible:
+            dt = _parse_created_at(ev.created_at)
+            if dt is not None and dt > lo:
+                filtered.append(ev)
+        visible = filtered
     if not his:
         return visible, later, False, []
     own = []
     stretches: Dict[int, list] = {}
     for ev in later:
-        index = bisect_left(his, _parse_created_at(ev.created_at))
+        dt = _parse_created_at(ev.created_at)
+        if dt is None:
+            continue
+        index = bisect_left(his, dt)
         if index == 0:
             own.append(ev)
         else:

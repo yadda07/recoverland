@@ -294,7 +294,7 @@ def assertions(ctx):
         ("F_landed_failure_has_its_bucket",
          bd.get("failed_postcommit_verification") == 1 and bd.get("failed") == 0
          and bd.get("apply_fail") == 1 and bd.get("applied") == 1,
-         f"seaux={ {k: bd.get(k) for k in ('applied', 'apply_fail', 'failed', 'failed_postcommit_verification')} } "
+         f"seaux={({k: bd.get(k) for k in ('applied', 'apply_fail', 'failed', 'failed_postcommit_verification')})} "
          f"('failed' = residu 'autre raison') : "
          f"l'echec ecrit doit avoir son seau, pas 'autre raison'."),
         ("F_message_says_the_file_was_written",

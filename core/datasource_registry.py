@@ -415,11 +415,12 @@ def _find_matching_saved_connection(info: DatasourceInfo) -> Optional[dict]:
         return None
 
     parsed = QgsDataSourceUri(info.source_uri)
+    target_service = (parsed.service() or "").strip().lower()
     target_host = parsed.host().lower()
     target_port = parsed.port() or _default_port(info.provider_type)
     target_db = parsed.database().lower()
 
-    if not target_host or not target_db:
+    if not target_service and (not target_host or not target_db):
         return None
 
     settings = QgsSettings()
@@ -429,12 +430,16 @@ def _find_matching_saved_connection(info: DatasourceInfo) -> Optional[dict]:
 
     for name in names:
         p = f"{prefix}/{name}"
-        host = (settings.value(f"{p}/host", "") or "").lower()
-        port = str(settings.value(f"{p}/port", target_port))
-        db = (settings.value(f"{p}/database", "") or "").lower()
-
-        if host != target_host or port != str(target_port) or db != target_db:
-            continue
+        if target_service and not (target_host and target_db):
+            svc = (settings.value(f"{p}/service", "") or "").strip().lower()
+            if svc != target_service:
+                continue
+        else:
+            host = (settings.value(f"{p}/host", "") or "").lower()
+            port = str(settings.value(f"{p}/port", target_port))
+            db = (settings.value(f"{p}/database", "") or "").lower()
+            if host != target_host or port != str(target_port) or db != target_db:
+                continue
 
         authcfg = settings.value(f"{p}/authcfg", "")
         if authcfg:
@@ -460,33 +465,49 @@ def _default_port(provider_type: str) -> str:
 
 def _extract_authcfg(source_uri: str) -> str:
     """Extract authcfg ID from a QGIS source URI, or return empty string."""
-    match = re.search(r"authcfg=([A-Za-z0-9]+)", source_uri)
-    return match.group(1) if match else ""
+    match = re.search(r"""authcfg=(?:'([A-Za-z0-9]+)'|"([A-Za-z0-9]+)"|([A-Za-z0-9]+))""",
+                      source_uri or "")
+    if not match:
+        return ""
+    return match.group(1) or match.group(2) or match.group(3) or ""
 
 
 _PASSWORD_RE = re.compile(
-    r"""\b(?:ssl)?passw(?:ord|d)?='[^']*'"""
-    r'|\b(?:ssl)?passw(?:ord|d)?="[^"]*"'
-    r"""|\b(?:ssl)?passw(?:ord|d)?=[^'"\s]+""",
+    r"""\b(?:ssl)?(?:passw(?:ord|d)?|pwd)='(?:\\.|[^'\\])*'"""
+    r'|\b(?:ssl)?(?:passw(?:ord|d)?|pwd)="(?:\\.|[^"\\])*"'
+    r"""|\b(?:ssl)?(?:passw(?:ord|d)?|pwd)=[^'"\s;&]+""",
     re.IGNORECASE,
 )
+_TOKEN_RE = re.compile(
+    r"""(\b(?:access_token|api_?key|token)=)(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|[^'"\s;&]+)""",
+    re.IGNORECASE,
+)
+_URL_CRED_RE = re.compile(r"(://[^/@\s:]+:)([^/@\s]+)(@)")
+_OCI_CRED_RE = re.compile(r"(\bOCI:[^/@\s:]+/)([^@\s]+)(@)", re.IGNORECASE)
 
 
 def _strip_password_from_uri(uri: str, provider_type: str = "") -> str:
-    """Remove password= variants from a source URI before storing.
+    """Remove passwords, tokens, and inline URL credentials before storing.
 
     Passwords must NEVER be persisted. QGIS resolves them via authcfg.
-    For DB providers, use QgsDataSourceUri.setPassword('') which is the
-    canonical QGIS-side parser and handles all quoting corner cases.
-    Falls back to a regex for non-DB URIs (files, delimited text, etc.).
+    For DB providers, uses QgsDataSourceUri.setPassword('') first and
+    always applies regex defense-in-depth afterward.
     """
+    cleaned = uri or ""
     if provider_type in _DB_PROVIDERS:
         try:
             from qgis.core import QgsDataSourceUri
-            parsed = QgsDataSourceUri(uri)
+            parsed = QgsDataSourceUri(cleaned)
             parsed.setPassword("")
-            return parsed.uri()
+            try:
+                cleaned = parsed.uri(False)
+            except TypeError:
+                cleaned = parsed.uri()
         except Exception as exc:
             flog(f"datasource_registry: QgsDataSourceUri strip failed ({exc}); "
                  f"falling back to regex", "WARNING")
-    return _PASSWORD_RE.sub("password=***", uri)
+    cleaned = _PASSWORD_RE.sub("password=***", cleaned)
+    cleaned = _TOKEN_RE.sub(r"\1***", cleaned)
+    cleaned = _URL_CRED_RE.sub(r"\1***\3", cleaned)
+    cleaned = _OCI_CRED_RE.sub(r"\1***\3", cleaned)
+    return cleaned

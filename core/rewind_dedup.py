@@ -144,13 +144,15 @@ Pipeline:
 Zero QGIS dependency. Pure deterministic logic.
 """
 import json
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .audit_backend import AuditEvent
 from .constants import GEOMETRY_NULL_MARKER
 from .logger import flog
-from .serialization import extract_delta_new, extract_delta_old
+from .serialization import (
+    _values_equal, extract_delta_new, extract_delta_old,
+)
 from .temporal_snapshot_engine import compute_entity_key
 
 
@@ -229,7 +231,7 @@ def _entity_key(event: AuditEvent) -> str:
 def _detect_fid_recycle(
     events: List[AuditEvent],
     traces: Optional[List[AuditEvent]] = None,
-) -> Tuple[Dict[tuple, tuple], List[Tuple[str, int, int]]]:
+) -> Tuple[Dict[tuple, List[Tuple[tuple, int]]], List[Tuple[str, int, int]]]:
     """Detect FID-recycle patterns within a single fp lifeline.
 
     Pattern of interest (BL-RW-P1-07, CR-1):
@@ -285,12 +287,13 @@ def _detect_fid_recycle(
             entity_fingerprint are skipped (defensive).
 
     Returns:
-        fp_split: dict {(datasource, fp) -> (order_key, event_id) of the
-            most recent SPLIT}. The order key is what the rewrite below
-            compares against, for the same chronological reason.
+        fp_split: dict {(datasource, fp) -> sorted list of
+            (order_key, event_id) for every detected SPLIT}. Keeping all
+            split points separates 2+ recycles of the same FID into
+            distinct buckets.
         splits: list of (fp, first_eid, second_eid) for logging.
     """
-    fp_split: Dict[tuple, tuple] = {}
+    fp_split: Dict[tuple, List[Tuple[tuple, int]]] = {}
     splits: List[Tuple[str, int, int]] = []
     writes = {id(t) for t in traces or ()}
     sorted_events = sorted(
@@ -321,7 +324,7 @@ def _detect_fid_recycle(
         state = fp_state.get(fp_key)
         if op == "INSERT":
             if state in ("closed", "pre_existing"):
-                fp_split[fp_key] = (_order_key(e), e.event_id)
+                fp_split.setdefault(fp_key, []).append((_order_key(e), e.event_id))
                 splits.append((e.entity_fingerprint,
                                fp_first_eid.get(fp_key), e.event_id))
                 fp_first_eid[fp_key] = e.event_id
@@ -337,7 +340,7 @@ def _detect_fid_recycle(
                 # re-inserted both, the executor's remap then pointed at
                 # the newer one, and the UPDATE rows of the first feature
                 # were written onto the second.
-                fp_split[fp_key] = (_order_key(e), e.event_id)
+                fp_split.setdefault(fp_key, []).append((_order_key(e), e.event_id))
                 splits.append((e.entity_fingerprint,
                                fp_first_eid.get(fp_key), e.event_id))
                 fp_first_eid[fp_key] = e.event_id
@@ -347,7 +350,7 @@ def _detect_fid_recycle(
                 fp_state[fp_key] = "pre_existing"
                 fp_first_eid[fp_key] = e.event_id
             elif state == "closed":
-                fp_split[fp_key] = (_order_key(e), e.event_id)
+                fp_split.setdefault(fp_key, []).append((_order_key(e), e.event_id))
                 splits.append((e.entity_fingerprint,
                                fp_first_eid.get(fp_key), e.event_id))
                 fp_first_eid[fp_key] = e.event_id
@@ -358,10 +361,10 @@ def _detect_fid_recycle(
 
 def _apply_fid_recycle_rewrite(
     events: List[AuditEvent],
-    fp_split: Dict[tuple, tuple],
+    fp_split: Dict[tuple, object],
 ) -> List[AuditEvent]:
     """Rewrite entity_fingerprint to fp@<split_eid> for events on or
-    after a detected FID-recycle split.
+    after each detected FID-recycle split.
 
     Keys are (datasource_fingerprint, entity_fingerprint) pairs, so a split
     detected in one layer never touches the identically-numbered feature of
@@ -381,17 +384,23 @@ def _apply_fid_recycle_rewrite(
     """
     if not fp_split:
         return events
+    split_keys = {
+        k: ([s[0] for s in v] if isinstance(v, list) else [v[0]])
+        for k, v in fp_split.items()
+    }
     rewritten: List[AuditEvent] = []
     for e in events:
         fp = e.entity_fingerprint
         fp_key = (e.datasource_fingerprint, fp)
         split = fp_split.get(fp_key)
-        if (fp and split is not None and e.event_id is not None
-                and _order_key(e) >= split[0]):
-            new_fp = f"{fp}@{split[1]}"
-            rewritten.append(e._replace(entity_fingerprint=new_fp))
-        else:
-            rewritten.append(e)
+        if fp and split is not None and e.event_id is not None:
+            split_list = split if isinstance(split, list) else [split]
+            pos = bisect_right(split_keys[fp_key], _order_key(e))
+            if pos > 0:
+                new_fp = f"{fp}@{split_list[pos - 1][1]}"
+                rewritten.append(e._replace(entity_fingerprint=new_fp))
+                continue
+        rewritten.append(e)
     return rewritten
 
 
@@ -1157,7 +1166,26 @@ def _full_state(row: AuditEvent) -> Optional[Tuple[dict, Optional[bytes]]]:
     if not isinstance(attrs, dict):
         return None
     geom = row.geometry_wkb
-    return dict(attrs), (bytes(geom) if geom is not None else None)
+    if geom is None:
+        return dict(attrs), None
+    raw = bytes(geom)
+    return dict(attrs), (None if raw == GEOMETRY_NULL_MARKER else raw)
+
+
+def _states_equal(
+    a: Optional[Tuple[dict, Optional[bytes]]],
+    b: Optional[Tuple[dict, Optional[bytes]]],
+) -> bool:
+    """Compare two (attrs, geom) full states using NaN/bool-safe equality."""
+    if a is None or b is None:
+        return False
+    a_attrs, a_geom = a
+    b_attrs, b_geom = b
+    if a_geom != b_geom:
+        return False
+    if a_attrs.keys() != b_attrs.keys():
+        return False
+    return all(_values_equal(a_attrs[k], b_attrs[k]) for k in a_attrs)
 
 
 def _state_before_chain(chain_desc: List[AuditEvent]
@@ -1373,13 +1401,15 @@ def _pair_reinserted_lifetimes(
                     or not r_pos < oldest):
                 continue
             state, between = state_at(r, r_key, r_pos, oldest)
-            if state is None or (state != (attrs, geom)
-                                 and _unwound(attrs, geom, between)
-                                 != _full_state(r)):
+            if state is None or (not _states_equal(state, (attrs, geom))
+                                 and not _states_equal(
+                                     _unwound(attrs, geom, between),
+                                     _full_state(r))):
                 state, between = shifted_state_at(r, r_key, r_pos, oldest, ds)
-            if state is None or (state != (attrs, geom)
-                                 and _unwound(attrs, geom, between)
-                                 != _full_state(r)):
+            if state is None or (not _states_equal(state, (attrs, geom))
+                                 and not _states_equal(
+                                     _unwound(attrs, geom, between),
+                                     _full_state(r))):
                 continue
             if best is None or r_pos > best[1]:
                 best = (r, r_pos, between)
@@ -2663,9 +2693,9 @@ def _lifetime_ends_as(lifetime: List[AuditEvent], delete_row: AuditEvent) -> boo
             old = bytes(row.geometry_wkb)
             geom = None if old == GEOMETRY_NULL_MARKER else old
     t_attrs, t_geom = target
-    if any(attrs[k] != t_attrs[k] for k in set(attrs) & set(t_attrs)):
+    if any(not _values_equal(attrs[k], t_attrs[k]) for k in set(attrs) & set(t_attrs)):
         return False
-    return geom is None or t_geom is None or geom == t_geom
+    return geom == t_geom
 
 
 def _cancel_replacements(rows_desc: List[AuditEvent]) -> List[AuditEvent]:
@@ -2687,7 +2717,7 @@ def _cancel_replacements(rows_desc: List[AuditEvent]) -> List[AuditEvent]:
                     or _INVERSE_OP.get(b.operation_type) != "INSERT"):
                 continue
             sa = _full_state(a)
-            if sa is None or sa != _full_state(b):
+            if sa is None or not _states_equal(sa, _full_state(b)):
                 continue
             flog(f"rewind_dedup: delete eid={a.event_id} then re-insert "
                  f"eid={b.event_id} of the same snapshot "

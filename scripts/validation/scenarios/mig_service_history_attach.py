@@ -283,7 +283,7 @@ def assertions(ctx):
             d.get("error") is None
             and not any("error" in c for c in cases.values()),
             f"le scenario a plante : {d.get('error')} "
-            f"{ {k: v.get('error') for k, v in cases.items() if 'error' in v} }")]
+            f"{({k: v.get('error') for k, v in cases.items() if 'error' in v})}")]
     alias = (uniq.get("aliases") or {}).get(_LEGACY)
     out.append((
         "single_service_history_attached",
